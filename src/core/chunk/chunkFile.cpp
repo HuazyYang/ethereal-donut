@@ -181,7 +181,10 @@ nvrhi::FRESULT ChunkFile::deserialize(
         }
 
         result->_filepath = filepath;
+        // The chunks point into the blob, so the file keeps it alive for its own lifetime;
+        // ~ChunkFile releases this reference. The caller keeps its own.
         result->_data = blob;
+        nvrhi::SafeAddRef(result->_data);
 
         if(ppChunkFile) {
             *ppChunkFile = result;
