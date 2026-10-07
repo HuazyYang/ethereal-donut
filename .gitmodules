@@ -1,6 +1,6 @@
-[submodule "nvrhi"]
-	path = nvrhi
-	url = ../NVRHI.git
+[submodule "ethereal-nvrhi"]
+	path = ethereal-nvrhi
+	url = https://github.com/HuazyYang/ethereal-nvrhi.git
 [submodule "thirdparty/imgui"]
 	path = thirdparty/imgui
 	url = https://github.com/ocornut/imgui

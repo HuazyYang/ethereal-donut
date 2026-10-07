@@ -40,7 +40,7 @@ target_link_libraries(donut_core jsoncpp_static)
 # The object model (IObject, AutoPtr, ObjectImpl, ...) is nvrhi::core. nvrhi/CMakeLists.txt defines it
 # when DONUT_WITH_NVRHI is on; otherwise only the core library is added here.
 if (NOT TARGET nvrhi::core)
-    include(${CMAKE_CURRENT_SOURCE_DIR}/nvrhi/cmake/NvrhiCore.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/ethereal-nvrhi/cmake/NvrhiCore.cmake)
 endif()
 target_link_libraries(donut_core nvrhi::core)
 

@@ -92,7 +92,7 @@ if (DONUT_WITH_NVRHI)
     set(NVRHI_WITH_VULKAN "${DONUT_WITH_VULKAN}" CACHE BOOL "" FORCE)
     set(NVRHI_WITH_AFTERMATH "${DONUT_WITH_AFTERMATH}" CACHE BOOL "" FORCE)
 
-    add_subdirectory(nvrhi)
+    add_subdirectory(ethereal-nvrhi)
 
     set(DONUT_SHADER_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/include CACHE PATH "" FORCE)
     
