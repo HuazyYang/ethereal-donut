@@ -31,9 +31,12 @@
 #
 # * This script can be configured to use either a given path location or
 #   a URL to a download server ; automated fetch from Microsfot's NuGet
-#   repository is the recommended method.
+#   repository is the recommended method. The download goes through EPM
+#   (ethereal-nvrhi/cmake/EPM.cmake): it is cached, extracted once, and checked
+#   against DONUT_D3D_AGILITY_SDK_URL_HASH (ALGO=hex) when that is set.
 #   ex:
 #      set(DONUT_D3D_AGILITY_SDK_URL "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.614.1")
+#      set(DONUT_D3D_AGILITY_SDK_URL_HASH "SHA256=...")
 #      include("${PROJECT_SOURCE_DIR}/extern/donut/cmake/FetchAgilitySDK.cmake")
 #
 # * The client application is responsible for managing the placement of
@@ -65,29 +68,27 @@ if(DONUT_D3D_AGILITY_SDK_PATH AND DONUT_D3D_AGILITY_SDK_URL)
     message(FATAL_ERROR "both DONUT_D3D_AGILITY_SDK_PATH and DONUT_D3D_AGILITY_SDK_URL were set: pick one")
 endif()
 
-set(DONUT_D3D_AGILITY_SDK_FETCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/agility_sdk" CACHE STRING "Directory to fetch the D3D12 Agility SDK to, empty uses build directory default")
+set(DONUT_D3D_AGILITY_SDK_FETCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/agility_sdk" CACHE STRING "Directory to fetch the D3D12 Agility SDK to, empty uses the EPM source cache")
 
 if(DONUT_D3D_AGILITY_SDK_URL)
 
     # example :
     #     set(DONUT_D3D_AGILITY_SDK_URL "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.614.1")
 
-    include(FetchContent)
+    include("${CMAKE_CURRENT_LIST_DIR}/../ethereal-nvrhi/cmake/EPM.cmake")
 
-    if(DONUT_D3D_AGILITY_SDK_FETCH_DIR)
-        FetchContent_Declare(d3d_agility_sdk 
-            URL "${DONUT_D3D_AGILITY_SDK_URL}"
-            SOURCE_DIR "${DONUT_D3D_AGILITY_SDK_FETCH_DIR}"
-            DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-        set(DONUT_D3D_AGILITY_SDK_PATH "${DONUT_D3D_AGILITY_SDK_FETCH_DIR}")
-    else()
-        FetchContent_Declare(d3d_agility_sdk 
-            URL "${DONUT_D3D_AGILITY_SDK_URL}"
-            DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-        set(DONUT_D3D_AGILITY_SDK_PATH "${CMAKE_BINARY_DIR}/_deps/d3d_agility_sdk-src/")        
+    # A NuGet URL has no file extension; the package is a zip archive.
+    set(_d3d_agility_hash_args ALLOW_UNVERIFIED)
+    if(DONUT_D3D_AGILITY_SDK_URL_HASH)
+        set(_d3d_agility_hash_args URL_HASH "${DONUT_D3D_AGILITY_SDK_URL_HASH}")
     endif()
-
-    FetchContent_MakeAvailable(d3d_agility_sdk)
+    epm_add_asset(
+        NAME d3d_agility_sdk
+        URL "${DONUT_D3D_AGILITY_SDK_URL}"
+        FILENAME d3d_agility_sdk.zip
+        ${_d3d_agility_hash_args}
+        DESTINATION "${DONUT_D3D_AGILITY_SDK_FETCH_DIR}")
+    set(DONUT_D3D_AGILITY_SDK_PATH "${d3d_agility_sdk_DIR}")
 
 endif()
 

@@ -1,18 +1,3 @@
 [submodule "ethereal-nvrhi"]
 	path = ethereal-nvrhi
 	url = https://github.com/HuazyYang/ethereal-nvrhi.git
-[submodule "thirdparty/imgui"]
-	path = thirdparty/imgui
-	url = https://github.com/ocornut/imgui
-[submodule "thirdparty/stb"]
-	path = thirdparty/stb
-	url = https://github.com/nothings/stb.git
-[submodule "thirdparty/glfw"]
-	path = thirdparty/glfw
-	url = https://github.com/glfw/glfw.git
-[submodule "thirdparty/cgltf"]
-	path = thirdparty/cgltf
-	url = https://github.com/jkuhlmann/cgltf
-[submodule "thirdparty/shader-tool"]
-	path = thirdparty/shader-tool
-	url = git@github.com:HuazyYang/shader-tool.git

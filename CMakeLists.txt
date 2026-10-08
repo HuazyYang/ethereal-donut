@@ -29,6 +29,9 @@ set(CMAKE_CXX_EXTENSIONS ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
+# EPM, the package manager of the Ethereal projects, lives in nvrhi (a submodule of this repository).
+include("${CMAKE_CURRENT_SOURCE_DIR}/ethereal-nvrhi/cmake/EPM.cmake")
+
 set_property( GLOBAL PROPERTY USE_FOLDERS ON)
 
 if (MSVC)
@@ -48,7 +51,6 @@ endif()
 string(APPEND CMAKE_CXX_FLAGS_DEBUG " -D_DEBUG")
 
 include(CMakeDependentOption)
-include(FetchContent)
 
 option(DONUT_WITH_NVRHI "Enable NVRHI and related projects" ON)
 
@@ -76,9 +78,6 @@ set(DONUT_DLSS_FETCH_TAG "a8ed84e2d1cc1efa7bef63fb9394be6cb06c0d74" CACHE STRING
 set(DONUT_DLSS_FETCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/DLSS" CACHE STRING "Directory to fetch DLSS to, empty uses build directory default")
 
 option(DONUT_WITH_KTX "Build KTX2 (BCn + Zstandard) texture loading support" ON)
-set(DONUT_ZSTD_FETCH_URL "https://github.com/facebook/zstd.git" CACHE STRING "URL of the Zstandard Git repository to fetch from")
-set(DONUT_ZSTD_FETCH_TAG "v1.5.6" CACHE STRING "Git commit hash or tag for Zstandard")
-set(DONUT_ZSTD_FETCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/zstd" CACHE STRING "Directory to fetch Zstandard to, empty uses build directory default")
 
 if (WIN32)
     option(DONUT_FORCE_DISCRETE_GPU "Declare symbols to make the OS run the app on discrete GPU on laptops" OFF)
@@ -92,7 +91,7 @@ if (DONUT_WITH_NVRHI)
     set(NVRHI_WITH_VULKAN "${DONUT_WITH_VULKAN}" CACHE BOOL "" FORCE)
     set(NVRHI_WITH_AFTERMATH "${DONUT_WITH_AFTERMATH}" CACHE BOOL "" FORCE)
 
-    add_subdirectory(ethereal-nvrhi)
+    epm_add_package(NAME nvrhi SOURCE_DIR ethereal-nvrhi)
 
     set(DONUT_SHADER_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/include CACHE PATH "" FORCE)
     
@@ -100,14 +99,11 @@ if (DONUT_WITH_NVRHI)
 endif()
 
 if (DONUT_WITH_DLSS)
-    message(STATUS "Updating DLSS from " ${DONUT_DLSS_FETCH_URL} ", tag " ${DONUT_DLSS_FETCH_TAG} ", into folder " ${DONUT_DLSS_FETCH_DIR} " - please wait!" )
-    FetchContent_Declare(
-        DLSS
+    epm_add_asset(
+        NAME DLSS
         GIT_REPOSITORY ${DONUT_DLSS_FETCH_URL}
         GIT_TAG ${DONUT_DLSS_FETCH_TAG}
-        SOURCE_DIR ${DONUT_DLSS_FETCH_DIR}
-    )
-    FetchContent_MakeAvailable(DLSS)
+        DESTINATION "${DONUT_DLSS_FETCH_DIR}")
 
     include(cmake/DLSS.cmake)
 endif()
@@ -143,15 +139,11 @@ if (DONUT_WITH_STREAMLINE)
     endif()
 
     if (DONUT_STREAMLINE_FETCH_URL AND DONUT_STREAMLINE_FETCH_SHA256)
-        message(STATUS "Updating Streamline from " ${DONUT_STREAMLINE_FETCH_URL} ", SHA256 " ${DONUT_STREAMLINE_FETCH_SHA256} ", into folder " ${DONUT_STREAMLINE_FETCH_DIR} " - please wait!" )
-        FetchContent_Declare(
-            streamline
+        epm_add_package(
+            NAME streamline
             URL ${DONUT_STREAMLINE_FETCH_URL}
             URL_HASH SHA256=${DONUT_STREAMLINE_FETCH_SHA256}
-            SOURCE_DIR ${DONUT_STREAMLINE_FETCH_DIR}
-            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-        )
-        FetchContent_MakeAvailable(streamline)
+            FETCH_DIR "${DONUT_STREAMLINE_FETCH_DIR}")
     else ()
         if (DONUT_STREAMLINE_SEARCH_PATHS)
             set(STREAMLINE_SEARCH_PATHS ${DONUT_STREAMLINE_SEARCH_PATHS})
@@ -159,7 +151,7 @@ if (DONUT_WITH_STREAMLINE)
         find_package(STREAMLINE REQUIRED)
 
         if (STREAMLINE_FOUND)
-            add_subdirectory(${STREAMLINE_SOURCE_DIR} ${CMAKE_BINARY_DIR}/streamline)
+            epm_add_package(NAME streamline SOURCE_DIR "${STREAMLINE_SOURCE_DIR}" BINARY_DIR "${CMAKE_BINARY_DIR}/streamline")
         endif()
     endif()
 endif()

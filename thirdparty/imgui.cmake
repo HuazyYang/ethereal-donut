@@ -21,21 +21,21 @@
 
 
 set(imgui_srcs
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/imconfig.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/imgui_draw.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/imgui_tables.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/imgui_widgets.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/imgui_internal.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/imgui.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/imgui.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/imstb_rectpack.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/imstb_textedit.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/imstb_truetype.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/imgui_demo.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends/imgui_impl_glfw.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/imconfig.h
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/imgui_internal.h
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui.h
+    ${imgui_SOURCE_DIR}/imstb_rectpack.h
+    ${imgui_SOURCE_DIR}/imstb_textedit.h
+    ${imgui_SOURCE_DIR}/imstb_truetype.h
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.h
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
     )
 
 add_library(imgui STATIC ${imgui_srcs})
-target_include_directories(imgui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/imgui)
+target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
 target_link_libraries(imgui PRIVATE glfw)

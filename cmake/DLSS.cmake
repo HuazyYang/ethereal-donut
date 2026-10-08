@@ -19,7 +19,7 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-set(dlss_sdk "${dlss_SOURCE_DIR}")
+set(dlss_sdk "${DLSS_DIR}")
 set(dlss_platform_win "Windows_x86_64")
 set(dlss_platform_lin "Linux_x86_64")
 
