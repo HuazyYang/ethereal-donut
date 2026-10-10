@@ -32,10 +32,14 @@ class AudioData;
 
 // Effect : transient interface to manipulate active sound effects
 //
+struct Effect;
+NVRHI_SCLSID(Effect, "0e5033e3-320e-4f9c-9f25-a18b02753138")
 struct Effect: nvrhi::WeakReferenceSourceImpl<nvrhi::IWeakReferenceSource>
 {
+    NVRHI_DECLARE_UUID_TRAITS(Effect)
     NVRHI_BEGIN_INTERFACE_TABLE_INLINE(Effect)
     NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+    NVRHI_IMPLEMENTS_CLASS(Effect)
     NVRHI_END_INTERFACE_TABLE()
 
     // returns the audio sample associated with this effect

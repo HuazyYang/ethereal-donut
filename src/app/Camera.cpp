@@ -522,7 +522,7 @@ dm::affine3 SwitchableCamera::GetWorldToViewMatrix() const
 
 bool SwitchableCamera::GetSceneCameraProjectionParams(float& verticalFov, float& zNear) const
 {
-    auto perspectiveCamera = dynamic_cast<engine::PerspectiveCamera *>(m_SceneCamera.Get());
+    auto perspectiveCamera = query_cast<engine::PerspectiveCamera>(m_SceneCamera.Get());
     if (perspectiveCamera)
     {
         zNear = perspectiveCamera->zNear;

@@ -523,7 +523,7 @@ void SceneGraph::RegisterLeaf(SceneGraphLeaf *leaf)
     if (!leaf)
         return;
     
-    auto meshInstance = dynamic_cast<MeshInstance *>(leaf);
+    auto meshInstance = query_cast<MeshInstance>(leaf);
     if (meshInstance)
     {
         const auto& mesh = meshInstance->GetMesh();
@@ -559,7 +559,7 @@ void SceneGraph::RegisterLeaf(SceneGraphLeaf *leaf)
         }
         m_MeshInstances.push_back(meshInstance);
 
-        auto skinnedInstance = dynamic_cast<SkinnedMeshInstance *>(meshInstance);
+        auto skinnedInstance = query_cast<SkinnedMeshInstance>(meshInstance);
         if (skinnedInstance)
         {
             m_SkinnedMeshInstances.push_back(skinnedInstance);
@@ -568,21 +568,21 @@ void SceneGraph::RegisterLeaf(SceneGraphLeaf *leaf)
         return;
     }
     
-    auto animation = dynamic_cast<SceneGraphAnimation *>(leaf);
+    auto animation = query_cast<SceneGraphAnimation>(leaf);
     if (animation)
     {
         m_Animations.push_back(animation);
         return;
     }
 
-    auto camera = dynamic_cast<SceneCamera *>(leaf);
+    auto camera = query_cast<SceneCamera>(leaf);
     if (camera)
     {
         m_Cameras.push_back(camera);
         return;
     }
 
-    auto light = dynamic_cast<Light *>(leaf);
+    auto light = query_cast<Light>(leaf);
     if (light)
     {
         m_Lights.push_back(light);
@@ -595,7 +595,7 @@ void SceneGraph::UnregisterLeaf(SceneGraphLeaf *leaf)
     if (!leaf)
         return;
 
-    auto meshInstance = dynamic_cast<MeshInstance *>(leaf);
+    auto meshInstance = query_cast<MeshInstance>(leaf);
     if (meshInstance)
     {
         const auto& mesh = meshInstance->GetMesh();
@@ -631,7 +631,7 @@ void SceneGraph::UnregisterLeaf(SceneGraphLeaf *leaf)
         return;
     }
 
-    auto skinnedInstance = dynamic_cast<SkinnedMeshInstance *>(leaf);
+    auto skinnedInstance = query_cast<SkinnedMeshInstance>(leaf);
     if (skinnedInstance)
     {
         auto it = std::find(m_SkinnedMeshInstances.begin(), m_SkinnedMeshInstances.end(), skinnedInstance);
@@ -640,7 +640,7 @@ void SceneGraph::UnregisterLeaf(SceneGraphLeaf *leaf)
         return;
     }
 
-    auto animation = dynamic_cast<SceneGraphAnimation *>(leaf);
+    auto animation = query_cast<SceneGraphAnimation>(leaf);
     if (animation)
     {
         auto it = std::find(m_Animations.begin(), m_Animations.end(), animation);
@@ -649,7 +649,7 @@ void SceneGraph::UnregisterLeaf(SceneGraphLeaf *leaf)
         return;
     }
 
-    auto camera = dynamic_cast<SceneCamera *>(leaf);
+    auto camera = query_cast<SceneCamera>(leaf);
     if (camera)
     {
         auto it = std::find(m_Cameras.begin(), m_Cameras.end(), camera);
@@ -658,7 +658,7 @@ void SceneGraph::UnregisterLeaf(SceneGraphLeaf *leaf)
         return;
     }
 
-    auto light = dynamic_cast<Light *>(leaf);
+    auto light = query_cast<Light>(leaf);
     if (light)
     {
         auto it = std::find(m_Lights.begin(), m_Lights.end(), light);
@@ -763,7 +763,7 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
         walker = SceneGraphWalker(attachedChild);
         while (walker)
         {
-            if (auto animation = dynamic_cast<SceneGraphAnimation*>(walker->m_Leaf.Get()))
+            if (auto animation = query_cast<SceneGraphAnimation>(walker->m_Leaf.Get()))
             {
                 for (const auto& channel : animation->GetChannels())
                 {
@@ -774,7 +774,7 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
                     }
                 }
             }
-            else if (auto skinnedInstance = dynamic_cast<SkinnedMeshInstance*>(walker->m_Leaf.Get()))
+            else if (auto skinnedInstance = query_cast<SkinnedMeshInstance>(walker->m_Leaf.Get()))
             {
                 for (auto& joint : skinnedInstance->joints)
                 {
@@ -786,7 +786,7 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
                     }
                 }
             }
-            else if (auto meshReference = dynamic_cast<SkinnedMeshReference*>(walker->m_Leaf.Get()))
+            else if (auto meshReference = query_cast<SkinnedMeshReference>(walker->m_Leaf.Get()))
             {
                 auto instance = meshReference->m_Instance.Lock();
                 if (instance)
@@ -795,7 +795,7 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
 
                     auto newNode = nodeMap[oldNode];
                     if (newNode)
-                        meshReference->m_Instance = dynamic_cast<SkinnedMeshInstance *>(newNode->m_Leaf.Get());
+                        meshReference->m_Instance = query_cast<SkinnedMeshInstance>(newNode->m_Leaf.Get());
                     else
                         meshReference->m_Instance.Reset();
                 }
@@ -1024,7 +1024,7 @@ void SceneGraph::Refresh(uint32_t frameIndex)
         }
 
         // store the update frame number for skinned groups
-        if (auto meshReference = dynamic_cast<SkinnedMeshReference*>(current->m_Leaf.Get()))
+        if (auto meshReference = query_cast<SkinnedMeshReference>(current->m_Leaf.Get()))
         {
             if ((current->m_Dirty & SceneGraphNode::DirtyFlags::LocalTransform) != 0)
             {
@@ -1229,7 +1229,7 @@ void donut::engine::PrintSceneGraph(const SceneGraphNode *root)
         {
             ss << ": ";
 
-            if (auto meshInstance = dynamic_cast<MeshInstance*>(walker->GetLeaf()))
+            if (auto meshInstance = query_cast<MeshInstance>(walker->GetLeaf()))
             {
                 if (!meshInstance->GetMesh()->name.empty())
                     ss << meshInstance->GetMesh()->name;
@@ -1238,13 +1238,13 @@ void donut::engine::PrintSceneGraph(const SceneGraphNode *root)
 
                 ss << " (" << meshInstance->GetMesh()->geometries.size() << " geometries)";
 
-                auto skinnedInstance = dynamic_cast<SkinnedMeshInstance*>(meshInstance);
+                auto skinnedInstance = query_cast<SkinnedMeshInstance>(meshInstance);
                 if (skinnedInstance)
                 {
                     ss << " - skinned, " << skinnedInstance->joints.size() << " joints";
                 }
             }
-            else if (auto animation = dynamic_cast<SceneGraphAnimation*>(walker->GetLeaf()))
+            else if (auto animation = query_cast<SceneGraphAnimation>(walker->GetLeaf()))
             {
                 ss << "Animation (" << animation->GetChannels().size() << " channels)";
                 log::info("%s", ss.str().c_str());
@@ -1286,10 +1286,10 @@ void donut::engine::PrintSceneGraph(const SceneGraphNode *root)
                     ss.str(std::string()); // clear
                 }
             }
-            else if (auto camera = dynamic_cast<SceneCamera*>(walker->GetLeaf()))
+            else if (auto camera = query_cast<SceneCamera>(walker->GetLeaf()))
             {
-                auto perspective = dynamic_cast<PerspectiveCamera*>(camera);
-                auto orthographic = dynamic_cast<OrthographicCamera*>(camera);
+                auto perspective = query_cast<PerspectiveCamera>(camera);
+                auto orthographic = query_cast<OrthographicCamera>(camera);
 
                 if (perspective)
                 {
@@ -1307,11 +1307,11 @@ void donut::engine::PrintSceneGraph(const SceneGraphNode *root)
                     ss << "Unknown Type Camera";
                 }
             }
-            else if (auto light = dynamic_cast<Light*>(walker->GetLeaf()))
+            else if (auto light = query_cast<Light>(walker->GetLeaf()))
             {
-                auto directional = dynamic_cast<DirectionalLight*>(light);
-                auto point = dynamic_cast<PointLight*>(light);
-                auto spot = dynamic_cast<SpotLight*>(light);
+                auto directional = query_cast<DirectionalLight>(light);
+                auto point = query_cast<PointLight>(light);
+                auto spot = query_cast<SpotLight>(light);
 
                 if (directional)
                 {
@@ -1349,7 +1349,7 @@ void donut::engine::PrintSceneGraph(const SceneGraphNode *root)
                     ss << "Unknown Type Light";
                 }
             }
-            else if (dynamic_cast<SkinnedMeshReference*>(walker->GetLeaf()))
+            else if (query_cast<SkinnedMeshReference>(walker->GetLeaf()))
             {
                 ss << "Joint";
             }

@@ -1671,14 +1671,14 @@ nvrhi::FRESULT GltfImporter::Load(
         switch(src->type)  // NOLINT(clang-diagnostic-switch-enum)
         {
         case cgltf_light_type_directional: {
-            nvrhi::AutoPtr<DirectionalLight> directional{dynamic_cast<DirectionalLight *>(m_SceneTypeFactory->CreateLeaf("DirectionalLight").Get())};
+            nvrhi::AutoPtr<DirectionalLight> directional{query_cast<DirectionalLight>(m_SceneTypeFactory->CreateLeaf("DirectionalLight").Get())};
             directional->irradiance = src->intensity;
             directional->color = src->color;
             dst = directional;
             break;
         }
         case cgltf_light_type_point: {
-            nvrhi::AutoPtr<PointLight> point {dynamic_cast<PointLight *>(m_SceneTypeFactory->CreateLeaf("PointLight").Get())};
+            nvrhi::AutoPtr<PointLight> point {query_cast<PointLight>(m_SceneTypeFactory->CreateLeaf("PointLight").Get())};
             point->intensity = src->intensity;
             point->color = src->color;
             point->range = src->range;
@@ -1686,7 +1686,7 @@ nvrhi::FRESULT GltfImporter::Load(
             break;
         }
         case cgltf_light_type_spot: {
-            nvrhi::AutoPtr<SpotLight> spot{dynamic_cast<SpotLight *>(m_SceneTypeFactory->CreateLeaf("SpotLight").Get())};
+            nvrhi::AutoPtr<SpotLight> spot{query_cast<SpotLight>(m_SceneTypeFactory->CreateLeaf("SpotLight").Get())};
             spot->intensity = src->intensity;
             spot->color = src->color;
             spot->range = src->range;

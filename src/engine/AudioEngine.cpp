@@ -23,6 +23,7 @@
 #include <donut/engine/AudioEngine.h>
 #include <donut/engine/AudioCache.h>
 #include <donut/core/log.h>
+#include <donut/core/query_cast.h>
 
 #ifdef WIN32
 #include <xaudio2.h>
@@ -217,9 +218,16 @@ class Xaudio2Implementation;
 // Xaudio2 effect specialization
 //
 
+struct Xaudio2Effect;
+NVRHI_SCLSID(Xaudio2Effect, "54807c01-129a-4094-90b2-2a35da1db78a")
 struct Xaudio2Effect : public Effect
 {
-    NVRHI_INHERIT_INTERFACE_TABLE()
+    NVRHI_DECLARE_UUID_TRAITS(Xaudio2Effect)
+    NVRHI_BEGIN_INTERFACE_TABLE_INLINE(Xaudio2Effect)
+    NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+    NVRHI_IMPLEMENTS_CLASS(Xaudio2Effect)
+    NVRHI_IMPLEMENTS_ROUTE_PARENT(Effect)
+    NVRHI_END_INTERFACE_TABLE()
     using Effect::Effect;
 
     AudioData *getSample() const override;
@@ -267,9 +275,16 @@ float Xaudio2Effect::played()
 
 // Xaudio2 3D effect specialization
 
+struct Xaudio2Effect3D;
+NVRHI_SCLSID(Xaudio2Effect3D, "ada81a1f-aace-4829-9b03-4a89916711c1")
 struct Xaudio2Effect3D : public Xaudio2Effect
 {
-    NVRHI_INHERIT_INTERFACE_TABLE()
+    NVRHI_DECLARE_UUID_TRAITS(Xaudio2Effect3D)
+    NVRHI_BEGIN_INTERFACE_TABLE_INLINE(Xaudio2Effect3D)
+    NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+    NVRHI_IMPLEMENTS_CLASS(Xaudio2Effect3D)
+    NVRHI_IMPLEMENTS_ROUTE_PARENT(Xaudio2Effect)
+    NVRHI_END_INTERFACE_TABLE()
     using Xaudio2Effect::Xaudio2Effect;
     virtual bool setEmitterTransform(donut::math::affine3 const & transform);
 
@@ -449,7 +464,7 @@ void Xaudio2Implementation::clearVoices()
     m_voicePoolMutex.lock();
     for (auto it : m_activeVoices)
     {
-        auto effect = dynamic_cast<Xaudio2Effect*>(it.Get());
+        auto effect = query_cast<Xaudio2Effect>(it.Get());
         effect->voice->Stop();
         effect->voice->DestroyVoice();
     }
@@ -688,7 +703,7 @@ void Xaudio2Implementation::update()
 
         for (auto it = m_activeVoices.begin(); it != m_activeVoices.end(); )
         {
-            auto effect = dynamic_cast<Xaudio2Effect *>((*it).Get());
+            auto effect = query_cast<Xaudio2Effect>((*it).Get());
             if (effect)
             {
                 XAUDIO2_VOICE_STATE xstate;
@@ -738,7 +753,7 @@ void Xaudio2Implementation::update()
 
                     // if the voice is still active & is a 3D emitter, compute volume mix
                     if (m_options.use3D)
-                        if (auto effect3D = dynamic_cast<Xaudio2Effect3D *>(effect))
+                        if (auto effect3D = query_cast<Xaudio2Effect3D>(effect))
                         {
                             effect3D->update(now, m_options.leftHanded);
 

@@ -81,7 +81,7 @@ void InstancedOpaqueDrawStrategy::FillChunk()
 
             if (nodeVisible && nodeContentsRelevant)
             {
-                auto meshInstance = dynamic_cast<MeshInstance*>(m_Walker->GetLeaf());
+                auto meshInstance = query_cast<MeshInstance>(m_Walker->GetLeaf());
                 if (meshInstance)
                 {
                     const engine::MeshInfo* mesh = meshInstance->GetMesh();
@@ -194,7 +194,7 @@ void TransparentDrawStrategy::PrepareForView(engine::SceneGraphNode* rootNode, c
 
             if (nodeVisible && nodeContentsRelevant)
             {
-                auto meshInstance = dynamic_cast<MeshInstance*>(walker->GetLeaf());
+                auto meshInstance = query_cast<MeshInstance>(walker->GetLeaf());
                 if (meshInstance)
                 {
                     const engine::MeshInfo* mesh = meshInstance->GetMesh();

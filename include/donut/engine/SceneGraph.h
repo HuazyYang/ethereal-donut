@@ -26,6 +26,7 @@
 #include <donut/engine/SceneTypes.h>
 #include <donut/engine/KeyframeAnimation.h>
 #include <donut/core/math/math.h>
+#include <donut/core/query_cast.h>
 #include <unordered_map>
 #include <utility>
 #include <functional>
@@ -49,11 +50,14 @@ namespace donut::engine
         Animations = 0x20
     };
 
+    NVRHI_CLASS_CLSID(SceneGraphLeaf, "c62d1eac-cc06-42ba-a1fe-dc5895517302")
     class SceneGraphLeaf: public nvrhi::WeakReferenceSourceImpl<nvrhi::IWeakReferenceSource>
     {
     public:
+        NVRHI_DECLARE_UUID_TRAITS(SceneGraphLeaf)
         NVRHI_BEGIN_INTERFACE_TABLE_INLINE(SceneGraphLeaf)
         NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(SceneGraphLeaf)
         NVRHI_END_INTERFACE_TABLE()
 
     private:
@@ -82,9 +86,16 @@ namespace donut::engine
         SceneGraphLeaf& operator=(const SceneGraphLeaf&&) = delete;
     };
 
+    NVRHI_CLASS_CLSID(MeshInstance, "5c165f2e-7e3a-4e58-8ffd-b8612f5829b9")
     class MeshInstance : public SceneGraphLeaf
     {
-        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(MeshInstance)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(MeshInstance)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(MeshInstance)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(SceneGraphLeaf)
+        NVRHI_END_INTERFACE_TABLE()
     private:
         friend class SceneGraph;
         int m_InstanceIndex = -1;
@@ -113,9 +124,16 @@ namespace donut::engine
         dm::float4x4 inverseBindMatrix;
     };
 
+    NVRHI_CLASS_CLSID(SkinnedMeshInstance, "f62efbc7-5386-4881-9692-186b85bf2040")
     class SkinnedMeshInstance : public MeshInstance
     {
-        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(SkinnedMeshInstance)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(SkinnedMeshInstance)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(SkinnedMeshInstance)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(MeshInstance)
+        NVRHI_END_INTERFACE_TABLE()
     protected:
         friend class SceneGraph;
         nvrhi::AutoPtr<MeshInfo> m_PrototypeMesh;
@@ -138,9 +156,16 @@ namespace donut::engine
     // This leaf is attached to the joint nodes for a skeleton, and it makes them point at the mesh.
     // When the bones are updated, the mesh is flagged for rebuild.
     // Cannot do this through the graph because the skeleton can be separate from the mesh instance node.
+    NVRHI_CLASS_CLSID(SkinnedMeshReference, "c6b937bf-9117-465f-be6b-8303d11eafd4")
     class SkinnedMeshReference : public SceneGraphLeaf
     {
-        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(SkinnedMeshReference)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(SkinnedMeshReference)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(SkinnedMeshReference)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(SceneGraphLeaf)
+        NVRHI_END_INTERFACE_TABLE()
     private:
         friend class SceneGraph;
         nvrhi::WeakPtr<SkinnedMeshInstance> m_Instance;
@@ -150,9 +175,16 @@ namespace donut::engine
        [[nodiscard]] nvrhi::AutoPtr<SceneGraphLeaf> Clone() override;
     };
 
+    NVRHI_CLASS_CLSID(SceneCamera, "b030d3bf-c8c8-453c-9570-2eede9086ebf")
     class SceneCamera : public SceneGraphLeaf
     {
-        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(SceneCamera)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(SceneCamera)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(SceneCamera)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(SceneGraphLeaf)
+        NVRHI_END_INTERFACE_TABLE()
     public:
         [[nodiscard]] SceneContentFlags GetContentFlags() const override { return SceneContentFlags::Cameras; }
 
@@ -163,9 +195,16 @@ namespace donut::engine
        using SceneGraphLeaf::SceneGraphLeaf;
     };
 
+    NVRHI_CLASS_CLSID(PerspectiveCamera, "5f410d0d-0596-4c2a-bb27-be68b7145106")
     class PerspectiveCamera : public SceneCamera
     {
-        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(PerspectiveCamera)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(PerspectiveCamera)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(PerspectiveCamera)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(SceneCamera)
+        NVRHI_END_INTERFACE_TABLE()
     public:
         float zNear = 1.f;
         float verticalFov = 1.f; // in radians
@@ -178,9 +217,16 @@ namespace donut::engine
         bool SetProperty(const std::string& name, const dm::float4& value) override;
     };
 
+    NVRHI_CLASS_CLSID(OrthographicCamera, "bac6c248-a65c-41d7-a671-1dd1fbb4c67f")
     class OrthographicCamera : public SceneCamera
     {
-        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(OrthographicCamera)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(OrthographicCamera)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(OrthographicCamera)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(SceneCamera)
+        NVRHI_END_INTERFACE_TABLE()
     public:
         float zNear = 0.f;
         float zFar = 1.f;
@@ -195,9 +241,16 @@ namespace donut::engine
 
     class IShadowMap;
 
+    NVRHI_CLASS_CLSID(Light, "b07e0ef2-7130-4d37-8dea-6f7ef7848177")
     class Light : public SceneGraphLeaf
     {
-        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(Light)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(Light)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(Light)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(SceneGraphLeaf)
+        NVRHI_END_INTERFACE_TABLE()
     public:
         nvrhi::AutoPtr<IShadowMap> shadowMap;
         int shadowChannel = -1;
@@ -219,9 +272,16 @@ namespace donut::engine
         Light();
     };
 
+    NVRHI_CLASS_CLSID(DirectionalLight, "48bc24b4-3827-49bd-a18d-331c1e8dc71f")
     class DirectionalLight : public Light
     {
-        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(DirectionalLight)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(DirectionalLight)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(DirectionalLight)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(Light)
+        NVRHI_END_INTERFACE_TABLE()
     public:
         float irradiance = 1.f; // Target illuminance (lm/m2) of surfaces lit by this light; multiplied by `color`.
         float angularSize = 0.f; // Angular size of the light source, in degrees.
@@ -236,9 +296,16 @@ namespace donut::engine
         bool SetProperty(const std::string& name, const dm::float4& value) override;
     };
 
+    NVRHI_CLASS_CLSID(SpotLight, "f95dd469-8ee4-4aa5-9afa-34f424666ebb")
     class SpotLight : public Light
     {
-        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(SpotLight)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(SpotLight)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(SpotLight)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(Light)
+        NVRHI_END_INTERFACE_TABLE()
     public:
         float intensity = 1.f;  // Luminous intensity of the light (lm/sr) in its primary direction; multiplied by `color`.
         float radius = 0.f;     // Radius of the light sphere, in world units.
@@ -255,9 +322,16 @@ namespace donut::engine
         bool SetProperty(const std::string& name, const dm::float4& value) override;
     };
 
+    NVRHI_CLASS_CLSID(PointLight, "ca2235fa-993c-4142-b51c-7ec4f949dedb")
     class PointLight : public Light
     {
-        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(PointLight)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(PointLight)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(PointLight)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(Light)
+        NVRHI_END_INTERFACE_TABLE()
     public:
         float intensity = 1.f;  // Luminous intensity of the light (lm/sr); multiplied by `color`.
         float radius = 0.f;    // Radius of the light sphere, in world units.
@@ -466,9 +540,16 @@ namespace donut::engine
         bool Apply(float time) const;  // NOLINT(modernize-use-nodiscard)
     };
 
+    NVRHI_CLASS_CLSID(SceneGraphAnimation, "e0f48aff-538f-4d8f-a39d-892c7a81bb74")
     class SceneGraphAnimation : public SceneGraphLeaf
     {
-        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(SceneGraphAnimation)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(SceneGraphAnimation)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(SceneGraphAnimation)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(SceneGraphLeaf)
+        NVRHI_END_INTERFACE_TABLE()
     private:
         std::vector<nvrhi::AutoPtr<SceneGraphAnimationChannel>> m_Channels;
         float m_Duration = 0.f;

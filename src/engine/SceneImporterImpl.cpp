@@ -518,20 +518,20 @@ nvrhi::FRESULT AssimpSceneImporter::Load(const std::filesystem::path& fileName, 
         switch (src->mType) {
             case aiLightSource_DIRECTIONAL: {
                 nvrhi::AutoPtr<DirectionalLight> directional{
-                    dynamic_cast<DirectionalLight*>(m_SceneTypeFactory->CreateLeaf("DirectionalLight").Get())};
+                    query_cast<DirectionalLight>(m_SceneTypeFactory->CreateLeaf("DirectionalLight").Get())};
                 directional->color = float3(src->mColorDiffuse.r, src->mColorDiffuse.g, src->mColorDiffuse.b);
                 dst = directional;
                 break;
             }
             case aiLightSource_POINT: {
                 nvrhi::AutoPtr<PointLight> point{
-                    dynamic_cast<PointLight*>(m_SceneTypeFactory->CreateLeaf("PointLight").Get())};
+                    query_cast<PointLight>(m_SceneTypeFactory->CreateLeaf("PointLight").Get())};
                 point->color = float3(src->mColorDiffuse.r, src->mColorDiffuse.g, src->mColorDiffuse.b);
                 dst = point;
                 break;
             }
             case aiLightSource_SPOT: {
-                nvrhi::AutoPtr<SpotLight> spot{dynamic_cast<SpotLight*>(m_SceneTypeFactory->CreateLeaf("SpotLight").Get())};
+                nvrhi::AutoPtr<SpotLight> spot{query_cast<SpotLight>(m_SceneTypeFactory->CreateLeaf("SpotLight").Get())};
                 spot->color = float3(src->mColorDiffuse.r, src->mColorDiffuse.g, src->mColorDiffuse.b);
                 spot->innerAngle = dm::degrees(src->mAngleInnerCone);
                 spot->outerAngle = dm::degrees(src->mAngleOuterCone);
