@@ -75,7 +75,7 @@ if(DONUT_D3D_AGILITY_SDK_URL)
     # example :
     #     set(DONUT_D3D_AGILITY_SDK_URL "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.614.1")
 
-    include("${CMAKE_CURRENT_LIST_DIR}/../ethereal-nvrhi/cmake/EPM.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/../../ethereal-nvrhi/cmake/EPM.cmake")
 
     # A NuGet URL has no file extension; the package is a zip archive.
     set(_d3d_agility_hash_args ALLOW_UNVERIFIED)

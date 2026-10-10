@@ -15,15 +15,15 @@ Donut has originated from the VRWorks Multi-Projection SDK and has been improved
 
 ## Dependencies
 
-Required (JsonCpp is included; the others are fetched by EPM into `thirdparty/` at configure time, see `thirdparty/CMakeLists.txt`):
+Required (JsonCpp is included; **stb** and **cgltf** use the installed copy, e.g. vcpkg, or are fetched by EPM at configure time, see `thirdparty/CMakeLists.txt`):
 
 * **cgltf** to load glTF scenes
 * **JsonCpp** to read and write JSON scene and configuration files
 * **stb** to read and write textures and other images
 
-Optional (fetched or included the same way, and can be disabled through CMake variables):
+Optional (resolved the same way, and can be disabled through CMake variables):
 
-* **NVRHI** (the `ethereal-nvrhi` git submodule), **ImGUI**, and **glfw** for rendering (`DONUT_WITH_NVRHI`)
+* **NVRHI** (the `ethereal-nvrhi` repository, a sibling of this one in the ethereal aggregate), **ImGUI**, **glfw** and **ShaderTool** (the `thirdparty/shader-tool` git submodule) for rendering (`DONUT_WITH_NVRHI`)
 * **tinyexr** to read EXR images (`DONUT_WITH_TINYEXR`)
 
 ## Examples

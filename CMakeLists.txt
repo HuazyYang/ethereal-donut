@@ -29,8 +29,8 @@ set(CMAKE_CXX_EXTENSIONS ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-# EPM, the package manager of the Ethereal projects, lives in nvrhi (a submodule of this repository).
-include("${CMAKE_CURRENT_SOURCE_DIR}/ethereal-nvrhi/cmake/EPM.cmake")
+# EPM, the package manager of the Ethereal projects, lives in nvrhi (a sibling of this repository in the ethereal aggregate).
+include("${CMAKE_CURRENT_SOURCE_DIR}/../ethereal-nvrhi/cmake/EPM.cmake")
 
 set_property( GLOBAL PROPERTY USE_FOLDERS ON)
 
@@ -91,7 +91,7 @@ if (DONUT_WITH_NVRHI)
     set(NVRHI_WITH_VULKAN "${DONUT_WITH_VULKAN}" CACHE BOOL "" FORCE)
     set(NVRHI_WITH_AFTERMATH "${DONUT_WITH_AFTERMATH}" CACHE BOOL "" FORCE)
 
-    epm_add_package(NAME nvrhi SOURCE_DIR ethereal-nvrhi)
+    epm_add_package(NAME nvrhi SOURCE_DIR ../ethereal-nvrhi)
 
     set(DONUT_SHADER_INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/include CACHE PATH "" FORCE)
     

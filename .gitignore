@@ -21,12 +21,4 @@ media
 **/*_d3d12.dir/*
 **/*_vk.dir/*
 **/Release/*
-thirdparty/streamline
-thirdparty/glfw
-thirdparty/imgui
-thirdparty/stb
-thirdparty/cgltf
-thirdparty/shader-tool
-thirdparty/DLSS
-thirdparty/zstd
 .cache
