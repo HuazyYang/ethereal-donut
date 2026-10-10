@@ -100,7 +100,12 @@ if(DONUT_WITH_VULKAN)
     if (NOT NVRHI_BUILD_SHARED)
         target_link_libraries(donut_app nvrhi_vk)
     endif()
-    target_link_libraries(donut_app Vulkan-Headers)
+    # The Vulkan headers are an EPM package: the installed one exports Vulkan::Headers, a fetched one Vulkan-Headers.
+    if (TARGET Vulkan-Headers)
+        target_link_libraries(donut_app Vulkan-Headers)
+    elseif (TARGET Vulkan::Headers)
+        target_link_libraries(donut_app Vulkan::Headers)
+    endif()
 endif()
 
 if(DONUT_WITH_AFTERMATH)

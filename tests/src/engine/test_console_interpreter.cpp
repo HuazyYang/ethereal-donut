@@ -124,7 +124,7 @@ void test_variables()
 	cvarFloat myfloat("myfloat", "just a random float", -.555f, /*read only*/true);
 	{
 		auto [s, o] = interpreter.Execute("myfloat");
-		CHECK(logs.empty() && (s == true) && (o == "-0.555"));
+		CHECK(logs.empty() && (s == true) && (o == "-0.555000"));
 	}
 	{
 		auto [s, o] = interpreter.Execute("help myfloat");

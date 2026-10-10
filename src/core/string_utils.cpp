@@ -22,6 +22,8 @@
 
 #include <donut/core/string_utils.h>
 #include <cstring>
+#include <cerrno>
+#include <cmath>
 
 namespace donut::string_utils
 {
@@ -51,13 +53,17 @@ namespace donut::string_utils
 		trim(s);
 		trim(s, '+');
 
-		char buf[32];
-		buf[sizeof(buf) - 1] = 0;
+		char buf[32] = {};   // strncpy does not terminate a string that fills the count
 		strncpy(buf, s.data(), std::min(s.size(), sizeof(buf) - 1));
 		char* endptr = buf;
+		errno = 0;
 		float value = strtof(buf, &endptr);
 
 		if (endptr == buf)
+			return std::optional<float>();
+
+		// out of range (overflow); underflow to a denormal or zero is accepted
+		if (errno == ERANGE && std::isinf(value))
 			return std::optional<float>();
 
 		return value;
@@ -68,13 +74,17 @@ namespace donut::string_utils
 		trim(s);
 		trim(s, '+');
 
-		char buf[32];
-		buf[sizeof(buf) - 1] = 0;
+		char buf[32] = {};   // strncpy does not terminate a string that fills the count
 		strncpy(buf, s.data(), std::min(s.size(), sizeof(buf) - 1));
 		char* endptr = buf;
+		errno = 0;
 		double value = strtod(buf, &endptr);
 
 		if (endptr == buf)
+			return std::optional<double>();
+
+		// out of range (overflow); underflow to a denormal or zero is accepted
+		if (errno == ERANGE && std::isinf(value))
 			return std::optional<double>();
 
 		return value;

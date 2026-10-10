@@ -32,7 +32,7 @@ foreach(test_src ${donut_engine_tests})
 
     add_dependencies(donut_all_tests "${test_name}")
 
-    add_test("${test_name}" "${test_name}")
+    add_test(NAME "${test_name}" COMMAND "${test_name}")
 
     set_property(TARGET "${test_name}" PROPERTY FOLDER "Donut/donut_tests/donut_engine_tests")
 

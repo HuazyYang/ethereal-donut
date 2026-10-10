@@ -168,7 +168,8 @@ bool test_float16()
 
 bool test_gpu_float16(nvrhi::IDevice* device)
 {
-    nvrhi::CommandListHandle commandList = device->createCommandList();
+    nvrhi::CommandListHandle commandList;
+    device->createCommandList(nvrhi::CommandListParameters(), &commandList);
 
     constexpr size_t count = 65536;
     std::vector<float> f32(count);
@@ -191,19 +192,22 @@ bool test_gpu_float16(nvrhi::IDevice* device)
         .setDebugName("Input Buffer")
         .setCanHaveRawViews(true)
         .enableAutomaticStateTracking(nvrhi::ResourceStates::CopyDest);
-    nvrhi::BufferHandle f32buf = device->createBuffer(bufferDesc);
+    nvrhi::BufferHandle f32buf;
+    device->createBuffer(bufferDesc, &f32buf);
 
     bufferDesc
         .setByteSize(count * sizeof(float16_t))
         .setDebugName("Output Buffer")
         .setCanHaveUAVs(true);
-    nvrhi::BufferHandle f16buf = device->createBuffer(bufferDesc);
+    nvrhi::BufferHandle f16buf;
+    device->createBuffer(bufferDesc, &f16buf);
 
     bufferDesc
         .setDebugName("Readback Buffer")
         .setCanHaveUAVs(false)
         .setCpuAccess(nvrhi::CpuAccessMode::Read);
-    nvrhi::BufferHandle readbackBuf = device->createBuffer(bufferDesc);
+    nvrhi::BufferHandle readbackBuf;
+    device->createBuffer(bufferDesc, &readbackBuf);
 
     commandList->open();
     commandList->writeBuffer(f32buf, f32.data(), count * sizeof(float));
@@ -407,7 +411,8 @@ bool test_float8e5m2()
 
 bool test_gpu_float8(nvrhi::IDevice* device, bool e5m2)
 {
-    nvrhi::CommandListHandle commandList = device->createCommandList();
+    nvrhi::CommandListHandle commandList;
+    device->createCommandList(nvrhi::CommandListParameters(), &commandList);
 
     constexpr size_t count = 65536;
     std::vector<float> f32(count);
@@ -438,19 +443,22 @@ bool test_gpu_float8(nvrhi::IDevice* device, bool e5m2)
         .setDebugName("Input Buffer")
         .setCanHaveRawViews(true)
         .enableAutomaticStateTracking(nvrhi::ResourceStates::CopyDest);
-    nvrhi::BufferHandle f32buf = device->createBuffer(bufferDesc);
+    nvrhi::BufferHandle f32buf;
+    device->createBuffer(bufferDesc, &f32buf);
 
     bufferDesc
         .setByteSize(count * sizeof(uint8_t))
         .setDebugName("Output Buffer")
         .setCanHaveUAVs(true);
-    nvrhi::BufferHandle f8buf = device->createBuffer(bufferDesc);
+    nvrhi::BufferHandle f8buf;
+    device->createBuffer(bufferDesc, &f8buf);
 
     bufferDesc
         .setDebugName("Readback Buffer")
         .setCanHaveUAVs(false)
         .setCpuAccess(nvrhi::CpuAccessMode::Read);
-    nvrhi::BufferHandle readbackBuf = device->createBuffer(bufferDesc);
+    nvrhi::BufferHandle readbackBuf;
+    device->createBuffer(bufferDesc, &readbackBuf);
 
     commandList->open();
     commandList->writeBuffer(f32buf, f32.data(), count * sizeof(float));
@@ -537,7 +545,10 @@ nvrhi::AutoPtr<donut::app::DeviceManager> InitializeGraphicsDevice(nvrhi::Graphi
 #if D3D12_PREVIEW_SDK_VERSION >= 720
         UUID Features[] = { D3D12ExperimentalShaderModels };
 #else
-        UUID Features[] = { D3D12ExperimentalShaderModels, D3D12CooperativeVectorExperiment };
+        // Not every d3d12.h that reports a preview SDK below 720 declares D3D12CooperativeVectorExperiment (the
+        // Agility SDK's does not), so the feature GUID is spelled out here.
+        static const UUID cooperativeVectorExperiment = { 0x384748be, 0xcca5, 0x471e, { 0xa1, 0x25, 0x5c, 0xc9, 0x97, 0xe0, 0x4d, 0x39 } };
+        UUID Features[] = { D3D12ExperimentalShaderModels, cooperativeVectorExperiment };
 #endif
         HRESULT hr = D3D12EnableExperimentalFeatures(_countof(Features), Features, nullptr, nullptr);
         if (FAILED(hr))
