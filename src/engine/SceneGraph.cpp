@@ -331,17 +331,84 @@ void SceneGraphNode::SetName(const std::string& name)
     m_Name = name;
 }
 
+SceneGraphNode::~SceneGraphNode()
+{
+    // Release the children one at a time, cutting every sibling link first, so that no destructor owns the
+    // next sibling and the destructors never nest per sibling. Destroying a node with N children then costs
+    // stack proportional to the depth of its subgraph, not to N (see NVIDIAGameWorks/donut#18).
+    nvrhi::AutoPtr<SceneGraphNode> child = std::move(m_FirstChild);
+    while (child)
+    {
+        // A child that someone else still references outlives this node as a root of its own subgraph.
+        child->m_Parent = nullptr;
+        child->m_PrevSibling = nullptr;
+
+        // Releases the previous child, which no longer owns a sibling
+        child = std::move(child->m_NextSibling);
+    }
+}
+
+void SceneGraphNode::AppendChild(SceneGraphNode* child)
+{
+    assert(child);
+#ifndef NDEBUG
+    // linking a node under itself or under one of its descendants would make a cycle
+    for (SceneGraphNode* ancestor = this; ancestor; ancestor = ancestor->m_Parent)
+        assert(ancestor != child);
+#endif
+
+    // A node is linked into at most one child list: a node that moves brings the reference its old list
+    // held, any other node gets a new one.
+    nvrhi::AutoPtr<SceneGraphNode> link;
+    if (child->m_Parent)
+        link = child->m_Parent->RemoveChild(child);
+    if (!link)
+        link = child;
+    assert(!child->m_NextSibling && !child->m_PrevSibling);
+
+    child->m_Parent = this;
+    child->m_PrevSibling = m_LastChild;
+    (m_LastChild ? m_LastChild->m_NextSibling : m_FirstChild) = std::move(link);
+    m_LastChild = child;
+}
+
+nvrhi::AutoPtr<SceneGraphNode> SceneGraphNode::RemoveChild(SceneGraphNode* child)
+{
+    if (!child || child->m_Parent != this)
+        return nullptr;
+
+    SceneGraphNode* prev = child->m_PrevSibling;
+    nvrhi::AutoPtr<SceneGraphNode>& link = prev ? prev->m_NextSibling : m_FirstChild;
+    assert(link.Get() == child);
+
+    // Take the list's reference to the child, and close the gap with the child's next sibling
+    nvrhi::AutoPtr<SceneGraphNode> removed = std::move(link);
+    link = std::move(child->m_NextSibling);
+
+    if (link)
+        link->m_PrevSibling = prev;
+    else
+        m_LastChild = prev;
+
+    child->m_Parent = nullptr;
+    child->m_PrevSibling = nullptr;
+    return removed;
+}
+
 int SceneGraphWalker::Next(bool allowChildren)
 {
     if (!m_Current)
         return 0;
 
-    // Try to move down to the children of the current node
-    if (allowChildren && m_Current->GetNumChildren() > 0)
+    // Try to move down to the first child of the current node
+    if (allowChildren)
     {
-        m_ChildIndices.push(0);
-        m_Current = m_Current->GetChild(0);
-        return 1;
+        SceneGraphNode* firstChild = m_Current->GetFirstChild();
+        if (firstChild)
+        {
+            m_Current = firstChild;
+            return 1;
+        }
     }
 
     int depth = 0;
@@ -355,19 +422,11 @@ int SceneGraphWalker::Next(bool allowChildren)
             return depth;
         }
 
-        if (!m_ChildIndices.empty())
+        SceneGraphNode* nextSibling = m_Current->GetNextSibling();
+        if (nextSibling)
         {
-            size_t& siblingIndex = m_ChildIndices.top();
-            ++siblingIndex;
-
-            SceneGraphNode* parent = m_Current->GetParent();
-            if (siblingIndex < parent->GetNumChildren())
-            {
-                m_Current = parent->GetChild(siblingIndex);
-                return depth;
-            }
-            
-            m_ChildIndices.pop();
+            m_Current = nextSibling;
+            return depth;
         }
 
         m_Current = m_Current->GetParent();
@@ -387,9 +446,6 @@ int SceneGraphWalker::Up()
         m_Current = nullptr;
         return 0;
     }
-
-    if (!m_ChildIndices.empty())
-        m_ChildIndices.pop();
 
     m_Current = m_Current->GetParent();
     return -1;
@@ -688,8 +744,12 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
         // operating on an orphaned subgraph - do not copy or register anything
 
         assert(parent);
-        parent->m_Children.push_back(child);
-        child->m_Parent = parent;
+        parent->AppendChild(child);
+
+        // keep the subgraph's dirty flags consistent, so that a Refresh reaches every node of the subgraph
+        // once it is attached to a graph
+        child->PropagateDirtyFlags(SceneGraphNode::DirtyFlags::SubgraphStructure
+            | (child->m_Dirty & SceneGraphNode::DirtyFlags::SubgraphMask));
         return child;
     }
 
@@ -699,12 +759,14 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
     if (childGraph)
     {
         // attaching a subgraph that already belongs to a graph - this one or another
-        // copy the subgraph first
+        // copy the subgraph first. The copy is assembled unlinked and attached to the parent at the end, so the
+        // walker never reaches the copies (the parent may lie inside the copied subgraph), and the dirty flags
+        // that SetTransform and SetLeaf propagate stay within the copy.
 
         // keep a mapping of old nodes to new nodes to patch the copied animations
         std::unordered_map<SceneGraphNode*, nvrhi::AutoPtr<SceneGraphNode>> nodeMap;
-        
-        SceneGraphNode* currentParent = parent;
+
+        SceneGraphNode* currentParent = nullptr;
         SceneGraphWalker walker(child);
         while (walker)
         {
@@ -713,9 +775,15 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
             nodeMap[walker.Get()] = copy;
 
             copy->m_Name = walker->m_Name;
-            copy->m_Parent = currentParent;
             copy->m_Graph = nvrhi::WeakPtr<SceneGraph>(this);
-            copy->m_Dirty = walker->m_Dirty;
+            // every copied node is new structure that the next Refresh has to visit
+            copy->m_Dirty = walker->m_Dirty | SceneGraphNode::DirtyFlags::SubgraphStructure;
+
+            // link the copy under its copied parent before SetTransform and SetLeaf propagate their flags
+            if (currentParent)
+            {
+                currentParent->AppendChild(copy);
+            }
 
             if (walker->m_HasLocalTransform)
             {
@@ -726,16 +794,6 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
             {
                 auto leafCopy = walker->m_Leaf->Clone();
                 copy->SetLeaf(leafCopy);
-            }
-
-            // attach the copy to the new parent
-            if (currentParent)
-            {
-                currentParent->m_Children.push_back(copy);
-            }
-            else
-            {
-                m_Root = copy;
             }
 
             // if it's the first node we copied, store it as the new root
@@ -803,6 +861,16 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
 
             walker.Next(true);
         }
+
+        // link the finished copy into this graph
+        if (parent)
+        {
+            parent->AppendChild(attachedChild);
+        }
+        else
+        {
+            m_Root = attachedChild;
+        }
     }
     else
     {
@@ -818,14 +886,14 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
             walker.Next(true);
         }
 
-        child->m_Parent = parent;
-
         if (parent)
         {
-            parent->m_Children.push_back(child);
+            parent->AppendChild(child);
         }
         else
         {
+            // a node taken out of an orphaned subgraph must not stay in its old parent's child list
+            nvrhi::AutoPtr<SceneGraphNode> unlinked = child->m_Parent ? child->m_Parent->RemoveChild(child) : nullptr;
             m_Root = child;
         }
 
@@ -833,7 +901,7 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
     }
 
     attachedChild->PropagateDirtyFlags(SceneGraphNode::DirtyFlags::SubgraphStructure
-        | (child->m_Dirty & SceneGraphNode::DirtyFlags::SubgraphMask));
+        | (attachedChild->m_Dirty & SceneGraphNode::DirtyFlags::SubgraphMask));
 
     return attachedChild;
 }
@@ -848,7 +916,7 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::AttachLeafNode(SceneGraphNode *parent
     return Attach(parent, node);
 }
 
-nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Detach(SceneGraphNode* node, bool preserveOrder)
+nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Detach(SceneGraphNode* node, bool /* preserveOrder */)
 {
     auto nodeGraph = node->m_Graph.Lock();
 
@@ -868,37 +936,20 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Detach(SceneGraphNode* node, bool pre
         }
     }
 
-    // remove the node from its parent
-    if (node->m_Parent)
+    // remove the node from its parent, taking over the reference the parent's child list held
+    nvrhi::AutoPtr<SceneGraphNode> detached;
+    if (SceneGraphNode* parent = node->m_Parent)
     {
-        std::vector<nvrhi::AutoPtr<SceneGraphNode>>& siblings = node->m_Parent->m_Children;
+        parent->PropagateDirtyFlags(SceneGraphNode::DirtyFlags::SubgraphStructure);
 
-        node->m_Parent->PropagateDirtyFlags(SceneGraphNode::DirtyFlags::SubgraphStructure);
+        detached = parent->RemoveChild(node);
 
-        auto found = std::find(siblings.begin(), siblings.end(), node);
-
-        // ensure that the parent actually contains this node
-        if (found != siblings.end())
-        {
-            auto last = siblings.end() - 1;
-            
-            if (preserveOrder || found == last)
-            {
-                siblings.erase(found);
-            }
-            else
-            {
-                std::swap(*found, *last);
-                siblings.erase(last);
-            }
-        }
-        else
-        {
-            // if the graph is correct, we should never get here
-            assert(false);
-        }
+        // if the graph is correct, the parent always contains this node
+        assert(detached);
     }
 
+    if (!detached)
+        detached = node;
     node->m_Parent = nullptr;
 
     if (m_Root == node)
@@ -906,7 +957,7 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Detach(SceneGraphNode* node, bool pre
         m_Root = MAKE_RC_OBJ_PTR(SceneGraphNode);
     }
 
-    return node;
+    return detached;
 }
 
 SceneGraphNode* SceneGraph::FindNode(const std::filesystem::path& path, SceneGraphNode* context) const
@@ -939,12 +990,13 @@ SceneGraphNode* SceneGraph::FindNode(const std::filesystem::path& path, SceneGra
             continue;
         }
 
-        auto found = std::find_if(current->m_Children.begin(), current->m_Children.end(),
-            [&pathComponent](nvrhi::AutoPtr<SceneGraphNode> const& item) { return item->GetName() == *pathComponent; });
+        auto children = current->GetChildren();
+        auto found = std::find_if(children.begin(), children.end(),
+            [&pathComponent](SceneGraphNode* item) { return item->GetName() == *pathComponent; });
 
-        if (found != current->m_Children.end())
+        if (found != children.end())
         {
-            current = found->Get();
+            current = *found;
             ++pathComponent;
             continue;
         }

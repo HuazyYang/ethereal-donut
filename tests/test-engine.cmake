@@ -20,7 +20,7 @@
 # DEALINGS IN THE SOFTWARE.
 
 
-file(GLOB donut_engine_tests src/engine/test_*.cpp)
+file(GLOB donut_engine_tests CONFIGURE_DEPENDS src/engine/test_*.cpp)
 
 foreach(test_src ${donut_engine_tests})
 

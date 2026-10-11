@@ -31,7 +31,7 @@
 #include <utility>
 #include <functional>
 #include <filesystem>
-#include <stack>
+#include <iterator>
 
 namespace donut::engine
 {
@@ -369,8 +369,17 @@ namespace donut::engine
     private:
         friend class SceneGraph;
         nvrhi::WeakPtr<SceneGraph> m_Graph;
+
+        // Children form a singly linked list: a node owns its first child, and every child owns the sibling
+        // that follows it, so the parent keeps the whole chain alive. m_Parent, m_LastChild and m_PrevSibling
+        // are non-owning back/tail links that make Attach (append) and Detach O(1).
+        // The destructor releases the chain in a loop, so destroying a node with a huge number of children
+        // needs stack proportional to the depth of the subgraph, not to the number of siblings.
         SceneGraphNode* m_Parent = nullptr;
-        std::vector<nvrhi::AutoPtr<SceneGraphNode>> m_Children;
+        nvrhi::AutoPtr<SceneGraphNode> m_FirstChild;
+        nvrhi::AutoPtr<SceneGraphNode> m_NextSibling;
+        SceneGraphNode* m_LastChild = nullptr;
+        SceneGraphNode* m_PrevSibling = nullptr;
         nvrhi::AutoPtr<SceneGraphLeaf> m_Leaf;
 
         std::string m_Name;
@@ -392,9 +401,15 @@ namespace donut::engine
         void UpdateLocalTransform();
         void PropagateDirtyFlags(SceneGraphNode::DirtyFlags flags);
 
+        // Links a node as the last child of this node, taking it out of its current parent's list first.
+        void AppendChild(SceneGraphNode* child);
+        // Unlinks a child of this node, keeping the order of the remaining children, and hands the reference the
+        // list held over to the caller. Returns null if the node is not a child of this one.
+        nvrhi::AutoPtr<SceneGraphNode> RemoveChild(SceneGraphNode* child);
+
     public:
        SceneGraphNode() {}
-       /* non-virtual */ ~SceneGraphNode() = default;
+       /* non-virtual */ ~SceneGraphNode();
 
        [[nodiscard]] const dm::dquat& GetRotation() const { return m_Rotation; }
        [[nodiscard]] const dm::double3& GetScaling() const { return m_Scaling; }
@@ -413,9 +428,44 @@ namespace donut::engine
         [[nodiscard]] SceneContentFlags GetLeafContentFlags() const { return m_LeafContent; }
         [[nodiscard]] SceneContentFlags GetSubgraphContentFlags() const { return m_SubgraphContent; }
 
+        // Forward iteration over the children of a node, in order:
+        //     for (SceneGraphNode* child : node->GetChildren()) ...
+        // The loop body must not detach the child it is visiting.
+        class ChildIterator
+        {
+        public:
+            using iterator_category = std::forward_iterator_tag;
+            using value_type = SceneGraphNode*;
+            using difference_type = std::ptrdiff_t;
+            using pointer = SceneGraphNode* const*;
+            using reference = SceneGraphNode* const&;
+
+            ChildIterator() = default;
+            explicit ChildIterator(SceneGraphNode* node) : m_Node(node) { }
+
+            reference operator*() const { return m_Node; }
+            ChildIterator& operator++() { m_Node = m_Node->m_NextSibling.Get(); return *this; }
+            ChildIterator operator++(int) { ChildIterator previous = *this; ++*this; return previous; }
+            bool operator==(const ChildIterator& other) const { return m_Node == other.m_Node; }
+            bool operator!=(const ChildIterator& other) const { return m_Node != other.m_Node; }
+
+        private:
+            SceneGraphNode* m_Node = nullptr;
+        };
+
+        struct ChildRange
+        {
+            SceneGraphNode* first = nullptr;
+            [[nodiscard]] ChildIterator begin() const { return ChildIterator(first); }
+            [[nodiscard]] ChildIterator end() const { return ChildIterator(); }
+        };
+
         [[nodiscard]] SceneGraphNode* GetParent() const { return m_Parent; }
-        [[nodiscard]] SceneGraphNode* GetChild(size_t index) const { return (index < m_Children.size()) ? m_Children[index] : nullptr; }
-        [[nodiscard]] size_t GetNumChildren() const { return m_Children.size(); }
+        [[nodiscard]] ChildRange GetChildren() const { return ChildRange{ m_FirstChild.Get() }; }
+        [[nodiscard]] SceneGraphNode* GetFirstChild() const { return m_FirstChild.Get(); }
+        [[nodiscard]] SceneGraphNode* GetLastChild() const { return m_LastChild; }
+        [[nodiscard]] SceneGraphNode* GetNextSibling() const { return m_NextSibling.Get(); }
+        [[nodiscard]] SceneGraphNode* GetPrevSibling() const { return m_PrevSibling; }
         [[nodiscard]] SceneGraphLeaf* GetLeaf() const { return m_Leaf; }
 
         [[nodiscard]] const std::string& GetName() const { return m_Name; }
@@ -460,12 +510,14 @@ namespace donut::engine
     // Scene graph traversal helper. Similar to an iterator, but only goes forward.
     // Create a SceneGraphWalker from a node, and it will go over every node in the sub-tree of that node.
     // On each location, the walker can move either down (deeper) or right (siblings), depending on the needs.
+    // A walker created with SceneGraphWalker(current, scope) continues the pre-order traversal of 'scope' from
+    // 'current': after the sub-tree of 'current' it moves on to the following siblings of 'current' and of its
+    // ancestors, up to 'scope' (or the root when scope is null).
     class SceneGraphWalker final
     {
     private:
         SceneGraphNode* m_Current;
         SceneGraphNode* m_Scope;
-        std::stack<size_t> m_ChildIndices;
     public:
         SceneGraphWalker() = default;
 
@@ -695,7 +747,8 @@ namespace donut::engine
         nvrhi::AutoPtr<SceneGraphNode> AttachLeafNode(SceneGraphNode* parent,SceneGraphLeaf* leaf);
         
         // Removes the node and its subgraph from the graph.
-        // When preserveOrder is 'false', the order of node's siblings may be changed during this operation to improve performance.
+        // The order of the node's remaining siblings is always preserved; preserveOrder is kept for source
+        // compatibility and has no effect.
         nvrhi::AutoPtr<SceneGraphNode> Detach(SceneGraphNode* node, bool preserveOrder = false);
 
         // Finds a node whose path (sequence of nested node names) matches the provided path,
