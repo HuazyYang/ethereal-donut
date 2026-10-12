@@ -307,7 +307,86 @@ backend defect pulls them forward.
 
 ## 6. Open decisions
 
-- Whether one shared `engine::BindingCache` contends enough under Phase 4 to warrant per-range caches.
-- Whether Vulkan Tier 1 waits for `memoryTypeBits` exposure in nvrhi or for a VMA-style allocator
-  behind `createHeap`; the first is smaller and keeps the ABI rules.
-- Owner for the nvrhi fork's two follow-ups and for the GBV machine.
+Three decisions are left to the owner. Each is stated with what is known, the options, when it must be
+taken, and a recommendation. None blocks Phase 0 or Phase 1.
+
+### 6.1 Binding-set caching under parallel recording (decide before Phase 4)
+
+**What is known.** `engine::BindingCache` is one shared map guarded by a `std::shared_mutex`. A lookup
+takes the shared lock. A miss takes the exclusive lock and calls `createBindingSet` while holding it, so
+every thread that misses at the same moment waits for one descriptor allocation at a time. Hits scale;
+misses serialise. Misses happen when physical resource identity changes: the first frame after a compile,
+after a resize, and whenever pooling rotates a texture into a slot. In steady state a frame should have
+no misses; the question is how long the first frame after a change stalls and whether that matters.
+
+**Options.**
+
+| Option | Cost | Risk |
+| --- | --- | --- |
+| A. Keep the shared cache; measure | None now | A visible hitch on the first frame after a resize if many ranges miss together |
+| B. Create under the shared lock, insert under the exclusive lock, drop duplicates | ~20 lines in `BindingCache` | Two threads may create the same binding set once; the loser's is released. Descriptor churn is bounded by thread count |
+| C. One `BindingCache` per recording range, cleared with the plan | Adapters take the cache from `IFrameGraphResources`, not from the graph | Duplicates the same binding sets in every range; multiplies descriptor-heap use by the range count |
+| D. Pre-warm: `bindResources` creates every binding set the pass will need, `execute` only looks up | Every adapter must know its binding sets ahead of time | Adapters that choose bindings at run time (TAA today, SSAO's indexed sets) cannot pre-warm until refactored under 3.3 |
+
+**Recommendation.** A now, B when Phase 4 starts, because B removes the only serialisation point for a
+small change and needs no adapter work. C only if measurements show descriptor-heap pressure is not a
+concern on the target hardware. D is the eventual shape once 3.3 has removed run-time binding choices,
+and it also makes `execute` allocation-free, which parallel recording wants anyway.
+
+### 6.2 Vulkan Tier 1: how placed resources get the right memory type (decide after Phase 3 numbers)
+
+**What is known.** Vulkan requires a placed image's memory to come from a type in that image's
+`memoryTypeBits`. nvrhi's `createHeap` passes `memoryTypeBits = ~0u` and the allocator takes the first
+type that matches the property flags, and `MemoryRequirements` carries only `size` and `alignment`, so
+the caller cannot check. On most desktop drivers every optimal-tiling image reports the same device-local
+type, so this works by accident; the specification does not promise it, and drivers do restrict types for
+some depth/stencil and lazily-allocated formats. The branch therefore keeps Vulkan at Tier 0 (pooling),
+which is correct and loses only the extra saving aliasing would bring on top of pooling. That saving is
+not yet measured anywhere; Phase 3 produces it on D3D12, where Tier 1 already runs.
+
+**Options.**
+
+| Option | What changes | Size | Consequence |
+| --- | --- | --- | --- |
+| A. Expose the mask | Add `memoryTypeBits` to `MemoryRequirements` and a type mask to `HeapDesc`; the Vulkan `createHeap` honours it; the graph groups resources by compatible mask and creates one heap per group | Two struct fields, one `c_HeaderVersion` bump (currently 28), ~50 lines in the Vulkan backend, a grouping step in the placement solver | Keeps the explicit heap-and-offset model the D3D12 path uses; every consumer recompiles for the header bump |
+| B. Allocator inside nvrhi (VMA-style) | The Vulkan backend owns a sub-allocator; `createHeap` becomes a pool with a requested mask union, and placement is checked at `bindTextureMemory` | A new dependency or ~1,000 lines, plus a bind-time failure path the graph must handle | Hides the problem in the backend but adds a second allocator under the graph's own placement solver, which already decides offsets; the two will disagree |
+| C. Stay at Tier 0 on Vulkan | Nothing | None | Vulkan keeps pooling only. Acceptable if Phase 3 shows Tier 1 saves little over Tier 0 on real scenes |
+| D. Probe at start-up | Query `memoryTypeBits` for one image per format class the graph uses; enable Tier 1 only if all masks are identical | Needs A's first field, no `HeapDesc` change | Correct on hardware where the accident holds, Tier 0 elsewhere; a half-step towards A |
+
+**Recommendation.** Do not decide until Phase 3 has the D3D12 number for aliased bytes over pooled
+bytes. If the extra saving is under about 15% of transient memory on `variable_shading_fg`, take C and
+close the item. Otherwise take A: it is the smallest correct change, it stays inside the ABI rules, and
+it needs nvrhi follow-up 2 in any case, which is the same header bump. B is not recommended: the graph
+already owns placement, and a second allocator beneath it is the design the branch avoided on D3D12.
+
+### 6.3 Ownership of the nvrhi follow-ups and the GBV run (decide at Phase 0)
+
+**What is known.** GBV is D3D12 GPU-Based Validation: a debug-layer mode that instruments shaders to
+check resource states, descriptors and out-of-bounds access at the point of use on the GPU. It is the
+only check that catches a resource used in the wrong state at dispatch time, which is exactly the class
+of error an aliasing or barrier bug produces. It runs 10 to 100 times slower than the debug layer alone,
+needs the Graphics Tools optional Windows feature, and donut already wires it:
+`DeviceCreationParameters::enableGPUValidation` reaches `SetEnableGPUBasedValidation` in the D3D12
+device manager. No sample or test sets it today; the ported samples set `enableDebugRuntime` only, so
+GBV has never been run on the graph.
+
+The two nvrhi follow-ups are changes to the fork's public header, each a `c_HeaderVersion` bump:
+
+1. Expose a virtual resource's heap and offset, so the validation layer can check that two resources
+   named in an `aliasingBarrier` genuinely overlap. Nothing else can catch a wrong offset.
+2. Expose and honour `memoryTypeBits` (the first field of option A in 6.2).
+
+**The decision is sequencing, not people.** This is one owner's fork, so "who" reduces to "when" and
+"how often".
+
+| Item | Early (Phase 0 or 1) | Late (Phase 5) |
+| --- | --- | --- |
+| Follow-up 1, heap binding | The Phase 1 A/B runs with the overlap check on, so a wrong placement is a validation error rather than a plausible image | Phase 1 relies on image comparison alone for aliasing correctness |
+| Follow-up 2, memoryTypeBits | Shares the header bump with follow-up 1; one recompile of everything instead of two | Only needed if 6.2 chooses A or D; may never be needed |
+| GBV run | Once per ported sample before the Phase 1 gate, by hand, with a `-gpuvalidation` switch added to the three `_fg` samples; about an hour of machine time | A scheduled job on a dedicated machine; not justified for three samples and one developer |
+
+**Recommendation.** Do follow-up 1 in Phase 1, before the A/B, because it is what makes the A/B a
+proof. Bundle follow-up 2 into the same header bump only if 6.2 has already chosen A or D; otherwise
+leave it. Run GBV by hand before each phase gate rather than standing up a machine for it, and record
+the run in the phase's exit evidence. If the project gains a CI machine with a D3D12 GPU, move the GBV
+run there and make it a gate; until then it is a checklist item.
