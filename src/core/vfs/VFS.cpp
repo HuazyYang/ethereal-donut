@@ -425,7 +425,7 @@ static void appendPatternToRegex(const std::string& pattern, std::stringstream& 
     }
 }
 
-std::string donut::vfs::getFileSearchRegex(const std::filesystem::path& path, const std::vector<std::string>& extensions)
+std::string getFileSearchRegex(const std::filesystem::path& path, const std::vector<std::string>& extensions)
 {
     std::filesystem::path normalizedPath = path.lexically_normal();
     std::string normalizedPathStr = normalizedPath.generic_string();

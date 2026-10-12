@@ -270,6 +270,8 @@ namespace donut::engine
         void SetDirection(const dm::double3& direction) const;
     protected:
         Light();
+    public:
+        ~Light() override;   // out of line: IShadowMap is only forward-declared here
     };
 
     NVRHI_CLASS_CLSID(DirectionalLight, "48bc24b4-3827-49bd-a18d-331c1e8dc71f")
@@ -288,6 +290,7 @@ namespace donut::engine
         std::vector<nvrhi::AutoPtr<IShadowMap>> perObjectShadows;
 
         DirectionalLight();
+        ~DirectionalLight() override;   // out of line: IShadowMap is only forward-declared here
         [[nodiscard]] nvrhi::AutoPtr<SceneGraphLeaf> Clone() override;
         [[nodiscard]] int GetLightType() const override { return LightType_Directional; }
         void FillLightConstants(LightConstants& lightConstants) const override;

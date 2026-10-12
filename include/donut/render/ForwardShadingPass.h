@@ -171,6 +171,7 @@ namespace donut::render
         ForwardShadingPass(
             nvrhi::IDevice* device,
             engine::CommonRenderPasses* commonPasses);
+        ~ForwardShadingPass();   // out of line: MaterialBindingCache is only forward-declared here
 
         virtual void Init(
             engine::ShaderFactory& shaderFactory,

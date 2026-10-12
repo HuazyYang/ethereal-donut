@@ -55,6 +55,8 @@ using namespace donut::math;
 using namespace donut::engine;
 using namespace donut::render;
 
+DepthPass::~DepthPass() {}
+
 DepthPass::DepthPass(
     nvrhi::IDevice* device,
     CommonRenderPasses *commonPasses)

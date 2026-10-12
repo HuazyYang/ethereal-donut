@@ -27,6 +27,7 @@
 #include <donut/shaders/light_types.h>
 #include <nvrhi/nvrhi.h>
 #include <array>
+#include <string>
 #include <optional>
 
 struct MaterialConstants;

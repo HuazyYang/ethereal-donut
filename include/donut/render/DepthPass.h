@@ -126,6 +126,7 @@ namespace donut::render
         DepthPass(
             nvrhi::IDevice* device,
             engine::CommonRenderPasses *commonPasses);
+        ~DepthPass();   // out of line: MaterialBindingCache is only forward-declared here
 
         virtual void Init(
             engine::ShaderFactory& shaderFactory,

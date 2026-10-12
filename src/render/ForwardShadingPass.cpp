@@ -60,6 +60,8 @@ using namespace donut::math;
 using namespace donut::engine;
 using namespace donut::render;
 
+ForwardShadingPass::~ForwardShadingPass() {}
+
 ForwardShadingPass::ForwardShadingPass(
     nvrhi::IDevice* device,
     CommonRenderPasses *commonPasses)

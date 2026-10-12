@@ -45,6 +45,12 @@ namespace donut::engine::console
 
 		Token nextToken();
 
+		// The part of the stream that starts at the next token (m_Next is the character just consumed from it)
+		std::string_view remaining() const
+		{
+			return m_Eof ? std::string_view() : std::string_view(m_Stream.data() - 1, m_Stream.size() + 1);
+		}
+
 		std::string const& getErrorString() const;
 
 	private:
@@ -193,10 +199,15 @@ namespace donut::engine::console
 
 		// Super-simple parser
 		Command::Args args;
+		std::string_view valueString; // the cmdline from the 2nd argument on
 		for (Lexer lexer(cmdline); lexer.hasNextToken(); )
 		{
 			if (Token token = lexer.nextToken(); token.type != TokenType::INVALID)
+			{
 				args.push_back(std::move(token.value));
+				if (args.size() == 1)
+					valueString = lexer.remaining();
+			}
 			else
 			{
 				std::string err = "syntax error";
@@ -226,11 +237,7 @@ namespace donut::engine::console
 				else
 				{
 					// string_view starting at the beginning of the 2nd arg & ending at end of cmdline
-					std::string_view value = { 
-						args[1].data(),
-						(size_t)((cmdline.data() + cmdline.size()) - args[1].data())
-					};
-					return { var->SetValueFromString(value), {} };
+					return { var->SetValueFromString(valueString), {} };
 				}
 			}
 		}

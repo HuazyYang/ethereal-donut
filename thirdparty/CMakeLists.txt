@@ -150,6 +150,18 @@ if (DONUT_WITH_TINYEXR AND NOT TARGET tinyexr)
     target_include_directories(tinyexr INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/tinyexr)
 endif()
 
+# GLFW builds its Wayland backend by default on Linux, which needs wayland-scanner (and the Wayland
+# development packages) at configure time; without them it stops with "Failed to find wayland-scanner".
+# Build the X11 backend only then.
+set(donut_glfw_platform_options)
+if (UNIX AND NOT APPLE)
+    find_program(DONUT_WAYLAND_SCANNER wayland-scanner)
+    if (NOT DONUT_WAYLAND_SCANNER)
+        message(STATUS "GLFW: wayland-scanner not found, building the X11 backend only")
+        list(APPEND donut_glfw_platform_options GLFW_BUILD_WAYLAND=OFF)
+    endif()
+endif()
+
 if (DONUT_WITH_NVRHI)
     epm_add_package(
         NAME glfw
@@ -163,7 +175,8 @@ if (DONUT_WITH_NVRHI)
             GLFW_BUILD_EXAMPLES=OFF
             GLFW_BUILD_TESTS=OFF
             GLFW_BUILD_DOCS=OFF
-            GLFW_INSTALL=OFF)
+            GLFW_INSTALL=OFF
+            ${donut_glfw_platform_options})
     if (glfw_SOURCE MATCHES "^(local|existing|cached|downloaded)$")
         set_target_properties(glfw PROPERTIES FOLDER ${third_party_folder})
         set_target_properties(update_mappings PROPERTIES FOLDER ${third_party_folder})

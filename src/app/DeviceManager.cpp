@@ -54,6 +54,7 @@ freely, subject to the following restrictions:
 
 #include <cstdio>
 #include <iomanip>
+#include <list>
 #include <thread>
 #include <sstream>
 

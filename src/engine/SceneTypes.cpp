@@ -140,7 +140,11 @@ void Light::SetDirection(const dm::double3& direction) const
 
 Light::Light() {}
 
+Light::~Light() {}
+
 DirectionalLight::DirectionalLight() {}
+
+DirectionalLight::~DirectionalLight() {}
 
 nvrhi::AutoPtr<SceneGraphLeaf> DirectionalLight::Clone() {
     auto copy = MAKE_RC_OBJ_PTR(DirectionalLight);

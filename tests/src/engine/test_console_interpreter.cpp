@@ -21,7 +21,7 @@
 */
 
 #include <donut/engine/ConsoleInterpreter.h>
-#include <donut/engine/COnsoleObjects.h>
+#include <donut/engine/ConsoleObjects.h>
 #include <donut/core/string_utils.h>
 #include <donut/core/log.h>
 #include <donut/tests/utils.h>

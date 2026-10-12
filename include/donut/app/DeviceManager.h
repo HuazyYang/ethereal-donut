@@ -85,6 +85,7 @@ freely, subject to the following restrictions:
 #include <array>
 #include <functional>
 #include <optional>
+#include <string>
 
 #include <nvrhi/core/foundation.h>
 
