@@ -643,11 +643,19 @@ bool DeviceManager_VK::findQueueFamilies(vk::PhysicalDevice physicalDevice)
 
 bool DeviceManager_VK::createDevice()
 {
+    const char* descriptorBufferEnv = getenv("DONUT_VULKAN_DESCRIPTOR_BUFFER");
+    const bool descriptorBufferRequested = m_DeviceParams.enableVulkanDescriptorBuffer
+        || (descriptorBufferEnv && descriptorBufferEnv[0] == '1');
+    bool descriptorBufferExtensionPresent = false;
+
     // figure out which optional extensions are supported
     auto deviceExtensions = m_VulkanPhysicalDevice.enumerateDeviceExtensionProperties();
     for(const auto& ext : deviceExtensions)
     {
         const std::string name = ext.extensionName;
+
+        if (name == VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME)
+            descriptorBufferExtensionPresent = true;
         if (optionalExtensions.device.find(name) != optionalExtensions.device.end())
         {
             if (name == VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME && m_DeviceParams.headlessDevice)
@@ -735,15 +743,31 @@ bool DeviceManager_VK::createDevice()
     auto aftermathPhysicalFeatures = vk::PhysicalDeviceDiagnosticsConfigFeaturesNV();
     // Determine support for mesh and task shaders
     auto meshShaderFeatures = vk::PhysicalDeviceMeshShaderFeaturesEXT();
+    // Determine support for descriptor buffers (nvrhi ADR 0008), when requested
+    auto descriptorBufferFeatures = vk::PhysicalDeviceDescriptorBufferFeaturesEXT();
 
     // Put the user-provided extension structure at the end of the chain
     pNext = m_DeviceParams.physicalDeviceFeatures2Extensions;
     APPEND_EXTENSION(true, bufferDeviceAddressFeatures);
     APPEND_EXTENSION(aftermathSupported, aftermathPhysicalFeatures);
     APPEND_EXTENSION(meshShaderSupported, meshShaderFeatures);
+    APPEND_EXTENSION(descriptorBufferRequested && descriptorBufferExtensionPresent, descriptorBufferFeatures);
 
     physicalDeviceFeatures2.pNext = pNext;
     m_VulkanPhysicalDevice.getFeatures2(&physicalDeviceFeatures2);
+
+    m_DescriptorBufferEnabled = descriptorBufferRequested && descriptorBufferExtensionPresent
+        && descriptorBufferFeatures.descriptorBuffer && bufferDeviceAddressFeatures.bufferDeviceAddress;
+    if (m_DescriptorBufferEnabled)
+    {
+        enabledExtensions.device.insert(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+        log::info("Vulkan: descriptor buffers requested and supported; nvrhi binds through VK_EXT_descriptor_buffer");
+    }
+    else if (descriptorBufferRequested)
+    {
+        log::warning("Vulkan: descriptor buffers requested, but the device has no VK_EXT_descriptor_buffer with "
+                     "descriptorBuffer and bufferDeviceAddress; nvrhi uses descriptor sets");
+    }
 
     // Optional Vulkan 1.2 features. Queried with a chain of their own, because VkPhysicalDeviceVulkan12Features
     // overlaps the per-feature structures (bufferDeviceAddressFeatures) in the chain above.
@@ -813,6 +837,8 @@ bool DeviceManager_VK::createDevice()
         .setRayTracingPositionFetch(true);
     auto rayTracingValidationFeatures = vk::PhysicalDeviceRayTracingValidationFeaturesNV()
         .setRayTracingValidation(true);
+    auto enabledDescriptorBufferFeatures = vk::PhysicalDeviceDescriptorBufferFeaturesEXT()
+        .setDescriptorBuffer(true);
 
     pNext = nullptr;
     APPEND_EXTENSION(true, vulkan13features)
@@ -828,6 +854,7 @@ bool DeviceManager_VK::createDevice()
     APPEND_EXTENSION(rayTracingValidationSupported, rayTracingValidationFeatures)
     APPEND_EXTENSION(meshShaderSupported, meshShaderFeatures)
     APPEND_EXTENSION(rayTracingPositionFetchSupported, rayTracingPositionFetchFeatures)
+    APPEND_EXTENSION(m_DescriptorBufferEnabled, enabledDescriptorBufferFeatures)
 
     // Too easy to end up silently inert, so report which way it went.
     if (m_DeviceParams.enableRayTracingValidation)
@@ -1230,6 +1257,7 @@ bool DeviceManager_VK::CreateDevice()
     deviceDesc.numDeviceExtensions = vecDeviceExt.size();
     deviceDesc.bufferDeviceAddressSupported = m_BufferDeviceAddressSupported;
     deviceDesc.descriptorBindingUniformBufferUpdateAfterBind = m_DescriptorBindingUniformBufferUpdateAfterBind;
+    deviceDesc.descriptorBufferEnabled = m_DescriptorBufferEnabled;
 #if DONUT_WITH_AFTERMATH
     deviceDesc.aftermathEnabled = m_DeviceParams.enableAftermath;
 #endif

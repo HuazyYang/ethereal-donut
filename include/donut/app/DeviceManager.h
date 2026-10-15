@@ -121,6 +121,10 @@ namespace donut::app
         // bind it. Vulkan only; needs descriptorBindingUniformBufferUpdateAfterBind, which is Turing
         // (GTX 1660) and newer, so requesting it narrows the set of usable GPUs.
         bool enableCbvDescriptorStreaming = false;
+        // Vulkan only: binding sets and descriptor tables live in descriptor buffers (VK_EXT_descriptor_buffer, nvrhi
+        // ADR 0008) instead of descriptor sets, when the device supports it; otherwise descriptor sets are used and the
+        // log says so. The environment variable DONUT_VULKAN_DESCRIPTOR_BUFFER=1 turns it on for any application.
+        bool enableVulkanDescriptorBuffer = false;
 
         // Enables per-monitor DPI scale support.
         //

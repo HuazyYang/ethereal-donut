@@ -267,6 +267,7 @@ protected:
 
     bool m_BufferDeviceAddressSupported = false;
     bool m_DescriptorBindingUniformBufferUpdateAfterBind = false;
+    bool m_DescriptorBufferEnabled = false;
 
 #if VK_HEADER_VERSION >= 301
     typedef vk::detail::DynamicLoader VulkanDynamicLoader;
