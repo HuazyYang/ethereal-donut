@@ -747,10 +747,12 @@ bool DeviceManager_VK::createDevice()
 
     // Optional Vulkan 1.2 features. Queried with a chain of their own, because VkPhysicalDeviceVulkan12Features
     // overlaps the per-feature structures (bufferDeviceAddressFeatures) in the chain above.
+    vk::PhysicalDeviceVulkan11Features supportedVulkan11Features;
     vk::PhysicalDeviceVulkan12Features supportedVulkan12Features;
     {
         vk::PhysicalDeviceFeatures2 query;
-        query.pNext = &supportedVulkan12Features;
+        query.pNext = &supportedVulkan11Features;
+        supportedVulkan11Features.pNext = &supportedVulkan12Features;
         m_VulkanPhysicalDevice.getFeatures2(&query);
     }
 
@@ -875,6 +877,8 @@ bool DeviceManager_VK::createDevice()
 
     // Add a Vulkan 1.1 structure with default settings to make it easier for apps to modify them
     auto vulkan11features = vk::PhysicalDeviceVulkan11Features()
+        // Slang's SV_VertexID lowering subtracts BaseVertex, declaring DrawParameters.
+        .setShaderDrawParameters(supportedVulkan11Features.shaderDrawParameters)
         .setStorageBuffer16BitAccess(true)
         .setVariablePointersStorageBuffer(true)
         .setPNext(pNext);
