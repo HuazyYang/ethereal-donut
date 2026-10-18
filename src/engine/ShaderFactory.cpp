@@ -25,6 +25,7 @@
 #include <donut/core/log.h>
 #include <donut/core/string_utils.h>
 #include <ShaderToolBlob.h>
+#include <nvrhi/shader-program.h>
 #if DONUT_WITH_AFTERMATH
 #include <donut/app/AftermathCrashDump.h>
 #endif
@@ -71,6 +72,52 @@ namespace
     };
 }
 #endif
+
+namespace
+{
+    bool IsShaderArtifact(const void* data, size_t size)
+    {
+        return data && size >= 4 && memcmp(data, "NSTA", 4) == 0;
+    }
+
+    nvrhi::FRESULT FindArtifactShader(nvrhi::IShaderProgram* program, const nvrhi::ShaderDesc& desc,
+        nvrhi::IShader** shader) noexcept
+    {
+        if (!shader) return nvrhi::FE_INVALID_ARGS;
+        *shader = nullptr;
+        uint32_t index = ~0u;
+        const auto result = program->findEntryPoint(desc.entryName.c_str(), desc.shaderType, &index);
+        if (NVRHI_FAILED(result)) return result;
+        return program->createShaderWithDesc(index, desc, shader);
+    }
+
+    class ArtifactShaderLibrary final : public nvrhi::ObjectImpl<nvrhi::IShaderLibrary>
+    {
+        nvrhi::ShaderProgramHandle m_Program;
+        std::vector<unsigned char> m_Bytes;
+    public:
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(ArtifactShaderLibrary)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IShaderLibrary)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IRHIObject)
+        NVRHI_END_INTERFACE_TABLE()
+
+        ArtifactShaderLibrary(nvrhi::IShaderProgram* program, const void* data, size_t size)
+            : m_Program(program), m_Bytes(static_cast<const unsigned char*>(data),
+                static_cast<const unsigned char*>(data) + size) { }
+
+        void getBytecode(const void** data, size_t* size) const noexcept override
+        {
+            if (data) *data = m_Bytes.data();
+            if (size) *size = m_Bytes.size();
+        }
+
+        nvrhi::FRESULT getShader(const char* name, nvrhi::ShaderType type,
+            nvrhi::IShader** shader) noexcept override
+        {
+            return FindArtifactShader(m_Program, nvrhi::ShaderDesc().setEntryName(name ? name : "").setShaderType(type), shader);
+        }
+    };
+}
 
 // Builds the "permutation not found" message using the two-call sizing convention
 // of ShaderToolBlobFormatNotFoundMessage (the required length excludes the NUL,
@@ -135,9 +182,10 @@ nvrhi::AutoPtr<nvrhi::IDataBlob> ShaderFactory::GetBytecode(const char* fileName
 
     string adjustedName = fileName;
     {
-        size_t pos = adjustedName.find(".hlsl");
-        if (pos != string::npos)
-            adjustedName.erase(pos, 5);
+        // Strip only the source suffix; directory names may contain ".hlsl".
+        std::filesystem::path sourcePath(adjustedName);
+        if (sourcePath.extension() == ".hlsl" || sourcePath.extension() == ".slang")
+            adjustedName = sourcePath.replace_extension().generic_string();
 
         if (entryName && strcmp(entryName, "main"))
             adjustedName += "_" + string(entryName);
@@ -212,6 +260,18 @@ nvrhi::ShaderHandle ShaderFactory::CreateStaticShader(StaticShader shader, const
     }
 
     nvrhi::ShaderHandle shaderHandle;
+    if (IsShaderArtifact(permutationBytecode, permutationSize))
+    {
+        nvrhi::ShaderProgramHandle program;
+        if (NVRHI_FAILED(nvrhi::createShaderProgram(m_Device, permutationBytecode, permutationSize, &program)))
+        {
+            log::error("Invalid Slang artifact or target does not match the device.");
+            return nullptr;
+        }
+        if (NVRHI_FAILED(FindArtifactShader(program, desc, &shaderHandle)))
+            log::error("Slang artifact entry lookup or shader creation failed: %s", desc.entryName.c_str());
+        return shaderHandle;
+    }
     m_Device->createShader(desc, permutationBytecode, permutationSize, &shaderHandle);
     return shaderHandle;
 }
@@ -268,6 +328,16 @@ nvrhi::ShaderLibraryHandle ShaderFactory::CreateStaticShaderLibrary(StaticShader
     }
 
     nvrhi::ShaderLibraryHandle shaderLibrary;
+    if (IsShaderArtifact(permutationBytecode, permutationSize))
+    {
+        nvrhi::ShaderProgramHandle program;
+        if (NVRHI_FAILED(nvrhi::createShaderProgram(m_Device, permutationBytecode, permutationSize, &program)))
+        {
+            log::error("Invalid Slang library artifact or target does not match the device.");
+            return nullptr;
+        }
+        return MAKE_RC_OBJ_PTR(ArtifactShaderLibrary, static_cast<nvrhi::IShaderProgram*>(program), permutationBytecode, permutationSize);
+    }
     m_Device->createShaderLibrary(permutationBytecode, permutationSize, &shaderLibrary);
     return shaderLibrary;
 }

@@ -43,3 +43,13 @@ foreach(test_src ${donut_engine_tests})
 
 endforeach()
 
+
+# Reuse the NVRHI recording device when both repositories are built from source.
+if(NVRHI_WITH_SLANG AND EXISTS "${nvrhi_SOURCE_DIR}/tests/recording-device.h")
+    add_executable(test_shader_artifact src/engine/shader-artifact.cpp)
+    target_include_directories(test_shader_artifact PRIVATE "${nvrhi_SOURCE_DIR}/tests")
+    target_link_libraries(test_shader_artifact PRIVATE donut_engine ShaderTool::Artifacts)
+    add_dependencies(donut_all_tests test_shader_artifact)
+    add_test(NAME test_shader_artifact COMMAND test_shader_artifact)
+    set_target_properties(test_shader_artifact PROPERTIES FOLDER "Donut/donut_tests/donut_engine_tests")
+endif()

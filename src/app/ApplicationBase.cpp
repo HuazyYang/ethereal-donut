@@ -164,6 +164,8 @@ const char* donut::app::GetShaderTypeName(nvrhi::GraphicsAPI api)
         return "dxil";
     case nvrhi::GraphicsAPI::VULKAN:
         return "spirv";
+    case nvrhi::GraphicsAPI::CUDA:
+        return "ptx";
     default:
         assert(!"Unknown graphics API");
         return "";
