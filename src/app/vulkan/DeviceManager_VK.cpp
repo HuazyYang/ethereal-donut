@@ -689,6 +689,7 @@ bool DeviceManager_VK::createDevice()
     bool meshShaderSupported = false;
     bool rayTracingPositionFetchSupported = false;
     bool rayTracingValidationSupported = false;
+    bool depthClipEnableSupported = false;
 
     log::message(m_DeviceParams.infoLogSeverity, "Enabled Vulkan device extensions:");
     for (const auto& ext : enabledExtensions.device)
@@ -723,6 +724,8 @@ bool DeviceManager_VK::createDevice()
             rayTracingPositionFetchSupported = true;
         else if (ext == VK_NV_RAY_TRACING_VALIDATION_EXTENSION_NAME)
             rayTracingValidationSupported = true;
+        else if (ext == VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME)
+            depthClipEnableSupported = true;
     }
 
 #define APPEND_EXTENSION(condition, desc) if (condition) { (desc).pNext = pNext; pNext = &(desc); }  // NOLINT(cppcoreguidelines-macro-usage)
@@ -735,15 +738,22 @@ bool DeviceManager_VK::createDevice()
     auto aftermathPhysicalFeatures = vk::PhysicalDeviceDiagnosticsConfigFeaturesNV();
     // Determine support for mesh and task shaders
     auto meshShaderFeatures = vk::PhysicalDeviceMeshShaderFeaturesEXT();
+    auto depthClipEnableFeatures = vk::PhysicalDeviceDepthClipEnableFeaturesEXT();
 
     // Put the user-provided extension structure at the end of the chain
     pNext = m_DeviceParams.physicalDeviceFeatures2Extensions;
     APPEND_EXTENSION(true, bufferDeviceAddressFeatures);
     APPEND_EXTENSION(aftermathSupported, aftermathPhysicalFeatures);
     APPEND_EXTENSION(meshShaderSupported, meshShaderFeatures);
+    APPEND_EXTENSION(depthClipEnableSupported, depthClipEnableFeatures);
 
     physicalDeviceFeatures2.pNext = pNext;
     m_VulkanPhysicalDevice.getFeatures2(&physicalDeviceFeatures2);
+    if (depthClipEnableSupported && !depthClipEnableFeatures.depthClipEnable)
+    {
+        log::error("VK_EXT_depth_clip_enable was enabled but its depthClipEnable feature is unavailable.");
+        return false;
+    }
 
     // Optional Vulkan 1.2 features. Queried with a chain of their own, because VkPhysicalDeviceVulkan12Features
     // overlaps the per-feature structures (bufferDeviceAddressFeatures) in the chain above.
@@ -830,6 +840,7 @@ bool DeviceManager_VK::createDevice()
     APPEND_EXTENSION(rayTracingValidationSupported, rayTracingValidationFeatures)
     APPEND_EXTENSION(meshShaderSupported, meshShaderFeatures)
     APPEND_EXTENSION(rayTracingPositionFetchSupported, rayTracingPositionFetchFeatures)
+    APPEND_EXTENSION(depthClipEnableSupported, depthClipEnableFeatures)
 
     // Too easy to end up silently inert, so report which way it went.
     if (m_DeviceParams.enableRayTracingValidation)
