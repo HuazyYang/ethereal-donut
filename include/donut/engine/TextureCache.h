@@ -122,6 +122,11 @@ namespace donut::engine
 
         bool m_GenerateMipmaps = true;
 
+        std::optional<SRGBMode> m_SRGBOverride;
+
+        // The options a load request actually runs with: the caller's, with the cache-wide sRGB override applied.
+        TextureLoadOptions ResolveLoadOptions(const TextureLoadOptions& options) const;
+
         log::Severity m_InfoLogSeverity = log::Severity::Info;
         log::Severity m_ErrorLogSeverity = log::Severity::Warning;
 
@@ -272,6 +277,11 @@ namespace donut::engine
 
         // Enables or disables automatic mip generation for loaded textures.
         void SetGenerateMipmaps(bool generateMipmaps);
+
+        // Replaces the sRGB mode of every subsequent load request, whatever the caller (importer, scene file) asked for.
+        // For renderers whose pipeline has no sRGB decode/encode stage, e.g. a UNORM G-buffer written straight to a UNORM
+        // swap chain: pass SRGBMode::ForceLinear. Passing std::nullopt restores the per-request behaviour.
+        void SetSRGBOverride(std::optional<SRGBMode> mode);
 
         // Sets the Severity of log messages about textures being loaded.
         void SetInfoLogSeverity(log::Severity value) { m_InfoLogSeverity = value; }

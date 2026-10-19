@@ -147,6 +147,19 @@ void TextureCache::SetGenerateMipmaps(bool generateMipmaps)
     m_GenerateMipmaps = generateMipmaps;
 }
 
+void TextureCache::SetSRGBOverride(std::optional<SRGBMode> mode)
+{
+    m_SRGBOverride = mode;
+}
+
+TextureLoadOptions TextureCache::ResolveLoadOptions(const TextureLoadOptions& options) const
+{
+    TextureLoadOptions resolved = options;
+    if (m_SRGBOverride)
+        resolved.sRGBMode = *m_SRGBOverride;
+    return resolved;
+}
+
 bool TextureCache::FindTextureInCache(const std::filesystem::path& path, const TextureLoadOptions& options, TextureData** ppTexture)
 {
     std::lock_guard<std::shared_mutex> guard(m_LoadedTexturesMutex);
@@ -154,7 +167,7 @@ bool TextureCache::FindTextureInCache(const std::filesystem::path& path, const T
     // First see if this texture is already loaded (or being loaded).
     nvrhi::AutoPtr<TextureData> texture;
 
-    const TextureCacheKey key{ path.generic_string(), options };
+    const TextureCacheKey key{ path.generic_string(), ResolveLoadOptions(options) };
 
     texture = m_LoadedTextures[key];
     if (texture)
@@ -529,7 +542,7 @@ nvrhi::AutoPtr<LoadedTexture> TextureCache::LoadTextureFromFile(
     if (FindTextureInCache(path, options, &texture))
         return texture;
 
-    texture->loadOptions = options;
+    texture->loadOptions = ResolveLoadOptions(options);
     texture->path = path.generic_string();
 
     auto fileData = ReadTextureFile(path);
@@ -557,7 +570,7 @@ nvrhi::AutoPtr<LoadedTexture> TextureCache::LoadTextureFromFileDeferred(
     if (FindTextureInCache(path, options, &texture))
         return texture;
 
-    texture->loadOptions = options;
+    texture->loadOptions = ResolveLoadOptions(options);
     texture->path = path.generic_string();
 
     auto fileData = ReadTextureFile(path);
@@ -588,7 +601,7 @@ nvrhi::AutoPtr<LoadedTexture> TextureCache::LoadTextureFromFileAsync(
     if (FindTextureInCache(path, options, &texture))
         return texture;
 
-    texture->loadOptions = options;
+    texture->loadOptions = ResolveLoadOptions(options);
     texture->path = path.generic_string();
 
     threadPool.AddTask([this, texture, path]()
@@ -621,7 +634,7 @@ nvrhi::AutoPtr<LoadedTexture> TextureCache::LoadTextureFromMemoryAsync(
 {
     nvrhi::AutoPtr<TextureData> texture = CreateTextureData();
     
-    texture->loadOptions = options;
+    texture->loadOptions = ResolveLoadOptions(options);
     texture->path = name;
     texture->mimeType = mimeType;
 
@@ -656,7 +669,7 @@ nvrhi::AutoPtr<LoadedTexture> TextureCache::LoadTextureFromMemory(
 {
     nvrhi::AutoPtr<TextureData> texture = CreateTextureData();
     
-    texture->loadOptions = options;
+    texture->loadOptions = ResolveLoadOptions(options);
     texture->path = name;
     texture->mimeType = mimeType;
 
@@ -680,7 +693,7 @@ nvrhi::AutoPtr<LoadedTexture> TextureCache::LoadTextureFromMemoryDeferred(
 {
     nvrhi::AutoPtr<TextureData> texture = CreateTextureData();
     
-    texture->loadOptions = options;
+    texture->loadOptions = ResolveLoadOptions(options);
     texture->path = name;
     texture->mimeType = mimeType;
 
@@ -705,7 +718,7 @@ nvrhi::AutoPtr<LoadedTexture> TextureCache::LoadTextureFromRawImageMemory(nvrhi:
                                                                             uint32_t imageBitsPerPixel,
                                                                             uint32_t imagePixelStride) {
     nvrhi::AutoPtr<TextureData> texture = CreateTextureData();
-    texture->loadOptions = options;
+    texture->loadOptions = ResolveLoadOptions(options);
     texture->path = name;
 
     uint32_t imageBytesPerPixel = div_ceil(imageBitsPerPixel, 8u);
@@ -768,7 +781,7 @@ nvrhi::AutoPtr<LoadedTexture> TextureCache::LoadTextureFromRawImageMemory(nvrhi:
 nvrhi::AutoPtr<TextureData> TextureCache::GetLoadedTexture(std::filesystem::path const& path, const TextureLoadOptions& options)
 {
 	std::lock_guard<std::shared_mutex> guard(m_LoadedTexturesMutex);
-	return m_LoadedTextures[TextureCacheKey{ path.generic_string(), options }];
+	return m_LoadedTextures[TextureCacheKey{ path.generic_string(), ResolveLoadOptions(options) }];
 }
 
 bool TextureCache::ProcessRenderingThreadCommands(CommonRenderPasses& passes, float timeLimitMilliseconds)
