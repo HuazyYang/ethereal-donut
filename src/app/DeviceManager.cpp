@@ -788,6 +788,17 @@ const DeviceCreationParameters& DeviceManager::GetDeviceParams()
     return m_DeviceParams;
 }
 
+nvrhi::IGraphicsFactory* DeviceManager::GetGraphicsFactory()
+{
+    if (!m_GraphicsFactory)
+    {
+        nvrhi::GraphicsFactoryDesc factoryDesc;
+        factoryDesc.messageCallback = DefaultMessageCallback::GetInstance();
+        m_GraphicsFactory = nvrhi::createGraphicsFactory(factoryDesc);
+    }
+    return m_GraphicsFactory;
+}
+
 donut::app::DeviceManager::DeviceManager()
 #if DONUT_WITH_AFTERMATH
     : m_AftermathCrashDumper(*this)

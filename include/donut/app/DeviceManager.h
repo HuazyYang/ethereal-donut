@@ -80,6 +80,7 @@ freely, subject to the following restrictions:
 #endif // _WIN32
 #include <GLFW/glfw3native.h>
 #include <nvrhi/nvrhi.h>
+#include <nvrhi/factory.h>
 #include <donut/core/log.h>
 
 #include <array>
@@ -343,6 +344,9 @@ namespace donut::app
         std::vector<nvrhi::FramebufferHandle> m_SwapChainWithDepthFramebuffers;
         nvrhi::TextureHandle m_DepthBuffer;
 
+        // Creates the NVRHI devices and the validation layer (created by GetGraphicsFactory).
+        nvrhi::GraphicsFactoryHandle m_GraphicsFactory;
+
         DeviceManager();
 
         void UpdateWindowSize();
@@ -370,6 +374,9 @@ namespace donut::app
 
     public:
         [[nodiscard]] virtual nvrhi::IDevice *GetDevice() const = 0;
+        // The NVRHI graphics factory the device manager creates its device with. Applications can create further
+        // devices with it, for example a CUDA device paired with GetDevice() (<nvrhi/cuda.h>).
+        [[nodiscard]] nvrhi::IGraphicsFactory* GetGraphicsFactory();
         [[nodiscard]] virtual const char *GetRendererString() const = 0;
         [[nodiscard]] virtual nvrhi::GraphicsAPI GetGraphicsAPI() const = 0;
 

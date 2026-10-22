@@ -1236,11 +1236,15 @@ bool DeviceManager_VK::CreateDevice()
     deviceDesc.vulkanLibraryName = m_DeviceParams.vulkanLibraryName;
     deviceDesc.logBufferLifetime = m_DeviceParams.logBufferLifetime;
 
-    m_NvrhiDevice = nvrhi::vulkan::createDevice(deviceDesc);
+    m_NvrhiDevice = nullptr;
+    GetGraphicsFactory()->createVulkanDevice(deviceDesc, &m_NvrhiDevice);
+    if (!m_NvrhiDevice)
+        return false;
 
     if (m_DeviceParams.enableNvrhiValidationLayer)
     {
-        m_ValidationLayer = nvrhi::validation::createValidationLayer(m_NvrhiDevice);
+        m_ValidationLayer = nullptr;
+        GetGraphicsFactory()->createValidationLayer(m_NvrhiDevice, &m_ValidationLayer);
     }
 
 #if DONUT_WITH_STREAMLINE

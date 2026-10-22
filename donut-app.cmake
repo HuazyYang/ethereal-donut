@@ -119,6 +119,10 @@ if (WIN32)
     target_compile_definitions(donut_app PRIVATE DONUT_FORCE_DISCRETE_GPU=$<BOOL:${DONUT_FORCE_DISCRETE_GPU}>)
 endif()
 
+if (NOT NVRHI_BUILD_SHARED)
+    # The graphics factory (nvrhi ADR 0010) creates the devices; it links every backend built into nvrhi.
+    target_link_libraries(donut_app nvrhi_factory)
+endif()
 target_link_libraries(donut_app nvrhi) # needs to come after nvrhi_d3d11 etc. for link order
 
 add_dependencies(donut_app donut_shaders)

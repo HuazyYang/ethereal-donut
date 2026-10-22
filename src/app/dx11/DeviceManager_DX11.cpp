@@ -243,11 +243,16 @@ bool DeviceManager_DX11::CreateDevice()
     deviceDesc.aftermathEnabled = m_DeviceParams.enableAftermath;
 #endif
 
-    m_NvrhiDevice = nvrhi::d3d11::createDevice(deviceDesc);
+    m_NvrhiDevice = nullptr;
+    GetGraphicsFactory()->createD3D11Device(deviceDesc, &m_NvrhiDevice);
+    if (!m_NvrhiDevice)
+        return false;
 
     if (m_DeviceParams.enableNvrhiValidationLayer)
     {
-        m_NvrhiDevice = nvrhi::validation::createValidationLayer(m_NvrhiDevice);
+        nvrhi::DeviceHandle validationLayer;
+        GetGraphicsFactory()->createValidationLayer(m_NvrhiDevice, &validationLayer);
+        m_NvrhiDevice = validationLayer;
     }
 
 #if DONUT_WITH_STREAMLINE

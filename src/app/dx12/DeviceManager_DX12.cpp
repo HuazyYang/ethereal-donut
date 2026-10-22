@@ -321,11 +321,17 @@ bool DeviceManager_DX12::CreateDevice()
     deviceDesc.enableHeapDirectlyIndexed = m_DeviceParams.enableHeapDirectlyIndexed;
     deviceDesc.enableRayTracingValidation = m_DeviceParams.enableRayTracingValidation;
 
-    m_NvrhiDevice = nvrhi::d3d12::createDevice(deviceDesc);
+    nvrhi::d3d12::DeviceHandle d3d12Device;
+    GetGraphicsFactory()->createD3D12Device(deviceDesc, &d3d12Device);
+    if (!d3d12Device)
+        return false;
+    m_NvrhiDevice = d3d12Device.Get();
 
     if (m_DeviceParams.enableNvrhiValidationLayer)
     {
-        m_NvrhiDevice = nvrhi::validation::createValidationLayer(m_NvrhiDevice);
+        nvrhi::DeviceHandle validationLayer;
+        GetGraphicsFactory()->createValidationLayer(m_NvrhiDevice, &validationLayer);
+        m_NvrhiDevice = validationLayer;
     }
 
 #if DONUT_WITH_STREAMLINE
