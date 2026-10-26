@@ -22,11 +22,6 @@
 
 #if DONUT_WITH_DX12
 #include <directx/d3d12.h>
-extern "C"
-{
-    _declspec(dllexport) extern const unsigned int D3D12SDKVersion = D3D12_PREVIEW_SDK_VERSION;
-    _declspec(dllexport) extern const char* D3D12SDKPath = ".\\d3d12\\";
-}
 #endif
 
 #include <donut/core/math/float.h>
@@ -542,6 +537,23 @@ nvrhi::AutoPtr<donut::app::DeviceManager> InitializeGraphicsDevice(nvrhi::Graphi
 #if DONUT_WITH_DX12
     if (graphicsApi == nvrhi::GraphicsAPI::D3D12)
     {
+        // The experimental features are enabled before the device exists: on the Agility SDK's device factory if the
+        // device manager loads one, or else through the system d3d12.dll that nvrhi's graphics factory loaded
+        // (nvrhi ADR 0014). The build ships no preview Agility SDK, so this is the system runtime.
+        InstanceParameters instanceParams;
+        instanceParams.headlessDevice = true;
+        if (!deviceManager->CreateInstance(instanceParams))
+        {
+            fprintf(stderr, "Failed to create the D3D12 graphics factory, skipping GPU tests.\n");
+            return nullptr;
+        }
+        auto deviceFactory = static_cast<ID3D12DeviceFactory*>(
+            deviceManager->GetGraphicsFactory()->getNativeObject(nvrhi::ObjectTypes::D3D12_DeviceFactory));
+        const HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+        typedef HRESULT(WINAPI* PFN_EnableExperimentalFeatures)(UINT, const IID*, void*, UINT*);
+        const auto enableExperimentalFeatures = d3d12 ? reinterpret_cast<PFN_EnableExperimentalFeatures>(
+            reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12EnableExperimentalFeatures"))) : nullptr;
+
 #if D3D12_PREVIEW_SDK_VERSION >= 720
         UUID Features[] = { D3D12ExperimentalShaderModels };
 #else
@@ -550,7 +562,9 @@ nvrhi::AutoPtr<donut::app::DeviceManager> InitializeGraphicsDevice(nvrhi::Graphi
         static const UUID cooperativeVectorExperiment = { 0x384748be, 0xcca5, 0x471e, { 0xa1, 0x25, 0x5c, 0xc9, 0x97, 0xe0, 0x4d, 0x39 } };
         UUID Features[] = { D3D12ExperimentalShaderModels, cooperativeVectorExperiment };
 #endif
-        HRESULT hr = D3D12EnableExperimentalFeatures(_countof(Features), Features, nullptr, nullptr);
+        HRESULT hr = deviceFactory
+            ? deviceFactory->EnableExperimentalFeatures(_countof(Features), Features, nullptr, nullptr)
+            : enableExperimentalFeatures ? enableExperimentalFeatures(_countof(Features), Features, nullptr, nullptr) : E_FAIL;
         if (FAILED(hr))
         {
             fprintf(stderr, "Failed to enable D3D12 experimental shader models, skipping GPU tests.\n");

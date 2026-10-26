@@ -28,11 +28,7 @@ foreach(test_src ${donut_engine_tests})
     #message(STATUS "Added test ${test_name}")
 
     add_executable("${test_name}" "${test_src}")
-    # A test that uses the device manager gets the dispatcher from donut_app; the others define it themselves.
-    file(STRINGS "${test_src}" test_uses_app REGEX "#include <donut/app/")
-    if (DONUT_WITH_VULKAN AND NOT test_uses_app)
-        target_sources("${test_name}" PRIVATE src/vulkan_dispatch_storage.cpp)
-    endif()
+    # The Vulkan-Hpp dispatcher is defined by nvrhi_vk (nvrhi ADR 0014).
     target_link_libraries("${test_name}" donut_app donut_engine donut_core donut_tests_utils)
 
     add_dependencies(donut_all_tests "${test_name}")

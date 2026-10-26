@@ -53,18 +53,11 @@ freely, subject to the following restrictions:
 #include <nvrhi/utils.h>
 
 #include <cstdio>
+#include <cstring>
 #include <iomanip>
 #include <list>
 #include <thread>
 #include <sstream>
-
-#if DONUT_WITH_DX11
-#include <d3d11.h>
-#endif
-
-#if DONUT_WITH_DX12
-#include <d3d12.h>
-#endif
 
 #if DONUT_WITH_STREAMLINE
 #include <StreamlineIntegration.h>
@@ -788,15 +781,179 @@ const DeviceCreationParameters& DeviceManager::GetDeviceParams()
     return m_DeviceParams;
 }
 
-nvrhi::IGraphicsFactory* DeviceManager::GetGraphicsFactory()
+namespace
+{
+    struct DefaultD3D12AgilitySDK
+    {
+        uint32_t sdkVersion = 0;
+        std::string sdkPath;
+    };
+
+    DefaultD3D12AgilitySDK& GetDefaultD3D12AgilitySDKStorage()
+    {
+        static DefaultD3D12AgilitySDK storage;
+        return storage;
+    }
+}
+
+void donut::app::SetDefaultD3D12AgilitySDK(uint32_t sdkVersion, const char* sdkPath)
+{
+    DefaultD3D12AgilitySDK& storage = GetDefaultD3D12AgilitySDKStorage();
+    storage.sdkVersion = sdkVersion;
+    storage.sdkPath = sdkPath ? sdkPath : "";
+}
+
+namespace donut::app
+{
+    // DeviceManager_DX12.cpp
+    bool GetDefaultD3D12AgilitySDK(uint32_t& outVersion, std::string& outPath)
+    {
+        const DefaultD3D12AgilitySDK& storage = GetDefaultD3D12AgilitySDKStorage();
+        outVersion = storage.sdkVersion;
+        outPath = storage.sdkPath;
+        return storage.sdkVersion != 0;
+    }
+}
+
+bool DeviceManager::EnumerateAdapters(std::vector<AdapterInfo>& outAdapters)
 {
     if (!m_GraphicsFactory)
+        return false;
+
+    outAdapters.clear();
+    const nvrhi::GraphicsAPI api = m_GraphicsFactory->getGraphicsAPI();
+    for (uint32_t index = 0; index < m_GraphicsFactory->getAdapterCount(); ++index)
     {
-        nvrhi::GraphicsFactoryDesc factoryDesc;
-        factoryDesc.messageCallback = DefaultMessageCallback::GetInstance();
-        m_GraphicsFactory = nvrhi::createGraphicsFactory(factoryDesc);
+        nvrhi::AdapterInfo info;
+        if (NVRHI_FAILED(m_GraphicsFactory->getAdapterInfo(index, info)))
+            return false;
+
+        AdapterInfo adapterInfo;
+        adapterInfo.name = info.name.c_str();
+        adapterInfo.vendorID = info.vendorID;
+        adapterInfo.deviceID = info.deviceID;
+        adapterInfo.dedicatedVideoMemory = info.dedicatedVideoMemory;
+        if (info.uuidValid)
+        {
+            AdapterInfo::UUID uuid;
+            static_assert(sizeof(uuid) == sizeof(info.uuid));
+            memcpy(uuid.data(), info.uuid, uuid.size());
+            adapterInfo.uuid = uuid;
+        }
+        if (info.luidValid)
+        {
+            AdapterInfo::LUID luid;
+            static_assert(sizeof(luid) == sizeof(info.luid));
+            memcpy(luid.data(), info.luid, luid.size());
+            adapterInfo.luid = luid;
+        }
+#if DONUT_WITH_DX11 || DONUT_WITH_DX12
+        if (api == nvrhi::GraphicsAPI::D3D11 || api == nvrhi::GraphicsAPI::D3D12)
+            adapterInfo.dxgiAdapter = static_cast<IDXGIAdapter*>(info.nativeAdapter);
+#endif
+#if DONUT_WITH_VULKAN
+        if (api == nvrhi::GraphicsAPI::VULKAN)
+            adapterInfo.vkPhysicalDevice = static_cast<VkPhysicalDevice>(info.nativeAdapter);
+#endif
+        outAdapters.push_back(std::move(adapterInfo));
     }
-    return m_GraphicsFactory;
+    return true;
+}
+
+nvrhi::SwapChainDesc DeviceManager::GetSwapChainDesc() const
+{
+    nvrhi::SwapChainDesc desc;
+#ifdef _WIN32
+    desc.window = glfwGetWin32Window(m_Window);
+#endif
+    // 0: the size of the window's client area, which is what the device parameters hold after window creation.
+    desc.width = 0;
+    desc.height = 0;
+    desc.bufferCount = m_DeviceParams.swapChainBufferCount;
+    desc.format = m_DeviceParams.swapChainFormat;
+    desc.sampleCount = m_DeviceParams.swapChainSampleCount;
+    desc.sampleQuality = m_DeviceParams.swapChainSampleQuality;
+    desc.maxFramesInFlight = m_DeviceParams.maxFramesInFlight;
+    desc.refreshRate = m_DeviceParams.refreshRate;
+#if DONUT_WITH_DX11 || DONUT_WITH_DX12
+    desc.dxgiUsage = m_DeviceParams.swapChainUsage;
+#endif
+    desc.vsync = m_DeviceParams.vsyncEnabled;
+    return desc;
+}
+
+void DeviceManager::SwapChainCreated()
+{
+    const nvrhi::SwapChainDesc& desc = m_SwapChain->getDesc();
+    m_DeviceParams.backBufferWidth = desc.width;
+    m_DeviceParams.backBufferHeight = desc.height;
+    // Vulkan swaps RGBA8 for the BGRA8 that surfaces offer.
+    m_DeviceParams.swapChainFormat = desc.format;
+}
+
+void DeviceManager::ResizeSwapChain()
+{
+    if (!m_SwapChain)
+        return;
+
+    m_SwapChain->setVsyncEnabled(m_DeviceParams.vsyncEnabled);
+    if (NVRHI_FAILED(m_SwapChain->resize(m_DeviceParams.backBufferWidth, m_DeviceParams.backBufferHeight)))
+        log::fatal("Failed to resize the swap chain");
+}
+
+bool DeviceManager::BeginFrame()
+{
+    if (!m_SwapChain)
+        return false;
+
+    // An out-of-date swap chain (Vulkan) is resized to the window and acquired again.
+    int const maxAttempts = 3;
+    for (int attempt = 0; attempt < maxAttempts; ++attempt)
+    {
+        const nvrhi::FRESULT result = m_SwapChain->beginFrame();
+        if (result != nvrhi::FE_OUT_OF_DATE)
+            return NVRHI_SUCCEEDED(result);
+
+        BackBufferResizing();
+        if (NVRHI_FAILED(m_SwapChain->resize(0, 0)))
+            return false;
+        m_DeviceParams.backBufferWidth = m_SwapChain->getDesc().width;
+        m_DeviceParams.backBufferHeight = m_SwapChain->getDesc().height;
+        BackBufferResized();
+    }
+
+    return false;
+}
+
+bool DeviceManager::Present()
+{
+    if (!m_SwapChain)
+        return false;
+
+    m_SwapChain->setVsyncEnabled(m_DeviceParams.vsyncEnabled);
+    // Out of date: the frame was presented or dropped; the next BeginFrame resizes.
+    const nvrhi::FRESULT result = m_SwapChain->present();
+    return result == nvrhi::FS_OK || result == nvrhi::FE_OUT_OF_DATE;
+}
+
+nvrhi::ITexture* DeviceManager::GetCurrentBackBuffer()
+{
+    return m_SwapChain ? m_SwapChain->getBackBuffer(m_SwapChain->getCurrentBackBufferIndex()) : nullptr;
+}
+
+nvrhi::ITexture* DeviceManager::GetBackBuffer(uint32_t index)
+{
+    return m_SwapChain ? m_SwapChain->getBackBuffer(index) : nullptr;
+}
+
+uint32_t DeviceManager::GetCurrentBackBufferIndex()
+{
+    return m_SwapChain ? m_SwapChain->getCurrentBackBufferIndex() : 0;
+}
+
+uint32_t DeviceManager::GetBackBufferCount()
+{
+    return m_SwapChain ? m_SwapChain->getBackBufferCount() : 0;
 }
 
 donut::app::DeviceManager::DeviceManager()
@@ -1108,6 +1265,9 @@ void DeviceManager::Shutdown()
     for(auto pRenderPass : m_vRenderPasses)
         pRenderPass->Release();
     m_vRenderPasses.clear();
+
+    // The swap chain waits for the device to finish its frames, so it goes first.
+    m_SwapChain = nullptr;
 
     DestroyDeviceAndSwapChain();
 

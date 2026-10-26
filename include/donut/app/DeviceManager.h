@@ -81,6 +81,7 @@ freely, subject to the following restrictions:
 #include <GLFW/glfw3native.h>
 #include <nvrhi/nvrhi.h>
 #include <nvrhi/factory.h>
+#include <nvrhi/swapchain.h>
 #include <donut/core/log.h>
 
 #include <array>
@@ -138,6 +139,14 @@ namespace donut::app
 
         // Severity of the information log messages from the device manager, like the device name or enabled extensions.
         log::Severity infoLogSeverity = log::Severity::Info;
+
+#if DONUT_WITH_DX12
+        // The D3D12 Agility SDK that nvrhi's D3D12 graphics factory loads (ID3D12SDKConfiguration1::CreateDeviceFactory):
+        // the D3D12_SDK_VERSION of the D3D12Core.dll in d3d12AgilitySDKPath, which is relative to the executable.
+        // 0 takes the default set with SetDefaultD3D12AgilitySDK, or else the D3D12 runtime of the system.
+        uint32_t d3d12AgilitySDKVersion = 0;
+        std::string d3d12AgilitySDKPath = ".\\D3D12\\";
+#endif
 
 #if DONUT_WITH_VULKAN
         // Allows overriding the Vulkan library name with something custom, useful for Streamline
@@ -247,6 +256,11 @@ namespace donut::app
 
     class IRenderPass;
 
+    // Sets the D3D12 Agility SDK that D3D12 device managers load when InstanceParameters::d3d12AgilitySDKVersion is 0.
+    // An executable that ships the Agility SDK calls it once, before creating a device manager (for example from a
+    // static initializer).
+    void SetDefaultD3D12AgilitySDK(uint32_t sdkVersion, const char* sdkPath);
+
     struct AdapterInfo
     {
         typedef std::array<uint8_t, 16> UUID;
@@ -286,9 +300,9 @@ namespace donut::app
         // in DeviceCreationParameters passed to the device call.
         bool CreateInstance(const InstanceParameters& params);
 
-        // Enumerates adapters or physical devices present in the system.
+        // Enumerates adapters or physical devices present in the system (through the graphics factory).
         // Note: a call to CreateInstance() or Create*Device*() is required before EnumerateAdapters().
-        virtual bool EnumerateAdapters(std::vector<AdapterInfo>& outAdapters) = 0;
+        virtual bool EnumerateAdapters(std::vector<AdapterInfo>& outAdapters);
 
         void AddRenderPassToFront(IRenderPass *pController);
         void AddRenderPassToBack(IRenderPass *pController);
@@ -344,8 +358,11 @@ namespace donut::app
         std::vector<nvrhi::FramebufferHandle> m_SwapChainWithDepthFramebuffers;
         nvrhi::TextureHandle m_DepthBuffer;
 
-        // Creates the NVRHI devices and the validation layer (created by GetGraphicsFactory).
+        // The graphics factory of the backend (nvrhi ADR 0014), created by CreateInstance(): it creates the device, the
+        // validation layer and the swap chain.
         nvrhi::GraphicsFactoryHandle m_GraphicsFactory;
+        // The swap chain of the window (none for a headless device), created by CreateSwapChain().
+        nvrhi::GraphicsSwapChainHandle m_SwapChain;
 
         DeviceManager();
 
@@ -363,20 +380,29 @@ namespace donut::app
         void UpdateAverageFrameTime(double elapsedTime);
         bool AnimateRenderPresent();
         // device-specific methods
-        virtual bool CreateInstanceInternal() = 0;
+        virtual bool CreateInstanceInternal() = 0;   // creates m_GraphicsFactory
         virtual bool CreateDevice() = 0;
-        virtual bool CreateSwapChain() = 0;
+        virtual bool CreateSwapChain() = 0;          // creates m_SwapChain from GetSwapChainDesc()
         virtual void DestroyDeviceAndSwapChain() = 0;
-        virtual void ResizeSwapChain() = 0;
-        virtual bool BeginFrame() = 0;
-        virtual bool Present() = 0;
+
+        // The swap chain: nvrhi's IGraphicsSwapChain does the backend work.
+        virtual void ResizeSwapChain();
+        virtual bool BeginFrame();
+        virtual bool Present();
+
+        // The swap chain description for the window and the device parameters.
+        [[nodiscard]] nvrhi::SwapChainDesc GetSwapChainDesc() const;
+        // Takes the size and format of the new swap chain into the device parameters.
+        void SwapChainCreated();
         void ToggleFullscreen();
 
     public:
         [[nodiscard]] virtual nvrhi::IDevice *GetDevice() const = 0;
-        // The NVRHI graphics factory the device manager creates its device with. Applications can create further
-        // devices with it, for example a CUDA device paired with GetDevice() (<nvrhi/cuda.h>).
-        [[nodiscard]] nvrhi::IGraphicsFactory* GetGraphicsFactory();
+        // The NVRHI graphics factory of the backend that the device manager creates its device with (nvrhi ADR 0014).
+        // QueryInterface it for d3d11/d3d12/vulkan::IGraphicsFactory to create further devices of that backend.
+        [[nodiscard]] nvrhi::IGraphicsFactory* GetGraphicsFactory() const { return m_GraphicsFactory; }
+        // The swap chain of the window, or nullptr for a headless device.
+        [[nodiscard]] nvrhi::IGraphicsSwapChain* GetSwapChain() const { return m_SwapChain; }
         [[nodiscard]] virtual const char *GetRendererString() const = 0;
         [[nodiscard]] virtual nvrhi::GraphicsAPI GetGraphicsAPI() const = 0;
 
@@ -417,10 +443,10 @@ namespace donut::app
         // state when null. No-op if the window is already in the requested state.
         void SetFullscreen(GLFWmonitor* targetMonitor);
 
-        virtual nvrhi::ITexture* GetCurrentBackBuffer() = 0;
-        virtual nvrhi::ITexture* GetBackBuffer(uint32_t index) = 0;
-        virtual uint32_t GetCurrentBackBufferIndex() = 0;
-        virtual uint32_t GetBackBufferCount() = 0;
+        virtual nvrhi::ITexture* GetCurrentBackBuffer();
+        virtual nvrhi::ITexture* GetBackBuffer(uint32_t index);
+        virtual uint32_t GetCurrentBackBufferIndex();
+        virtual uint32_t GetBackBufferCount();
         nvrhi::IFramebuffer* GetCurrentFramebuffer(bool withDepth = true);
         nvrhi::IFramebuffer* GetFramebuffer(uint32_t index, bool withDepth = true);
         nvrhi::ITexture* GetDepthBuffer() const { return m_DepthBuffer; }

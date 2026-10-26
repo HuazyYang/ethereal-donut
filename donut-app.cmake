@@ -35,11 +35,12 @@ file(GLOB donut_app_vr_src
 add_library(donut_app STATIC EXCLUDE_FROM_ALL ${donut_app_src})
 target_include_directories(donut_app PUBLIC include)
 
-#link streamline since we need to link before d3d11, d3d12, dxgi functions
+# Streamline: nvrhi's graphics factories load DXGI, D3D11, D3D12 and Vulkan from sl.interposer.dll when the device
+# managers ask for it (DONUT_WITH_STREAMLINE); StreamlineIntegration.cpp itself still calls DXGI directly.
 if(DONUT_WITH_STREAMLINE)
 target_sources(donut_app PRIVATE src/app/streamline/StreamlineIntegration.cpp)
 target_include_directories(donut_app PRIVATE src/app/streamline/)
-target_link_libraries(donut_app streamline)
+target_link_libraries(donut_app streamline dxgi)
 
 if(DONUT_WITH_VULKAN)
 # Override vulkan dll used by glfw
@@ -84,7 +85,8 @@ if(DONUT_WITH_DX11)
     if (NOT NVRHI_BUILD_SHARED)
         target_link_libraries(donut_app nvrhi_d3d11)
     endif()
-    target_link_libraries(donut_app d3d11 dxgi dxguid)
+    # nvrhi's D3D11 graphics factory loads dxgi.dll and d3d11.dll at run time (nvrhi ADR 0014).
+    target_link_libraries(donut_app dxguid)
 endif()
 
 if(DONUT_WITH_DX12)
@@ -92,7 +94,8 @@ if(DONUT_WITH_DX12)
     if (NOT NVRHI_BUILD_SHARED)
         target_link_libraries(donut_app nvrhi_d3d12)
     endif()
-    target_link_libraries(donut_app d3d12 dxgi dxguid)
+    # nvrhi's D3D12 graphics factory loads dxgi.dll and d3d12.dll (or the Agility SDK) at run time (nvrhi ADR 0014).
+    target_link_libraries(donut_app dxguid)
 endif()
 
 if(DONUT_WITH_VULKAN)
@@ -120,7 +123,7 @@ if (WIN32)
 endif()
 
 if (NOT NVRHI_BUILD_SHARED)
-    # The graphics factory (nvrhi ADR 0010) creates the devices; it links every backend built into nvrhi.
+    # The graphics factories (nvrhi ADR 0014): nvrhi_factory links every backend library built into nvrhi.
     target_link_libraries(donut_app nvrhi_factory)
 endif()
 target_link_libraries(donut_app nvrhi) # needs to come after nvrhi_d3d11 etc. for link order
