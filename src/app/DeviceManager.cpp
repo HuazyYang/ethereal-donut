@@ -92,7 +92,7 @@ public:
 		return singleton;
 	}
 
-	void UpdateAllJoysticks(const std::vector<IRenderPass*>& passes);
+	void UpdateAllJoysticks(const std::vector<IAppLayer*>& layers);
 	
 	void EraseDisconnectedJoysticks();
 	void EnumerateJoysticks();
@@ -102,7 +102,7 @@ public:
 
 private:
 	JoyStickManager() {}
-	void UpdateJoystick(int j, const std::vector<IRenderPass*>& passes);
+	void UpdateJoystick(int j, const std::vector<IAppLayer*>& layers);
 
 	std::list<int> m_JoystickIDs, m_RemovedJoysticks;
 };
@@ -476,54 +476,54 @@ bool DeviceManager::CreateWindowDeviceAndSwapChain(const DeviceCreationParameter
     return true;
 }
 
-void DeviceManager::AddRenderPassToFront(IRenderPass *pRenderPass)
+void DeviceManager::AddLayerToFront(IAppLayer *pLayer)
 {
-    if (auto it = std::find(m_vRenderPasses.begin(), m_vRenderPasses.end(), pRenderPass);
-        it != m_vRenderPasses.end()) {
+    if (auto it = std::find(m_vLayers.begin(), m_vLayers.end(), pLayer);
+        it != m_vLayers.end()) {
         (*it)->Release();
-        m_vRenderPasses.erase(it);
-        m_vRenderPasses.insert(m_vRenderPasses.begin(), pRenderPass);
-        pRenderPass->AddRef();
+        m_vLayers.erase(it);
+        m_vLayers.insert(m_vLayers.begin(), pLayer);
+        pLayer->AddRef();
         return;
     }
 
-    m_vRenderPasses.insert(m_vRenderPasses.begin(), pRenderPass);
-    pRenderPass->AddRef();
+    m_vLayers.insert(m_vLayers.begin(), pLayer);
+    pLayer->AddRef();
 
-    pRenderPass->BackBufferResizing();
-    pRenderPass->BackBufferResized(
+    pLayer->BackBufferResizing();
+    pLayer->BackBufferResized(
         m_DeviceParams.backBufferWidth,
         m_DeviceParams.backBufferHeight,
         m_DeviceParams.swapChainSampleCount);
 }
 
-void DeviceManager::AddRenderPassToBack(IRenderPass *pRenderPass)
+void DeviceManager::AddLayerToBack(IAppLayer *pLayer)
 {
-    if (auto it = std::find(m_vRenderPasses.begin(), m_vRenderPasses.end(), pRenderPass);
-        it != m_vRenderPasses.end()) {
+    if (auto it = std::find(m_vLayers.begin(), m_vLayers.end(), pLayer);
+        it != m_vLayers.end()) {
         (*it)->Release();
-        m_vRenderPasses.erase(it);
-        m_vRenderPasses.push_back(pRenderPass);
-        pRenderPass->AddRef();
+        m_vLayers.erase(it);
+        m_vLayers.push_back(pLayer);
+        pLayer->AddRef();
         return;
     }
 
-    m_vRenderPasses.push_back(pRenderPass);
-    pRenderPass->AddRef();
+    m_vLayers.push_back(pLayer);
+    pLayer->AddRef();
 
-    pRenderPass->BackBufferResizing();
-    pRenderPass->BackBufferResized(
+    pLayer->BackBufferResizing();
+    pLayer->BackBufferResized(
         m_DeviceParams.backBufferWidth,
         m_DeviceParams.backBufferHeight,
         m_DeviceParams.swapChainSampleCount);
 }
 
-void DeviceManager::RemoveRenderPass(IRenderPass *pRenderPass)
+void DeviceManager::RemoveLayer(IAppLayer *pLayer)
 {
-    if (auto it = std::find(m_vRenderPasses.begin(), m_vRenderPasses.end(), pRenderPass);
-        it != m_vRenderPasses.end()) {
+    if (auto it = std::find(m_vLayers.begin(), m_vLayers.end(), pLayer);
+        it != m_vLayers.end()) {
         (*it)->Release();
-        m_vRenderPasses.erase(it);
+        m_vLayers.erase(it);
     }
 }
 
@@ -532,7 +532,7 @@ void DeviceManager::BackBufferResizing()
     m_SwapChainFramebuffers.clear();
     m_SwapChainWithDepthFramebuffers.clear();
 
-    for (auto it : m_vRenderPasses)
+    for (auto it : m_vLayers)
     {
         it->BackBufferResizing();
     }
@@ -542,7 +542,7 @@ void DeviceManager::BackBufferResized()
 {
     CreateDepthBuffer();
 
-    for(auto it : m_vRenderPasses)
+    for(auto it : m_vLayers)
     {
         it->BackBufferResized(m_DeviceParams.backBufferWidth,
                               m_DeviceParams.backBufferHeight,
@@ -573,7 +573,7 @@ void DeviceManager::BackBufferResized()
 
 void DeviceManager::DisplayScaleChanged()
 {
-    for(auto it : m_vRenderPasses)
+    for(auto it : m_vLayers)
     {
         it->DisplayScaleChanged(m_DPIScaleFactorX, m_DPIScaleFactorY);
     }
@@ -605,7 +605,7 @@ void DeviceManager::CreateDepthBuffer()
 
 void DeviceManager::Animate(double elapsedTime, bool windowIsFocused)
 {
-    for(auto it : m_vRenderPasses)
+    for(auto it : m_vLayers)
     {
         if (windowIsFocused || it->ShouldAnimateUnfocused())
         {
@@ -617,7 +617,7 @@ void DeviceManager::Animate(double elapsedTime, bool windowIsFocused)
 
 void DeviceManager::Render()
 {
-    for (auto it : m_vRenderPasses)
+    for (auto it : m_vLayers)
     {
         it->Render(GetCurrentFramebuffer(it->SupportsDepthBuffer()));
     }
@@ -638,7 +638,7 @@ void DeviceManager::UpdateAverageFrameTime(double elapsedTime)
 
 bool DeviceManager::ShouldRenderUnfocused() const
 {
-    for (auto it = m_vRenderPasses.crbegin(); it != m_vRenderPasses.crend(); it++)
+    for (auto it = m_vLayers.crbegin(); it != m_vLayers.crend(); it++)
     {
         bool ret = (*it)->ShouldRenderUnfocused();
         if (ret)
@@ -691,7 +691,7 @@ bool DeviceManager::AnimateRenderPresent()
     double elapsedTime = curTime - m_PreviousFrameTimestamp;
 
 	JoyStickManager::Singleton().EraseDisconnectedJoysticks();
-	JoyStickManager::Singleton().UpdateAllJoysticks(m_vRenderPasses);
+	JoyStickManager::Singleton().UpdateAllJoysticks(m_vLayers);
 
     if (m_windowVisible && (m_windowIsInFocus || ShouldRenderUnfocused() || m_RequestedRenderUnfocused))
     {
@@ -752,7 +752,7 @@ bool DeviceManager::AnimateRenderPresent()
     }
     else if (m_windowVisible)
     {
-        // Call Animate() even when not rendering, some render passes (e.g. ImGui) need it to process input.
+        // Call Animate() even when not rendering, some layers (e.g. ImGui) need it to process input.
         // Whether the before/afterAnimate callbacks are necessary in this case is unclear...
         if (m_callbacks.beforeAnimate) m_callbacks.beforeAnimate(*this, m_FrameIndex);
         Animate(elapsedTime, false);
@@ -1010,7 +1010,7 @@ void DeviceManager::WindowContentScaleCallback(float scaleX, float scaleY)
 
 void DeviceManager::WindowPosCallback(int x, int y)
 {
-    for (auto it : m_vRenderPasses)
+    for (auto it : m_vLayers)
     {
         it->WindowPosUpdate(x, y);
     }
@@ -1105,7 +1105,7 @@ void DeviceManager::KeyboardUpdate(int key, int scancode, int action, int mods)
         return;
     }
 
-    for (auto it = m_vRenderPasses.crbegin(); it != m_vRenderPasses.crend(); it++)
+    for (auto it = m_vLayers.crbegin(); it != m_vLayers.crend(); it++)
     {
         bool ret = (*it)->KeyboardUpdate(key, scancode, action, mods);
         if (ret)
@@ -1115,7 +1115,7 @@ void DeviceManager::KeyboardUpdate(int key, int scancode, int action, int mods)
 
 void DeviceManager::KeyboardCharInput(unsigned int unicode, int mods)
 {
-    for (auto it = m_vRenderPasses.crbegin(); it != m_vRenderPasses.crend(); it++)
+    for (auto it = m_vLayers.crbegin(); it != m_vLayers.crend(); it++)
     {
         bool ret = (*it)->KeyboardCharInput(unicode, mods);
         if (ret)
@@ -1131,7 +1131,7 @@ void DeviceManager::MousePosUpdate(double xpos, double ypos)
         ypos /= m_DPIScaleFactorY;
     }
     
-    for (auto it = m_vRenderPasses.crbegin(); it != m_vRenderPasses.crend(); it++)
+    for (auto it = m_vLayers.crbegin(); it != m_vLayers.crend(); it++)
     {
         bool ret = (*it)->MousePosUpdate(xpos, ypos);
         if (ret)
@@ -1141,7 +1141,7 @@ void DeviceManager::MousePosUpdate(double xpos, double ypos)
 
 void DeviceManager::MouseButtonUpdate(int button, int action, int mods)
 {
-    for (auto it = m_vRenderPasses.crbegin(); it != m_vRenderPasses.crend(); it++)
+    for (auto it = m_vLayers.crbegin(); it != m_vLayers.crend(); it++)
     {
         bool ret = (*it)->MouseButtonUpdate(button, action, mods);
         if (ret)
@@ -1151,7 +1151,7 @@ void DeviceManager::MouseButtonUpdate(int button, int action, int mods)
 
 void DeviceManager::MouseScrollUpdate(double xoffset, double yoffset)
 {
-    for (auto it = m_vRenderPasses.crbegin(); it != m_vRenderPasses.crend(); it++)
+    for (auto it = m_vLayers.crbegin(); it != m_vLayers.crend(); it++)
     {
         bool ret = (*it)->MouseScrollUpdate(xoffset, yoffset);
         if (ret)
@@ -1194,10 +1194,10 @@ void JoyStickManager::DisconnectJoystick(int id)
 	m_RemovedJoysticks.push_back(id);
 }
 
-void JoyStickManager::UpdateAllJoysticks(const std::vector<IRenderPass*>& passes)
+void JoyStickManager::UpdateAllJoysticks(const std::vector<IAppLayer*>& layers)
 {
 	for (auto j = m_JoystickIDs.begin(); j != m_JoystickIDs.end(); ++j)
-		UpdateJoystick(*j, passes);
+		UpdateJoystick(*j, layers);
 }
 
 static void ApplyDeadZone(dm::float2& v, const float deadZone = 0.1f)
@@ -1205,7 +1205,7 @@ static void ApplyDeadZone(dm::float2& v, const float deadZone = 0.1f)
     v *= std::max(dm::length(v) - deadZone, 0.f) / (1.f - deadZone);
 }
 
-void JoyStickManager::UpdateJoystick(int j, const std::vector<IRenderPass*>& passes)
+void JoyStickManager::UpdateJoystick(int j, const std::vector<IAppLayer*>& layers)
 {
     GLFWgamepadstate gamepadState;
     glfwGetGamepadState(j, &gamepadState);
@@ -1214,7 +1214,7 @@ void JoyStickManager::UpdateJoystick(int j, const std::vector<IRenderPass*>& pas
 
     auto updateAxis = [&] (int axis, float axisVal)
     {
-		for (auto it = passes.crbegin(); it != passes.crend(); it++)
+		for (auto it = layers.crbegin(); it != layers.crend(); it++)
 		{
 			bool ret = (*it)->JoystickAxisUpdate(axis, axisVal);
 			if (ret)
@@ -1242,7 +1242,7 @@ void JoyStickManager::UpdateJoystick(int j, const std::vector<IRenderPass*>& pas
 	for (int b = 0; b != GLFW_GAMEPAD_BUTTON_LAST; ++b)
 	{
 		auto buttonVal = gamepadState.buttons[b];
-		for (auto it = passes.crbegin(); it != passes.crend(); it++)
+		for (auto it = layers.crbegin(); it != layers.crend(); it++)
 		{
 			bool ret = (*it)->JoystickButtonUpdate(b, buttonVal == GLFW_PRESS);
 			if (ret)
@@ -1262,9 +1262,9 @@ void DeviceManager::Shutdown()
     m_SwapChainWithDepthFramebuffers.clear();
     m_DepthBuffer = nullptr;
 
-    for(auto pRenderPass : m_vRenderPasses)
-        pRenderPass->Release();
-    m_vRenderPasses.clear();
+    for(auto pLayer : m_vLayers)
+        pLayer->Release();
+    m_vLayers.clear();
 
     // The swap chain waits for the device to finish its frames, so it goes first.
     m_SwapChain = nullptr;

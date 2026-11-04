@@ -190,7 +190,7 @@ namespace donut::app
         uint32_t swapChainSampleQuality = 0;
 
         // Sets the format for the primary depth buffer. UNKNOWN means no depth buffer (legacy behavior).
-        // The depth buffer is attached to every swap chain framebuffer provided to the render passes.
+        // The depth buffer is attached to every swap chain framebuffer provided to the layers.
         nvrhi::Format depthBufferFormat = nvrhi::Format::UNKNOWN;
 
         uint32_t maxFramesInFlight = 2;
@@ -254,7 +254,7 @@ namespace donut::app
 #endif
     };
 
-    class IRenderPass;
+    class IAppLayer;
 
     // Sets the D3D12 Agility SDK that D3D12 device managers load when InstanceParameters::d3d12AgilitySDKVersion is 0.
     // An executable that ships the Agility SDK calls it once, before creating a device manager (for example from a
@@ -304,9 +304,9 @@ namespace donut::app
         // Note: a call to CreateInstance() or Create*Device*() is required before EnumerateAdapters().
         virtual bool EnumerateAdapters(std::vector<AdapterInfo>& outAdapters);
 
-        void AddRenderPassToFront(IRenderPass *pController);
-        void AddRenderPassToBack(IRenderPass *pController);
-        void RemoveRenderPass(IRenderPass *pController);
+        void AddLayerToFront(IAppLayer *pLayer);
+        void AddLayerToBack(IAppLayer *pLayer);
+        void RemoveLayer(IAppLayer *pLayer);
 
         void RunMessageLoop();
 
@@ -331,7 +331,7 @@ namespace donut::app
         bool m_EnableRenderDuringWindowMovement = false;
         // set to true if running on NV GPU
         bool m_IsNvidia = false;
-        std::vector<IRenderPass *> m_vRenderPasses;
+        std::vector<IAppLayer *> m_vLayers;
         // timestamp in seconds for the previous frame
         double m_PreviousFrameTimestamp = 0.0;
         // current DPI scale info (updated when window moves)
@@ -492,10 +492,10 @@ namespace donut::app
 #endif
     };
 
-    class IRenderPass: public nvrhi::ObjectImpl<nvrhi::IObject>
+    class IAppLayer: public nvrhi::ObjectImpl<nvrhi::IObject>
     {
     public:
-        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(IRenderPass)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(IAppLayer)
         NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IObject)
         NVRHI_END_INTERFACE_TABLE()
 
@@ -503,11 +503,11 @@ namespace donut::app
         DeviceManager* m_DeviceManager;
 
     public:
-        explicit IRenderPass(DeviceManager* deviceManager)
+        explicit IAppLayer(DeviceManager* deviceManager)
             : m_DeviceManager(deviceManager)
         { }
 
-        virtual ~IRenderPass() = default;
+        virtual ~IAppLayer() = default;
 
         virtual void SetLatewarpOptions() { }
         virtual bool ShouldAnimateUnfocused() { return false; }
@@ -529,7 +529,7 @@ namespace donut::app
 
         // all of these pass in GLFW constants as arguments
         // see http://www.glfw.org/docs/latest/input.html
-        // return value is true if the event was consumed by this render pass, false if it should be passed on
+        // return value is true if the event was consumed by this layer, false if it should be passed on
         virtual bool KeyboardUpdate(int key, int scancode, int action, int mods) { return false; }
         virtual bool KeyboardCharInput(unsigned int unicode, int mods) { return false; }
         virtual bool MousePosUpdate(double xpos, double ypos) { return false; }
