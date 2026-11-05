@@ -623,8 +623,11 @@ namespace donut::render::rdg
         bool fencesSupported = false;
         std::array<std::vector<nvrhi::AutoPtr<nvrhi::ICommandList>>, 3> commandLists;
         nvrhi::AutoPtr<nvrhi::ICommandList> prologueList;
-        nvrhi::AutoPtr<nvrhi::IEventQuery> frameQuery;               // D3D11 before 11.4: no fences
-        bool frameQueryPending = false;
+        // Without fences (D3D11, 8.3): one event query per frame, in a ring. A query's results are read before it is
+        // ended again, as D3D11 expects; a query three frames old has normally completed.
+        std::array<nvrhi::AutoPtr<nvrhi::IEventQuery>, 3> frameQueries;
+        std::array<bool, 3> frameQueryPending = {};
+        uint32_t frameQueryNext = 0;
         nvrhi::AutoPtr<CompiledRenderGraph> lastPlan;
         std::vector<FrameResource> frameResources;
         std::vector<nvrhi::ResourceBarrier> patches;

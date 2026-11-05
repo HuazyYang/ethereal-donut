@@ -860,8 +860,13 @@ namespace donut::render::rdg
                 else
                     reason = prev.isWrite || prev.entry ? BarrierReason::RAW : BarrierReason::ReadGroupChange;
 
+                // D3D12 legacy: DiscardResource is a command of its own, and a clear that follows initializes the
+                // subresources anyway (a placed render target or depth texture may start with either), so a cleared
+                // first use is not discarded. Enhanced barriers and Vulkan keep the discard: it leaves the undefined
+                // layout.
                 bool discardFlag = discard && (m_Profile.barrierModel != BarrierModel::D3D12Legacy ||
-                    LegacyDiscardable(item.state, occupant.isBuffer, occupant.hasDepth, !occupant.isBuffer && occupant.texture.isRenderTarget));
+                    (!first.clearSubStep &&
+                     LegacyDiscardable(item.state, occupant.isBuffer, occupant.hasDepth, !occupant.isBuffer && occupant.texture.isRenderTarget)));
                 const CommandQueue owner = prev.accesses.empty() ? first.queue : OwnerQueue(prev);
                 const bool transfer = m_Profile.queueOwnershipTransfer && !discard && !prev.entry &&
                     !prev.accesses.empty() && owner != first.queue;

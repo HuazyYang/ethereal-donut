@@ -61,10 +61,18 @@ namespace donut::render::rdg
             if (count)
                 m_Device->waitFences(values, count, true);
         }
-        else if (m_Runtime.frameQuery && m_Runtime.frameQueryPending)
+        else
         {
-            m_Device->waitEventQuery(m_Runtime.frameQuery);
-            m_Runtime.frameQueryPending = false;
+            // Oldest first: they complete in order.
+            for (uint32_t i = 0; i < uint32_t(m_Runtime.frameQueries.size()); ++i)
+            {
+                const uint32_t q = (m_Runtime.frameQueryNext + i) % uint32_t(m_Runtime.frameQueries.size());
+                if (m_Runtime.frameQueries[q] && m_Runtime.frameQueryPending[q])
+                {
+                    m_Device->waitEventQuery(m_Runtime.frameQueries[q]);
+                    m_Runtime.frameQueryPending[q] = false;
+                }
+            }
         }
     }
 

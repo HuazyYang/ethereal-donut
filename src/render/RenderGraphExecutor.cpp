@@ -1638,7 +1638,9 @@ namespace donut::render::rdg
             if (!runtime.fencesChecked)
             {
                 runtime.fencesChecked = true;
-                runtime.fencesSupported = true;
+                // D3D11 has one in-order queue: a fence would only signal and wait in the immediate context on every
+                // submission, which costs the frame (P2.1 measured 10 %). One event query per frame tracks completion.
+                runtime.fencesSupported = device->getGraphicsAPI() != nvrhi::GraphicsAPI::D3D11;
                 static const char* const c_Names[3] = { "render graph: graphics", "render graph: compute", "render graph: copy" };
                 for (uint32_t q = 0; q < 3 && runtime.fencesSupported; ++q)
                 {
@@ -1649,11 +1651,14 @@ namespace donut::render::rdg
                 }
                 if (!runtime.fencesSupported)
                 {
-                    // D3D11 before 11.4 (8.3): one event query per frame instead.
+                    // D3D11 (above), or a device without fences (8.3): one event query per frame instead.
                     for (auto& fence : runtime.fences)
                         fence = nullptr;
-                    if (device->createEventQuery(runtime.frameQuery.ReleaseAndGetAddressOf()) == nvrhi::FS_OK)
-                        ++runtime.objectsCreated;
+                    for (nvrhi::AutoPtr<nvrhi::IEventQuery>& query : runtime.frameQueries)
+                    {
+                        if (device->createEventQuery(query.ReleaseAndGetAddressOf()) == nvrhi::FS_OK)
+                            ++runtime.objectsCreated;
+                    }
                 }
             }
             if (!runtime.prepareContext)
@@ -1896,11 +1901,16 @@ namespace donut::render::rdg
                     .setWaits(waits, waitCount).setSignals(&signal, 1));
             }
 
-            if (!fences && runtime.frameQuery)
+            if (!fences && runtime.frameQueries[runtime.frameQueryNext])
             {
-                device->resetEventQuery(runtime.frameQuery);
-                device->setEventQuery(runtime.frameQuery, CommandQueue::Graphics);
-                runtime.frameQueryPending = true;
+                const uint32_t q = runtime.frameQueryNext;
+                nvrhi::IEventQuery* query = runtime.frameQueries[q];
+                if (runtime.frameQueryPending[q])
+                    device->waitEventQuery(query);
+                device->resetEventQuery(query);
+                device->setEventQuery(query, CommandQueue::Graphics);
+                runtime.frameQueryPending[q] = true;
+                runtime.frameQueryNext = (q + 1) % uint32_t(runtime.frameQueries.size());
             }
 
             // Extracted textures go to their callers (5.2).
