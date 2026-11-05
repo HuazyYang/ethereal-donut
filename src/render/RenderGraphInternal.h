@@ -630,7 +630,6 @@ namespace donut::render::rdg
         std::vector<nvrhi::ResourceBarrier> patches;
         std::vector<PhysicalResource*> patchOwners;                  // per patch: the tracker fallback's resource
         std::vector<nvrhi::ResourceStates> scratchStates;
-        std::vector<nvrhi::IResource*> trackedInList;                // the tracker fallback (9.1, item 6)
         nvrhi::AutoPtr<IPrepareContext> prepareContext;
         std::vector<nvrhi::AutoPtr<IPassContext>> passContexts;      // one per segment
         uint64_t objectsCreated = 0;

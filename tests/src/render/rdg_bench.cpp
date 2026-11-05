@@ -23,6 +23,7 @@
 // rdg_bench: the device-free budgets of design 10.3.
 //
 //     rdg_bench [--quick] [--gate] [--profile d3d12|vulkan]
+//     rdg_bench --parallel d3d12|vulkan [--quick] [--gate]
 //
 // Reports, as medians:
 // - compile on a cache miss, 64 passes / 256 resources (budget 1 ms) and 1024 passes / 4096 resources (16 ms);
@@ -30,6 +31,7 @@
 // - the frame cost without the cache (maxCachedPlans = 0: recording and a full compile), beside it, not gated;
 // - heap allocations per steady-state frame (0).
 // --gate exits with 1 when a gated budget is missed (Release builds; Debug numbers are not comparable).
+// --parallel measures the parallel-recording budget on a device instead (rdg_bench_parallel.cpp).
 
 #include "rdg_corpus.h"
 
@@ -44,6 +46,8 @@
 
 using namespace donut::render;
 using namespace rdgtest;
+
+int RunParallelBench(const char* backend, bool quick, bool gate);   // rdg_bench_parallel.cpp
 
 static std::atomic<bool> g_CountAllocations{ false };
 static std::atomic<uint64_t> g_Allocations{ 0 };
@@ -179,6 +183,7 @@ int main(int argc, char** argv)
 {
     bool quick = false;
     bool gate = false;
+    const char* parallelBackend = nullptr;
     ReferenceProfile kind = ReferenceProfile::D3D12Legacy;
     for (int i = 1; i < argc; ++i)
     {
@@ -186,12 +191,17 @@ int main(int argc, char** argv)
             quick = true;
         else if (!std::strcmp(argv[i], "--gate"))
             gate = true;
+        else if (!std::strcmp(argv[i], "--parallel") && i + 1 < argc)
+            parallelBackend = argv[++i];
         else if (!std::strcmp(argv[i], "--profile") && i + 1 < argc)
         {
             ++i;
             kind = !std::strcmp(argv[i], "vulkan") ? ReferenceProfile::Vulkan : ReferenceProfile::D3D12Legacy;
         }
     }
+    if (parallelBackend)
+        return RunParallelBench(parallelBackend, quick, gate);
+
     BackendProfile profile;
     GetReferenceProfile(kind, &profile);
 

@@ -31,6 +31,7 @@
 
 #include "rdg_corpus.h"
 #include "rdg_donut_frame.h"
+#include "rdg_worker_pool.h"
 
 #include <donut/core/vfs/VFS.h>
 
@@ -70,6 +71,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace donut::render;
@@ -263,6 +265,7 @@ namespace
         uint64_t compileAllocations = 0;   // in the last Run, while the allocation hook counts
         uint64_t executeAllocations = 0;
         bool timers = false;               // ExecuteDesc::timers
+        rdgtest::WorkerPool* pool = nullptr;   // ExecuteDesc::parallelFor (10.1)
 
         // Compiles and executes the recorded frame; returns the plan's statistics.
         PlanStatistics Run(const CompileOptions& options = CompileOptions())
@@ -288,6 +291,12 @@ namespace
             }
             ExecuteDesc execute;
             execute.timers = timers;
+            if (pool)
+            {
+                execute.parallelFor = &rdgtest::WorkerPool::ParallelFor;
+                execute.schedulerContext = pool;
+                execute.workerCount = pool->ThreadCount();
+            }
             const nvrhi::FRESULT executed = graph->Execute(plan, execute);
             compileAllocations = afterCompile - start;
             executeAllocations = g_Allocations - afterCompile;
@@ -721,7 +730,7 @@ namespace
     // ------------------------------------------------------------------------------------------ textures
 
     // Texel (0, 0) of an RGBA8 texture in the CopySource state.
-    uint32_t ReadTexel(Env& env, nvrhi::ITexture* texture)
+    uint32_t ReadTexel(Env& env, nvrhi::ITexture* texture, ResourceStates state = ResourceStates::CopySource)
     {
         nvrhi::TextureDesc stagingDesc = texture->getDesc();
         stagingDesc.isRenderTarget = false;
@@ -732,8 +741,9 @@ namespace
         check(staging != nullptr, "staging texture");
         nvrhi::AutoPtr<nvrhi::ICommandList> list = CreateList(env.device);
         list->open();
-        list->beginTrackingTextureState(texture, nvrhi::AllSubresources, ResourceStates::CopySource);
+        list->beginTrackingTextureState(texture, nvrhi::AllSubresources, state);
         list->copyTexture2(staging, nvrhi::TextureSlice(), texture, nvrhi::TextureSlice());
+        list->setTextureState(texture, nvrhi::AllSubresources, state);
         list->close();
         Submit(env.device, list);
         size_t pitch = 0;
@@ -1358,15 +1368,243 @@ namespace
 
     // Design 13.3, plan step P1.5: one frame of every graph-capable donut pass, executed for several frames under the
     // validation layers. The scene is empty, so the geometry passes only clear; every other pass runs in full.
-    void testDonutPasses(Env& env)
+    // ------------------------------------------------------------------------------------------ parallel recording
+
+    // donut's shaders and CommonRenderPasses, as the samples load them.
+    struct DonutShaders
     {
-        const char* shaderType = env.api == nvrhi::GraphicsAPI::D3D11 ? "dxbc" : env.api == nvrhi::GraphicsAPI::D3D12 ? "dxil" : "spirv";
-        const std::filesystem::path shaderPath = ExecutableDirectory() / "shaders/framework" / shaderType;
-        check(std::filesystem::exists(shaderPath / "passes"), "donut's shaders are in " + shaderPath.string());
-        nvrhi::AutoPtr<donut::vfs::RootFileSystem> rootFS = MAKE_RC_OBJ_PTR(donut::vfs::RootFileSystem);
-        rootFS->mount("/shaders/donut", shaderPath);
-        nvrhi::AutoPtr<donut::engine::ShaderFactory> shaderFactory = MAKE_RC_OBJ_PTR(donut::engine::ShaderFactory, env.device, rootFS, "/shaders");
-        nvrhi::AutoPtr<donut::engine::CommonRenderPasses> commonPasses = MAKE_RC_OBJ_PTR(donut::engine::CommonRenderPasses, env.device, shaderFactory);
+        nvrhi::AutoPtr<donut::vfs::RootFileSystem> rootFS;
+        nvrhi::AutoPtr<donut::engine::ShaderFactory> shaderFactory;
+        nvrhi::AutoPtr<donut::engine::CommonRenderPasses> commonPasses;
+
+        explicit DonutShaders(Env& env)
+        {
+            const char* shaderType = env.api == nvrhi::GraphicsAPI::D3D11 ? "dxbc" : env.api == nvrhi::GraphicsAPI::D3D12 ? "dxil" : "spirv";
+            const std::filesystem::path shaderPath = ExecutableDirectory() / "shaders/framework" / shaderType;
+            check(std::filesystem::exists(shaderPath / "passes"), "donut's shaders are in " + shaderPath.string());
+            rootFS = MAKE_RC_OBJ_PTR(donut::vfs::RootFileSystem);
+            rootFS->mount("/shaders/donut", shaderPath);
+            shaderFactory = MAKE_RC_OBJ_PTR(donut::engine::ShaderFactory, env.device, rootFS, "/shaders");
+            commonPasses = MAKE_RC_OBJ_PTR(donut::engine::CommonRenderPasses, env.device, shaderFactory);
+        }
+    };
+
+    // 10.1: segments recorded by worker threads, submitted in plan order. Buffer chains with an async fill, one pass per
+    // segment, on every backend; then a chain of 32 blits, each by its own BlitPass, all sharing CommonRenderPasses'
+    // pipeline cache. D3D11 records on the calling thread.
+    void testParallelRecording(Env& env)
+    {
+        rdgtest::WorkerPool pool(3);
+        const bool parallelBackend = env.api != nvrhi::GraphicsAPI::D3D11;
+        {
+            GraphOnDevice g(env.device);
+            g.pool = &pool;
+            BufferChain chain;
+            chain.readback = CreateReadback(env.device);
+            CompileOptions options;
+            options.recordGranularity = 1;
+            for (uint32_t frame = 0; frame < 8; ++frame)
+            {
+                g.graph->Reset();
+                RecordBufferChain(g.graph, chain, frame, frame % 2 == 1, true, frame % 4 < 2);
+                g.Run(options);
+                if (frame % 2 == 1)
+                    CheckReadback(env.device, chain, "parallel recording: buffer chain, frame " + std::to_string(frame));
+            }
+            RunStatistics run;
+            g.registry->GetRunStatistics(run);
+            check(parallelBackend ? run.recordTasks > 1 : run.recordTasks == 1, "parallel recording: " + std::to_string(run.segments) +
+                  " segments recorded by " + std::to_string(run.recordTasks) + " tasks");
+            checkClean(env, "parallel recording: buffer chains");
+        }
+        if (!env.raster)
+            return;
+
+        DonutShaders shaders(env);
+        std::vector<nvrhi::AutoPtr<donut::render::BlitPass>> blits;
+        for (uint32_t i = 0; i < 32; ++i)
+            blits.push_back(MAKE_RC_OBJ_PTR(donut::render::BlitPass, env.device, shaders.commonPasses));
+        nvrhi::AutoPtr<nvrhi::ITexture> result = CreateImported(env, "blit result", 64);
+        GraphOnDevice g(env.device);
+        g.pool = &pool;
+        CompileOptions options;
+        options.recordGranularity = 4;
+        for (uint32_t frame = 0; frame < 6; ++frame)
+        {
+            g.graph->Reset();
+            const uint32_t value = 30u + frame * 30u;
+            const ClearValue clear = { { float(value) / 255.0f, 0.f, 0.f, 1.f }, 0.f, 0 };
+            ResourceId current = g.graph->CreateTexture(ColorDesc("Seed").setWidth(64).setHeight(64), ResourceFlags::None);
+            AddPass(g.graph, "Seed", PassType::Raster, PassFlags::None,
+                [&](ISetupContext* s) { current = s->SetColorTarget(0, current, nvrhi::SubresourceRegion(), AccessFlags::Clear, &clear); },
+                [](IPassContext*) { });
+            for (uint32_t i = 0; i < 32; ++i)
+            {
+                donut::render::BlitGraphInputs inputs;
+                inputs.source = current;
+                inputs.target = g.graph->CreateTexture(ColorDesc("Blit").setWidth(64).setHeight(64), ResourceFlags::None);
+                inputs.sampler = donut::engine::BlitSampler::Point;
+                current = blits[i]->AddToGraph(g.graph, inputs).target;
+            }
+            ResourceId out = g.graph->ImportTexture(result, ResourceStates::CopySource, ResourceStates::CopySource);
+            AddPass(g.graph, "Save", PassType::Copy, PassFlags::None,
+                [&](ISetupContext* s) { Read(s, current, Access::CopySource); out = Write(s, out, Access::CopyDest); },
+                [current, out](IPassContext* context) {
+                    context->GetCommandList()->copyTexture1(context->GetTexture(out), nvrhi::TextureSlice(), context->GetTexture(current), nvrhi::TextureSlice());
+                });
+            g.Run(options);
+            if (frame % 2 == 1)
+            {
+                const uint32_t texel = ReadTexel(env, result);
+                check((texel & 0xff) == value, "parallel recording: 32 blits, frame " + std::to_string(frame) + " (" + Hex(texel) + ")");
+            }
+        }
+        RunStatistics run;
+        g.registry->GetRunStatistics(run);
+        check(parallelBackend ? run.recordTasks == pool.ThreadCount() : run.recordTasks == 1, "parallel recording: " + std::to_string(run.passes) +
+              " passes in " + std::to_string(run.segments) + " segments by " + std::to_string(run.recordTasks) + " tasks");
+        checkClean(env, "parallel recording: blit chain");
+    }
+
+    // 10.1: BindingCache creates a missed set outside its lock; the first insert wins, and every caller gets it.
+    void testBindingCacheConcurrency(Env& env)
+    {
+        nvrhi::BindingLayoutDesc layoutDesc;
+        layoutDesc.visibility = nvrhi::ShaderType::All;
+        layoutDesc.bindings = { nvrhi::BindingLayoutItem::Texture_SRV(0) };
+        nvrhi::AutoPtr<nvrhi::IBindingLayout> layout;
+        env.device->createBindingLayout(layoutDesc, layout.ReleaseAndGetAddressOf());
+        check(layout != nullptr, "binding layout");
+        constexpr uint32_t c_Sets = 16;
+        constexpr uint32_t c_Threads = 8;
+        std::vector<nvrhi::AutoPtr<nvrhi::ITexture>> textures(c_Sets);
+        for (uint32_t k = 0; k < c_Sets; ++k)
+        {
+            env.device->createTexture(nvrhi::TextureDesc().setWidth(4).setHeight(4).setFormat(Format::RGBA8_UNORM)
+                .setDebugName("binding cache texture"), textures[k].ReleaseAndGetAddressOf());
+            check(textures[k] != nullptr, "binding cache texture");
+        }
+        donut::engine::BindingCache cache(env.device);
+        std::vector<nvrhi::AutoPtr<nvrhi::IBindingSet>> seen(size_t(c_Threads) * c_Sets);
+        std::atomic<uint32_t> ready{ 0 };
+        std::atomic<uint32_t> failures{ 0 };
+        std::vector<std::thread> threads;
+        for (uint32_t t = 0; t < c_Threads; ++t)
+        {
+            threads.emplace_back([&, t] {
+                ready.fetch_add(1);
+                while (ready.load() < c_Threads)
+                    std::this_thread::yield();
+                for (uint32_t round = 0; round < 32; ++round)
+                {
+                    for (uint32_t i = 0; i < c_Sets; ++i)
+                    {
+                        const uint32_t k = (i + t * 5) % c_Sets;
+                        nvrhi::BindingSetDesc desc;
+                        desc.bindings = { nvrhi::BindingSetItem::Texture_SRV(0, textures[k]) };
+                        nvrhi::BindingSetHandle set = cache.GetOrCreateBindingSet(desc, layout);
+                        nvrhi::AutoPtr<nvrhi::IBindingSet>& slot = seen[size_t(t) * c_Sets + k];
+                        if (!set || (slot && slot.Get() != set.Get()))
+                            failures.fetch_add(1);
+                        else
+                            slot = set;
+                    }
+                }
+            });
+        }
+        for (std::thread& thread : threads)
+            thread.join();
+        bool same = true;
+        for (uint32_t k = 0; k < c_Sets; ++k)
+        {
+            for (uint32_t t = 1; t < c_Threads; ++t)
+                same = same && seen[size_t(t) * c_Sets + k].Get() == seen[k].Get();
+        }
+        check(failures.load() == 0 && same, "BindingCache: 8 threads x 16 sets, one set per description (" +
+              std::to_string(failures.load()) + " failures)");
+        checkClean(env, "BindingCache concurrency");
+    }
+
+    // 10.1: CommonRenderPasses::BlitTexture from four recording threads at once, into targets of four formats with two
+    // blend states each, so that its pipeline cache misses on every thread at the same time.
+    void testBlitConcurrency(Env& env)
+    {
+        DonutShaders shaders(env);
+        donut::engine::BindingCache bindingCache(env.device);
+        constexpr uint32_t c_Threads = 4;
+        const Format formats[c_Threads] = { Format::RGBA8_UNORM, Format::RGBA16_FLOAT, Format::RG16_FLOAT, Format::BGRA8_UNORM };
+        struct PerThread
+        {
+            nvrhi::AutoPtr<nvrhi::ITexture> source, target;
+            nvrhi::AutoPtr<nvrhi::IFramebuffer> framebuffer;
+            nvrhi::AutoPtr<nvrhi::ICommandList> list;
+        };
+        std::vector<PerThread> work(c_Threads);
+        nvrhi::AutoPtr<nvrhi::ICommandList> setup = CreateList(env.device);
+        setup->open();
+        for (uint32_t t = 0; t < c_Threads; ++t)
+        {
+            PerThread& w = work[t];
+            env.device->createTexture(ColorDesc("blit source").setWidth(32).setHeight(32).setInitialState(ResourceStates::ShaderResource)
+                .setKeepInitialState(true), w.source.ReleaseAndGetAddressOf());
+            env.device->createTexture(ColorDesc("blit target").setWidth(32).setHeight(32).setFormat(formats[t]).setIsUAV(false)
+                .setInitialState(ResourceStates::RenderTarget).setKeepInitialState(true), w.target.ReleaseAndGetAddressOf());
+            check(w.source && w.target, "blit textures");
+            env.device->createFramebuffer(nvrhi::FramebufferDesc().addColorAttachment(w.target), w.framebuffer.ReleaseAndGetAddressOf());
+            check(w.framebuffer != nullptr, "blit framebuffer");
+            setup->clearTextureFloat(w.source, nvrhi::AllSubresources, nvrhi::Color(0.25f, 0.5f, 0.75f, 1.f));
+            w.list = CreateList(env.device);
+        }
+        setup->close();
+        Submit(env.device, setup);
+
+        std::atomic<uint32_t> ready{ 0 };
+        std::vector<std::thread> threads;
+        for (uint32_t t = 0; t < c_Threads; ++t)
+        {
+            threads.emplace_back([&, t] {
+                PerThread& w = work[t];
+                ready.fetch_add(1);
+                while (ready.load() < c_Threads)
+                    std::this_thread::yield();
+                w.list->open();
+                for (uint32_t i = 0; i < 16; ++i)
+                {
+                    donut::engine::BlitParameters params;
+                    params.targetFramebuffer = w.framebuffer;
+                    params.sourceTexture = w.source;
+                    params.sampler = donut::engine::BlitSampler::Point;
+                    if (i % 2)
+                        params.blendState = nvrhi::BlendState::RenderTarget().enableBlend().setSrcBlend(nvrhi::BlendFactor::One)
+                            .setDestBlend(nvrhi::BlendFactor::Zero);
+                    shaders.commonPasses->BlitTexture(w.list, params, &bindingCache);
+                }
+                w.list->close();
+            });
+        }
+        for (std::thread& thread : threads)
+            thread.join();
+        std::vector<nvrhi::ICommandList*> lists;
+        for (PerThread& w : work)
+            lists.push_back(w.list);
+        env.device->submit(nvrhi::SubmitDesc().setCommandLists(lists.data(), uint32_t(lists.size())));
+        env.device->waitForIdle();
+        env.device->runGarbageCollection();
+        const uint32_t texel = ReadTexel(env, work[0].target, ResourceStates::RenderTarget);
+        check((texel & 0xff) == 0x40, "BlitTexture: four threads, eight pipelines; the RGBA8 target holds the source (" + Hex(texel) + ")");
+        checkClean(env, "BlitTexture concurrency");
+    }
+
+    // `parallel`: recorded by four threads, three passes per segment (10.1); a pass's per-view uses stay on one thread.
+    void testDonutPasses(Env& env, bool parallel)
+    {
+        DonutShaders shaders(env);
+        donut::engine::ShaderFactory* shaderFactory = shaders.shaderFactory;
+        donut::engine::CommonRenderPasses* commonPasses = shaders.commonPasses;
+        const std::string prefix = parallel ? "donut's passes in parallel" : "donut's passes";
+        rdgtest::WorkerPool pool(parallel ? 3 : 0);
+        CompileOptions options;
+        options.recordGranularity = parallel ? 3 : 0;
 
         rdgtest::DonutScene scene;
         rdgtest::DonutPasses passes;
@@ -1385,6 +1623,8 @@ namespace
 
         GraphOnDevice g(env.device);
         g.timers = true;
+        if (parallel)
+            g.pool = &pool;
         for (uint32_t frame = 0; frame < 6; ++frame)
         {
             g.graph->Reset();
@@ -1394,19 +1634,21 @@ namespace
             imports.mipChain = g.graph->ImportTexture(mipChain, ResourceStates::ShaderResource, ResourceStates::ShaderResource);
             imports.backBuffer = g.graph->ImportTexture(backBuffer, ResourceStates::RenderTarget, ResourceStates::RenderTarget);
             rdgtest::RecordDonutFrame(g.graph, passes, scene, imports);
-            const PlanStatistics stats = g.Run();
+            const PlanStatistics stats = g.Run(options);
             if (frame == 0)
-                std::printf("  donut frame: %u passes, %u barriers, %u segments\n", stats.scheduledPasses, stats.barriers, stats.segments);
+                std::printf("  %s: %u passes, %u barriers, %u segments\n", prefix.c_str(), stats.scheduledPasses, stats.barriers, stats.segments);
             env.device->waitForIdle();
             check(env.messages->errors == 0 && env.nativeErrors() == 0,
-                  "donut's passes, frame " + std::to_string(frame) + ": no NVRHI or debug-layer errors");
+                  prefix + ", frame " + std::to_string(frame) + ": no NVRHI or debug-layer errors");
         }
 
         // 11.3: run statistics of the last frame, and the per-pass timers of a completed one.
         RunStatistics run;
         g.registry->GetRunStatistics(run);
-        check(run.passes == 22 && run.segments >= 1 && run.frameIndex == g.graph->GetFrameIndex(),
-              "run statistics: " + std::to_string(run.passes) + " passes, " + std::to_string(run.barriers) + " barriers, " +
+        const bool tasksRight = !parallel || env.api == nvrhi::GraphicsAPI::D3D11 ? run.recordTasks == 1 : run.recordTasks > 1;
+        check(run.passes == 22 && run.segments >= 1 && run.frameIndex == g.graph->GetFrameIndex() && tasksRight,
+              prefix + ": run statistics: " + std::to_string(run.passes) + " passes, " + std::to_string(run.segments) + " segments, " +
+              std::to_string(run.recordTasks) + " tasks, " + std::to_string(run.barriers) + " barriers, " +
               std::to_string(run.stateCalls) + " state calls, record " + std::to_string(run.recordMilliseconds) + " ms");
         const uint32_t timings = g.registry->GetPassTimingCount();
         bool lighting = false;
@@ -1418,9 +1660,9 @@ namespace
             lighting = lighting || std::strcmp(timing.name, "DeferredLighting") == 0;
             total += timing.gpuMilliseconds;
         }
-        check(timings == 22 && lighting && total >= 0.f, "per-pass timers: " + std::to_string(timings) + " passes, " +
+        check(timings == 22 && lighting && total >= 0.f, prefix + ": per-pass timers: " + std::to_string(timings) + " passes, " +
               std::to_string(total) + " ms in all");
-        checkClean(env, "donut's passes");
+        checkClean(env, prefix);
     }
 
     void runAll(Env& env)
@@ -1449,7 +1691,11 @@ namespace
         run("placed", true, [&] { testPlaced(env, 0); });
         run("placed_heap_tier_1", env.api == nvrhi::GraphicsAPI::D3D12, [&] { testPlaced(env, 1); });
         run("skip_aliasing_barriers", true, [&] { testSkipAliasingBarriers(env); });
-        run("donut_passes", env.raster, [&] { testDonutPasses(env); });
+        run("donut_passes", env.raster, [&] { testDonutPasses(env, false); });
+        run("parallel_recording", true, [&] { testParallelRecording(env); });
+        run("binding_cache_concurrency", env.raster, [&] { testBindingCacheConcurrency(env); });
+        run("blit_concurrency", env.raster && env.api != nvrhi::GraphicsAPI::D3D11, [&] { testBlitConcurrency(env); });
+        run("donut_passes_parallel", env.raster, [&] { testDonutPasses(env, true); });
         checkClean(env, "all graphs");
         run("steady_state", true, [&] { testSteadyState(env); });
     }

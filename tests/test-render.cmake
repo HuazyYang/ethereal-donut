@@ -41,17 +41,41 @@ add_dependencies(donut_all_tests test_render_graph_passes)
 add_test(NAME test_render_graph_passes COMMAND test_render_graph_passes)
 set_property(TARGET test_render_graph_passes PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
-# The device-free benchmark of design 10.3. The ctest entry is a smoke run; budgets are measured in Release with
-# `rdg_bench --gate`.
-add_executable(rdg_bench src/render/rdg_bench.cpp)
+# The benchmark of design 10.3. The device-free budgets: a smoke run in ctest, measured in Release with
+# `rdg_bench --gate`. The parallel-recording budget needs a device (plan step P1.7): `rdg_bench --parallel d3d12|vulkan
+# --gate`, with GPU smoke runs in ctest.
+add_executable(rdg_bench src/render/rdg_bench.cpp src/render/rdg_bench_parallel.cpp src/render/rdg_worker_pool.h)
 target_link_libraries(rdg_bench donut_rdg_corpus donut_render donut_engine donut_core)
+if(TARGET nvrhi_factory)
+    target_link_libraries(rdg_bench nvrhi_factory)
+endif()
+target_link_libraries(rdg_bench nvrhi)
 add_dependencies(donut_all_tests rdg_bench)
 add_test(NAME rdg_bench_smoke COMMAND rdg_bench --quick)
+if(DONUT_WITH_DX12)
+    if(TARGET Microsoft::DirectX-Headers)
+        target_link_libraries(rdg_bench Microsoft::DirectX-Headers)
+    endif()
+    target_link_libraries(rdg_bench dxguid)
+    target_compile_definitions(rdg_bench PRIVATE RDG_BENCH_D3D12=1)
+    add_test(NAME rdg_bench_parallel_d3d12 COMMAND rdg_bench --parallel d3d12 --quick)
+    set_tests_properties(rdg_bench_parallel_d3d12 PROPERTIES RUN_SERIAL TRUE LABELS gpu)
+endif()
+if(DONUT_WITH_VULKAN)
+    if(TARGET Vulkan-Headers)
+        target_link_libraries(rdg_bench Vulkan-Headers)
+    elseif(TARGET Vulkan::Headers)
+        target_link_libraries(rdg_bench Vulkan::Headers)
+    endif()
+    target_compile_definitions(rdg_bench PRIVATE RDG_BENCH_VULKAN=1)
+    add_test(NAME rdg_bench_parallel_vulkan COMMAND rdg_bench --parallel vulkan --quick)
+    set_tests_properties(rdg_bench_parallel_vulkan PROPERTIES RUN_SERIAL TRUE LABELS gpu)
+endif()
 set_property(TARGET rdg_bench PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
 # Headless graphs on a device, per backend, under the debug layers (plan step P1.4). The nvrhi backends are static
 # libraries linked through nvrhi_factory; a shared nvrhi build exports them from its DLL.
-add_executable(test_render_graph_gpu src/render/test_render_graph_gpu.cpp)
+add_executable(test_render_graph_gpu src/render/test_render_graph_gpu.cpp src/render/rdg_worker_pool.h)
 target_link_libraries(test_render_graph_gpu donut_rdg_corpus donut_render donut_engine donut_core)
 if(TARGET nvrhi_factory)
     target_link_libraries(test_render_graph_gpu nvrhi_factory)

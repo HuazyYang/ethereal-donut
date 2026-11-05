@@ -268,6 +268,10 @@ namespace donut::render
     typedef void (*TaskFunction)(void* taskContext, uint32_t index);
     typedef void (*ParallelForFunction)(void* schedulerContext, uint32_t count, TaskFunction task, void* taskContext);
 
+    // Parallel recording (10.1): the segments are recorded by at most workerCount tasks (0: one per segment), each
+    // task recording whole segments in plan order, and the segments that share a pass object in one task. Submission
+    // stays in plan order. D3D11 records on the calling thread. Split segments with CompileOptions::recordGranularity
+    // from 16 passes; below that, one list records faster.
     struct ExecuteDesc
     {
         ParallelForFunction parallelFor = nullptr;   // nullptr: segments are recorded on the calling thread
@@ -410,6 +414,7 @@ namespace donut::render
         uint32_t segments = 0;
         uint32_t barriers = 0;            // barriers recorded, patches included
         uint32_t stateCalls = 0;          // tracker calls: host-kept resources, Tracked and Restore passes, the fallback
+        uint32_t recordTasks = 1;         // the tasks that recorded the segments; 1 without ExecuteDesc::parallelFor (10.1)
         bool planSwitched = false;        // 6.12
     };
 

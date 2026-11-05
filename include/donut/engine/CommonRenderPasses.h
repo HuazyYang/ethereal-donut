@@ -25,6 +25,7 @@
 #include <nvrhi/core/autoptr.h>
 #include <donut/core/math/math.h>
 #include <nvrhi/nvrhi.h>
+#include <shared_mutex>
 #include <unordered_map>
 
 namespace donut::engine
@@ -91,6 +92,7 @@ namespace donut::engine
         };
 
         std::unordered_map<PsoCacheKey, nvrhi::GraphicsPipelineHandle, PsoCacheKey::Hash> m_BlitPsoCache;
+        std::shared_mutex m_BlitPsoMutex;   // BlitTexture runs on parallel recording threads (render graph 10.1)
         
     public:
         nvrhi::ShaderHandle m_FullscreenVS;

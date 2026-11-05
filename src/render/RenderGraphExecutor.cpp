@@ -35,6 +35,7 @@
 #include "RenderGraphCompile.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -80,6 +81,8 @@ namespace donut::render::rdg
         uint64_t lastUsed = 0;
     };
 
+    class PassContext;
+
     struct PlanInstance
     {
         StructureInstance* structure = nullptr;
@@ -94,6 +97,21 @@ namespace donut::render::rdg
         std::vector<uint64_t> segmentValue;          // this frame's fence value of each segment
         std::vector<uint64_t> previousSegmentValue;
         std::vector<uint32_t> segmentOrdinal;        // per segment: its index among its queue's segments
+
+        // Recording (10.1), sized once per plan instance: each segment's list, context and result, each pass's timer
+        // slot, and the tasks of a parallel recording (their segments, in plan order).
+        std::vector<nvrhi::ICommandList*> segmentLists;
+        std::vector<PassContext*> segmentContexts;
+        std::vector<nvrhi::FRESULT> segmentResults;
+        std::vector<uint32_t> timerSlots;
+        std::vector<uint32_t> segmentGroup;
+        std::vector<uint32_t> groupWeight;
+        std::vector<uint32_t> groupOrder;
+        std::vector<uint32_t> groupTask;
+        std::vector<uint32_t> taskLoad;
+        std::vector<uint32_t> taskBegin;
+        std::vector<uint32_t> taskSegments;
+        std::vector<std::pair<const void*, uint32_t>> passOwners;
     };
 
     CompiledRenderGraph::CompiledRenderGraph()
@@ -191,6 +209,7 @@ namespace donut::render::rdg
         ExecutorFrame* frame = nullptr;
         uint32_t sched = 0;
         nvrhi::ICommandList* commandList = nullptr;
+        std::vector<nvrhi::IResource*> trackedInList;   // the tracker fallback (9.1): resources this list tracks
     };
 
     // The state of one Execute call.
@@ -206,9 +225,12 @@ namespace donut::render::rdg
         nvrhi::ICommandList* prologue = nullptr;
         bool prologueOpen = false;
         RegistryRuntime::TimerSet* timers = nullptr;   // ExecuteDesc::timers (11.3)
-        uint32_t barriers = 0;
-        uint32_t stateCalls = 0;
-        uint32_t passes = 0;
+        // Updated by every recording thread (10.1).
+        std::atomic<uint32_t> barriers{ 0 };
+        std::atomic<uint32_t> stateCalls{ 0 };
+        std::atomic<uint32_t> passes{ 0 };
+        std::atomic<uint32_t> framebuffersCreated{ 0 };
+        uint32_t recordTasks = 1;
 
         // The prologue opens on demand, so that a frame without patches or uploads neither records nor submits it:
         // the patch barriers first, then Prepare's uploads with automatic barriers, as for any upload outside a graph.
@@ -387,7 +409,7 @@ namespace donut::render::rdg
         oldest->framebuffer = nullptr;
         if (frame->device->createFramebuffer(desc, oldest->framebuffer.ReleaseAndGetAddressOf()) != nvrhi::FS_OK)
             return nullptr;
-        ++frame->runtime.objectsCreated;
+        frame->framebuffersCreated.fetch_add(1, std::memory_order_relaxed);
         std::copy(std::begin(attachments), std::end(attachments), std::begin(oldest->attachments));
         oldest->lastUsed = frame->frameIndex;
         return oldest->framebuffer;
@@ -1046,12 +1068,15 @@ namespace donut::render::rdg
 
     // ------------------------------------------------------------------------------------------------ recording
 
-    static void ApplyBatch(ExecutorFrame& frame, nvrhi::ICommandList* list, uint32_t sched, uint32_t slot)
+    static void ApplyBatch(ExecutorFrame& frame, nvrhi::ICommandList* list, std::vector<nvrhi::IResource*>& tracked,
+                           uint32_t sched, uint32_t slot)
     {
         const PlanInstance& instance = frame.instance;
         const LoweredBatch& batch = instance.batches[size_t(sched) * c_SlotCount + slot];
-        frame.barriers += batch.explicitCount + batch.trackerCount;
-        frame.stateCalls += batch.trackerCount;
+        if (batch.explicitCount + batch.trackerCount)
+            frame.barriers.fetch_add(batch.explicitCount + batch.trackerCount, std::memory_order_relaxed);
+        if (batch.trackerCount)
+            frame.stateCalls.fetch_add(batch.trackerCount, std::memory_order_relaxed);
         if (batch.trackerCount)
         {
             for (uint32_t t = batch.trackerBegin; t < batch.trackerBegin + batch.trackerCount; ++t)
@@ -1062,7 +1087,6 @@ namespace donut::render::rdg
                 // The fallback starts tracking a resource in each list at the state the plan says it holds.
                 if (record.kind != ResourceKind::HostKept)
                 {
-                    std::vector<nvrhi::IResource*>& tracked = frame.runtime.trackedInList;
                     if (std::find(tracked.begin(), tracked.end(), resource.resource) == tracked.end())
                     {
                         tracked.push_back(resource.resource);
@@ -1179,7 +1203,8 @@ namespace donut::render::rdg
     static void BeginTracking(ExecutorFrame& frame, nvrhi::ICommandList* list, uint32_t sched, bool restore)
     {
         const PlanPass& pass = frame.plan.m_Passes[sched];
-        frame.stateCalls += pass.trackedCount;
+        if (pass.trackedCount)
+            frame.stateCalls.fetch_add(pass.trackedCount, std::memory_order_relaxed);
         for (uint32_t t = pass.trackedBegin; t < pass.trackedBegin + pass.trackedCount; ++t)
         {
             const PlanTrackedState& tracked = frame.plan.m_TrackedStates[t];
@@ -1242,7 +1267,7 @@ namespace donut::render::rdg
         // except around Tracked bodies.
         const bool planBarriers = plan.m_Profile.barrierModel != BarrierModel::Implicit;
         nvrhi::FRESULT result = nvrhi::FS_OK;
-        frame.runtime.trackedInList.clear();
+        context->trackedInList.clear();
 
         list->open();
         if (planBarriers)
@@ -1296,9 +1321,9 @@ namespace donut::render::rdg
             const PassRecord& record = frame.graph.GetPass(pass.program);
             const char* name = plan.GetName(pass.nameOffset);
             list->beginMarker(name);
-            ApplyBatch(frame, list, s, uint32_t(BatchSlot::Prologue));
+            ApplyBatch(frame, list, context->trackedInList, s, uint32_t(BatchSlot::Prologue));
             RecordClears(frame, list, s);
-            ApplyBatch(frame, list, s, uint32_t(BatchSlot::PostClear));
+            ApplyBatch(frame, list, context->trackedInList, s, uint32_t(BatchSlot::PostClear));
             FillTransients(frame, list, s);
 
             // D3D11 and CUDA have no barriers to track: Tracked and Restore change nothing there.
@@ -1319,15 +1344,12 @@ namespace donut::render::rdg
             context->sched = s;
             context->commandList = list;
             nvrhi::ITimerQuery* timer = nullptr;
-            if (frame.timers && segment.queue != CommandQueue::Copy && frame.timers->used < frame.timers->queries.size())
+            if (frame.timers && frame.instance.timerSlots[s] != ~0u)
             {
-                RegistryRuntime::TimerSet& set = *frame.timers;
-                timer = set.queries[set.used];
-                set.names[set.used].assign(name);
-                ++set.used;
+                timer = frame.timers->queries[frame.instance.timerSlots[s]];
                 list->beginTimerQuery(timer);
             }
-            ++frame.passes;
+            frame.passes.fetch_add(1, std::memory_order_relaxed);
             const nvrhi::FRESULT passResult = record.pass->Execute(context, record.data);
             if (timer)
                 list->endTimerQuery(timer);
@@ -1350,7 +1372,7 @@ namespace donut::render::rdg
             {
                 list->setExplicitBarrierScope(nullptr);
             }
-            ApplyBatch(frame, list, s, uint32_t(BatchSlot::Epilogue));
+            ApplyBatch(frame, list, context->trackedInList, s, uint32_t(BatchSlot::Epilogue));
             list->endMarker();
         }
 
@@ -1390,6 +1412,125 @@ namespace donut::render::rdg
         PassContext* context = static_cast<PassContext*>(runtime.passContexts[segmentIndex].Get());
         context->frame = &frame;
         return context;
+    }
+
+    // ------------------------------------------------------------------------------------------------ parallel recording
+
+    // 11.3: each recorded pass's timer, in schedule order, on the calling thread before any recording.
+    static void AssignTimerSlots(ExecutorFrame& frame)
+    {
+        const CompiledRenderGraph& plan = frame.plan;
+        PlanInstance& instance = frame.instance;
+        instance.timerSlots.assign(plan.m_Passes.size(), ~0u);
+        if (!frame.timers)
+            return;
+        RegistryRuntime::TimerSet& set = *frame.timers;
+        for (uint32_t s = 0; s < uint32_t(plan.m_Passes.size()); ++s)
+        {
+            const PlanPass& pass = plan.m_Passes[s];
+            if (!pass.enabled || plan.m_Segments[pass.segment].queue == CommandQueue::Copy || set.used >= set.queries.size())
+                continue;
+            instance.timerSlots[s] = set.used;
+            set.names[set.used].assign(plan.GetName(pass.nameOffset));
+            ++set.used;
+        }
+    }
+
+    // 10.1: the tasks of a parallel recording. A pass object records on one thread, so the segments that share one
+    // (a pass's per-view uses) form a group. The groups go to at most `maxTasks` tasks, the largest group first to the
+    // least loaded task; each task records its segments in plan order. Returns the number of tasks; below 2 the
+    // segments are recorded on the calling thread.
+    static uint32_t PlanRecordingTasks(ExecutorFrame& frame, uint32_t maxTasks)
+    {
+        const CompiledRenderGraph& plan = frame.plan;
+        PlanInstance& instance = frame.instance;
+        const uint32_t segmentCount = uint32_t(plan.m_Segments.size());
+
+        std::vector<uint32_t>& group = instance.segmentGroup;
+        group.resize(segmentCount);
+        for (uint32_t i = 0; i < segmentCount; ++i)
+            group[i] = i;
+        auto find = [&group](uint32_t x) {
+            while (group[x] != x)
+            {
+                group[x] = group[group[x]];
+                x = group[x];
+            }
+            return x;
+        };
+
+        instance.passOwners.clear();
+        for (const PlanPass& pass : plan.m_Passes)
+        {
+            if (pass.enabled)
+                instance.passOwners.emplace_back(frame.graph.GetPass(pass.program).pass, pass.segment);
+        }
+        std::sort(instance.passOwners.begin(), instance.passOwners.end());
+        for (size_t i = 1; i < instance.passOwners.size(); ++i)
+        {
+            if (instance.passOwners[i].first != instance.passOwners[i - 1].first)
+                continue;
+            const uint32_t a = find(instance.passOwners[i].second);
+            const uint32_t b = find(instance.passOwners[i - 1].second);
+            if (a != b)
+                group[std::max(a, b)] = std::min(a, b);
+        }
+
+        instance.groupWeight.assign(segmentCount, 0);
+        instance.groupOrder.clear();
+        for (uint32_t i = 0; i < segmentCount; ++i)
+        {
+            const uint32_t root = find(i);
+            instance.groupWeight[root] += plan.m_Segments[i].passCount;
+            if (root == i)
+                instance.groupOrder.push_back(i);
+        }
+        const uint32_t tasks = std::min(maxTasks, uint32_t(instance.groupOrder.size()));
+        if (tasks < 2)
+            return tasks;
+
+        std::stable_sort(instance.groupOrder.begin(), instance.groupOrder.end(), [&instance](uint32_t a, uint32_t b) {
+            return instance.groupWeight[a] > instance.groupWeight[b];
+        });
+        instance.taskLoad.assign(tasks, 0);
+        instance.groupTask.assign(segmentCount, 0);
+        for (uint32_t root : instance.groupOrder)
+        {
+            const uint32_t task = uint32_t(std::min_element(instance.taskLoad.begin(), instance.taskLoad.end()) - instance.taskLoad.begin());
+            instance.groupTask[root] = task;
+            instance.taskLoad[task] += instance.groupWeight[root];
+        }
+
+        instance.taskBegin.assign(tasks + 1, 0);
+        for (uint32_t i = 0; i < segmentCount; ++i)
+            ++instance.taskBegin[instance.groupTask[find(i)] + 1];
+        for (uint32_t t = 0; t < tasks; ++t)
+            instance.taskBegin[t + 1] += instance.taskBegin[t];
+        instance.taskSegments.resize(segmentCount);
+        instance.taskLoad.assign(instance.taskBegin.begin(), instance.taskBegin.end() - 1);   // reused as cursors
+        for (uint32_t i = 0; i < segmentCount; ++i)
+            instance.taskSegments[instance.taskLoad[instance.groupTask[find(i)]]++] = i;
+        return tasks;
+    }
+
+    // A ParallelForFunction task: one task's segments. Nothing escapes to the host's scheduler.
+    static void RecordTask(void* context, uint32_t task)
+    {
+        ExecutorFrame& frame = *static_cast<ExecutorFrame*>(context);
+        PlanInstance& instance = frame.instance;
+        for (uint32_t i = instance.taskBegin[task]; i < instance.taskBegin[task + 1]; ++i)
+        {
+            const uint32_t segment = instance.taskSegments[i];
+            try
+            {
+                instance.segmentResults[segment] = RecordSegment(frame, segment, instance.segmentLists[segment],
+                                                                 instance.segmentContexts[segment]);
+            }
+            catch (...)
+            {
+                instance.segmentResults[segment] = nvrhi::FE_OUT_OF_MEMORY;
+            }
+        }
     }
 
     // ------------------------------------------------------------------------------------------------ execute
@@ -1481,7 +1622,6 @@ namespace donut::render::rdg
 
     nvrhi::FRESULT ExecutePlan(RenderGraph& graph, CompiledRenderGraph& plan, const ExecuteDesc& desc) noexcept
     {
-        (void)desc;   // the task scheduler is P1.7, the timers P1.5
         ResourceRegistry& registry = *graph.GetRegistry();
         RegistryRuntime& runtime = registry.m_Runtime;
         nvrhi::IDevice* device = registry.GetDevice();
@@ -1635,17 +1775,38 @@ namespace donut::render::rdg
             if (frame.prologueOpen)
                 prologue->close();
 
-            // Record every segment, then submit in plan order (10.1).
+            // Record every segment, on worker threads where the host gives a scheduler (10.1), then submit in plan
+            // order. The lists, contexts and timer slots are taken first, on this thread.
             const uint32_t segmentCount = uint32_t(plan.m_Segments.size());
+            instance.segmentLists.resize(segmentCount);
+            instance.segmentContexts.resize(segmentCount);
+            instance.segmentResults.assign(segmentCount, nvrhi::FS_OK);
             for (uint32_t i = 0; i < segmentCount; ++i)
             {
-                nvrhi::ICommandList* list = SegmentList(frame, i);
-                if (!list)
+                instance.segmentLists[i] = SegmentList(frame, i);
+                if (!instance.segmentLists[i])
                     return nvrhi::FE_OUT_OF_MEMORY;
-                const nvrhi::FRESULT recorded = RecordSegment(frame, i, list, SegmentContext(frame, i));
-                if (recorded != nvrhi::FS_OK && result == nvrhi::FS_OK)
-                    result = recorded;
+                instance.segmentContexts[i] = SegmentContext(frame, i);
             }
+            AssignTimerSlots(frame);
+            const bool parallel = desc.parallelFor && profile.recordingMode != RecordingMode::ImmediateSerial && segmentCount > 1;
+            const uint32_t tasks = parallel ? PlanRecordingTasks(frame, desc.workerCount ? desc.workerCount : segmentCount) : 0;
+            if (tasks > 1)
+            {
+                desc.parallelFor(desc.schedulerContext, tasks, RecordTask, &frame);
+            }
+            else
+            {
+                for (uint32_t i = 0; i < segmentCount; ++i)
+                    instance.segmentResults[i] = RecordSegment(frame, i, instance.segmentLists[i], instance.segmentContexts[i]);
+            }
+            for (uint32_t i = 0; i < segmentCount; ++i)
+            {
+                if (instance.segmentResults[i] != nvrhi::FS_OK && result == nvrhi::FS_OK)
+                    result = instance.segmentResults[i];
+            }
+            runtime.objectsCreated += frame.framebuffersCreated.load(std::memory_order_relaxed);
+            frame.recordTasks = tasks > 1 ? tasks : 1;
 
             const auto submitStart = std::chrono::steady_clock::now();
             const bool fences = runtime.fencesSupported;
@@ -1762,10 +1923,12 @@ namespace donut::render::rdg
             run.frameIndex = frameIndex;
             run.recordMilliseconds = std::chrono::duration<float, std::milli>(submitStart - recordStart).count();
             run.submitMilliseconds = std::chrono::duration<float, std::milli>(submitEnd - submitStart).count();
-            run.passes = frame.passes;
+            run.passes = frame.passes.load(std::memory_order_relaxed);
+            run.recordTasks = frame.recordTasks;
             run.segments = segmentCount;
-            run.barriers = frame.barriers + uint32_t(runtime.patches.size());
-            run.stateCalls = frame.stateCalls + (plan.m_Profile.explicitBarriers ? 0u : 2u * uint32_t(runtime.patches.size()));
+            run.barriers = frame.barriers.load(std::memory_order_relaxed) + uint32_t(runtime.patches.size());
+            run.stateCalls = frame.stateCalls.load(std::memory_order_relaxed) +
+                (plan.m_Profile.explicitBarriers ? 0u : 2u * uint32_t(runtime.patches.size()));
             run.planSwitched = switched;
             if (frame.timers && frame.timers->used)
                 frame.timers->pending = true;
