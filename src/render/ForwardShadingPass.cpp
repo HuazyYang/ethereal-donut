@@ -68,7 +68,7 @@ ForwardShadingPass::ForwardShadingPass(
     : m_Device(device)
     , m_CommonPasses(commonPasses)
 {
-    m_IsDX11 = m_Device->getGraphicsAPI() == nvrhi::GraphicsAPI::D3D11;
+    m_IsDX11 = m_Device && m_Device->getGraphicsAPI() == nvrhi::GraphicsAPI::D3D11;
 }
 
 void ForwardShadingPass::Init(ShaderFactory& shaderFactory, const CreateParameters& params)
@@ -502,19 +502,20 @@ bool ForwardShadingPass::SetupMaterial(GeometryPassContext& abstractContext, con
     key.domain = material->domain;
 
     nvrhi::GraphicsPipelineHandle& pipeline = m_Pipelines[key];
+    nvrhi::FramebufferInfo const framebufferInfo = state.framebuffer->getFramebufferInfo().getInfo();
 
-    if (!pipeline)
+    // The framebuffer's formats are part of the cache key (design 13.3): a target of another format, such as a
+    // render graph's, replaces the pipeline instead of asserting.
+    if (!pipeline || pipeline->getFramebufferInfo() != framebufferInfo)
     {
         std::lock_guard<std::mutex> lockGuard(m_Mutex);
 
-        if (!pipeline)
-            pipeline = CreateGraphicsPipeline(key, state.framebuffer->getFramebufferInfo().getInfo());
+        if (!pipeline || pipeline->getFramebufferInfo() != framebufferInfo)
+            pipeline = CreateGraphicsPipeline(key, framebufferInfo);
 
         if (!pipeline)
             return false;
     }
-
-    assert(pipeline->getFramebufferInfo() == state.framebuffer->getFramebufferInfo().getInfo());
 
     state.pipeline = pipeline;
     state.bindings = { materialBindingSet, m_ViewBindingSet, context.shadingBindingSet };

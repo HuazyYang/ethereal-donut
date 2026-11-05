@@ -24,6 +24,9 @@
 
 #include <nvrhi/core/autoptr.h>
 #include <nvrhi/nvrhi.h>
+#include <donut/engine/BindingCache.h>
+#include <nvrhi/core/foundation.h>
+#include <donut/render/RenderGraph.h>
 
 namespace donut::engine
 {
@@ -31,13 +34,36 @@ namespace donut::engine
     class CommonRenderPasses;
     class FramebufferFactory;
     class ICompositeView;
+    class IView;
 }
 
 
 namespace donut::render
 {
-    class EnvironmentMapPass
+    // The pass in a render graph (design 13.3): one raster use per planar child view of `view`, drawing
+    // `environmentMap` (a cube map or a lat-long texture, imported) into that view's subresources of `color`,
+    // depth-tested against `depth` (read-only) when it is valid. `view` must stay valid until the graph has executed.
+    struct EnvironmentMapGraphInputs
     {
+        const engine::ICompositeView* view = nullptr;
+        ResourceId color = InvalidResourceId;
+        ResourceId depth = InvalidResourceId;
+        ResourceId environmentMap = InvalidResourceId;
+    };
+
+    struct EnvironmentMapGraphOutputs
+    {
+        ResourceId color = InvalidResourceId;
+    };
+
+    class EnvironmentMapPass : public nvrhi::ObjectImpl<IGpuPass>
+    {
+    public:
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(EnvironmentMapPass)
+        NVRHI_IMPLEMENTS_INTERFACE(IGpuPass)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IObject)
+        NVRHI_END_INTERFACE_TABLE()
+
     private:
         nvrhi::ShaderHandle m_PixelShader;
         nvrhi::BufferHandle m_SkyCB;
@@ -60,6 +86,30 @@ namespace donut::render
         void Render(
             nvrhi::ICommandList* commandList,
             const engine::ICompositeView& compositeView);
+
+        // For a render graph: the map is chosen per AddToGraph; Prepare creates the shader and pipelines.
+        EnvironmentMapPass(
+            nvrhi::IDevice* device,
+            engine::ShaderFactory* shaderFactory,
+            engine::CommonRenderPasses* commonPasses);
+
+        EnvironmentMapGraphOutputs AddToGraph(IRenderGraph* graph, const EnvironmentMapGraphInputs& inputs);
+
+        nvrhi::FRESULT Setup(ISetupContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Prepare(IPrepareContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Execute(IPassContext* context, const void* data) noexcept override;
+        void OnResourcesReleased() noexcept override;
+
+    private:
+        void DrawView(nvrhi::ICommandList* commandList, const engine::IView& view, nvrhi::IFramebuffer* framebuffer,
+                      nvrhi::IGraphicsPipeline* pipeline, nvrhi::IBindingSet* bindingSet);
+
+        // Graph construction: one pixel shader per map kind, one pipeline per depth convention.
+        nvrhi::DeviceHandle m_Device;
+        nvrhi::AutoPtr<engine::ShaderFactory> m_ShaderFactory;
+        int m_GraphCubeMap = -1;
+        nvrhi::GraphicsPipelineHandle m_GraphPso[2];
+        engine::BindingCache m_GraphBindings{ nullptr };
     };
 
 }

@@ -45,6 +45,31 @@ using namespace donut::math;
 using namespace donut::engine;
 using namespace donut::render;
 
+void BloomPass::CreateCommonObjects(ShaderFactory* shaderFactory)
+{
+    m_BloomBlurPixelShader = shaderFactory->CreateAutoShader("donut/passes/bloom_ps.hlsl", "main", DONUT_MAKE_PLATFORM_SHADER(g_bloom_ps), nullptr, nvrhi::ShaderType::Pixel);
+
+    nvrhi::BufferDesc constantBufferDesc;
+    constantBufferDesc.byteSize = sizeof(BloomConstants);
+    constantBufferDesc.isConstantBuffer = true;
+    constantBufferDesc.isVolatile = true;
+    constantBufferDesc.debugName = "BloomConstantsH";
+    constantBufferDesc.maxVersions = engine::c_MaxRenderPassConstantBufferVersions;
+    m_Device->createBuffer(constantBufferDesc, &m_BloomHBlurCB);
+    constantBufferDesc.debugName = "BloomConstantsV";
+    m_Device->createBuffer(constantBufferDesc, &m_BloomVBlurCB);
+
+    nvrhi::BindingLayoutDesc layoutDesc;
+    layoutDesc.visibility = nvrhi::ShaderType::Pixel;
+    layoutDesc.bindings = {
+        nvrhi::BindingLayoutItem::VolatileConstantBuffer(0),
+        nvrhi::BindingLayoutItem::Sampler(0),
+        nvrhi::BindingLayoutItem::Texture_SRV(0)
+    };
+    m_Device->createBindingLayout(layoutDesc, &m_BloomBlurBindingLayout);
+
+}
+
 BloomPass::BloomPass(
     nvrhi::IDevice* device,
     ShaderFactory* shaderFactory,
@@ -56,26 +81,7 @@ BloomPass::BloomPass(
     , m_Device(device)
     , m_BindingCache(device)
 {
-    m_BloomBlurPixelShader = shaderFactory->CreateAutoShader("donut/passes/bloom_ps.hlsl", "main", DONUT_MAKE_PLATFORM_SHADER(g_bloom_ps), nullptr, nvrhi::ShaderType::Pixel);
-
-    nvrhi::BufferDesc constantBufferDesc;
-    constantBufferDesc.byteSize = sizeof(BloomConstants);
-    constantBufferDesc.isConstantBuffer = true;
-    constantBufferDesc.isVolatile = true;
-    constantBufferDesc.debugName = "BloomConstantsH";
-    constantBufferDesc.maxVersions = engine::c_MaxRenderPassConstantBufferVersions;
-    device->createBuffer(constantBufferDesc, &m_BloomHBlurCB);
-    constantBufferDesc.debugName = "BloomConstantsV";
-    device->createBuffer(constantBufferDesc, &m_BloomVBlurCB);
-
-    nvrhi::BindingLayoutDesc layoutDesc;
-    layoutDesc.visibility = nvrhi::ShaderType::Pixel;
-    layoutDesc.bindings = {
-        nvrhi::BindingLayoutItem::VolatileConstantBuffer(0),
-        nvrhi::BindingLayoutItem::Sampler(0),
-        nvrhi::BindingLayoutItem::Texture_SRV(0)
-    };
-    device->createBindingLayout(layoutDesc, &m_BloomBlurBindingLayout);
+    CreateCommonObjects(shaderFactory);
 
     m_PerViewData.resize(compositeView.GetNumChildViews(ViewType::PLANAR));
     for (uint viewIndex = 0; viewIndex < compositeView.GetNumChildViews(ViewType::PLANAR); viewIndex++)
@@ -276,4 +282,232 @@ void BloomPass::Render(
     }
 
     commandList->endMarker(); // "Bloom"
+}
+
+// ------------------------------------------------------------------------------------------ render graph (13.3)
+
+BloomPass::BloomPass(
+    nvrhi::IDevice* device,
+    ShaderFactory* shaderFactory,
+    CommonRenderPasses* commonPasses)
+    : m_CommonPasses(commonPasses)
+    , m_Device(device)
+    , m_BindingCache(device)
+    , m_ShaderFactory(shaderFactory)
+{
+}
+
+namespace
+{
+    enum class BloomStage : uint32_t { Downscale1, Downscale2, BlurHorizontal, BlurVertical, Apply };
+
+    struct BloomUse
+    {
+        BloomStage stage;
+        const IView* view;
+        ResourceId source;
+        ResourceId target;
+        dm::box2 sourceBox;
+        float sigmaInPixels;
+        float blendFactor;
+        nvrhi::SubresourceRegion region;
+    };
+
+    const char* const c_BloomStageNames[] = { "Bloom/Downscale1", "Bloom/Downscale2", "Bloom/BlurH", "Bloom/BlurV", "Bloom/Apply" };
+}
+
+BloomGraphOutputs BloomPass::AddToGraph(IRenderGraph* graph, const BloomGraphInputs& inputs)
+{
+    BloomGraphOutputs outputs{ inputs.color };
+    nvrhi::TextureDesc colorDesc;
+    if (!inputs.view || graph->GetTextureDesc(inputs.color, colorDesc) != nvrhi::FS_OK)
+        return outputs;
+
+    const uint32_t viewCount = inputs.view->GetNumChildViews(ViewType::PLANAR);
+    for (uint32_t viewIndex = 0; viewIndex < viewCount; ++viewIndex)
+    {
+        const IView* view = inputs.view->GetChildView(ViewType::PLANAR, viewIndex);
+        const nvrhi::Rect viewExtent = view->GetViewExtent();
+        const nvrhi::Rect scissor = view->GetViewportState().scissorRects[0];
+
+        // The chain's transients, without debug names so that recording allocates nothing.
+        nvrhi::TextureDesc desc;
+        desc.format = colorDesc.format;
+        desc.isRenderTarget = true;
+        desc.width = uint32_t(ceil((viewExtent.maxX - viewExtent.minX) / 2.f));
+        desc.height = uint32_t(ceil((viewExtent.maxY - viewExtent.minY) / 2.f));
+        const ResourceId downscale1 = graph->CreateTexture(desc, ResourceFlags::None);
+        desc.width = uint32_t(ceil(desc.width / 2.f));
+        desc.height = uint32_t(ceil(desc.height / 2.f));
+        const ResourceId downscale2 = graph->CreateTexture(desc, ResourceFlags::None);
+        const ResourceId blur1 = graph->CreateTexture(desc, ResourceFlags::None);
+        const ResourceId blur2 = graph->CreateTexture(desc, ResourceFlags::None);
+
+        const nvrhi::TextureSubresourceSet subresources = view->GetSubresources();
+        const nvrhi::SubresourceRegion viewRegion = nvrhi::SubresourceRegion().setMips(subresources.baseMipLevel, 1)
+            .setSlices(subresources.baseArraySlice, subresources.numArraySlices);
+        const dm::box2 sourceBox(
+            float2(float(scissor.minX) / float(colorDesc.width), float(scissor.minY) / float(colorDesc.height)),
+            float2(float(scissor.maxX) / float(colorDesc.width), float(scissor.maxY) / float(colorDesc.height)));
+
+        const struct { BloomStage stage; ResourceId source; ResourceId target; } chain[] = {
+            { BloomStage::Downscale1, outputs.color, downscale1 },
+            { BloomStage::Downscale2, downscale1, downscale2 },
+            { BloomStage::BlurHorizontal, downscale2, blur1 },
+            { BloomStage::BlurVertical, blur1, blur2 },
+            { BloomStage::Apply, blur2, outputs.color },
+        };
+        ResourceId written[5] = {};
+        for (uint32_t i = 0; i < 5; ++i)
+        {
+            BloomUse* use = NewFrameData<BloomUse>(graph);
+            if (!use)
+                return outputs;
+            // Each stage reads what the stage before it wrote.
+            const ResourceId source = i == 0 ? chain[i].source : written[i - 1];
+            const ResourceId target = i == 4 ? outputs.color : chain[i].target;
+            *use = BloomUse{ chain[i].stage, view, source, target, sourceBox, inputs.sigmaInPixels, inputs.blendFactor,
+                             i == 4 ? viewRegion : nvrhi::SubresourceRegion() };
+            graph->AddPass(PassDesc{ c_BloomStageNames[i], PassType::Raster, PassFlags::None, 0 }, this, use, nullptr);
+            written[i] = use->target;
+        }
+        outputs.color = written[4];
+    }
+    return outputs;
+}
+
+nvrhi::FRESULT BloomPass::Setup(ISetupContext* context, void* data) noexcept
+{
+    BloomUse& use = *static_cast<BloomUse*>(data);
+    context->Read(use.source, Access::ShaderRead, nvrhi::ShaderType::Pixel, nvrhi::SubresourceRegion());
+    // The apply blends onto the colour target and keeps what is there; the other stages write all of theirs.
+    const AccessFlags flags = use.stage == BloomStage::Apply ? AccessFlags::None : AccessFlags::FullWrite;
+    use.target = context->SetColorTarget(0, use.target, use.region, flags, nullptr);
+    return nvrhi::FS_OK;
+}
+
+nvrhi::FRESULT BloomPass::Prepare(IPrepareContext* context, void* data) noexcept
+{
+    const BloomUse& use = *static_cast<const BloomUse*>(data);
+    try
+    {
+        if (!m_BloomBlurPixelShader)
+        {
+            if (!m_Device || !m_ShaderFactory)
+                return nvrhi::FE_INVALID_ARGS;
+            CreateCommonObjects(m_ShaderFactory);
+        }
+        if (use.stage == BloomStage::BlurHorizontal || use.stage == BloomStage::BlurVertical)
+        {
+            const nvrhi::FramebufferInfo framebufferInfo = context->GetFramebufferInfo().getInfo();
+            if (!m_GraphBlurPso || m_GraphBlurPso->getFramebufferInfo() != framebufferInfo)
+            {
+                nvrhi::GraphicsPipelineDesc graphicsPipelineDesc;
+                graphicsPipelineDesc.primType = nvrhi::PrimitiveType::TriangleStrip;
+                graphicsPipelineDesc.VS = m_CommonPasses->m_FullscreenVS;
+                graphicsPipelineDesc.PS = m_BloomBlurPixelShader;
+                graphicsPipelineDesc.bindingLayouts = { m_BloomBlurBindingLayout };
+                graphicsPipelineDesc.renderState.rasterState.setCullNone();
+                graphicsPipelineDesc.renderState.depthStencilState.depthTestEnable = false;
+                graphicsPipelineDesc.renderState.depthStencilState.stencilEnable = false;
+                m_GraphBlurPso = nullptr;
+                m_Device->createGraphicsPipeline1(graphicsPipelineDesc, framebufferInfo, &m_GraphBlurPso);
+            }
+            if (!m_GraphBlurPso)
+                return nvrhi::FE_GENERIC_ERROR;
+        }
+        return nvrhi::FS_OK;
+    }
+    catch (...)
+    {
+        return nvrhi::FE_OUT_OF_MEMORY;
+    }
+}
+
+nvrhi::FRESULT BloomPass::Execute(IPassContext* context, const void* data) noexcept
+{
+    const BloomUse& use = *static_cast<const BloomUse*>(data);
+    nvrhi::ICommandList* commandList = context->GetCommandList();
+    nvrhi::IFramebuffer* framebuffer = context->GetFramebuffer();
+    nvrhi::ITexture* source = context->GetTexture(use.source);
+    if (!framebuffer || !source)
+        return nvrhi::FE_INVALID_ARGS;
+    try
+    {
+        switch (use.stage)
+        {
+        case BloomStage::Downscale1:
+        case BloomStage::Downscale2:
+        {
+            BlitParameters blitParams;
+            blitParams.targetFramebuffer = framebuffer;
+            blitParams.sourceTexture = source;
+            if (use.stage == BloomStage::Downscale1)
+                blitParams.sourceBox = use.sourceBox;
+            m_CommonPasses->BlitTexture(commandList, blitParams, &m_BindingCache);
+            break;
+        }
+        case BloomStage::BlurHorizontal:
+        case BloomStage::BlurVertical:
+        {
+            const bool horizontal = use.stage == BloomStage::BlurHorizontal;
+            const nvrhi::FramebufferInfoEx& info = framebuffer->getFramebufferInfo();
+            const float effectiveSigma = clamp(use.sigmaInPixels * 0.25f, 1.f, 100.f);
+            BloomConstants constants = {};
+            constants.pixstep.x = horizontal ? 1.f / float(info.width) : 0.f;
+            constants.pixstep.y = horizontal ? 0.f : 1.f / float(info.height);
+            constants.argumentScale = -1.f / (2 * effectiveSigma * effectiveSigma);
+            constants.normalizationScale = 1.f / (sqrtf(2 * PI_f) * effectiveSigma);
+            constants.numSamples = ::round(effectiveSigma * 4.f);
+            nvrhi::IBuffer* constantBuffer = horizontal ? m_BloomHBlurCB.Get() : m_BloomVBlurCB.Get();
+            commandList->writeBuffer(constantBuffer, &constants, sizeof(constants));
+
+            nvrhi::BindingSetDesc bindingSetDesc;
+            bindingSetDesc.bindings = {
+                nvrhi::BindingSetItem::ConstantBuffer(0, constantBuffer),
+                nvrhi::BindingSetItem::Sampler(0, m_CommonPasses->m_LinearClampSampler),
+                nvrhi::BindingSetItem::Texture_SRV(0, source)
+            };
+            nvrhi::GraphicsState state;
+            state.pipeline = m_GraphBlurPso;
+            state.framebuffer = framebuffer;
+            state.bindings = { m_BindingCache.GetOrCreateBindingSet(bindingSetDesc, m_BloomBlurBindingLayout) };
+            const nvrhi::Viewport viewport(float(info.width), float(info.height));
+            state.viewport.addViewport(viewport);
+            state.viewport.addScissorRect(nvrhi::Rect(viewport));
+            commandList->setGraphicsState(state);
+
+            nvrhi::DrawArguments args;
+            args.instanceCount = 1;
+            args.vertexCount = 4;
+            commandList->draw(args);
+            break;
+        }
+        case BloomStage::Apply:
+        {
+            BlitParameters blitParams;
+            blitParams.targetFramebuffer = framebuffer;
+            blitParams.targetViewport = use.view->GetViewportState().viewports[0];
+            blitParams.sourceTexture = source;
+            blitParams.blendState.setBlendEnable(true)
+                .setSrcBlend(nvrhi::BlendFactor::ConstantColor)
+                .setDestBlend(nvrhi::BlendFactor::InvConstantColor)
+                .setSrcBlendAlpha(nvrhi::BlendFactor::Zero)
+                .setDestBlendAlpha(nvrhi::BlendFactor::One);
+            blitParams.blendConstantColor = nvrhi::Color(use.blendFactor);
+            m_CommonPasses->BlitTexture(commandList, blitParams, &m_BindingCache);
+            break;
+        }
+        }
+    }
+    catch (...)
+    {
+        return nvrhi::FE_OUT_OF_MEMORY;
+    }
+    return nvrhi::FS_OK;
+}
+
+void BloomPass::OnResourcesReleased() noexcept
+{
+    m_BindingCache.Clear();
 }

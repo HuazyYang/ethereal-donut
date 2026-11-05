@@ -35,6 +35,7 @@
 #include "RenderGraphCompile.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <string>
 
@@ -103,60 +104,6 @@ namespace donut::render::rdg
     CompiledRenderGraph::~CompiledRenderGraph() = default;
 
     // ------------------------------------------------------------------------------------------------ descriptions
-
-    static nvrhi::TextureDesc MakeTextureDesc(const ResourceRecord& record)
-    {
-        const TextureInfo& info = record.texture;
-        nvrhi::TextureDesc desc;
-        desc.width = info.width;
-        desc.height = info.height;
-        desc.depth = info.depth;
-        desc.arraySize = info.arraySize;
-        desc.mipLevels = info.mipLevels;
-        desc.sampleCount = info.sampleCount;
-        desc.sampleQuality = info.sampleQuality;
-        desc.format = info.format;
-        desc.dimension = info.dimension;
-        desc.isShaderResource = info.isShaderResource;
-        desc.isRenderTarget = info.isRenderTarget;
-        desc.isUAV = info.isUAV;
-        desc.isTypeless = info.isTypeless;
-        desc.isShadingRateSurface = info.isShadingRateSurface;
-        desc.useClearValue = info.useClearValue;
-        desc.clearValue = info.clearValue;
-        desc.sharedResourceFlags = info.sharedResourceFlags;
-        // Created in the backend's initial state (D3D12 COMMON, Vulkan UNDEFINED); the first frame's patch moves it.
-        desc.initialState = ResourceStates::Unknown;
-        desc.keepInitialState = false;
-        if (record.name)
-            desc.debugName = record.name;
-        return desc;
-    }
-
-    static nvrhi::BufferDesc MakeBufferDesc(const ResourceRecord& record)
-    {
-        const BufferInfo& info = record.buffer;
-        nvrhi::BufferDesc desc;
-        desc.byteSize = info.byteSize;
-        desc.structStride = info.structStride;
-        desc.format = info.format;
-        desc.canHaveUAVs = info.canHaveUAVs;
-        desc.canHaveTypedViews = info.canHaveTypedViews;
-        desc.canHaveRawViews = info.canHaveRawViews;
-        desc.isVertexBuffer = info.isVertexBuffer;
-        desc.isIndexBuffer = info.isIndexBuffer;
-        desc.isConstantBuffer = info.isConstantBuffer;
-        desc.isDrawIndirectArgs = info.isDrawIndirectArgs;
-        desc.isAccelStructBuildInput = info.isAccelStructBuildInput;
-        desc.isAccelStructStorage = info.isAccelStructStorage;
-        desc.isShaderBindingTable = info.isShaderBindingTable;
-        desc.cpuAccess = info.cpuAccess;
-        desc.initialState = ResourceStates::Unknown;
-        desc.keepInitialState = false;
-        if (record.name)
-            desc.debugName = record.name;
-        return desc;
-    }
 
     static std::unique_ptr<PhysicalResource> CreatePhysical(nvrhi::IDevice* device, const ResourceRecord& record,
                                                            const BackendProfile& profile, RegistryRuntime& runtime)
@@ -258,6 +205,10 @@ namespace donut::render::rdg
         uint64_t frameIndex;
         nvrhi::ICommandList* prologue = nullptr;
         bool prologueOpen = false;
+        RegistryRuntime::TimerSet* timers = nullptr;   // ExecuteDesc::timers (11.3)
+        uint32_t barriers = 0;
+        uint32_t stateCalls = 0;
+        uint32_t passes = 0;
 
         // The prologue opens on demand, so that a frame without patches or uploads neither records nor submits it:
         // the patch barriers first, then Prepare's uploads with automatic barriers, as for any upload outside a graph.
@@ -777,11 +728,6 @@ namespace donut::render::rdg
         }
     }
 
-    static bool LegacyDiscardable(ResourceStates state)
-    {
-        return state == ResourceStates::RenderTarget || state == ResourceStates::DepthWrite || state == ResourceStates::UnorderedAccess;
-    }
-
     // The barriers that bring every physical resource the plan touches into the plan's frame-start states: after
     // creation, and after a plan switch.
     static void BuildPatches(ExecutorFrame& frame, bool switched)
@@ -833,7 +779,8 @@ namespace donut::render::rdg
                         region.setPlanes(plane == 0 ? nvrhi::PlaneMask::Depth : nvrhi::PlaneMask::Stencil);
                 }
                 const bool discard = contentIrrelevant &&
-                    (profile.barrierModel != BarrierModel::D3D12Legacy || LegacyDiscardable(after));
+                    (profile.barrierModel != BarrierModel::D3D12Legacy ||
+                     LegacyDiscardable(after, record.isBuffer, record.hasDepth, record.isRenderTarget));
                 runtime.patches.push_back(nvrhi::ResourceBarrier::Transition(physical->resource, before, after, region,
                     discard ? nvrhi::BarrierFlags::Discard : nvrhi::BarrierFlags::None));
                 runtime.patchOwners.push_back(physical);
@@ -851,6 +798,8 @@ namespace donut::render::rdg
     {
         const PlanInstance& instance = frame.instance;
         const LoweredBatch& batch = instance.batches[size_t(sched) * c_SlotCount + slot];
+        frame.barriers += batch.explicitCount + batch.trackerCount;
+        frame.stateCalls += batch.trackerCount;
         if (batch.trackerCount)
         {
             for (uint32_t t = batch.trackerBegin; t < batch.trackerBegin + batch.trackerCount; ++t)
@@ -937,7 +886,9 @@ namespace donut::render::rdg
                 (record.kind != ResourceKind::Transient && record.kind != ResourceKind::PassLocal))
                 continue;
             const nvrhi::ShaderType stages = use.stages == nvrhi::ShaderType::None ? DefaultStages(pass.type) : use.stages;
-            const ResourceStates state = LowerAccess(use.access, stages);
+            const PlanResource& lowered = frame.plan.m_Resources[use.resource];
+            const ResourceStates state = LowerAccess(use.access, stages, !lowered.isBuffer && (lowered.hasDepth || lowered.hasStencil),
+                                                     frame.plan.m_Profile);
             if (profile.barrierModel != BarrierModel::Implicit &&
                 state != ClearState(record.isBuffer, record.hasDepth, record.isRenderTarget, profile))
                 continue;
@@ -957,31 +908,31 @@ namespace donut::render::rdg
         }
     }
 
-    // Tracked and Restore passes (9.1): the tracker starts from the declared states.
+    // Tracked and Restore passes (9.1): the tracker starts from the states the plan put the ranges in, which a merged
+    // read group can make wider than the pass's own access; Restore returns them there.
     static void BeginTracking(ExecutorFrame& frame, nvrhi::ICommandList* list, uint32_t sched, bool restore)
     {
         const PlanPass& pass = frame.plan.m_Passes[sched];
-        for (uint32_t u = pass.useBegin; u < pass.useBegin + pass.useCount; ++u)
+        frame.stateCalls += pass.trackedCount;
+        for (uint32_t t = pass.trackedBegin; t < pass.trackedBegin + pass.trackedCount; ++t)
         {
-            const PlanUse& use = frame.plan.m_Uses[u];
-            if (frame.plan.m_Resources[use.resource].kind == ResourceKind::HostKept)
+            const PlanTrackedState& tracked = frame.plan.m_TrackedStates[t];
+            if (frame.plan.m_Resources[tracked.resource].kind == ResourceKind::HostKept)
                 continue;
-            const nvrhi::ShaderType stages = use.stages == nvrhi::ShaderType::None ? DefaultStages(pass.type) : use.stages;
-            const ResourceStates state = LowerAccess(use.access, stages);
-            const FrameResource& resource = frame.runtime.frameResources[use.resource];
+            const FrameResource& resource = frame.runtime.frameResources[tracked.resource];
             if (!restore)
             {
                 if (resource.texture)
-                    list->beginTrackingTextureState(resource.texture, ToSubresourceSet(use.region), state);
+                    list->beginTrackingTextureState(resource.texture, ToSubresourceSet(tracked.region), tracked.state);
                 else if (resource.buffer)
-                    list->beginTrackingBufferState(resource.buffer, state);
+                    list->beginTrackingBufferState(resource.buffer, tracked.state);
             }
             else
             {
                 if (resource.texture)
-                    list->setTextureState(resource.texture, ToSubresourceSet(use.region), state);
+                    list->setTextureState(resource.texture, ToSubresourceSet(tracked.region), tracked.state);
                 else if (resource.buffer)
-                    list->setBufferState(resource.buffer, state);
+                    list->setBufferState(resource.buffer, tracked.state);
             }
         }
         if (restore)
@@ -993,23 +944,21 @@ namespace donut::render::rdg
     {
 #ifndef NDEBUG
         const PlanPass& pass = frame.plan.m_Passes[sched];
-        for (uint32_t u = pass.useBegin; u < pass.useBegin + pass.useCount; ++u)
+        for (uint32_t t = pass.trackedBegin; t < pass.trackedBegin + pass.trackedCount; ++t)
         {
-            const PlanUse& use = frame.plan.m_Uses[u];
-            if (frame.plan.m_Resources[use.resource].kind == ResourceKind::HostKept)
+            const PlanTrackedState& tracked = frame.plan.m_TrackedStates[t];
+            if (frame.plan.m_Resources[tracked.resource].kind == ResourceKind::HostKept)
                 continue;
-            const nvrhi::ShaderType stages = use.stages == nvrhi::ShaderType::None ? DefaultStages(pass.type) : use.stages;
-            const ResourceStates state = LowerAccess(use.access, stages);
-            const FrameResource& resource = frame.runtime.frameResources[use.resource];
-            ResourceStates actual = state;
+            const FrameResource& resource = frame.runtime.frameResources[tracked.resource];
+            ResourceStates actual = tracked.state;
             if (resource.texture)
-                actual = list->getTextureSubresourceState(resource.texture, use.region.baseSlice, use.region.baseMip);
+                actual = list->getTextureSubresourceState(resource.texture, tracked.region.baseSlice, tracked.region.baseMip);
             else if (resource.buffer)
                 actual = list->getBufferState(resource.buffer);
-            if (actual != state)
+            if (actual != tracked.state)
                 frame.ReportError("pass '" + std::string(frame.plan.GetName(pass.nameOffset)) + "' left resource #" +
-                    std::to_string(use.resource) + " in " + StatesToString(actual) + " instead of its declared " +
-                    StatesToString(state) + ": an undeclared access (Tracked mode)");
+                    std::to_string(tracked.resource) + " in " + StatesToString(actual) + " instead of " +
+                    StatesToString(tracked.state) + ": an undeclared access (Tracked mode)");
         }
 #else
         (void)frame;
@@ -1103,7 +1052,19 @@ namespace donut::render::rdg
 
             context->sched = s;
             context->commandList = list;
+            nvrhi::ITimerQuery* timer = nullptr;
+            if (frame.timers && segment.queue != CommandQueue::Copy && frame.timers->used < frame.timers->queries.size())
+            {
+                RegistryRuntime::TimerSet& set = *frame.timers;
+                timer = set.queries[set.used];
+                set.names[set.used].assign(name);
+                ++set.used;
+                list->beginTimerQuery(timer);
+            }
+            ++frame.passes;
             const nvrhi::FRESULT passResult = record.pass->Execute(context, record.data);
+            if (timer)
+                list->endTimerQuery(timer);
             if (passResult != nvrhi::FS_OK && result == nvrhi::FS_OK)
             {
                 result = passResult;
@@ -1166,6 +1127,79 @@ namespace donut::render::rdg
     }
 
     // ------------------------------------------------------------------------------------------------ execute
+
+    // 11.3: publishes the newest timer set whose queries have completed and frees every completed set.
+    static void CollectTimers(RegistryRuntime& runtime, nvrhi::IDevice* device)
+    {
+        RegistryRuntime::TimerSet* newest = nullptr;
+        for (RegistryRuntime::TimerSet& set : runtime.timerSets)
+        {
+            if (!set.pending)
+                continue;
+            bool ready = true;
+            for (uint32_t q = 0; q < set.used && ready; ++q)
+                ready = device->pollTimerQuery(set.queries[q]);
+            if (!ready)
+                continue;
+            if (!newest || set.frameIndex > newest->frameIndex)
+                newest = &set;
+        }
+        if (newest)
+        {
+            runtime.timingNames.resize(newest->used);
+            runtime.timings.resize(newest->used);
+            for (uint32_t q = 0; q < newest->used; ++q)
+            {
+                runtime.timingNames[q] = newest->names[q];
+                runtime.timings[q] = PassTiming{ runtime.timingNames[q].c_str(), newest->frameIndex,
+                                                 device->getTimerQueryTime(newest->queries[q]) * 1000.f };
+            }
+        }
+        for (RegistryRuntime::TimerSet& set : runtime.timerSets)
+        {
+            if (!set.pending || (newest && set.frameIndex > newest->frameIndex))
+                continue;
+            bool ready = true;
+            for (uint32_t q = 0; q < set.used && ready; ++q)
+                ready = device->pollTimerQuery(set.queries[q]);
+            if (!ready)
+                continue;
+            for (uint32_t q = 0; q < set.used; ++q)
+                device->resetTimerQuery(set.queries[q]);
+            set.pending = false;
+            set.used = 0;
+        }
+    }
+
+    // A free set for this frame, with a query per enabled pass; nullptr when every set still waits for the GPU.
+    static RegistryRuntime::TimerSet* AcquireTimers(RegistryRuntime& runtime, nvrhi::IDevice* device, const CompiledRenderGraph& plan,
+                                                    uint64_t frameIndex)
+    {
+        CollectTimers(runtime, device);
+        for (RegistryRuntime::TimerSet& set : runtime.timerSets)
+        {
+            if (set.pending)
+                continue;
+            const size_t needed = plan.m_Passes.size();
+            while (set.queries.size() < needed)
+            {
+                nvrhi::AutoPtr<nvrhi::ITimerQuery> query;
+                if (device->createTimerQuery(query.ReleaseAndGetAddressOf()) != nvrhi::FS_OK || !query)
+                {
+                    runtime.timersSupported = false;
+                    return nullptr;
+                }
+                ++runtime.objectsCreated;
+                set.queries.push_back(query);
+            }
+            if (set.names.size() < needed)
+                set.names.resize(needed);
+            set.used = 0;
+            set.frameIndex = frameIndex;
+            return &set;
+        }
+        return nullptr;
+    }
 
     void FinalizeLastPlan(ResourceRegistry& registry) noexcept
     {
@@ -1245,6 +1279,9 @@ namespace donut::render::rdg
             PlanInstance& instance = *plan.m_Instance;
             const uint64_t frameIndex = graph.FrameIndexValue();
             ExecutorFrame frame{ graph, plan, instance, registry, runtime, device, frameIndex };
+            const auto recordStart = std::chrono::steady_clock::now();
+            if (desc.timers && runtime.timersSupported)
+                frame.timers = AcquireTimers(runtime, device, plan, frameIndex);
 
             // This frame's resources.
             const uint32_t resourceCount = graph.ResourceCount();
@@ -1345,6 +1382,7 @@ namespace donut::render::rdg
                     result = recorded;
             }
 
+            const auto submitStart = std::chrono::steady_clock::now();
             const bool fences = runtime.fencesSupported;
             const bool prologueNeeded = frame.prologueOpen;
             uint64_t prologueValue = 0;
@@ -1453,6 +1491,20 @@ namespace donut::render::rdg
             for (uint32_t q = 0; q < 3; ++q)
                 runtime.lastFrameValues[q] = runtime.fenceValues[q];
             instance.previousSegmentValue.swap(instance.segmentValue);
+            // 11.3: the run statistics, and the timer set waits for the GPU.
+            const auto submitEnd = std::chrono::steady_clock::now();
+            RunStatistics& run = runtime.run;
+            run.frameIndex = frameIndex;
+            run.recordMilliseconds = std::chrono::duration<float, std::milli>(submitStart - recordStart).count();
+            run.submitMilliseconds = std::chrono::duration<float, std::milli>(submitEnd - submitStart).count();
+            run.passes = frame.passes;
+            run.segments = segmentCount;
+            run.barriers = frame.barriers + uint32_t(runtime.patches.size());
+            run.stateCalls = frame.stateCalls + (plan.m_Profile.explicitBarriers ? 0u : 2u * uint32_t(runtime.patches.size()));
+            run.planSwitched = switched;
+            if (frame.timers && frame.timers->used)
+                frame.timers->pending = true;
+
             runtime.lastPlan = &plan;
             runtime.lastFrameIndex = frameIndex;
             ++runtime.framesExecuted;

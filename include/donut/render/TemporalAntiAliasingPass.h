@@ -25,7 +25,10 @@
 #include <nvrhi/core/foundation.h>
 #include <nvrhi/core/autoptr.h>
 #include <donut/core/math/math.h>
+#include <donut/engine/BindingCache.h>
+#include <donut/render/RenderGraph.h>
 #include <nvrhi/nvrhi.h>
+#include <string>
 
 namespace donut::engine
 {
@@ -34,6 +37,7 @@ namespace donut::engine
     class CommonRenderPasses;
     class FramebufferFactory;
     class ICompositeView;
+    class IView;
 }
 
 namespace donut::render
@@ -59,10 +63,36 @@ namespace donut::render
         bool useHistoryClampRelax = false;
     };
 
-    class TemporalAntiAliasingPass: public nvrhi::ObjectImpl<nvrhi::IObject>
+    // The pass in a render graph (design 13.3). With `viewPrevious` and `depth`, one raster use per planar child
+    // view of `view` writes that view's motion vectors; then one compute use resolves `unresolvedColor` into
+    // `resolvedColor`. The feedback is a two-layer history of this pass object (GetHistoryPair), and a new
+    // previous layer resolves without history. The views must stay valid until the graph has executed.
+    struct TemporalAntiAliasingGraphInputs
+    {
+        const engine::ICompositeView* view = nullptr;           // the input (render) resolution
+        const engine::ICompositeView* viewPrevious = nullptr;   // for motion vectors
+        const engine::ICompositeView* viewOutput = nullptr;     // the output resolution; nullptr: view
+        ResourceId depth = InvalidResourceId;
+        ResourceId motionVectors = InvalidResourceId;
+        ResourceId unresolvedColor = InvalidResourceId;
+        ResourceId resolvedColor = InvalidResourceId;
+        ResourceId historyClampRelax = InvalidResourceId;
+        nvrhi::Format feedbackFormat = nvrhi::Format::RGBA16_FLOAT;
+        TemporalAntiAliasingParameters params;
+        dm::float3 preViewTranslationDifference = 0.f;
+    };
+
+    struct TemporalAntiAliasingGraphOutputs
+    {
+        ResourceId motionVectors = InvalidResourceId;
+        ResourceId resolvedColor = InvalidResourceId;
+    };
+
+    class TemporalAntiAliasingPass: public nvrhi::ObjectImpl<IGpuPass>
     {
     public:
         NVRHI_BEGIN_INTERFACE_TABLE_INLINE(TemporalAntiAliasingPass)
+        NVRHI_IMPLEMENTS_INTERFACE(IGpuPass)
         NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IObject)
         NVRHI_END_INTERFACE_TABLE()
 
@@ -115,6 +145,13 @@ namespace donut::render
             const engine::ICompositeView& compositeView,
             const CreateParameters& params);
 
+        // For a render graph: the textures of `params` are ignored; Prepare creates the shaders and pipelines.
+        TemporalAntiAliasingPass(
+            nvrhi::IDevice* device,
+            engine::ShaderFactory* shaderFactory,
+            engine::CommonRenderPasses* commonPasses,
+            const CreateParameters& params);
+
         void RenderMotionVectors(
             nvrhi::ICommandList* commandList,
             const engine::ICompositeView& compositeView,
@@ -131,5 +168,31 @@ namespace donut::render
         void AdvanceFrame();
         void SetJitter(TemporalAntiAliasingJitter jitter);
         dm::float2 GetCurrentPixelOffset();
+
+        TemporalAntiAliasingGraphOutputs AddToGraph(IRenderGraph* graph, const TemporalAntiAliasingGraphInputs& inputs);
+
+        nvrhi::FRESULT Setup(ISetupContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Prepare(IPrepareContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Execute(IPassContext* context, const void* data) noexcept override;
+        void OnResourcesReleased() noexcept override;
+
+    private:
+        void DrawMotionVectors(nvrhi::ICommandList* commandList, const engine::IView& view, const engine::IView& viewPrevious,
+                               nvrhi::IFramebuffer* framebuffer, nvrhi::IGraphicsPipeline* pipeline,
+                               nvrhi::IBindingSet* bindingSet, dm::float3 preViewTranslationDifference);
+        void ResolveViews(nvrhi::ICommandList* commandList, const TemporalAntiAliasingParameters& params, bool feedbackIsValid,
+                          const engine::ICompositeView& compositeViewInput, const engine::ICompositeView& compositeViewOutput,
+                          nvrhi::IBindingSet* bindingSet, dm::float2 resolvedColorSize, bool hasHistoryClampRelax);
+
+        // Graph construction: shader variants follow the graph's textures.
+        nvrhi::DeviceHandle m_Device;
+        nvrhi::AutoPtr<engine::ShaderFactory> m_ShaderFactory;
+        bool m_UseCatmullRomFilter = true;
+        uint32_t m_NumConstantBufferVersions = 16;
+        uint32_t m_GraphSampleCount = 0;
+        int m_GraphUseStencil = -1;
+        nvrhi::GraphicsPipelineHandle m_GraphMotionVectorsPso;
+        engine::BindingCache m_GraphBindings;
+        std::string m_FeedbackName;
     };
 }

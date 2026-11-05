@@ -370,7 +370,7 @@ namespace donut::render
     struct ICompiledRenderGraph : nvrhi::IObject
     {
         NVRHI_DECLARE_UUID_TRAITS(ICompiledRenderGraph)
-        virtual uint64_t GetPlanHash() noexcept = 0;            // structural hash of the graph it was compiled from
+        virtual uint64_t GetPlanHash() noexcept = 0;            // the cache key: structural hash, profile and options
         virtual uint64_t GetPlanEnableMaskHash() noexcept = 0;
         virtual uint32_t GetScheduledPassCount() noexcept = 0;
         // FE_INVALID_ARGS for an index at or above GetScheduledPassCount.
@@ -400,6 +400,28 @@ namespace donut::render
         uint64_t objectsCreated = 0;      // every create* call the registry and the executor made (10.3: 0 per steady frame)
     };
 
+    // The CPU side of the last Execute (11.3).
+    struct RunStatistics
+    {
+        uint64_t frameIndex = 0;          // the graph's frame index (IRenderGraph::GetFrameIndex)
+        float recordMilliseconds = 0.f;   // patches, Prepare and command recording
+        float submitMilliseconds = 0.f;
+        uint32_t passes = 0;              // passes recorded
+        uint32_t segments = 0;
+        uint32_t barriers = 0;            // barriers recorded, patches included
+        uint32_t stateCalls = 0;          // tracker calls: host-kept resources, Tracked and Restore passes, the fallback
+        bool planSwitched = false;        // 6.12
+    };
+
+    // The GPU time of one pass of a frame that has completed (11.3), measured when ExecuteDesc::timers was set.
+    // Passes on the copy queue are not timed.
+    struct PassTiming
+    {
+        const char* name = nullptr;       // valid until the next Execute
+        uint64_t frameIndex = 0;          // the graph frame it was measured in
+        float gpuMilliseconds = 0.f;
+    };
+
     // What survives between frames: persistent resources and their cross-frame states, the plan cache, transient
     // heaps and pools, framebuffer and binding caches, per-queue fences and retirement.
     NVRHI_IID(IResourceRegistry, "639705d2-183f-43ee-8c37-1b10c11af515")
@@ -414,6 +436,11 @@ namespace donut::render
         virtual nvrhi::FRESULT ReleasePersistent(const char* name) noexcept = 0;
         virtual void ClearPlanCache() noexcept = 0;
         virtual void GetRegistryStatistics(RegistryStatistics& out) noexcept = 0;
+        virtual void GetRunStatistics(RunStatistics& out) noexcept = 0;
+        // The timings of the most recent timed frame whose queries have completed, in schedule order; none until
+        // a frame executes with ExecuteDesc::timers. FE_INVALID_ARGS for an index at or above GetPassTimingCount.
+        virtual uint32_t GetPassTimingCount() noexcept = 0;
+        virtual nvrhi::FRESULT GetPassTiming(uint32_t index, PassTiming& out) noexcept = 0;
     };
 
     // --------------------------------------------------------------------------------- pass interfaces
@@ -437,8 +464,9 @@ namespace donut::render
                                  const nvrhi::SubresourceRegion& region, AccessFlags flags) noexcept = 0;
         virtual ResourceId SetColorTarget(uint32_t slot, ResourceId texture, const nvrhi::SubresourceRegion& region,
                                           AccessFlags flags, _In_opt_ const ClearValue* clear) noexcept = 0;
-        virtual ResourceId SetDepthTarget(ResourceId texture, bool readOnly, AccessFlags flags,
-                                          _In_opt_ const ClearValue* clear) noexcept = 0;
+        // `region` selects the mip and slices, as for a colour target: one shadow-map cascade or cube face (13.3).
+        virtual ResourceId SetDepthTarget(ResourceId texture, const nvrhi::SubresourceRegion& region, bool readOnly,
+                                          AccessFlags flags, _In_opt_ const ClearValue* clear) noexcept = 0;
         // What consumers of `written` see when this pass is disabled (13.5).
         virtual void SetDisabledOutput(ResourceId written, DisabledOutput policy, ResourceId substituteOrInput) noexcept = 0;
     };
@@ -545,6 +573,10 @@ namespace donut::render
         virtual uint32_t GetPassCount() noexcept = 0;
         virtual uint32_t GetResourceCount() noexcept = 0;
         virtual uint64_t GetFrameIndex() noexcept = 0;     // frames started with Reset since the graph was created
+        // The description a texture or buffer of this frame was declared or imported with, for passes that size
+        // their transients from their inputs (13.2). FE_INVALID_ARGS for an invalid id or one of the other kind.
+        virtual nvrhi::FRESULT GetTextureDesc(ResourceId texture, nvrhi::TextureDesc& out) noexcept = 0;
+        virtual nvrhi::FRESULT GetBufferDesc(ResourceId buffer, nvrhi::BufferDesc& out) noexcept = 0;
         // The validation errors and warnings of the last Compile, one per line (empty when there were none).
         virtual void GetDiagnostics(nvrhi::string& out) noexcept = 0;
     };

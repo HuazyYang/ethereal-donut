@@ -122,6 +122,14 @@ namespace donut::render::rdg
             nvrhi::ResourceStates state;
         };
         std::vector<EntryUnit> entryUnits;  // frame-start state of every unit the plan touches
+        struct TrackedUnit
+        {
+            uint32_t sched;
+            uint32_t resource;
+            UnitKey unit;
+            nvrhi::ResourceStates state;
+        };
+        std::vector<TrackedUnit> trackedUnits;   // per Tracked or Restore pass: the states its body finds (9.1)
         uint32_t transitionCount = 0;
         uint32_t transferCount = 0;
 

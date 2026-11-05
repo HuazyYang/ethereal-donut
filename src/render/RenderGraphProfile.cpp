@@ -42,6 +42,16 @@ namespace donut::render::rdg
         }
     }
 
+    ResourceStates LowerAccess(Access access, nvrhi::ShaderType stages, bool depthStencilTexture,
+                               const BackendProfile& profile) noexcept
+    {
+        ResourceStates state = LowerAccess(access, stages);
+        if (depthStencilTexture && profile.barrierModel == BarrierModel::Vulkan &&
+            (state & ResourceStates::ShaderResource) != 0)
+            state = state | ResourceStates::DepthRead;
+        return state;
+    }
+
     ResourceStates LowerAccess(Access access, nvrhi::ShaderType stages) noexcept
     {
         ResourceStates state = ResourceStates::Unknown;
@@ -99,7 +109,12 @@ namespace donut::render::rdg
             return true;
         switch (queue)
         {
-        case nvrhi::CommandQueue::Compute: return (state & c_ComputeQueueIllegal) == 0;
+        case nvrhi::CommandQueue::Compute:
+            // A sampled depth texture on Vulkan (ShaderResource | DepthRead, see LowerAccess): nvrhi keeps its layout
+            // and drops the fragment-test stages on a compute queue.
+            if (profile.barrierModel == BarrierModel::Vulkan && (state & ResourceStates::ShaderResource) != 0)
+                state = state & ~ResourceStates::DepthRead;
+            return (state & c_ComputeQueueIllegal) == 0;
         case nvrhi::CommandQueue::Copy:    return (state & ~c_CopyQueueLegal) == 0;
         default:                           return true;
         }

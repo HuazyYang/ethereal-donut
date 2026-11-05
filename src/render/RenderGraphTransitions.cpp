@@ -803,12 +803,6 @@ namespace donut::render::rdg
             return (state & writes) != 0;
         }
 
-        static bool IsLegacyDiscardable(ResourceStates state) noexcept
-        {
-            return state == ResourceStates::RenderTarget || state == ResourceStates::DepthWrite ||
-                state == ResourceStates::UnorderedAccess;
-        }
-
         ResourceStates TransitionBuilder::Walk(const Object& object, const UnitKey& unit, const std::vector<Step>& steps,
                                                const std::vector<Item>& items, Prev prev, bool hasPredecessor)
         {
@@ -822,6 +816,16 @@ namespace donut::render::rdg
 
             for (const Item& item : items)
             {
+                if (!implicit)
+                {
+                    for (uint32_t k = item.begin; k < item.end; ++k)
+                    {
+                        const Step& step = steps[k];
+                        const PassFlags flags = graph.GetPass(m_State.schedule[step.sched]).flags;
+                        if (!step.clearSubStep && (flags & (PassFlags::Tracked | PassFlags::Restore)) != PassFlags::None)
+                            m_State.trackedUnits.push_back(CompileState::TrackedUnit{ step.sched, step.resource, unit, item.state });
+                    }
+                }
                 const Step& first = steps[item.begin];
                 const ResourceRecord& occupant = graph.GetResource(first.resource);
                 const bool discard = object.transientLike && first.firstOfOccupant;
@@ -856,7 +860,8 @@ namespace donut::render::rdg
                 else
                     reason = prev.isWrite || prev.entry ? BarrierReason::RAW : BarrierReason::ReadGroupChange;
 
-                bool discardFlag = discard && (m_Profile.barrierModel != BarrierModel::D3D12Legacy || IsLegacyDiscardable(item.state));
+                bool discardFlag = discard && (m_Profile.barrierModel != BarrierModel::D3D12Legacy ||
+                    LegacyDiscardable(item.state, occupant.isBuffer, occupant.hasDepth, !occupant.isBuffer && occupant.texture.isRenderTarget));
                 const CommandQueue owner = prev.accesses.empty() ? first.queue : OwnerQueue(prev);
                 const bool transfer = m_Profile.queueOwnershipTransfer && !discard && !prev.entry &&
                     !prev.accesses.empty() && owner != first.queue;

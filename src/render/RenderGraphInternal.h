@@ -317,6 +317,11 @@ namespace donut::render::rdg
     // The lowering of accesses to nvrhi states (6.1) and the lattice of 6.3. RenderGraphProfile.cpp.
     nvrhi::ShaderType DefaultStages(PassType type) noexcept;
     nvrhi::ResourceStates LowerAccess(Access access, nvrhi::ShaderType stages) noexcept;
+    // The state of one access of one resource (6.1). On Vulkan, nvrhi samples a depth or stencil texture in
+    // eDepthStencilReadOnlyOptimal, ShaderResource | DepthRead, and its descriptors declare that layout: a shader read
+    // of such a texture lowers to that pair.
+    nvrhi::ResourceStates LowerAccess(Access access, nvrhi::ShaderType stages, bool depthStencilTexture,
+                                      const BackendProfile& profile) noexcept;
     bool IsStateLegalOnQueue(nvrhi::ResourceStates state, nvrhi::CommandQueue queue, const BackendProfile& profile) noexcept;
 
     struct CombineResult
@@ -361,6 +366,7 @@ namespace donut::render::rdg
         uint32_t nameOffset;              // into CompiledRenderGraph::m_Names
         nvrhi::CommandQueue queue;
         PassType type;
+        PassFlags flags;                  // as declared: Tracked, Restore, AsyncCompute (11.3 dumps)
         bool enabled;
         uint32_t segment;
         uint32_t batchBegin[c_SlotCount];
@@ -369,6 +375,8 @@ namespace donut::render::rdg
         uint32_t waitCount;
         uint32_t useBegin;
         uint32_t useCount;
+        uint32_t trackedBegin;            // into CompiledRenderGraph::m_TrackedStates: Tracked and Restore passes
+        uint32_t trackedCount;
         uint32_t clearMask;               // attachments recorded with a Clear access
         LoadOp load[9];
         StoreOp store[9];
@@ -439,6 +447,15 @@ namespace donut::render::rdg
     // The state a region of a physical resource is in at frame start, by the plan's cyclic model (6.12): the state its
     // previous frame left it in. `resource` names the physical resource through its first occupant (or the history
     // layer). The registry compares these with the states it tracks and patches the difference on a plan switch.
+    // The state a Tracked or Restore pass's body finds a range in (9.1): the state of the read group or write the
+    // pass takes part in, which a merged read group widens beyond the pass's own access.
+    struct PlanTrackedState
+    {
+        uint32_t resource;
+        nvrhi::SubresourceRegion region;
+        nvrhi::ResourceStates state;
+    };
+
     struct PlanEntryState
     {
         uint32_t resource;
@@ -533,6 +550,7 @@ namespace donut::render::rdg
         std::vector<PlanResource> m_Resources;
         std::vector<uint32_t> m_ScheduleOfProgram;   // per program pass: schedule index or c_None
         std::vector<PlanEntryState> m_EntryStates;
+        std::vector<PlanTrackedState> m_TrackedStates;   // per scheduled pass, PlanPass::trackedBegin
         std::vector<char> m_Names;
         PlanStatistics m_Statistics;
 
@@ -601,11 +619,93 @@ namespace donut::render::rdg
         std::vector<nvrhi::AutoPtr<IPassContext>> passContexts;      // one per segment
         uint64_t objectsCreated = 0;
         uint64_t framesExecuted = 0;
+
+        // 11.3: the last Execute's statistics, and per-pass timers in a ring of frames, read back when they complete.
+        RunStatistics run;
+        struct TimerSet
+        {
+            std::vector<nvrhi::AutoPtr<nvrhi::ITimerQuery>> queries;
+            std::vector<std::string> names;
+            uint32_t used = 0;
+            uint64_t frameIndex = 0;
+            bool pending = false;
+        };
+        std::array<TimerSet, 4> timerSets;
+        bool timersSupported = true;
+        std::vector<std::string> timingNames;
+        std::vector<PassTiming> timings;
         uint64_t lastFrameIndex = 0;                                 // the graph frame index of the last Execute
     };
 
     // Runs a plan that Compile returned for the graph's current frame (9.1). RenderGraphExecutor.cpp.
+    // The descriptions a record holds, for the executor's create calls and IRenderGraph::GetTextureDesc. The
+    // initial state is the backend's (D3D12 COMMON, Vulkan UNDEFINED); the first frame's patch moves it.
+    inline nvrhi::TextureDesc MakeTextureDesc(const ResourceRecord& record, bool withName = true)
+    {
+        const TextureInfo& info = record.texture;
+        nvrhi::TextureDesc desc;
+        desc.width = info.width;
+        desc.height = info.height;
+        desc.depth = info.depth;
+        desc.arraySize = info.arraySize;
+        desc.mipLevels = info.mipLevels;
+        desc.sampleCount = info.sampleCount;
+        desc.sampleQuality = info.sampleQuality;
+        desc.format = info.format;
+        desc.dimension = info.dimension;
+        desc.isShaderResource = info.isShaderResource;
+        desc.isRenderTarget = info.isRenderTarget;
+        desc.isUAV = info.isUAV;
+        desc.isTypeless = info.isTypeless;
+        desc.isShadingRateSurface = info.isShadingRateSurface;
+        desc.useClearValue = info.useClearValue;
+        desc.clearValue = info.clearValue;
+        desc.sharedResourceFlags = info.sharedResourceFlags;
+        // Created in the backend's initial state (D3D12 COMMON, Vulkan UNDEFINED); the first frame's patch moves it.
+        desc.initialState = nvrhi::ResourceStates::Unknown;
+        desc.keepInitialState = false;
+        if (withName && record.name)
+            desc.debugName = record.name;
+        return desc;
+    }
+
+    inline nvrhi::BufferDesc MakeBufferDesc(const ResourceRecord& record, bool withName = true)
+    {
+        const BufferInfo& info = record.buffer;
+        nvrhi::BufferDesc desc;
+        desc.byteSize = info.byteSize;
+        desc.structStride = info.structStride;
+        desc.format = info.format;
+        desc.canHaveUAVs = info.canHaveUAVs;
+        desc.canHaveTypedViews = info.canHaveTypedViews;
+        desc.canHaveRawViews = info.canHaveRawViews;
+        desc.isVertexBuffer = info.isVertexBuffer;
+        desc.isIndexBuffer = info.isIndexBuffer;
+        desc.isConstantBuffer = info.isConstantBuffer;
+        desc.isDrawIndirectArgs = info.isDrawIndirectArgs;
+        desc.isAccelStructBuildInput = info.isAccelStructBuildInput;
+        desc.isAccelStructStorage = info.isAccelStructStorage;
+        desc.isShaderBindingTable = info.isShaderBindingTable;
+        desc.cpuAccess = info.cpuAccess;
+        desc.initialState = nvrhi::ResourceStates::Unknown;
+        desc.keepInitialState = false;
+        if (withName && record.name)
+            desc.debugName = record.name;
+        return desc;
+    }
+
     nvrhi::FRESULT ExecutePlan(RenderGraph& graph, CompiledRenderGraph& plan, const ExecuteDesc& desc) noexcept;
+
+    // D3D12 legacy DiscardResource (6.6): a depth texture is discarded in DEPTH_WRITE, another render-target texture
+    // in RENDER_TARGET, any other texture or a buffer in UNORDERED_ACCESS. The debug layer rejects the other states.
+    inline bool LegacyDiscardable(nvrhi::ResourceStates state, bool isBuffer, bool hasDepth, bool isRenderTarget) noexcept
+    {
+        if (!isBuffer && hasDepth)
+            return state == nvrhi::ResourceStates::DepthWrite;
+        if (!isBuffer && isRenderTarget)
+            return state == nvrhi::ResourceStates::RenderTarget;
+        return state == nvrhi::ResourceStates::UnorderedAccess;
+    }
     // Makes the last executed plan's cyclic states exact (6.12) and forgets the plan; before ReleaseResources drops it.
     void FinalizeLastPlan(ResourceRegistry& registry) noexcept;
 
@@ -653,6 +753,9 @@ namespace donut::render::rdg
         nvrhi::FRESULT ReleasePersistent(const char* name) noexcept override;
         void ClearPlanCache() noexcept override;
         void GetRegistryStatistics(RegistryStatistics& out) noexcept override;
+        void GetRunStatistics(RunStatistics& out) noexcept override;
+        uint32_t GetPassTimingCount() noexcept override;
+        nvrhi::FRESULT GetPassTiming(uint32_t index, PassTiming& out) noexcept override;
 
         // Persistent records: the entry for `name`, created or reallocated when the description changes.
         uint32_t AcquirePersistent(const char* name, uint8_t kind, uint64_t descHash, uint8_t layerCount,
@@ -673,7 +776,7 @@ namespace donut::render::rdg
         std::shared_ptr<const StructurePlan> FindStructure(uint64_t key) const noexcept;
         void CountMiss() noexcept { ++m_PlanMisses; }
 
-        bool m_HasGraph = false;
+        RenderGraph* m_Graph = nullptr;   // the one graph (12): not AddRef'd, it holds this registry
 
     private:
         nvrhi::IDevice* m_Device;
@@ -723,6 +826,8 @@ namespace donut::render::rdg
         uint32_t GetPassCount() noexcept override { return m_Passes.size; }
         uint32_t GetResourceCount() noexcept override { return m_Resources.size; }
         uint64_t GetFrameIndex() noexcept override { return m_FrameIndex; }
+        nvrhi::FRESULT GetTextureDesc(ResourceId texture, nvrhi::TextureDesc& out) noexcept override;
+        nvrhi::FRESULT GetBufferDesc(ResourceId buffer, nvrhi::BufferDesc& out) noexcept override;
         void GetDiagnostics(nvrhi::string& out) noexcept override;
 
         // ISetupContext
@@ -731,7 +836,8 @@ namespace donut::render::rdg
         void Read(ResourceId resource, Access access, nvrhi::ShaderType stages, const nvrhi::SubresourceRegion& region) noexcept override;
         ResourceId Write(ResourceId resource, Access access, nvrhi::ShaderType stages, const nvrhi::SubresourceRegion& region, AccessFlags flags) noexcept override;
         ResourceId SetColorTarget(uint32_t slot, ResourceId texture, const nvrhi::SubresourceRegion& region, AccessFlags flags, const ClearValue* clear) noexcept override;
-        ResourceId SetDepthTarget(ResourceId texture, bool readOnly, AccessFlags flags, const ClearValue* clear) noexcept override;
+        ResourceId SetDepthTarget(ResourceId texture, const nvrhi::SubresourceRegion& region, bool readOnly, AccessFlags flags,
+                                  const ClearValue* clear) noexcept override;
         void SetDisabledOutput(ResourceId written, DisabledOutput policy, ResourceId substituteOrInput) noexcept override;
 
         // For the compiler and the verifier.

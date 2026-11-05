@@ -25,6 +25,8 @@
 #include <donut/core/math/math.h>
 #include <map>
 #include <nvrhi/nvrhi.h>
+#include <nvrhi/core/foundation.h>
+#include <donut/render/RenderGraph.h>
 
 
 namespace donut::engine
@@ -37,8 +39,22 @@ namespace donut::engine
 
 namespace donut::render
 {
-    class PixelReadbackPass
+    class PixelReadbackPass : public nvrhi::ObjectImpl<IGpuPass>
     {
+    public:
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(PixelReadbackPass)
+        NVRHI_IMPLEMENTS_INTERFACE(IGpuPass)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IObject)
+        NVRHI_END_INTERFACE_TABLE()
+
+        // Not in a render graph yet (design 13.3): AddPass fails with a diagnostic naming the pass, and the caller
+        // runs the pass outside the graph and imports its results.
+        nvrhi::FRESULT Setup(ISetupContext*, void*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
+        nvrhi::FRESULT Prepare(IPrepareContext*, void*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
+        nvrhi::FRESULT Execute(IPassContext*, const void*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
+        void OnResourcesReleased() noexcept override { }
+
+    private:
     private:
         nvrhi::DeviceHandle m_Device;
         nvrhi::ShaderHandle m_Shader;

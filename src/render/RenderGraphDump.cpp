@@ -223,6 +223,45 @@ namespace donut::render::rdg
         return out + "\"";
     }
 
+    static const char* PassTypeName(PassType type)
+    {
+        switch (type)
+        {
+        case PassType::Raster: return "raster";
+        case PassType::Compute: return "compute";
+        case PassType::Copy: return "copy";
+        case PassType::RayTracing: return "rayTracing";
+        }
+        return "?";
+    }
+
+    // One declared use: "<resource> <access>", then the stages, flags, region and attachment that differ from the
+    // defaults. The golden access lists of donut's passes compare these (plan step P1.5).
+    static std::string DescribeUse(const CompiledRenderGraph& plan, const PlanUse& use)
+    {
+        std::string text = ResourceLabel(plan, use.resource) + " " + AccessToString(use.access);
+        if (use.stages != nvrhi::ShaderType::None)
+        {
+            char stages[16];
+            std::snprintf(stages, sizeof(stages), "0x%04x", uint32_t(use.stages));
+            text += std::string(" stages=") + stages;
+        }
+        const struct { AccessFlags flag; const char* name; } flags[] = {
+            { AccessFlags::Clear, "Clear" }, { AccessFlags::FullWrite, "FullWrite" },
+            { AccessFlags::RelaxedOrder, "RelaxedOrder" }, { AccessFlags::Preserve, "Preserve" } };
+        for (const auto& flag : flags)
+        {
+            if ((use.flags & flag.flag) != AccessFlags::None)
+                text += std::string(" ") + flag.name;
+        }
+        const nvrhi::SubresourceRegion& region = use.region;
+        text += " mips=" + std::to_string(region.baseMip) + "+" + std::to_string(region.mipCount) +
+            " slices=" + std::to_string(region.baseSlice) + "+" + std::to_string(region.sliceCount);
+        if (use.attachment != c_NoAttachment)
+            text += use.attachment == c_DepthAttachment ? " depthTarget" : " colorTarget" + std::to_string(use.attachment);
+        return text;
+    }
+
     static void WriteJson(const CompiledRenderGraph& plan, std::string& out)
     {
         static const char* const c_SlotNames[c_SlotCount] = { "prologue", "postClear", "epilogue" };
@@ -234,9 +273,19 @@ namespace donut::render::rdg
         {
             const PlanPass& pass = plan.m_Passes[s];
             out += "    { \"index\": " + std::to_string(s) + ", \"pass\": " + std::to_string(pass.program) +
-                ", \"name\": " + JsonString(plan.GetName(pass.nameOffset)) + ", \"queue\": \"" + QueueName(pass.queue) +
+                ", \"name\": " + JsonString(plan.GetName(pass.nameOffset)) + ", \"type\": \"" + PassTypeName(pass.type) +
+                "\", \"queue\": \"" + QueueName(pass.queue) +
                 "\", \"segment\": " + (pass.segment == c_None ? std::string("null") : std::to_string(pass.segment)) +
                 ", \"enabled\": " + (pass.enabled ? "true" : "false");
+            const PassFlags modes = pass.flags & (PassFlags::Tracked | PassFlags::Restore | PassFlags::AsyncCompute);
+            out += std::string(", \"mode\": \"") +
+                ((pass.flags & PassFlags::Restore) != PassFlags::None ? "restore" :
+                 (pass.flags & PassFlags::Tracked) != PassFlags::None ? "tracked" : "native") +
+                ((modes & PassFlags::AsyncCompute) != PassFlags::None ? "+async" : "") + "\"";
+            out += ", \"uses\": [";
+            for (uint32_t u = 0; u < pass.useCount; ++u)
+                out += (u ? ", " : "") + JsonString(DescribeUse(plan, plan.m_Uses[pass.useBegin + u]));
+            out += "]";
             for (uint32_t slot = 0; slot < c_SlotCount; ++slot)
             {
                 out += std::string(", \"") + c_SlotNames[slot] + "\": [";

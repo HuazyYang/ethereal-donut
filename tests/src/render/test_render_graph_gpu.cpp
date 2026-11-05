@@ -30,6 +30,9 @@
 // on the device without the nvrhi validation layer and counts heap allocations against a hand-written baseline.
 
 #include "rdg_corpus.h"
+#include "rdg_donut_frame.h"
+
+#include <donut/core/vfs/VFS.h>
 
 #include <nvrhi/nvrhi.h>
 #include <nvrhi/factory.h>
@@ -62,6 +65,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <new>
 #include <stdexcept>
@@ -243,6 +247,7 @@ namespace
 
         uint64_t compileAllocations = 0;   // in the last Run, while the allocation hook counts
         uint64_t executeAllocations = 0;
+        bool timers = false;               // ExecuteDesc::timers
 
         // Compiles and executes the recorded frame; returns the plan's statistics.
         PlanStatistics Run(const CompileOptions& options = CompileOptions())
@@ -257,7 +262,9 @@ namespace
                 graph->GetDiagnostics(diagnostics);
                 throw std::runtime_error(std::string("compile failed:\n") + diagnostics.c_str());
             }
-            const nvrhi::FRESULT executed = graph->Execute(plan, ExecuteDesc());
+            ExecuteDesc execute;
+            execute.timers = timers;
+            const nvrhi::FRESULT executed = graph->Execute(plan, execute);
             compileAllocations = afterCompile - start;
             executeAllocations = g_Allocations - afterCompile;
             // The host's once-per-frame collection; the steady-state test collects outside its measurement.
@@ -756,7 +763,7 @@ namespace
             AddPass(g.graph, "ClearTargets", PassType::Raster, PassFlags::None,
                 [&](ISetupContext* s) {
                     color = s->SetColorTarget(0, color, nvrhi::SubresourceRegion(), AccessFlags::Clear, &clear);
-                    depth = s->SetDepthTarget(depth, false, AccessFlags::Clear, &clear);
+                    depth = s->SetDepthTarget(depth, {}, false, AccessFlags::Clear, &clear);
                 },
                 [&framebuffer](IPassContext* context) { framebuffer = context->GetFramebuffer() != nullptr; });
             AddPass(g.graph, "Resolve", PassType::Copy, PassFlags::None,
@@ -993,6 +1000,86 @@ namespace
         check(env.messages->expectedErrorsSeen > 0, "synchronization validation reports a hazard (it is loaded)");
     }
 
+    // ------------------------------------------------------------------------------------------ donut's passes
+
+    std::filesystem::path ExecutableDirectory()
+    {
+#ifdef _WIN32
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        return std::filesystem::path(path).parent_path();
+#else
+        return std::filesystem::current_path();
+#endif
+    }
+
+    // Design 13.3, plan step P1.5: one frame of every graph-capable donut pass, executed for several frames under the
+    // validation layers. The scene is empty, so the geometry passes only clear; every other pass runs in full.
+    void testDonutPasses(Env& env)
+    {
+        const char* shaderType = env.api == nvrhi::GraphicsAPI::D3D11 ? "dxbc" : env.api == nvrhi::GraphicsAPI::D3D12 ? "dxil" : "spirv";
+        const std::filesystem::path shaderPath = ExecutableDirectory() / "shaders/framework" / shaderType;
+        check(std::filesystem::exists(shaderPath / "passes"), "donut's shaders are in " + shaderPath.string());
+        nvrhi::AutoPtr<donut::vfs::RootFileSystem> rootFS = MAKE_RC_OBJ_PTR(donut::vfs::RootFileSystem);
+        rootFS->mount("/shaders/donut", shaderPath);
+        nvrhi::AutoPtr<donut::engine::ShaderFactory> shaderFactory = MAKE_RC_OBJ_PTR(donut::engine::ShaderFactory, env.device, rootFS, "/shaders");
+        nvrhi::AutoPtr<donut::engine::CommonRenderPasses> commonPasses = MAKE_RC_OBJ_PTR(donut::engine::CommonRenderPasses, env.device, shaderFactory);
+
+        rdgtest::DonutScene scene;
+        rdgtest::DonutPasses passes;
+        passes.Create(env.device, shaderFactory, commonPasses);
+
+        nvrhi::AutoPtr<nvrhi::ITexture> shadowMap, environmentMap, mipChain, backBuffer;
+        env.device->createTexture(rdgtest::ShadowMapDesc(), shadowMap.ReleaseAndGetAddressOf());
+        env.device->createTexture(rdgtest::EnvironmentMapDesc(), environmentMap.ReleaseAndGetAddressOf());
+        env.device->createTexture(rdgtest::MipChainDesc(), mipChain.ReleaseAndGetAddressOf());
+        env.device->createTexture(rdgtest::BackBufferDesc(scene), backBuffer.ReleaseAndGetAddressOf());
+        check(shadowMap && environmentMap && mipChain && backBuffer, "the frame's imports");
+        InitialState(env, shadowMap, ResourceStates::ShaderResource);
+        InitialState(env, environmentMap, ResourceStates::ShaderResource);
+        InitialState(env, mipChain, ResourceStates::ShaderResource);
+        InitialState(env, backBuffer, ResourceStates::RenderTarget);
+
+        GraphOnDevice g(env.device);
+        g.timers = true;
+        for (uint32_t frame = 0; frame < 6; ++frame)
+        {
+            g.graph->Reset();
+            rdgtest::DonutImports imports;
+            imports.shadowMap = g.graph->ImportTexture(shadowMap, ResourceStates::ShaderResource, ResourceStates::ShaderResource);
+            imports.environmentMap = g.graph->ImportTexture(environmentMap, ResourceStates::ShaderResource, ResourceStates::ShaderResource);
+            imports.mipChain = g.graph->ImportTexture(mipChain, ResourceStates::ShaderResource, ResourceStates::ShaderResource);
+            imports.backBuffer = g.graph->ImportTexture(backBuffer, ResourceStates::RenderTarget, ResourceStates::RenderTarget);
+            rdgtest::RecordDonutFrame(g.graph, passes, scene, imports);
+            const PlanStatistics stats = g.Run();
+            if (frame == 0)
+                std::printf("  donut frame: %u passes, %u barriers, %u segments\n", stats.scheduledPasses, stats.barriers, stats.segments);
+            env.device->waitForIdle();
+            check(env.messages->errors == 0 && env.nativeErrors() == 0,
+                  "donut's passes, frame " + std::to_string(frame) + ": no NVRHI or debug-layer errors");
+        }
+
+        // 11.3: run statistics of the last frame, and the per-pass timers of a completed one.
+        RunStatistics run;
+        g.registry->GetRunStatistics(run);
+        check(run.passes == 22 && run.segments >= 1 && run.frameIndex == g.graph->GetFrameIndex(),
+              "run statistics: " + std::to_string(run.passes) + " passes, " + std::to_string(run.barriers) + " barriers, " +
+              std::to_string(run.stateCalls) + " state calls, record " + std::to_string(run.recordMilliseconds) + " ms");
+        const uint32_t timings = g.registry->GetPassTimingCount();
+        bool lighting = false;
+        float total = 0.f;
+        for (uint32_t i = 0; i < timings; ++i)
+        {
+            PassTiming timing;
+            g.registry->GetPassTiming(i, timing);
+            lighting = lighting || std::strcmp(timing.name, "DeferredLighting") == 0;
+            total += timing.gpuMilliseconds;
+        }
+        check(timings == 22 && lighting && total >= 0.f, "per-pass timers: " + std::to_string(timings) + " passes, " +
+              std::to_string(total) + " ms in all");
+        checkClean(env, "donut's passes");
+    }
+
     void runAll(Env& env)
     {
         if (env.api == nvrhi::GraphicsAPI::VULKAN)
@@ -1013,6 +1100,8 @@ namespace
             testTrackerFallback(env);
         if (env.explicitScopes)
             testNativeGuard(env);
+        if (env.raster)
+            testDonutPasses(env);
         checkClean(env, "all graphs");
         testSteadyState(env);
     }

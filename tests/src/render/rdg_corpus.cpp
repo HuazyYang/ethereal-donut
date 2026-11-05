@@ -187,10 +187,10 @@ namespace rdgtest
         ResourceId back = b.BackBuffer("BackBuffer", w, h);
 
         b.Pass("DepthPrepass", PassType::Raster, PassFlags::None, [&](ISetupContext* c) {
-            depth = c->SetDepthTarget(depth, false, AccessFlags::None, &c_Clear);
+            depth = c->SetDepthTarget(depth, {}, false, AccessFlags::None, &c_Clear);
         });
         b.Pass("GBuffer", PassType::Raster, PassFlags::None, [&](ISetupContext* c) {
-            c->SetDepthTarget(depth, true, AccessFlags::None, nullptr);
+            c->SetDepthTarget(depth, {}, true, AccessFlags::None, nullptr);
             gb0 = c->SetColorTarget(0, gb0, {}, AccessFlags::None, &c_Clear);
             gb1 = c->SetColorTarget(1, gb1, {}, AccessFlags::None, &c_Clear);
             normals = c->SetColorTarget(2, normals, {}, AccessFlags::None, &c_Clear);
@@ -203,7 +203,7 @@ namespace rdgtest
             ao = Write(c, ao, Access::UAVWrite);
         });
         b.Pass("Shadow", PassType::Raster, PassFlags::None, [&](ISetupContext* c) {
-            shadow = c->SetDepthTarget(shadow, false, AccessFlags::None, &c_Clear);
+            shadow = c->SetDepthTarget(shadow, {}, false, AccessFlags::None, &c_Clear);
         });
         b.Pass("DeferredLighting", PassType::Compute, PassFlags::None, [&](ISetupContext* c) {
             Read(c, depth, Access::ShaderRead);
@@ -216,7 +216,7 @@ namespace rdgtest
             hdr = Write(c, hdr, Access::UAVWrite);
         });
         b.Pass("ForwardTransparent", PassType::Raster, PassFlags::None, [&](ISetupContext* c) {
-            c->SetDepthTarget(depth, true, AccessFlags::None, nullptr);
+            c->SetDepthTarget(depth, {}, true, AccessFlags::None, nullptr);
             hdr = c->SetColorTarget(0, hdr, {}, AccessFlags::None, nullptr);
         });
         b.Pass("TAA", PassType::Compute, PassFlags::None, [&](ISetupContext* c) {
@@ -583,7 +583,7 @@ namespace rdgtest
             ResourceId out = b.Import("Out", 1024, 1024, Format::RGBA16_FLOAT, ResourceStates::ShaderResource,
                                       ResourceStates::ShaderResource);
             b.Pass("Prepass", PassType::Raster, PassFlags::None, [&](ISetupContext* c) {
-                ds = c->SetDepthTarget(ds, false, AccessFlags::None, &c_Clear);
+                ds = c->SetDepthTarget(ds, {}, false, AccessFlags::None, &c_Clear);
             });
             b.Pass("SampleDepth", PassType::Compute, PassFlags::SideEffect, [&](ISetupContext* c) {
                 Read(c, ds, Access::ShaderRead, ShaderType::None, Planes(nvrhi::PlaneMask::Depth));
@@ -875,7 +875,7 @@ namespace rdgtest
                                       ResourceStates::ShaderResource);
             b.Pass("Draw", PassType::Raster, PassFlags::None, [&](ISetupContext* c) {
                 rt = c->SetColorTarget(0, rt, {}, AccessFlags::None, &c_Clear);
-                depth = c->SetDepthTarget(depth, false, AccessFlags::None, &c_Clear);
+                depth = c->SetDepthTarget(depth, {}, false, AccessFlags::None, &c_Clear);
             });
             b.Pass("Count", PassType::Compute, PassFlags::None, [&](ISetupContext* c) {
                 Read(c, rt, Access::ShaderRead);
@@ -938,10 +938,10 @@ namespace rdgtest
             ResourceId out = b.Import("Out", 1024, 1024, Format::RGBA16_FLOAT, ResourceStates::ShaderResource,
                                       ResourceStates::ShaderResource);
             b.Pass("Depth", PassType::Raster, PassFlags::None, [&](ISetupContext* c) {
-                depth = c->SetDepthTarget(depth, false, AccessFlags::None, &c_Clear);
+                depth = c->SetDepthTarget(depth, {}, false, AccessFlags::None, &c_Clear);
             });
             b.Pass("Opaque", PassType::Raster, PassFlags::None, [&](ISetupContext* c) {
-                c->SetDepthTarget(depth, true, AccessFlags::None, nullptr);
+                c->SetDepthTarget(depth, {}, true, AccessFlags::None, nullptr);
                 color = c->SetColorTarget(0, color, {}, AccessFlags::None, &c_Clear);
             });
             b.Pass("Fog", PassType::Raster, PassFlags::None, [&](ISetupContext* c) {
@@ -949,7 +949,7 @@ namespace rdgtest
                 color = c->SetColorTarget(0, color, {}, AccessFlags::None, nullptr);
             });
             b.Pass("Particles", PassType::Raster, PassFlags::None, [&](ISetupContext* c) {
-                c->SetDepthTarget(depth, true, AccessFlags::None, nullptr);
+                c->SetDepthTarget(depth, {}, true, AccessFlags::None, nullptr);
                 Read(c, depth, Access::ShaderRead, ShaderType::Pixel);
                 color = c->SetColorTarget(0, color, {}, AccessFlags::None, nullptr);
             });

@@ -193,7 +193,7 @@ namespace donut::render::rdg
     RenderGraph::RenderGraph(ResourceRegistry* registry)
         : m_Registry(registry)
     {
-        m_Registry->m_HasGraph = true;
+        m_Registry->m_Graph = this;
     }
 
     RenderGraph::~RenderGraph()
@@ -205,7 +205,7 @@ namespace donut::render::rdg
         }
         m_Passes.Clear();
         m_Plan = nullptr;
-        m_Registry->m_HasGraph = false;
+        m_Registry->m_Graph = nullptr;
     }
 
     void RenderGraph::Reset() noexcept
@@ -749,7 +749,8 @@ namespace donut::render::rdg
         return MakeResourceId(index, record->currentVersion);
     }
 
-    ResourceId RenderGraph::SetDepthTarget(ResourceId texture, bool readOnly, AccessFlags flags, const ClearValue* clear) noexcept
+    ResourceId RenderGraph::SetDepthTarget(ResourceId texture, const nvrhi::SubresourceRegion& region, bool readOnly,
+                                           AccessFlags flags, const ClearValue* clear) noexcept
     {
         if (!CheckOpen())
             return InvalidResourceId;
@@ -767,8 +768,7 @@ namespace donut::render::rdg
                 return InvalidResourceId;
             }
             const Access access = record->hasStencil ? Access::DepthRead | Access::StencilRead : Access::DepthRead;
-            AccessRecord* entry = AddAccess(record, index, access, nvrhi::ShaderType::None, nvrhi::SubresourceRegion(),
-                                            AccessFlags::None, false);
+            AccessRecord* entry = AddAccess(record, index, access, nvrhi::ShaderType::None, region, AccessFlags::None, false);
             if (!entry)
                 return InvalidResourceId;
             entry->attachment = c_DepthAttachment;
@@ -777,7 +777,7 @@ namespace donut::render::rdg
         }
 
         const Access access = record->hasStencil ? Access::DepthWrite | Access::StencilWrite : Access::DepthWrite;
-        AccessRecord* entry = AddAccess(record, index, access, nvrhi::ShaderType::None, nvrhi::SubresourceRegion(), flags, true);
+        AccessRecord* entry = AddAccess(record, index, access, nvrhi::ShaderType::None, region, flags, true);
         if (!entry)
             return InvalidResourceId;
         entry->attachment = c_DepthAttachment;
@@ -1060,6 +1060,38 @@ namespace donut::render::rdg
         return ExecutePlan(*this, *m_Plan, desc);
     }
 
+    nvrhi::FRESULT RenderGraph::GetTextureDesc(ResourceId texture, nvrhi::TextureDesc& out) noexcept
+    {
+        const uint32_t index = GetResourceIndex(texture);
+        if (texture == InvalidResourceId || index >= m_Resources.size || m_Resources[index].isBuffer)
+            return nvrhi::FE_INVALID_ARGS;
+        try
+        {
+            out = MakeTextureDesc(m_Resources[index], false);   // no name: recording allocates nothing (10.3)
+        }
+        catch (...)
+        {
+            return nvrhi::FE_OUT_OF_MEMORY;
+        }
+        return nvrhi::FS_OK;
+    }
+
+    nvrhi::FRESULT RenderGraph::GetBufferDesc(ResourceId buffer, nvrhi::BufferDesc& out) noexcept
+    {
+        const uint32_t index = GetResourceIndex(buffer);
+        if (buffer == InvalidResourceId || index >= m_Resources.size || !m_Resources[index].isBuffer)
+            return nvrhi::FE_INVALID_ARGS;
+        try
+        {
+            out = MakeBufferDesc(m_Resources[index], false);
+        }
+        catch (...)
+        {
+            return nvrhi::FE_OUT_OF_MEMORY;
+        }
+        return nvrhi::FS_OK;
+    }
+
     void RenderGraph::GetDiagnostics(nvrhi::string& out) noexcept
     {
         try
@@ -1190,7 +1222,7 @@ namespace donut::render
             return nvrhi::FE_INVALID_ARGS;
         // Only registries made by CreateResourceRegistry are accepted.
         rdg::ResourceRegistry* concrete = static_cast<rdg::ResourceRegistry*>(registry);
-        if (concrete->m_HasGraph)
+        if (concrete->m_Graph)
             return nvrhi::FE_INVALID_ARGS;
         try
         {

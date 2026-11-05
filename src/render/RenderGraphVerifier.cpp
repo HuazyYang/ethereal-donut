@@ -324,6 +324,14 @@ namespace donut::render::rdg
             if ((release || acquire) && !profile.queueOwnershipTransfer)
                 Error(Where(plan, sched) + ": an ownership transfer in a profile with one queue family");
 
+            if (discard && profile.barrierModel == BarrierModel::D3D12Legacy)
+            {
+                const PlanResource& discarded = plan.m_Resources[barrier.resource];
+                if (!LegacyDiscardable(barrier.after, discarded.isBuffer, discarded.hasDepth, discarded.isRenderTarget))
+                    Error(Where(plan, sched) + ": " + Name(plan, barrier.resource) + " is discarded into " +
+                        StatesToString(barrier.after) + ", which D3D12's DiscardResource rejects for it");
+            }
+
             const bool hostKept = plan.m_Resources[barrier.resource].kind == ResourceKind::HostKept;
             bool reported = false;
             ForEachElement(plan, barrier.resource, barrier.region, [&](Identity&, Element& element) {
@@ -421,7 +429,9 @@ namespace donut::render::rdg
             const BackendProfile& profile = plan.m_Profile;
             const bool implicit = profile.barrierModel == BarrierModel::Implicit;
             const nvrhi::ShaderType stages = use.stages == nvrhi::ShaderType::None ? DefaultStages(type) : use.stages;
-            ResourceStates required = LowerAccess(use.access, stages);
+            const PlanResource& accessed = plan.m_Resources[use.resource];
+            ResourceStates required = LowerAccess(use.access, stages, !accessed.isBuffer && (accessed.hasDepth || accessed.hasStencil),
+                                                  profile);
             const bool write = use.isWrite || clearSubStep;
             if (clearSubStep)
             {

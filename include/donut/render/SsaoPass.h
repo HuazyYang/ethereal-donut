@@ -24,6 +24,8 @@
 #include <nvrhi/core/foundation.h>
 #include <nvrhi/core/autoptr.h>
 #include <donut/core/math/math.h>
+#include <donut/engine/BindingCache.h>
+#include <donut/render/RenderGraph.h>
 #include <nvrhi/nvrhi.h>
 
 namespace donut::engine
@@ -49,10 +51,31 @@ namespace donut::render
         float blurSharpness = 16.f;
     };
 
-    class SsaoPass : public nvrhi::ObjectImpl<nvrhi::IObject>
+    // The pass in a render graph (design 13.3): one compute use in Restore mode. The deinterleaved quarter-resolution
+    // arrays are pass-local transients sized from `depth`, so the graph pools and aliases them. `view` must stay
+    // valid until the graph has executed.
+    struct SsaoGraphInputs
+    {
+        const engine::ICompositeView* view = nullptr;
+        ResourceId depth = InvalidResourceId;
+        ResourceId normals = InvalidResourceId;
+        ResourceId output = InvalidResourceId;
+        SsaoParameters params;
+        bool inputLinearDepth = false;
+        bool octEncodedNormals = false;
+        bool directionalOcclusion = false;
+    };
+
+    struct SsaoGraphOutputs
+    {
+        ResourceId output = InvalidResourceId;
+    };
+
+    class SsaoPass : public nvrhi::ObjectImpl<IGpuPass>
     {
     public:
         NVRHI_BEGIN_INTERFACE_TABLE_INLINE(SsaoPass)
+        NVRHI_IMPLEMENTS_INTERFACE(IGpuPass)
         NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IObject)
         NVRHI_END_INTERFACE_TABLE()
 
@@ -113,5 +136,30 @@ namespace donut::render
             const SsaoParameters& params,
             const engine::ICompositeView& compositeView,
             int bindingSetIndex = 0);
+
+        // For a render graph: Prepare creates the shaders and pipelines of each use's variant.
+        SsaoPass(
+            nvrhi::IDevice* device,
+            engine::ShaderFactory* shaderFactory,
+            engine::CommonRenderPasses* commonPasses);
+
+        SsaoGraphOutputs AddToGraph(IRenderGraph* graph, const SsaoGraphInputs& inputs);
+
+        nvrhi::FRESULT Setup(ISetupContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Prepare(IPrepareContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Execute(IPassContext* context, const void* data) noexcept override;
+        void OnResourcesReleased() noexcept override;
+
+    private:
+        void CreatePipelines(engine::ShaderFactory* shaderFactory, bool inputLinearDepth, bool octEncodedNormals,
+                             bool directionalOcclusion);
+        void DispatchViews(nvrhi::ICommandList* commandList, const SsaoParameters& params,
+                           const engine::ICompositeView& compositeView, nvrhi::IBindingSet* deinterleave,
+                           nvrhi::IBindingSet* compute, nvrhi::IBindingSet* blur, dm::float2 quantizedGbufferTextureSize);
+
+        // Graph construction.
+        nvrhi::AutoPtr<engine::ShaderFactory> m_ShaderFactory;
+        int m_GraphVariant = -1;
+        engine::BindingCache m_GraphBindings;
     };
 }

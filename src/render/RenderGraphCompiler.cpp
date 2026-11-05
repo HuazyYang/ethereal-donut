@@ -449,7 +449,8 @@ namespace donut::render::rdg
                     }
                     const nvrhi::ShaderType stages = access.stages == nvrhi::ShaderType::None ? DefaultStages(pass.type) : access.stages;
                     state.uses.push_back(use);
-                    state.useState.push_back(LowerAccess(access.access, stages));
+                    state.useState.push_back(LowerAccess(access.access, stages, !record.isBuffer && (record.hasDepth || record.hasStencil),
+                                                         state.profile));
                     state.useStages.push_back((access.access & shaderAccess) != Access::None ? stages : nvrhi::ShaderType::None);
                 }
                 state.useCount[s] = uint32_t(state.uses.size()) - state.useBegin[s];
@@ -639,7 +640,9 @@ namespace donut::render::rdg
                 {
                     const AccessRecord& access = graph.GetAccess(a);
                     const nvrhi::ShaderType stages = access.stages == nvrhi::ShaderType::None ? DefaultStages(pass.type) : access.stages;
-                    const ResourceStates state = LowerAccess(access.access, stages);
+                    const ResourceRecord& accessed = graph.GetResource(access.resource);
+                    const ResourceStates state = LowerAccess(access.access, stages,
+                        !accessed.isBuffer && (accessed.hasDepth || accessed.hasStencil), profile);
                     const bool graphicsStages = (stages & (nvrhi::ShaderType::AllGraphics)) != 0;
                     if (!IsStateLegalOnQueue(state, structure->passQueues[p], profile) || graphicsStages)
                         check.Error(check.PassName(p) + ": " + AccessToString(access.access) + " on " +
@@ -1327,6 +1330,7 @@ namespace donut::render::rdg
                 pass.nameOffset = record.name ? plan->AddName(record.name) : 0;
                 pass.queue = state.schedQueue[s];
                 pass.type = record.type;
+                pass.flags = record.flags;
                 pass.enabled = state.scheduledLive[s] != 0;
                 pass.segment = segOf[s];
                 for (uint32_t slot = 0; slot < c_SlotCount; ++slot)
@@ -1339,6 +1343,8 @@ namespace donut::render::rdg
                 plan->m_PassWaits.insert(plan->m_PassWaits.end(), passWaits[s].begin(), passWaits[s].end());
                 pass.useBegin = uint32_t(plan->m_Uses.size());
                 pass.useCount = state.useCount[s];
+                pass.trackedBegin = 0;
+                pass.trackedCount = 0;
                 for (uint32_t u = state.useBegin[s]; u < state.useBegin[s] + state.useCount[s]; ++u)
                     plan->m_Uses.push_back(state.uses[u]);
                 pass.clearMask = state.clearMask.empty() ? 0 : state.clearMask[s];
@@ -1348,6 +1354,37 @@ namespace donut::render::rdg
                     pass.store[a] = state.store.empty() ? StoreOp::Store : state.store[s][a];
                 }
                 plan->m_ScheduleOfProgram[program] = s;
+            }
+
+            // The states Tracked and Restore bodies find, per pass, one region per (resource, state).
+            {
+                std::vector<CompileState::TrackedUnit>& tracked = state.trackedUnits;
+                std::stable_sort(tracked.begin(), tracked.end(), [](const CompileState::TrackedUnit& a, const CompileState::TrackedUnit& b) {
+                    if (a.sched != b.sched) return a.sched < b.sched;
+                    if (a.resource != b.resource) return a.resource < b.resource;
+                    return uint32_t(a.state) < uint32_t(b.state);
+                });
+                std::vector<UnitKey> groupUnits;
+                std::vector<nvrhi::SubresourceRegion> groupRegions;
+                size_t first = 0;
+                while (first < tracked.size())
+                {
+                    size_t end = first;
+                    groupUnits.clear();
+                    while (end < tracked.size() && tracked[end].sched == tracked[first].sched &&
+                        tracked[end].resource == tracked[first].resource && tracked[end].state == tracked[first].state)
+                        groupUnits.push_back(tracked[end++].unit);
+                    PlanPass& pass = plan->m_Passes[tracked[first].sched];
+                    if (pass.trackedCount == 0)
+                        pass.trackedBegin = uint32_t(plan->m_TrackedStates.size());
+                    MergeUnits(graph.GetResource(tracked[first].resource), state.profile, groupUnits, groupRegions);
+                    for (const nvrhi::SubresourceRegion& region : groupRegions)
+                    {
+                        plan->m_TrackedStates.push_back(PlanTrackedState{ tracked[first].resource, region, tracked[first].state });
+                        ++pass.trackedCount;
+                    }
+                    first = end;
+                }
             }
 
             // Statistics (10.3, 11.3).

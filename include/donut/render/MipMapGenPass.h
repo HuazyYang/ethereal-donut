@@ -25,6 +25,8 @@
 #include <nvrhi/core/autoptr.h>
 #include <donut/engine/BindingCache.h>
 #include <donut/core/math/math.h>
+#include <nvrhi/core/foundation.h>
+#include <donut/render/RenderGraph.h>
 #include <nvrhi/nvrhi.h>
 #include <vector>
 
@@ -39,9 +41,26 @@ namespace donut::engine
 namespace donut::render
 {
 
-    class MipMapGenPass {
+    // The pass in a render graph (design 13.3): one compute use in Restore mode that reads mip 0 of `texture` and
+    // writes mips 1 to `maxLOD` (all of them when negative); the body reads the mips it has just written.
+    struct MipMapGenGraphInputs
+    {
+        ResourceId texture = InvalidResourceId;
+        int maxLOD = -1;
+    };
+
+    struct MipMapGenGraphOutputs
+    {
+        ResourceId texture = InvalidResourceId;
+    };
+
+    class MipMapGenPass : public nvrhi::ObjectImpl<IGpuPass> {
 
     public:
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(MipMapGenPass)
+        NVRHI_IMPLEMENTS_INTERFACE(IGpuPass)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IObject)
+        NVRHI_END_INTERFACE_TABLE()
 
         enum Mode : uint8_t {
             MODE_COLOR = 0,  // bilinear reduction of RGB channels
@@ -68,6 +87,22 @@ namespace donut::render
             nvrhi::ICommandList* commandList, 
             nvrhi::IFramebuffer* target);
 
+        // Out of line: NullTextures is only declared here, and the reference-counted object is destroyed elsewhere.
+        ~MipMapGenPass();
+
+        // For a render graph: the texture is chosen per AddToGraph; Prepare creates the shader and pipeline.
+        MipMapGenPass(
+            nvrhi::IDevice* device,
+            engine::ShaderFactory* shaderFactory,
+            Mode mode = Mode::MODE_MAX);
+
+        MipMapGenGraphOutputs AddToGraph(IRenderGraph* graph, const MipMapGenGraphInputs& inputs);
+
+        nvrhi::FRESULT Setup(ISetupContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Prepare(IPrepareContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Execute(IPassContext* context, const void* data) noexcept override;
+        void OnResourcesReleased() noexcept override;
+
     private:
 
         nvrhi::DeviceHandle m_Device;
@@ -83,6 +118,12 @@ namespace donut::render
         nvrhi::AutoPtr<NullTextures> m_NullTextures;
 
         engine::BindingCache m_BindingCache;
+
+        // Graph construction.
+        void CreateObjects(engine::ShaderFactory* shaderFactory);
+        nvrhi::AutoPtr<engine::ShaderFactory> m_ShaderFactory;
+        Mode m_Mode = Mode::MODE_MAX;
+        nvrhi::Format m_NullFormat = nvrhi::Format::UNKNOWN;
 
     };
 

@@ -22,8 +22,9 @@
 
 # The render graph's device-free tests (aggregate docs/rdg-design.md; plan step P1.3).
 
-add_library(donut_rdg_corpus STATIC src/render/rdg_corpus.cpp src/render/rdg_corpus.h)
-target_link_libraries(donut_rdg_corpus PUBLIC donut_render)
+add_library(donut_rdg_corpus STATIC src/render/rdg_corpus.cpp src/render/rdg_corpus.h
+    src/render/rdg_donut_frame.cpp src/render/rdg_donut_frame.h)
+target_link_libraries(donut_rdg_corpus PUBLIC donut_render donut_engine donut_core)
 set_property(TARGET donut_rdg_corpus PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
 # Recording, validation, culling, the plan cache, golden barrier lists and the verifier corpus.
@@ -32,6 +33,13 @@ target_link_libraries(test_render_graph donut_rdg_corpus donut_render donut_engi
 add_dependencies(donut_all_tests test_render_graph)
 add_test(NAME test_render_graph COMMAND test_render_graph)
 set_property(TARGET test_render_graph PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
+# donut's passes in a graph, device-free (plan step P1.5): golden access lists of every AddToGraph, per-view folding.
+add_executable(test_render_graph_passes src/render/test_render_graph_passes.cpp)
+target_link_libraries(test_render_graph_passes donut_rdg_corpus donut_render donut_engine donut_core)
+add_dependencies(donut_all_tests test_render_graph_passes)
+add_test(NAME test_render_graph_passes COMMAND test_render_graph_passes)
+set_property(TARGET test_render_graph_passes PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
 # The device-free benchmark of design 10.3. The ctest entry is a smoke run; budgets are measured in Release with
 # `rdg_bench --gate`.
@@ -86,6 +94,20 @@ foreach(_test ${_rdg_gpu_tests})
 endforeach()
 add_dependencies(donut_all_tests test_render_graph_gpu)
 set_property(TARGET test_render_graph_gpu PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
+# app::RenderGraphLayer on a headless DeviceManager (plan step P1.5).
+add_executable(test_render_graph_layer src/render/test_render_graph_layer.cpp)
+target_link_libraries(test_render_graph_layer donut_app donut_render donut_engine donut_core)
+foreach(_backend d3d11 d3d12 vulkan)
+    string(TOUPPER "${_backend}" _upper)
+    if((_backend STREQUAL "d3d11" AND DONUT_WITH_DX11) OR (_backend STREQUAL "d3d12" AND DONUT_WITH_DX12) OR
+       (_backend STREQUAL "vulkan" AND DONUT_WITH_VULKAN))
+        add_test(NAME test_render_graph_layer_${_backend} COMMAND test_render_graph_layer ${_backend})
+        set_tests_properties(test_render_graph_layer_${_backend} PROPERTIES RUN_SERIAL TRUE LABELS gpu)
+    endif()
+endforeach()
+add_dependencies(donut_all_tests test_render_graph_layer)
+set_property(TARGET test_render_graph_layer PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
 # Header hygiene (design 3.2): the RenderGraph* files include only nvrhi/, donut/core/, other RenderGraph* headers
 # and the standard library.

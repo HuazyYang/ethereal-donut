@@ -511,7 +511,7 @@ namespace
         Builder b(f.graph);
         ResourceId depth = b.Depth("D", 64, 64, Format::D32);
         b.Pass("Prepass", PassType::Raster, PassFlags::None, [&](ISetupContext* c) {
-            depth = c->SetDepthTarget(depth, false, AccessFlags::Clear, nullptr);
+            depth = c->SetDepthTarget(depth, {}, false, AccessFlags::Clear, nullptr);
         });
         b.Pass("AsyncDepthTest", PassType::Compute, PassFlags::AsyncCompute | PassFlags::SideEffect, [&](ISetupContext* c) {
             Read(c, depth, Access::DepthRead);

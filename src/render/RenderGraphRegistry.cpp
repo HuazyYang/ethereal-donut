@@ -77,6 +77,20 @@ namespace donut::render::rdg
         m_Runtime.instances.clear();
         m_Runtime.freePool.clear();
         m_Runtime.extractPool.clear();
+        // 13.1: the passes drop the framebuffers and binding sets that point at those resources. Cached plans hold no
+        // pass, so the passes reached are those of the graph's current frame, each object once.
+        if (m_Graph)
+        {
+            for (uint32_t index = 0; index < m_Graph->PassCount(); ++index)
+            {
+                IGpuPass* pass = m_Graph->GetPass(index).pass;
+                bool seen = false;
+                for (uint32_t earlier = 0; earlier < index && !seen; ++earlier)
+                    seen = m_Graph->GetPass(earlier).pass == pass;
+                if (pass && !seen)
+                    pass->OnResourcesReleased();
+            }
+        }
     }
 
     nvrhi::FRESULT ResourceRegistry::ReleasePersistent(const char* name) noexcept
@@ -114,6 +128,24 @@ namespace donut::render::rdg
         out.pooledResources = uint32_t(m_Runtime.freePool.size());
         out.framesExecuted = m_Runtime.framesExecuted;
         out.objectsCreated = m_Runtime.objectsCreated;
+    }
+
+    void ResourceRegistry::GetRunStatistics(RunStatistics& out) noexcept
+    {
+        out = m_Runtime.run;
+    }
+
+    uint32_t ResourceRegistry::GetPassTimingCount() noexcept
+    {
+        return uint32_t(m_Runtime.timings.size());
+    }
+
+    nvrhi::FRESULT ResourceRegistry::GetPassTiming(uint32_t index, PassTiming& out) noexcept
+    {
+        if (index >= m_Runtime.timings.size())
+            return nvrhi::FE_INVALID_ARGS;
+        out = m_Runtime.timings[index];
+        return nvrhi::FS_OK;
     }
 
     uint32_t ResourceRegistry::AcquirePersistent(const char* name, uint8_t kind, uint64_t descHash, uint8_t layerCount,
