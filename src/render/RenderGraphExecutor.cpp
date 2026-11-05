@@ -530,6 +530,7 @@ namespace donut::render::rdg
             physical->placed = true;
             physical->heap = object.heap;
             physical->heapSize = requirements.size;
+            instance.placedObjectBytes += requirements.size;
             instance.physicals[p] = std::move(physical);
             candidates.push_back(Candidate{ p, requirements.size, std::max<uint64_t>(requirements.alignment, 1), 0 });
         }
@@ -697,6 +698,7 @@ namespace donut::render::rdg
                 physical.reset();
             instance->heaps.clear();
             instance->heapBytes = 0;
+            instance->placedObjectBytes = 0;
             if (nvrhi::IMessageCallback* callback = device->getMessageCallback())
                 callback->message(nvrhi::MessageSeverity::Warning,
                     "render graph: the Placed tier failed to place a plan's resources; they are dedicated instead");
@@ -1546,21 +1548,22 @@ namespace donut::render::rdg
     }
 
     // ------------------------------------------------------------------------------------------------ execute
-
-    // 11.3: publishes the newest timer set whose queries have completed and frees every completed set.
+    // 11.3: publishes the newest timer set whose queries have completed and frees every completed set. Each set is
+    // polled once: a backend may report a query it has read as not started (Vulkan's getTimerQueryTime), so a set is
+    // freed on that poll, not on a second one.
     static void CollectTimers(RegistryRuntime& runtime, nvrhi::IDevice* device)
     {
+        bool ready[std::tuple_size<decltype(runtime.timerSets)>::value] = {};
         RegistryRuntime::TimerSet* newest = nullptr;
-        for (RegistryRuntime::TimerSet& set : runtime.timerSets)
+        for (size_t s = 0; s < runtime.timerSets.size(); ++s)
         {
+            RegistryRuntime::TimerSet& set = runtime.timerSets[s];
             if (!set.pending)
                 continue;
-            bool ready = true;
-            for (uint32_t q = 0; q < set.used && ready; ++q)
-                ready = device->pollTimerQuery(set.queries[q]);
-            if (!ready)
-                continue;
-            if (!newest || set.frameIndex > newest->frameIndex)
+            ready[s] = true;
+            for (uint32_t q = 0; q < set.used && ready[s]; ++q)
+                ready[s] = device->pollTimerQuery(set.queries[q]);
+            if (ready[s] && (!newest || set.frameIndex > newest->frameIndex))
                 newest = &set;
         }
         if (newest)
@@ -1574,14 +1577,11 @@ namespace donut::render::rdg
                                                  device->getTimerQueryTime(newest->queries[q]) * 1000.f };
             }
         }
-        for (RegistryRuntime::TimerSet& set : runtime.timerSets)
+        // Every completed set is at most as new as the published one.
+        for (size_t s = 0; s < runtime.timerSets.size(); ++s)
         {
-            if (!set.pending || (newest && set.frameIndex > newest->frameIndex))
-                continue;
-            bool ready = true;
-            for (uint32_t q = 0; q < set.used && ready; ++q)
-                ready = device->pollTimerQuery(set.queries[q]);
-            if (!ready)
+            RegistryRuntime::TimerSet& set = runtime.timerSets[s];
+            if (!ready[s])
                 continue;
             for (uint32_t q = 0; q < set.used; ++q)
                 device->resetTimerQuery(set.queries[q]);
@@ -1589,7 +1589,6 @@ namespace donut::render::rdg
             set.used = 0;
         }
     }
-
     // A free set for this frame, with a query per enabled pass; nullptr when every set still waits for the GPU.
     static RegistryRuntime::TimerSet* AcquireTimers(RegistryRuntime& runtime, nvrhi::IDevice* device, const CompiledRenderGraph& plan,
                                                     uint64_t frameIndex)

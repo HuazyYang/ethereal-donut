@@ -64,6 +64,7 @@ namespace donut::render
         bool inputLinearDepth = false;
         bool octEncodedNormals = false;
         bool directionalOcclusion = false;
+        bool asyncCompute = false;   // PassFlags::AsyncCompute: the compute queue, where the profile has one (6.8)
     };
 
     struct SsaoGraphOutputs

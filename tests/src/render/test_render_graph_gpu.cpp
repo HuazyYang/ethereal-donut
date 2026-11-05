@@ -1702,15 +1702,21 @@ namespace
         const uint32_t timings = g.registry->GetPassTimingCount();
         bool lighting = false;
         float total = 0.f;
+        uint64_t timedFrame = ~0ull;
         for (uint32_t i = 0; i < timings; ++i)
         {
             PassTiming timing;
             g.registry->GetPassTiming(i, timing);
             lighting = lighting || std::strcmp(timing.name, "DeferredLighting") == 0;
             total += timing.gpuMilliseconds;
+            timedFrame = timing.frameIndex;
         }
         check(timings == 22 && lighting && total >= 0.f, prefix + ": per-pass timers: " + std::to_string(timings) + " passes, " +
               std::to_string(total) + " ms in all");
+        // Each frame waits for the GPU, so the last frame published the one before it: the four timer sets are reused
+        // past the fourth frame.
+        check(timedFrame + 1 == run.frameIndex, prefix + ": the timers are of frame " + std::to_string(timedFrame) +
+              ", the frame before " + std::to_string(run.frameIndex));
         checkClean(env, prefix);
     }
 

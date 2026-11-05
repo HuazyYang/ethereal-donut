@@ -351,7 +351,8 @@ SsaoGraphOutputs SsaoPass::AddToGraph(IRenderGraph* graph, const SsaoGraphInputs
                     inputs.params, (depthDesc.width + 3) / 4, (depthDesc.height + 3) / 4, inputs.inputLinearDepth,
                     inputs.octEncodedNormals, inputs.directionalOcclusion };
     // Restore: the body moves the arrays between UAV and SRV states through the automatic barriers.
-    graph->AddPass(PassDesc{ "SSAO", PassType::Compute, PassFlags::Restore, 0 }, this, use, nullptr);
+    const PassFlags flags = PassFlags::Restore | (inputs.asyncCompute ? PassFlags::AsyncCompute : PassFlags::None);
+    graph->AddPass(PassDesc{ "SSAO", PassType::Compute, flags, 0 }, this, use, nullptr);
     outputs.output = use->output;
     return outputs;
 }

@@ -782,10 +782,12 @@ namespace donut::render::rdg
                 if (structure->resourceFirst[r] == c_None)
                     continue;
                 structure->poolableTransientBytes += sizes[r];
-                if ((record.flags & (ResourceFlags::NoAlias | ResourceFlags::DebugCapture)) != ResourceFlags::None)
+                if ((record.flags & (ResourceFlags::NoAlias | ResourceFlags::DebugCapture)) != ResourceFlags::None ||
+                    structure->resourceCrossQueue[r])
+                {
+                    structure->unplacedTransientBytes += sizes[r];
                     continue;
-                if (structure->resourceCrossQueue[r])
-                    continue;
+                }
                 candidates.push_back(r);
             }
 
@@ -1422,6 +1424,7 @@ namespace donut::render::rdg
             stats.heaps = uint32_t(structure->heaps.size());
             stats.poolableTransientBytes = structure->poolableTransientBytes;
             stats.placedPeakBytes = structure->placedPeakBytes;
+            stats.unplacedTransientBytes = structure->unplacedTransientBytes;
 
             return plan.Detach();
         }

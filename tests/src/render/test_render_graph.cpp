@@ -896,6 +896,9 @@ namespace
                 const uint32_t expected = tier == 2 ? 2u : 5u;
                 EXPECT(stats.heaps == expected, std::string(ProfileName(kind)) + ", heap tier " + std::to_string(tier) + ": " +
                        std::to_string(stats.heaps) + " heaps, expected " + std::to_string(expected) + "\n" + Listing(b, plan));
+                // Shared crosses queues, so it stays out of the heaps: its 64 KiB are counted beside placedPeakBytes.
+                EXPECT(stats.unplacedTransientBytes == 65536, std::string(ProfileName(kind)) + ": unplaced " +
+                       std::to_string(stats.unplacedTransientBytes) + " bytes, expected the cross-queue buffer's 65536");
             }
         }
     }

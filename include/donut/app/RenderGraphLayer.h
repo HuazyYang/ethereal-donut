@@ -54,6 +54,9 @@ namespace donut::app
         // The plan the last frame executed, for diagnostics (RenderGraphVisualizer); nullptr before the first frame.
         [[nodiscard]] render::ICompiledRenderGraph* GetLastPlan() const { return m_LastPlan; }
         [[nodiscard]] const render::BackendProfile& GetProfile() const { return m_Profile; }
+        // The device's profile, which an application may narrow (split barriers off, its LatticePolicy) between
+        // frames; the plan cache keys on it.
+        render::BackendProfile& GetProfile() { return m_Profile; }
         render::CompileOptions& GetCompileOptions() { return m_CompileOptions; }
         render::ExecuteDesc& GetExecuteDesc() { return m_ExecuteDesc; }
 

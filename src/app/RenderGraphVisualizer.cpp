@@ -123,8 +123,9 @@ void RenderGraphVisualizer::DrawWindow()
     ImGui::Text("compile %.3f ms%s; record %.3f ms, submit %.3f ms%s", double(stats.compileMicroseconds) / 1000.0,
                 stats.cacheHit ? " (cached)" : "", double(run.recordMilliseconds), double(run.submitMilliseconds),
                 run.planSwitched ? ", plan switch" : "");
-    ImGui::Text("transients %.2f MB, placed peak %.2f MB; %u plans cached, %llu objects created",
+    ImGui::Text("transients %.2f MB, placed peak %.2f MB + unplaced %.2f MB; %u plans cached, %llu objects created",
                 double(stats.poolableTransientBytes) / 1048576.0, double(stats.placedPeakBytes) / 1048576.0,
+                double(stats.unplacedTransientBytes) / 1048576.0,
                 registryStats.cachedPlans, (unsigned long long)registryStats.objectsCreated);
 
     // Switches.

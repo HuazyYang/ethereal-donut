@@ -364,6 +364,8 @@ namespace donut::render
         uint32_t heaps = 0;
         uint64_t poolableTransientBytes = 0;   // the sum over transients, excluding imports and histories
         uint64_t placedPeakBytes = 0;          // the placement estimate, on every backend (7.5)
+        uint64_t unplacedTransientBytes = 0;   // transients kept out of placement (cross-queue, NoAlias, DebugCapture):
+                                               // memory of their own beside placedPeakBytes
         uint64_t compileMicroseconds = 0;
         bool cacheHit = false;
     };
@@ -399,6 +401,7 @@ namespace donut::render
         uint32_t pooledResources = 0;
         uint32_t heaps = 0;
         uint64_t heapBytes = 0;
+        uint64_t placedObjectBytes = 0;   // the device's sizes of the objects in those heaps, summed: their memory unaliased
         uint64_t pooledBytes = 0;
         uint64_t framesExecuted = 0;
         uint64_t objectsCreated = 0;      // every create* call the registry and the executor made (10.3: 0 per steady frame)

@@ -139,6 +139,7 @@ namespace donut::render::rdg
             for (const nvrhi::AutoPtr<nvrhi::IHeap>& heap : instance.heaps)
                 out.heaps += heap ? 1 : 0;
             out.heapBytes += instance.heapBytes;
+            out.placedObjectBytes += instance.placedObjectBytes;
         };
         for (const std::unique_ptr<StructureInstance>& instance : m_Runtime.instances)
             countHeaps(*instance);

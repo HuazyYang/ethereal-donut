@@ -353,6 +353,7 @@ namespace donut::render::rdg
             std::to_string(stats.fenceWaits) + ", \"fenceSignals\": " + std::to_string(stats.fenceSignals) +
             ", \"heaps\": " + std::to_string(stats.heaps) + ", \"poolableTransientBytes\": " +
             std::to_string(stats.poolableTransientBytes) + ", \"placedPeakBytes\": " + std::to_string(stats.placedPeakBytes) +
+            ", \"unplacedTransientBytes\": " + std::to_string(stats.unplacedTransientBytes) +
             ", \"compileMicroseconds\": " + std::to_string(stats.compileMicroseconds) + " }\n}\n";
     }
 

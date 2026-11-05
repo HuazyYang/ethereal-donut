@@ -500,6 +500,7 @@ namespace donut::render::rdg
         std::vector<std::vector<uint32_t>> overlaps;     // per resource: placed resources sharing bytes with it
         uint64_t poolableTransientBytes = 0;
         uint64_t placedPeakBytes = 0;
+        uint64_t unplacedTransientBytes = 0;
         std::vector<std::string> warnings;
     };
 
@@ -591,6 +592,7 @@ namespace donut::render::rdg
         std::vector<std::unique_ptr<PhysicalResource>> physicals;   // per PhysicalObject
         std::vector<nvrhi::AutoPtr<nvrhi::IHeap>> heaps;            // the Placed tier: per planned heap
         uint64_t heapBytes = 0;
+        uint64_t placedObjectBytes = 0;                              // the placed objects' own sizes, summed
     };
 
     // A resource of the frame being executed.
