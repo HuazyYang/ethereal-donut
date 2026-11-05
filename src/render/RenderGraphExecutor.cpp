@@ -74,9 +74,14 @@ namespace donut::render::rdg
         uint8_t field;
     };
 
+    // A raster pass's framebuffer: colour slots 0..7, the depth target (c_DepthAttachment, 8), and the shading-rate
+    // surface its ShadingRateRead names (9).
+    constexpr uint32_t c_FramebufferSlots = 10;
+    constexpr uint32_t c_ShadingRateSlot = 9;
+
     struct FramebufferEntry
     {
-        nvrhi::ITexture* attachments[9] = {};
+        nvrhi::ITexture* attachments[c_FramebufferSlots] = {};
         nvrhi::AutoPtr<nvrhi::IFramebuffer> framebuffer;
         uint64_t lastUsed = 0;
     };
@@ -293,7 +298,7 @@ namespace donut::render::rdg
             return &runtime.frameResources[index];
         }
 
-        bool BuildFramebufferDesc(uint32_t sched, nvrhi::FramebufferDesc& desc, nvrhi::ITexture* (&attachments)[9]) const;
+        bool BuildFramebufferDesc(uint32_t sched, nvrhi::FramebufferDesc& desc, nvrhi::ITexture* (&attachments)[c_FramebufferSlots]) const;
     };
 
     static nvrhi::TextureSubresourceSet ToSubresourceSet(const nvrhi::SubresourceRegion& region)
@@ -301,7 +306,7 @@ namespace donut::render::rdg
         return nvrhi::TextureSubresourceSet(region.baseMip, region.mipCount, region.baseSlice, region.sliceCount);
     }
 
-    bool ExecutorFrame::BuildFramebufferDesc(uint32_t sched, nvrhi::FramebufferDesc& desc, nvrhi::ITexture* (&attachments)[9]) const
+    bool ExecutorFrame::BuildFramebufferDesc(uint32_t sched, nvrhi::FramebufferDesc& desc, nvrhi::ITexture* (&attachments)[c_FramebufferSlots]) const
     {
         const PlanPass& pass = plan.m_Passes[sched];
         nvrhi::FramebufferAttachment slots[9];
@@ -310,6 +315,11 @@ namespace donut::render::rdg
         for (uint32_t u = pass.useBegin; u < pass.useBegin + pass.useCount; ++u)
         {
             const PlanUse& use = plan.m_Uses[u];
+            if ((use.access & Access::ShadingRateRead) != Access::None && runtime.frameResources[use.resource].texture)
+            {
+                attachments[c_ShadingRateSlot] = runtime.frameResources[use.resource].texture;
+                continue;
+            }
             if (use.attachment == c_NoAttachment)
                 continue;
             nvrhi::ITexture* texture = runtime.frameResources[use.resource].texture;
@@ -334,6 +344,8 @@ namespace donut::render::rdg
         }
         if (attachments[c_DepthAttachment])
             desc.setDepthAttachment(slots[c_DepthAttachment]);
+        if (attachments[c_ShadingRateSlot])
+            desc.setShadingRateAttachment(nvrhi::FramebufferAttachment().setTexture(attachments[c_ShadingRateSlot]));
         return true;
     }
 
@@ -348,7 +360,7 @@ namespace donut::render::rdg
     {
         nvrhi::FramebufferInfoEx& info = frame->instance.framebufferInfos[sched];
         nvrhi::FramebufferDesc desc;
-        nvrhi::ITexture* attachments[9];
+        nvrhi::ITexture* attachments[c_FramebufferSlots];
         info = frame->BuildFramebufferDesc(sched, desc, attachments) ? nvrhi::FramebufferInfoEx(desc) : nvrhi::FramebufferInfoEx();
         return info;
     }
@@ -386,7 +398,7 @@ namespace donut::render::rdg
     nvrhi::IFramebuffer* PassContext::GetFramebuffer() noexcept
     {
         nvrhi::FramebufferDesc desc;
-        nvrhi::ITexture* attachments[9];
+        nvrhi::ITexture* attachments[c_FramebufferSlots];
         if (!frame->BuildFramebufferDesc(sched, desc, attachments))
         {
             frame->ReportError("the colour targets of a pass are not contiguous from slot 0");

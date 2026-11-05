@@ -1179,6 +1179,55 @@ namespace
               std::to_string(env.messages->vvlEventFalsePositives - before) + " reports); if not, drop the exemption");
     }
 
+    // P2.2: a ShadingRateRead use is the raster pass's shading-rate attachment. A compute pass clears the surface; the
+    // raster pass reads it, and its framebuffer carries it. Where the device has variable-rate shading.
+    void testShadingRateAttachment(Env& env)
+    {
+        nvrhi::VariableRateShadingFeatureInfo info = {};
+        if (!env.device->queryFeatureSupport(nvrhi::Feature::VariableRateShading, &info, sizeof(info)) || !info.shadingRateImageTileSize)
+        {
+            std::printf("  shading-rate attachment: no variable-rate shading on this device\n");
+            return;
+        }
+        GraphOnDevice g(env.device);
+        const uint32_t size = 128;
+        const uint32_t tiles = (size + info.shadingRateImageTileSize - 1) / info.shadingRateImageTileSize;
+        bool attached = true;
+        nvrhi::AutoPtr<nvrhi::ITexture> result = CreateImported(env, "vrs result", size);
+        for (uint32_t frame = 0; frame < 3; ++frame)
+        {
+            g.graph->Reset();
+            nvrhi::TextureDesc surfaceDesc = nvrhi::TextureDesc().setWidth(tiles).setHeight(tiles).setFormat(Format::R8_UINT)
+                .setIsUAV(true).setDebugName("ShadingRate");
+            surfaceDesc.isShadingRateSurface = true;
+            ResourceId surface = g.graph->CreateTexture(surfaceDesc, ResourceFlags::None);
+            ResourceId target = g.graph->CreateTexture(ColorDesc("Target").setWidth(size).setHeight(size), ResourceFlags::None);
+            AddPass(g.graph, "ShadingRates", PassType::Compute, PassFlags::None,
+                [&](ISetupContext* s) { surface = Write(s, surface, Access::UAVWrite, AccessFlags::Clear); },
+                [](IPassContext*) { });
+            static const ClearValue c_Clear = { { 0.f, 0.f, 0.f, 1.f }, 0.f, 0 };
+            ResourceId out = g.graph->ImportTexture(result, ResourceStates::CopySource, ResourceStates::CopySource);
+            AddPass(g.graph, "Shade", PassType::Raster, PassFlags::None,
+                [&](ISetupContext* s) {
+                    s->Read(surface, Access::ShadingRateRead, nvrhi::ShaderType::None, nvrhi::SubresourceRegion());
+                    target = s->SetColorTarget(0, target, nvrhi::SubresourceRegion(), AccessFlags::Clear, &c_Clear);
+                },
+                [surface, &attached](IPassContext* context) {
+                    nvrhi::IFramebuffer* framebuffer = context->GetFramebuffer();
+                    attached = attached && framebuffer && framebuffer->getDesc().shadingRateAttachment.texture == context->GetTexture(surface);
+                });
+            AddPass(g.graph, "Save", PassType::Copy, PassFlags::None,
+                [&](ISetupContext* s) { Read(s, target, Access::CopySource); out = Write(s, out, Access::CopyDest); },
+                [target, out](IPassContext* context) {
+                    context->GetCommandList()->copyTexture1(context->GetTexture(out), nvrhi::TextureSlice(), context->GetTexture(target), nvrhi::TextureSlice());
+                });
+            g.Run();
+        }
+        check(attached, "the ShadingRateRead surface is the framebuffer's shading-rate attachment (tile " +
+              std::to_string(info.shadingRateImageTileSize) + ")");
+        checkClean(env, "shading-rate attachment");
+    }
+
     // 6.4: a transition split around two passes, on every backend that splits (Vulkan splits layout transitions of
     // resources of 1 MiB or more). Consecutive frames overlap on the GPU; the frame boundary meets the split's states.
     void testSplitBarriers(Env& env)
@@ -1688,6 +1737,7 @@ namespace
         run("native_guard", env.explicitScopes, [&] { testNativeGuard(env); });
         run("vvl_event_witness", vulkan, [&] { testVvlEventWitness(env); });
         run("split_barriers", env.raster, [&] { testSplitBarriers(env); });
+        run("shading_rate_attachment", env.raster && env.api != nvrhi::GraphicsAPI::D3D11, [&] { testShadingRateAttachment(env); });
         run("placed", true, [&] { testPlaced(env, 0); });
         run("placed_heap_tier_1", env.api == nvrhi::GraphicsAPI::D3D12, [&] { testPlaced(env, 1); });
         run("skip_aliasing_barriers", true, [&] { testSkipAliasingBarriers(env); });

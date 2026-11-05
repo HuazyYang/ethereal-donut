@@ -449,15 +449,23 @@ TemporalAntiAliasingGraphOutputs TemporalAntiAliasingPass::AddToGraph(IRenderGra
     if (!inputs.view || inputs.motionVectors == InvalidResourceId || inputs.unresolvedColor == InvalidResourceId ||
         graph->GetTextureDesc(inputs.resolvedColor, resolvedDesc) != nvrhi::FS_OK)
         return outputs;
+    TemporalAntiAliasingGraphInputs resolve = inputs;
+    resolve.motionVectors = outputs.motionVectors = AddMotionVectorsToGraph(graph, inputs);
+    outputs.resolvedColor = AddResolveToGraph(graph, resolve);
+    return outputs;
+}
 
-    if (inputs.viewPrevious && inputs.depth != InvalidResourceId)
+ResourceId TemporalAntiAliasingPass::AddMotionVectorsToGraph(IRenderGraph* graph, const TemporalAntiAliasingGraphInputs& inputs)
+{
+    TemporalAntiAliasingGraphOutputs outputs{ inputs.motionVectors, inputs.resolvedColor };
+    if (inputs.view && inputs.motionVectors != InvalidResourceId && inputs.viewPrevious && inputs.depth != InvalidResourceId)
     {
         const uint32_t viewCount = inputs.view->GetNumChildViews(ViewType::PLANAR);
         for (uint32_t viewIndex = 0; viewIndex < viewCount; ++viewIndex)
         {
             TaaUse* use = NewFrameData<TaaUse>(graph);
             if (!use)
-                return outputs;
+                return outputs.motionVectors;
             const IView* view = inputs.view->GetChildView(ViewType::PLANAR, viewIndex);
             const nvrhi::TextureSubresourceSet subresources = view->GetSubresources();
             *use = TaaUse{ TaaStage::MotionVectors, view, inputs.viewPrevious->GetChildView(ViewType::PLANAR, viewIndex),
@@ -470,6 +478,16 @@ TemporalAntiAliasingGraphOutputs TemporalAntiAliasingPass::AddToGraph(IRenderGra
             outputs.motionVectors = use->motionVectors;
         }
     }
+    return outputs.motionVectors;
+}
+
+ResourceId TemporalAntiAliasingPass::AddResolveToGraph(IRenderGraph* graph, const TemporalAntiAliasingGraphInputs& inputs)
+{
+    TemporalAntiAliasingGraphOutputs outputs{ inputs.motionVectors, inputs.resolvedColor };
+    nvrhi::TextureDesc resolvedDesc;
+    if (!inputs.view || inputs.motionVectors == InvalidResourceId || inputs.unresolvedColor == InvalidResourceId ||
+        graph->GetTextureDesc(inputs.resolvedColor, resolvedDesc) != nvrhi::FS_OK)
+        return outputs.resolvedColor;
 
     // The feedback: no debug name, so that the description allocates nothing; the registry names it.
     nvrhi::TextureDesc feedbackDesc;
@@ -480,17 +498,16 @@ TemporalAntiAliasingGraphOutputs TemporalAntiAliasingPass::AddToGraph(IRenderGra
     ResourceId current = InvalidResourceId;
     ResourceId previous = InvalidResourceId;
     if (GetHistoryPair(graph, m_FeedbackName.c_str(), feedbackDesc, &current, &previous) != nvrhi::FS_OK)
-        return outputs;
+        return outputs.resolvedColor;
 
     TaaUse* use = NewFrameData<TaaUse>(graph);
     if (!use)
-        return outputs;
+        return outputs.resolvedColor;
     *use = TaaUse{ TaaStage::Resolve, nullptr, nullptr, inputs.view, inputs.viewOutput ? inputs.viewOutput : inputs.view,
                    InvalidResourceId, outputs.motionVectors, inputs.unresolvedColor, outputs.resolvedColor, current, previous,
                    inputs.historyClampRelax, inputs.params, inputs.preViewTranslationDifference, nvrhi::SubresourceRegion() };
     graph->AddPass(PassDesc{ "TemporalAA", PassType::Compute, PassFlags::None, 0 }, this, use, nullptr);
-    outputs.resolvedColor = use->resolved;
-    return outputs;
+    return use->resolved;
 }
 
 nvrhi::FRESULT TemporalAntiAliasingPass::Setup(ISetupContext* context, void* data) noexcept

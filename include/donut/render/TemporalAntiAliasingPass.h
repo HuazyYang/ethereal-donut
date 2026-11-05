@@ -170,6 +170,11 @@ namespace donut::render
         dm::float2 GetCurrentPixelOffset();
 
         TemporalAntiAliasingGraphOutputs AddToGraph(IRenderGraph* graph, const TemporalAntiAliasingGraphInputs& inputs);
+        // AddToGraph's two stages, for a frame that uses the motion vectors before the resolve (variable-rate shading
+        // reads them before the scene is drawn). Each returns the new version of what it writes; the resolve reads
+        // inputs.motionVectors as given.
+        ResourceId AddMotionVectorsToGraph(IRenderGraph* graph, const TemporalAntiAliasingGraphInputs& inputs);
+        ResourceId AddResolveToGraph(IRenderGraph* graph, const TemporalAntiAliasingGraphInputs& inputs);
 
         nvrhi::FRESULT Setup(ISetupContext* context, void* data) noexcept override;
         nvrhi::FRESULT Prepare(IPrepareContext* context, void* data) noexcept override;
