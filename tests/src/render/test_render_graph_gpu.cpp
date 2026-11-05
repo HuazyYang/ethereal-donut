@@ -31,7 +31,7 @@
 
 #include "rdg_corpus.h"
 #include "rdg_donut_frame.h"
-#include "rdg_worker_pool.h"
+#include <donut/render/RenderGraphWorkerPool.h>
 
 #include <donut/core/vfs/VFS.h>
 
@@ -265,7 +265,7 @@ namespace
         uint64_t compileAllocations = 0;   // in the last Run, while the allocation hook counts
         uint64_t executeAllocations = 0;
         bool timers = false;               // ExecuteDesc::timers
-        rdgtest::WorkerPool* pool = nullptr;   // ExecuteDesc::parallelFor (10.1)
+        donut::render::RenderGraphWorkerPool* pool = nullptr;   // ExecuteDesc::parallelFor (10.1)
 
         // Compiles and executes the recorded frame; returns the plan's statistics.
         PlanStatistics Run(const CompileOptions& options = CompileOptions())
@@ -293,7 +293,7 @@ namespace
             execute.timers = timers;
             if (pool)
             {
-                execute.parallelFor = &rdgtest::WorkerPool::ParallelFor;
+                execute.parallelFor = &donut::render::RenderGraphWorkerPool::ParallelFor;
                 execute.schedulerContext = pool;
                 execute.workerCount = pool->ThreadCount();
             }
@@ -1443,7 +1443,7 @@ namespace
     // pipeline cache. D3D11 records on the calling thread.
     void testParallelRecording(Env& env)
     {
-        rdgtest::WorkerPool pool(3);
+        donut::render::RenderGraphWorkerPool pool(3);
         const bool parallelBackend = env.api != nvrhi::GraphicsAPI::D3D11;
         {
             GraphOnDevice g(env.device);
@@ -1651,7 +1651,7 @@ namespace
         donut::engine::ShaderFactory* shaderFactory = shaders.shaderFactory;
         donut::engine::CommonRenderPasses* commonPasses = shaders.commonPasses;
         const std::string prefix = parallel ? "donut's passes in parallel" : "donut's passes";
-        rdgtest::WorkerPool pool(parallel ? 3 : 0);
+        donut::render::RenderGraphWorkerPool pool(parallel ? 3 : 0);
         CompileOptions options;
         options.recordGranularity = parallel ? 3 : 0;
 
@@ -1699,6 +1699,11 @@ namespace
               prefix + ": run statistics: " + std::to_string(run.passes) + " passes, " + std::to_string(run.segments) + " segments, " +
               std::to_string(run.recordTasks) + " tasks, " + std::to_string(run.barriers) + " barriers, " +
               std::to_string(run.stateCalls) + " state calls, record " + std::to_string(run.recordMilliseconds) + " ms");
+        // Consecutive graphics segments with no wait between them share a submission; D3D11 submits each.
+        const bool batched = env.api == nvrhi::GraphicsAPI::D3D11 ? run.submissions == run.segments
+                                                                 : run.submissions >= 1 && (!parallel || run.submissions < run.segments);
+        check(batched, prefix + ": " + std::to_string(run.submissions) + " submissions for " + std::to_string(run.segments) +
+              " segments");
         const uint32_t timings = g.registry->GetPassTimingCount();
         bool lighting = false;
         float total = 0.f;

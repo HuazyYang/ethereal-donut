@@ -25,13 +25,13 @@
 //
 // A frame is 64 passes: a cleared seed, 62 blits through BlitPass (one object each, sharing CommonRenderPasses) and a
 // copy out. The recording time is RunStatistics::recordMilliseconds: patches, Prepare and the command recording. It is
-// measured on one list (no scheduler, one segment) and on four threads (WorkerPool with three workers and the caller,
+// measured on one list (no scheduler, one segment) and on four threads (RenderGraphWorkerPool with three workers and the caller,
 // 16 passes per segment). Protocol 10.4: Release, the NVIDIA adapter, no validation layers, 100 warm-up frames per
 // mode, then 300 frames per mode in alternating blocks of 50; medians. The budget: four threads take at most 60 % of
 // the single list's time.
 
 #include "rdg_corpus.h"
-#include "rdg_worker_pool.h"
+#include <donut/render/RenderGraphWorkerPool.h>
 
 #include <donut/core/vfs/VFS.h>
 #include <donut/engine/CommonRenderPasses.h>
@@ -142,7 +142,7 @@ namespace
         }
 
         // One frame; returns its recording time in microseconds, or a negative value on failure.
-        double Frame(rdgtest::WorkerPool* pool, uint32_t granularity)
+        double Frame(donut::render::RenderGraphWorkerPool* pool, uint32_t granularity)
         {
             graph->Reset();
             static const ClearValue c_Seed = { { 0.5f, 0.25f, 0.f, 1.f }, 0.f, 0 };
@@ -185,7 +185,7 @@ namespace
             ExecuteDesc execute;
             if (pool)
             {
-                execute.parallelFor = &rdgtest::WorkerPool::ParallelFor;
+                execute.parallelFor = &donut::render::RenderGraphWorkerPool::ParallelFor;
                 execute.schedulerContext = pool;
                 execute.workerCount = pool->ThreadCount();
             }
@@ -215,7 +215,7 @@ namespace
             std::fprintf(stderr, "rdg_bench --parallel: setup failed\n");
             return 1;
         }
-        rdgtest::WorkerPool pool(3);
+        donut::render::RenderGraphWorkerPool pool(3);
         const uint32_t warmup = quick ? 5 : 100;
         const uint32_t blocks = quick ? 1 : 6;
         const uint32_t perBlock = quick ? 5 : 50;

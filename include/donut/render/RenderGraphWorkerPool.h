@@ -20,9 +20,15 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-// A host task scheduler for ExecuteDesc::parallelFor in the render graph's tests and rdg_bench (aggregate plan,
-// step P1.7). Fixed worker threads, and the calling thread works too. A call allocates nothing. Workers spin briefly
-// before they sleep, so that a frame's recording does not wait for a thread to wake.
+// A host task scheduler for ExecuteDesc::parallelFor (design 10.1), for applications without a task system of their
+// own: the samples, the render graph's tests and rdg_bench. Fixed worker threads, and the calling thread works too.
+// A call allocates nothing. Workers spin briefly before they sleep, so that a frame's recording does not wait for a
+// thread to wake.
+//
+//     RenderGraphWorkerPool pool(3);                      // three workers and the caller
+//     execute.parallelFor = &RenderGraphWorkerPool::ParallelFor;
+//     execute.schedulerContext = &pool;
+//     execute.workerCount = pool.ThreadCount();
 
 #pragma once
 
@@ -35,19 +41,19 @@
 #include <thread>
 #include <vector>
 
-namespace rdgtest
+namespace donut::render
 {
-    class WorkerPool
+    class RenderGraphWorkerPool
     {
     public:
         // `threads` workers besides the caller.
-        explicit WorkerPool(uint32_t threads)
+        explicit RenderGraphWorkerPool(uint32_t threads)
         {
             for (uint32_t i = 0; i < threads; ++i)
                 m_Threads.emplace_back([this] { Work(); });
         }
 
-        ~WorkerPool()
+        ~RenderGraphWorkerPool()
         {
             {
                 std::lock_guard<std::mutex> lock(m_Mutex);
@@ -59,19 +65,19 @@ namespace rdgtest
                 thread.join();
         }
 
-        WorkerPool(const WorkerPool&) = delete;
-        WorkerPool& operator=(const WorkerPool&) = delete;
+        RenderGraphWorkerPool(const RenderGraphWorkerPool&) = delete;
+        RenderGraphWorkerPool& operator=(const RenderGraphWorkerPool&) = delete;
 
         // The threads that run tasks: the workers and the caller.
         uint32_t ThreadCount() const { return uint32_t(m_Threads.size()) + 1; }
 
-        // A donut::render::ParallelForFunction; `pool` is the WorkerPool.
-        static void ParallelFor(void* pool, uint32_t count, donut::render::TaskFunction task, void* taskContext)
+        // A ParallelForFunction; `pool` is the RenderGraphWorkerPool.
+        static void ParallelFor(void* pool, uint32_t count, TaskFunction task, void* taskContext)
         {
-            static_cast<WorkerPool*>(pool)->Run(count, task, taskContext);
+            static_cast<RenderGraphWorkerPool*>(pool)->Run(count, task, taskContext);
         }
 
-        void Run(uint32_t count, donut::render::TaskFunction task, void* taskContext)
+        void Run(uint32_t count, TaskFunction task, void* taskContext)
         {
             if (m_Threads.empty() || count < 2)
             {
@@ -142,7 +148,7 @@ namespace rdgtest
         std::atomic<uint64_t> m_Generation{ 0 };
         std::atomic<uint32_t> m_Next{ 0 };
         std::atomic<uint32_t> m_Active{ 0 };
-        donut::render::TaskFunction m_Task = nullptr;
+        TaskFunction m_Task = nullptr;
         void* m_Context = nullptr;
         uint32_t m_Count = 0;
         bool m_Quit = false;

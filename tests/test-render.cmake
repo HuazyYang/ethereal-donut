@@ -44,7 +44,7 @@ set_property(TARGET test_render_graph_passes PROPERTY FOLDER "Donut/donut_tests/
 # The benchmark of design 10.3. The device-free budgets: a smoke run in ctest, measured in Release with
 # `rdg_bench --gate`. The parallel-recording budget needs a device (plan step P1.7): `rdg_bench --parallel d3d12|vulkan
 # --gate`, with GPU smoke runs in ctest.
-add_executable(rdg_bench src/render/rdg_bench.cpp src/render/rdg_bench_parallel.cpp src/render/rdg_worker_pool.h)
+add_executable(rdg_bench src/render/rdg_bench.cpp src/render/rdg_bench_parallel.cpp)
 target_link_libraries(rdg_bench donut_rdg_corpus donut_render donut_engine donut_core)
 if(TARGET nvrhi_factory)
     target_link_libraries(rdg_bench nvrhi_factory)
@@ -75,7 +75,7 @@ set_property(TARGET rdg_bench PROPERTY FOLDER "Donut/donut_tests/donut_render_te
 
 # Headless graphs on a device, per backend, under the debug layers (plan step P1.4). The nvrhi backends are static
 # libraries linked through nvrhi_factory; a shared nvrhi build exports them from its DLL.
-add_executable(test_render_graph_gpu src/render/test_render_graph_gpu.cpp src/render/rdg_worker_pool.h)
+add_executable(test_render_graph_gpu src/render/test_render_graph_gpu.cpp)
 target_link_libraries(test_render_graph_gpu donut_rdg_corpus donut_render donut_engine donut_core)
 if(TARGET nvrhi_factory)
     target_link_libraries(test_render_graph_gpu nvrhi_factory)
@@ -141,7 +141,7 @@ add_test(NAME donut_render_graph_header_hygiene
 
 # Every public RenderGraph header is self-contained: one compile-only translation unit each, which includes it twice.
 set(_rdg_header_tus "")
-foreach(_header RenderGraph RenderGraphLambdaPass RenderGraphFrameData)
+foreach(_header RenderGraph RenderGraphLambdaPass RenderGraphFrameData RenderGraphWorkerPool)
     set(_tu "${CMAKE_CURRENT_BINARY_DIR}/render_graph_header_tus/${_header}.cpp")
     file(WRITE "${_tu}.in" "#include <donut/render/${_header}.h>\n#include <donut/render/${_header}.h>\n")
     configure_file("${_tu}.in" "${_tu}" COPYONLY)

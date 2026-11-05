@@ -109,11 +109,12 @@ namespace donut::render::rdg
         std::vector<PassContext*> segmentContexts;
         std::vector<nvrhi::FRESULT> segmentResults;
         std::vector<uint32_t> timerSlots;
+        std::vector<uint64_t> segmentCost;           // each segment's last recording, in ns: the next frame's weights
         std::vector<uint32_t> segmentGroup;
-        std::vector<uint32_t> groupWeight;
+        std::vector<uint64_t> groupWeight;
         std::vector<uint32_t> groupOrder;
         std::vector<uint32_t> groupTask;
-        std::vector<uint32_t> taskLoad;
+        std::vector<uint64_t> taskLoad;
         std::vector<uint32_t> taskBegin;
         std::vector<uint32_t> taskSegments;
         std::vector<std::pair<const void*, uint32_t>> passOwners;
@@ -1490,12 +1491,16 @@ namespace donut::render::rdg
                 group[std::max(a, b)] = std::min(a, b);
         }
 
+        // A group weighs what its segments took to record last frame; until each has been recorded once, its passes.
+        bool measured = instance.segmentCost.size() == segmentCount;
+        for (uint32_t i = 0; i < segmentCount && measured; ++i)
+            measured = instance.segmentCost[i] != 0;
         instance.groupWeight.assign(segmentCount, 0);
         instance.groupOrder.clear();
         for (uint32_t i = 0; i < segmentCount; ++i)
         {
             const uint32_t root = find(i);
-            instance.groupWeight[root] += plan.m_Segments[i].passCount;
+            instance.groupWeight[root] += measured ? instance.segmentCost[i] : plan.m_Segments[i].passCount;
             if (root == i)
                 instance.groupOrder.push_back(i);
         }
@@ -1528,23 +1533,30 @@ namespace donut::render::rdg
     }
 
     // A ParallelForFunction task: one task's segments. Nothing escapes to the host's scheduler.
+    // Records one segment and keeps what it took, for the next frame's task weights.
+    static void RecordTimedSegment(ExecutorFrame& frame, uint32_t segment)
+    {
+        PlanInstance& instance = frame.instance;
+        const auto start = std::chrono::steady_clock::now();
+        try
+        {
+            instance.segmentResults[segment] = RecordSegment(frame, segment, instance.segmentLists[segment],
+                                                             instance.segmentContexts[segment]);
+        }
+        catch (...)
+        {
+            instance.segmentResults[segment] = nvrhi::FE_OUT_OF_MEMORY;
+        }
+        const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start);
+        instance.segmentCost[segment] = std::max<uint64_t>(uint64_t(nanoseconds.count()), 1);
+    }
+
     static void RecordTask(void* context, uint32_t task)
     {
         ExecutorFrame& frame = *static_cast<ExecutorFrame*>(context);
         PlanInstance& instance = frame.instance;
         for (uint32_t i = instance.taskBegin[task]; i < instance.taskBegin[task + 1]; ++i)
-        {
-            const uint32_t segment = instance.taskSegments[i];
-            try
-            {
-                instance.segmentResults[segment] = RecordSegment(frame, segment, instance.segmentLists[segment],
-                                                                 instance.segmentContexts[segment]);
-            }
-            catch (...)
-            {
-                instance.segmentResults[segment] = nvrhi::FE_OUT_OF_MEMORY;
-            }
-        }
+            RecordTimedSegment(frame, instance.taskSegments[i]);
     }
 
     // ------------------------------------------------------------------------------------------------ execute
@@ -1805,6 +1817,7 @@ namespace donut::render::rdg
                 instance.segmentContexts[i] = SegmentContext(frame, i);
             }
             AssignTimerSlots(frame);
+            instance.segmentCost.resize(segmentCount, 0);
             const bool parallel = desc.parallelFor && profile.recordingMode != RecordingMode::ImmediateSerial && segmentCount > 1;
             const uint32_t tasks = parallel ? PlanRecordingTasks(frame, desc.workerCount ? desc.workerCount : segmentCount) : 0;
             if (tasks > 1)
@@ -1814,7 +1827,7 @@ namespace donut::render::rdg
             else
             {
                 for (uint32_t i = 0; i < segmentCount; ++i)
-                    instance.segmentResults[i] = RecordSegment(frame, i, instance.segmentLists[i], instance.segmentContexts[i]);
+                    RecordTimedSegment(frame, i);
             }
             for (uint32_t i = 0; i < segmentCount; ++i)
             {
@@ -1856,17 +1869,32 @@ namespace donut::render::rdg
             }
 
             bool firstOfQueue[3] = { true, true, true };
-            for (uint32_t i = 0; i < segmentCount; ++i)
+            uint32_t submissions = 0;
+            for (uint32_t i = 0; i < segmentCount; )
             {
                 const PlanSegment& segment = plan.m_Segments[i];
                 const uint32_t q = uint32_t(segment.queue);
-                nvrhi::ICommandList* list = runtime.commandLists[q][instance.segmentOrdinal[i]];
                 if (!fences)
                 {
-                    device->executeCommandList(list, segment.queue);
+                    device->executeCommandList(runtime.commandLists[q][instance.segmentOrdinal[i]], segment.queue);
                     firstOfQueue[q] = false;
+                    ++submissions;
+                    ++i;
                     continue;
                 }
+                // One submission for a run of segments, in plan order, on one queue: every segment after the first
+                // waits for nothing, and nothing waits for one before the last (PlanSegment::signals). Every wait and
+                // every signal that some segment waits for stays where separate submissions put it; the run's
+                // segments share its one fence value.
+                constexpr uint32_t c_MaxBatch = 16;
+                nvrhi::ICommandList* lists[c_MaxBatch];
+                uint32_t end = i;
+                do
+                {
+                    lists[end - i] = runtime.commandLists[q][instance.segmentOrdinal[end]];
+                    ++end;
+                } while (end < segmentCount && end - i < c_MaxBatch && plan.m_Segments[end].queue == segment.queue &&
+                         plan.m_Segments[end].waitCount == 0 && !plan.m_Segments[end - 1].signals);
                 nvrhi::FenceValue waits[8];
                 uint32_t waitCount = 0;
                 auto addWait = [&](uint32_t queue, uint64_t value) {
@@ -1905,11 +1933,13 @@ namespace donut::render::rdg
                 }
                 firstOfQueue[q] = false;
                 const uint64_t value = ++runtime.fenceValues[q];
-                instance.segmentValue[i] = value;
+                for (uint32_t s = i; s < end; ++s)
+                    instance.segmentValue[s] = value;
                 const nvrhi::FenceValue signal{ runtime.fences[q], value };
-                nvrhi::ICommandList* const lists[] = { list };
-                device->submit(nvrhi::SubmitDesc().setCommandLists(lists, 1).setQueue(segment.queue)
+                device->submit(nvrhi::SubmitDesc().setCommandLists(lists, end - i).setQueue(segment.queue)
                     .setWaits(waits, waitCount).setSignals(&signal, 1));
+                ++submissions;
+                i = end;
             }
 
             if (!fences && runtime.frameQueries[runtime.frameQueryNext])
@@ -1947,6 +1977,7 @@ namespace donut::render::rdg
             run.passes = frame.passes.load(std::memory_order_relaxed);
             run.recordTasks = frame.recordTasks;
             run.segments = segmentCount;
+            run.submissions = submissions;
             run.barriers = frame.barriers.load(std::memory_order_relaxed) + uint32_t(runtime.patches.size());
             run.stateCalls = frame.stateCalls.load(std::memory_order_relaxed) +
                 (plan.m_Profile.explicitBarriers ? 0u : 2u * uint32_t(runtime.patches.size()));
