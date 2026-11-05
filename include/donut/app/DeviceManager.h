@@ -179,6 +179,11 @@ namespace donut::app
         // true to keep GLFW's stock always-on-top behavior — appropriate only
         // for true exclusive-fullscreen / kiosk-style apps.
         bool fullscreenAlwaysOnTop = false;
+        // Whether the new window takes the focus and comes to the front of the display when it is shown. The default
+        // (false) shows it without activating it, just below the window that has the focus, so that an app started
+        // from a script or a test run does not cover what the user is working in. Donut renders an unfocused window
+        // only when a layer asks for it (IAppLayer::ShouldRenderUnfocused): click the window to work in it.
+        bool bringWindowToFront = false;
         int windowPosX = -1;            // -1 means use default placement
         int windowPosY = -1;
         uint32_t backBufferWidth = 1280;

@@ -287,6 +287,22 @@ static void ClearFullscreenTopmost(GLFWwindow* window)
 #endif
 }
 
+// DeviceCreationParameters::bringWindowToFront = false: the window, shown without activation, goes just below the
+// window that has the focus, or to the bottom of the Z order when no other window has it.
+static void KeepBehindForeground(GLFWwindow* window)
+{
+#if _WIN32
+    if (HWND hwnd = glfwGetWin32Window(window))
+    {
+        HWND foreground = GetForegroundWindow();
+        SetWindowPos(hwnd, foreground && foreground != hwnd ? foreground : HWND_BOTTOM, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+#else
+    (void)window;
+#endif
+}
+
 bool DeviceManager::CreateWindowDeviceAndSwapChain(const DeviceCreationParameters& params, const char *windowTitle)
 {
     m_DeviceParams = params;
@@ -387,6 +403,7 @@ bool DeviceManager::CreateWindowDeviceAndSwapChain(const DeviceCreationParameter
     glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE);
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);   // Ignored for fullscreen
+    glfwWindowHint(GLFW_FOCUS_ON_SHOW, m_DeviceParams.bringWindowToFront ? GLFW_TRUE : GLFW_FALSE);
 
     if (m_DeviceParams.startBorderless)
     {
@@ -459,12 +476,22 @@ bool DeviceManager::CreateWindowDeviceAndSwapChain(const DeviceCreationParameter
     if (!CreateSwapChain())
         return false;
 
-    glfwShowWindow(m_Window);
-    glfwFocusWindow(m_Window);
-
-    if (m_DeviceParams.startMaximized)
+    if (m_DeviceParams.bringWindowToFront)
     {
-        glfwMaximizeWindow(m_Window);
+        glfwShowWindow(m_Window);
+        glfwFocusWindow(m_Window);
+
+        if (m_DeviceParams.startMaximized)
+            glfwMaximizeWindow(m_Window);
+    }
+    else
+    {
+        // Maximized while hidden: GLFW maximizes a visible window by activating it.
+        if (m_DeviceParams.startMaximized)
+            glfwMaximizeWindow(m_Window);
+
+        glfwShowWindow(m_Window);   // GLFW_FOCUS_ON_SHOW is off: shown without activation
+        KeepBehindForeground(m_Window);
     }
 
     // reset the back buffer size state to enforce a resize event
