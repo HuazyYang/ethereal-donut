@@ -424,7 +424,10 @@ namespace donut::render::rdg
             ResourceStates required = LowerAccess(use.access, stages);
             const bool write = use.isWrite || clearSubStep;
             if (clearSubStep)
-                required = ClearState(use.access, plan.m_Resources[use.resource].isBuffer, profile);
+            {
+                const PlanResource& cleared = plan.m_Resources[use.resource];
+                required = ClearState(cleared.isBuffer, cleared.hasDepth, cleared.isRenderTarget, profile);
+            }
             const bool fullWrite = clearSubStep || (use.isWrite &&
                 (use.flags & (AccessFlags::FullWrite | AccessFlags::Clear)) != AccessFlags::None);
             const PlanResource& resource = plan.m_Resources[use.resource];

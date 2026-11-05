@@ -35,11 +35,48 @@ namespace donut::render::rdg
     {
     }
 
-    ResourceRegistry::~ResourceRegistry() = default;
+    ResourceRegistry::~ResourceRegistry()
+    {
+        WaitForFrames();
+        // Everything that holds device objects goes before the device reference does.
+        m_Runtime.lastPlan = nullptr;
+        m_Plans.clear();
+        m_Persistent.clear();
+        m_Runtime = RegistryRuntime();
+    }
+
+    void ResourceRegistry::WaitForFrames() noexcept
+    {
+        if (!m_Device || m_Runtime.framesExecuted == 0)
+            return;
+        if (m_Runtime.fencesSupported)
+        {
+            nvrhi::FenceValue values[3];
+            uint32_t count = 0;
+            for (uint32_t q = 0; q < 3; ++q)
+            {
+                if (m_Runtime.fences[q] && m_Runtime.fenceValues[q])
+                    values[count++] = nvrhi::FenceValue{ m_Runtime.fences[q], m_Runtime.fenceValues[q] };
+            }
+            if (count)
+                m_Device->waitFences(values, count, true);
+        }
+        else if (m_Runtime.frameQuery && m_Runtime.frameQueryPending)
+        {
+            m_Device->waitEventQuery(m_Runtime.frameQuery);
+            m_Runtime.frameQueryPending = false;
+        }
+    }
 
     void ResourceRegistry::ReleaseResources() noexcept
     {
+        // After the GPU has finished with them (4). The persistent resources stay, with exact states.
+        WaitForFrames();
+        FinalizeLastPlan(*this);
         ClearPlanCache();
+        m_Runtime.instances.clear();
+        m_Runtime.freePool.clear();
+        m_Runtime.extractPool.clear();
     }
 
     nvrhi::FRESULT ResourceRegistry::ReleasePersistent(const char* name) noexcept
@@ -51,8 +88,10 @@ namespace donut::render::rdg
         {
             if (entry.live && entry.nameHash == hash && entry.name == name)
             {
-                // Entries keep their index: plans name them. A released entry is reallocated on its next use.
+                // Entries keep their index: plans name them. A released entry is reallocated on its next use; frames
+                // in flight keep the old textures alive through their command lists.
                 entry.live = false;
+                entry.physicals.clear();
                 return nvrhi::FS_OK;
             }
         }
@@ -72,6 +111,9 @@ namespace donut::render::rdg
         out.planMisses = m_PlanMisses;
         for (const PersistentEntry& entry : m_Persistent)
             out.persistentResources += entry.live ? 1 : 0;
+        out.pooledResources = uint32_t(m_Runtime.freePool.size());
+        out.framesExecuted = m_Runtime.framesExecuted;
+        out.objectsCreated = m_Runtime.objectsCreated;
     }
 
     uint32_t ResourceRegistry::AcquirePersistent(const char* name, uint8_t kind, uint64_t descHash, uint8_t layerCount,

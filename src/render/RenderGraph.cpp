@@ -1046,7 +1046,8 @@ namespace donut::render::rdg
 
     nvrhi::FRESULT RenderGraph::Execute(ICompiledRenderGraph* plan, const ExecuteDesc& desc) noexcept
     {
-        (void)desc;
+        if (m_InSetup)
+            return nvrhi::FE_INVALID_ARGS;
         if (!plan || plan != static_cast<ICompiledRenderGraph*>(m_Plan.Get()))
             return nvrhi::FE_INVALID_ARGS;
         for (const PlanResource& resource : m_Plan->m_Resources)
@@ -1056,8 +1057,7 @@ namespace donut::render::rdg
         }
         if (!m_Registry->GetDevice())
             return nvrhi::FE_UNSUPPORTED;
-        // The executor is step P1.4 of the plan.
-        return nvrhi::FE_NOT_IMPLEMENT;
+        return ExecutePlan(*this, *m_Plan, desc);
     }
 
     void RenderGraph::GetDiagnostics(nvrhi::string& out) noexcept

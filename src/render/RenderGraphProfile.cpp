@@ -213,7 +213,7 @@ namespace donut::render::rdg
         }
     }
 
-    ResourceStates ClearState(Access access, bool isBuffer, const BackendProfile& profile) noexcept
+    ResourceStates ClearState(bool isBuffer, bool hasDepth, bool isRenderTarget, const BackendProfile& profile) noexcept
     {
         switch (profile.barrierModel)
         {
@@ -223,15 +223,13 @@ namespace donut::render::rdg
             // vkCmdClearColorImage, vkCmdClearDepthStencilImage and vkCmdFillBuffer are transfer operations.
             return ResourceStates::CopyDest;
         default:
+            // nvrhi's D3D12 clears pick the view from the description: a render target clears through its RTV, any
+            // other texture and every buffer through a UAV, depth through its DSV.
             if (isBuffer)
                 return ResourceStates::UnorderedAccess;
-            if ((access & Access::ColorTarget) != Access::None)
-                return ResourceStates::RenderTarget;
-            if ((access & (Access::DepthWrite | Access::StencilWrite)) != Access::None)
+            if (hasDepth)
                 return ResourceStates::DepthWrite;
-            if ((access & Access::CopyDest) != Access::None)
-                return ResourceStates::CopyDest;
-            return ResourceStates::UnorderedAccess;
+            return isRenderTarget ? ResourceStates::RenderTarget : ResourceStates::UnorderedAccess;
         }
     }
 

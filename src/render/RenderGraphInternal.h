@@ -36,6 +36,7 @@
 #include <donut/render/RenderGraph.h>
 #include <nvrhi/core/foundation.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -330,8 +331,9 @@ namespace donut::render::rdg
                                     const BackendProfile& profile) noexcept;
     // Vulkan: whether a transition between the two states changes the image layout.
     bool ChangesVulkanLayout(nvrhi::ResourceStates before, nvrhi::ResourceStates after) noexcept;
-    // The state a Clear access is recorded in (6.9); Unknown when the profile records no barriers.
-    nvrhi::ResourceStates ClearState(Access access, bool isBuffer, const BackendProfile& profile) noexcept;
+    // The state a Clear access is recorded in (6.9), as nvrhi's clear functions need it; Unknown when the profile
+    // records no barriers.
+    nvrhi::ResourceStates ClearState(bool isBuffer, bool hasDepth, bool isRenderTarget, const BackendProfile& profile) noexcept;
     bool QueuesShareFamily(nvrhi::CommandQueue a, nvrhi::CommandQueue b, const BackendProfile& profile) noexcept;
     uint64_t HashProfile(const BackendProfile& profile) noexcept;
 
@@ -376,6 +378,7 @@ namespace donut::render::rdg
     // replays these.
     struct PlanUse
     {
+        uint32_t accessIndex;             // the graph's access record (stable for one structure)
         uint32_t resource;
         Access access;
         nvrhi::ShaderType stages;
@@ -411,6 +414,7 @@ namespace donut::render::rdg
         bool isBuffer;
         bool hasDepth;
         bool hasStencil;
+        bool isRenderTarget;
         bool extracted;
         bool crossQueue;
         bool aliased;
@@ -430,6 +434,16 @@ namespace donut::render::rdg
         nvrhi::ResourceStates exit;       // declared exit (imports, extracted)
         nvrhi::ResourceStates creation;   // the state a new physical resource is created in: its frame-start state
         uint64_t descHash;
+    };
+
+    // The state a region of a physical resource is in at frame start, by the plan's cyclic model (6.12): the state its
+    // previous frame left it in. `resource` names the physical resource through its first occupant (or the history
+    // layer). The registry compares these with the states it tracks and patches the difference on a plan switch.
+    struct PlanEntryState
+    {
+        uint32_t resource;
+        nvrhi::SubresourceRegion region;
+        nvrhi::ResourceStates state;
     };
 
     // ------------------------------------------------------------------------------------------------ memory plan
@@ -474,6 +488,8 @@ namespace donut::render::rdg
 
     // ------------------------------------------------------------------------------------------------ the plan
 
+    struct PlanInstance;   // the executor's lowered form of a plan (RenderGraphExecutor.cpp)
+
     class CompiledRenderGraph final : public nvrhi::ObjectImpl<ICompiledRenderGraph>
     {
     public:
@@ -481,7 +497,8 @@ namespace donut::render::rdg
         NVRHI_IMPLEMENTS_INTERFACE(ICompiledRenderGraph)
         NVRHI_END_INTERFACE_TABLE()
 
-        CompiledRenderGraph() = default;
+        CompiledRenderGraph();
+        ~CompiledRenderGraph();
 
         // ICompiledRenderGraph
         uint64_t GetPlanHash() noexcept override { return m_Key; }
@@ -515,9 +532,82 @@ namespace donut::render::rdg
         std::vector<SegmentWait> m_SegmentWaits;
         std::vector<PlanResource> m_Resources;
         std::vector<uint32_t> m_ScheduleOfProgram;   // per program pass: schedule index or c_None
+        std::vector<PlanEntryState> m_EntryStates;
         std::vector<char> m_Names;
         PlanStatistics m_Statistics;
+
+        uint64_t m_Serial = 0;                       // unique per plan object, never reused
+        std::unique_ptr<PlanInstance> m_Instance;    // created by the first Execute
     };
+
+    // ------------------------------------------------------------------------------------------------ runtime (9.1)
+
+    // A GPU resource the registry owns: the memory of transients, a persistent resource, a history layer, or an
+    // extracted texture. `states` (planes x mips x slices) is exact when `stateOwner` is 0. Otherwise it is the
+    // frame-start state of plan `stateOwner`'s cyclic model (6.12), which holds as long as that plan runs every frame.
+    struct PhysicalResource
+    {
+        nvrhi::AutoPtr<nvrhi::ITexture> texture;
+        nvrhi::AutoPtr<nvrhi::IBuffer> buffer;
+        nvrhi::IResource* resource = nullptr;
+        bool isBuffer = false;
+        uint64_t descHash = 0;
+        uint32_t planes = 1;
+        uint32_t mips = 1;
+        uint32_t slices = 1;
+        std::vector<nvrhi::ResourceStates> states;
+        bool fresh = true;                // never used: in the backend's creation state
+        uint64_t stateOwner = 0;
+        uint64_t lastUsedFrame = 0;
+    };
+
+    // The physical resources of one structure (one memory plan), shared by the plans of all its masks.
+    struct StructureInstance
+    {
+        std::shared_ptr<const StructurePlan> structure;
+        std::vector<std::unique_ptr<PhysicalResource>> physicals;   // per PhysicalObject
+    };
+
+    // A resource of the frame being executed.
+    struct FrameResource
+    {
+        nvrhi::IResource* resource;
+        nvrhi::ITexture* texture;
+        nvrhi::IBuffer* buffer;
+        PhysicalResource* physical;       // nullptr for imports
+    };
+
+    struct RegistryRuntime
+    {
+        std::vector<std::unique_ptr<StructureInstance>> instances;
+        std::vector<std::unique_ptr<PhysicalResource>> freePool;     // transient memory of retired structures
+        std::vector<std::unique_ptr<PhysicalResource>> extractPool;
+        std::array<nvrhi::AutoPtr<nvrhi::IFence>, 3> fences;
+        std::array<uint64_t, 3> fenceValues = {};
+        std::array<uint64_t, 3> lastFrameValues = {};                // each queue's last signal of the last frame
+        bool fencesChecked = false;
+        bool fencesSupported = false;
+        std::array<std::vector<nvrhi::AutoPtr<nvrhi::ICommandList>>, 3> commandLists;
+        nvrhi::AutoPtr<nvrhi::ICommandList> prologueList;
+        nvrhi::AutoPtr<nvrhi::IEventQuery> frameQuery;               // D3D11 before 11.4: no fences
+        bool frameQueryPending = false;
+        nvrhi::AutoPtr<CompiledRenderGraph> lastPlan;
+        std::vector<FrameResource> frameResources;
+        std::vector<nvrhi::ResourceBarrier> patches;
+        std::vector<PhysicalResource*> patchOwners;                  // per patch: the tracker fallback's resource
+        std::vector<nvrhi::ResourceStates> scratchStates;
+        std::vector<nvrhi::IResource*> trackedInList;                // the tracker fallback (9.1, item 6)
+        nvrhi::AutoPtr<IPrepareContext> prepareContext;
+        std::vector<nvrhi::AutoPtr<IPassContext>> passContexts;      // one per segment
+        uint64_t objectsCreated = 0;
+        uint64_t framesExecuted = 0;
+        uint64_t lastFrameIndex = 0;                                 // the graph frame index of the last Execute
+    };
+
+    // Runs a plan that Compile returned for the graph's current frame (9.1). RenderGraphExecutor.cpp.
+    nvrhi::FRESULT ExecutePlan(RenderGraph& graph, CompiledRenderGraph& plan, const ExecuteDesc& desc) noexcept;
+    // Makes the last executed plan's cyclic states exact (6.12) and forgets the plan; before ReleaseResources drops it.
+    void FinalizeLastPlan(ResourceRegistry& registry) noexcept;
 
     // ------------------------------------------------------------------------------------------------ registry
 
@@ -532,6 +622,8 @@ namespace donut::render::rdg
         uint64_t allocatedFrame = 0;        // the frame of the current generation's first use
         uint64_t lastFrame = 0;
         bool live = true;
+        std::vector<std::unique_ptr<PhysicalResource>> physicals;   // 1, or the history's layer count
+        uint32_t physicalGeneration = 0;
     };
 
     struct PlanCacheEntry
@@ -566,6 +658,12 @@ namespace donut::render::rdg
         uint32_t AcquirePersistent(const char* name, uint8_t kind, uint64_t descHash, uint8_t layerCount,
                                    uint64_t frameIndex, uint32_t& generation, bool& kindMismatch);
         const PersistentEntry& GetPersistent(uint32_t index) const { return m_Persistent[index]; }
+        PersistentEntry& GetPersistentMutable(uint32_t index) { return m_Persistent[index]; }
+
+        // The executor's state (RenderGraphExecutor.cpp).
+        RegistryRuntime m_Runtime;
+        // Waits until the GPU has finished every frame this registry submitted.
+        void WaitForFrames() noexcept;
 
         // Plan cache (7.7).
         CompiledRenderGraph* FindPlan(uint64_t key, uint64_t maskHash, uint32_t passCount, uint32_t resourceCount,
@@ -647,6 +745,9 @@ namespace donut::render::rdg
         const PolicyRecord& GetPolicy(uint32_t index) const noexcept { return m_Policies[index]; }
         ResourceRegistry* GetRegistry() const noexcept { return m_Registry; }
         uint64_t StructuralHashValue() const noexcept { return m_StructuralHash; }
+        uint64_t FrameIndexValue() const noexcept { return m_FrameIndex; }
+        uint32_t MarkerCount() const noexcept { return m_Markers.size; }
+        const MarkerRecord& GetMarker(uint32_t index) const noexcept { return m_Markers[index]; }
         CompiledRenderGraph* GetCompiledPlan() const noexcept { return m_Plan; }
 
     private:

@@ -117,8 +117,9 @@ namespace donut::render::rdg
             void BuildItems(const std::vector<Step>& steps, bool isTexture, std::vector<Item>& items);
             bool GroupLegal(ResourceStates state, uint32_t queueMask, CommandQueue firstQueue) const;
             Prev MakePrev(const std::vector<Step>& steps, const Item& item, int8_t frameDelta) const;
-            void Walk(const Object& object, const UnitKey& unit, const std::vector<Step>& steps,
-                      const std::vector<Item>& items, Prev prev, bool hasPredecessor);
+            // Returns the unit's frame-start state.
+            ResourceStates Walk(const Object& object, const UnitKey& unit, const std::vector<Step>& steps,
+                                const std::vector<Item>& items, Prev prev, bool hasPredecessor);
 
             bool Legal(ResourceStates state, CommandQueue queue) const { return IsStateLegalOnQueue(state, queue, m_Profile); }
             void AddWait(uint32_t waiter, uint32_t producer, int8_t frameDelta);
@@ -432,7 +433,7 @@ namespace donut::render::rdg
                     // 6.9: the prologue moves the range into the clear state, the clear is recorded, and a post-clear
                     // batch moves it into the pass's state.
                     Step clearStep = step;
-                    clearStep.state = ClearState(clearAccess, record.isBuffer, m_Profile);
+                    clearStep.state = ClearState(record.isBuffer, record.hasDepth, !record.isBuffer && record.texture.isRenderTarget, m_Profile);
                     clearStep.stages = nvrhi::ShaderType::None;
                     clearStep.write = true;
                     clearStep.fullWrite = true;
@@ -794,14 +795,22 @@ namespace donut::render::rdg
             ++m_State.transitionCount;
         }
 
+        static bool HasWriteState(ResourceStates state) noexcept
+        {
+            const ResourceStates writes = ResourceStates::UnorderedAccess | ResourceStates::RenderTarget |
+                ResourceStates::DepthWrite | ResourceStates::CopyDest | ResourceStates::ResolveDest |
+                ResourceStates::StreamOut | ResourceStates::AccelStructWrite;
+            return (state & writes) != 0;
+        }
+
         static bool IsLegacyDiscardable(ResourceStates state) noexcept
         {
             return state == ResourceStates::RenderTarget || state == ResourceStates::DepthWrite ||
                 state == ResourceStates::UnorderedAccess;
         }
 
-        void TransitionBuilder::Walk(const Object& object, const UnitKey& unit, const std::vector<Step>& steps,
-                                     const std::vector<Item>& items, Prev prev, bool hasPredecessor)
+        ResourceStates TransitionBuilder::Walk(const Object& object, const UnitKey& unit, const std::vector<Step>& steps,
+                                               const std::vector<Item>& items, Prev prev, bool hasPredecessor)
         {
             const RenderGraph& graph = m_State.graph;
             const ResourceRecord& record = graph.GetResource(object.record);
@@ -809,6 +818,7 @@ namespace donut::render::rdg
             const bool isTexture = !record.isBuffer;
             const bool frameStartWrap = object.cyclic && hasPredecessor;
             bool firstItem = true;
+            ResourceStates entry = prev.state;
 
             for (const Item& item : items)
             {
@@ -879,7 +889,7 @@ namespace donut::render::rdg
                     if (Place(args, wrapped) && wrapped)
                     {
                         // The hand-off happens at the end of the previous frame: the frame starts in the new state.
-                        m_State.entryState[object.record] = item.state;
+                        entry = item.state;
                     }
                     placed = stateChange || m_Profile.barrierModel != BarrierModel::D3D12Legacy;
                 }
@@ -921,6 +931,22 @@ namespace donut::render::rdg
                     }
                     CrossQueueWaits(prev, steps, item);
                 }
+                else if (!placed && prev.entry && firstItem && !object.cyclic && !object.transientLike &&
+                         m_Profile.barrierModel == BarrierModel::Vulkan && (item.write || HasWriteState(prev.state)))
+                {
+                    // An import first used in its entry state: its previous user's accesses come from another
+                    // submission, which Vulkan does not order (D3D12 orders and flushes between ExecuteCommandLists
+                    // calls). A same-state barrier from the entry state's stages makes them a dependency.
+                    PlanBarrier same;
+                    same.type = nvrhi::BarrierType::Transition;
+                    same.reason = item.write ? BarrierReason::WAW : BarrierReason::RAW;
+                    same.resource = first.resource;
+                    same.before = prev.state;
+                    same.after = item.state;
+                    same.stagesAfter = first.stages;
+                    Emit(first.sched, first.slot, first.queue, same, unit);
+                    ++m_State.transitionCount;
+                }
 
                 // Readers of one group on queues of different families hand the resource over between them.
                 if (!item.write && m_Profile.queueOwnershipTransfer)
@@ -944,7 +970,7 @@ namespace donut::render::rdg
             }
 
             if (implicit)
-                return;
+                return entry;
 
             // Imports and extracted transients end the frame in their declared exit state.
             if (!object.cyclic && !items.empty())
@@ -954,6 +980,7 @@ namespace donut::render::rdg
                 if (exit != ResourceStates::Unknown && exit != prev.state)
                     PlaceExit(prev, exit, steps[items.back().begin].resource, unit);
             }
+            return entry;
         }
 
         void TransitionBuilder::ProcessGroup(const std::vector<uint32_t>& group)
@@ -1011,18 +1038,14 @@ namespace donut::render::rdg
 
                     // PlanResource::entry is per resource: the first unit's frame-start state. The verifier does not
                     // rely on it (its first replayed frame learns every state).
-                    const bool firstUnit = &unit == &units[0];
-                    if (firstUnit)
+                    const ResourceStates entry = Walk(object, unit, steps[g], items[g], prev, hasPredecessor);
+                    if (&unit == &units[0])
                     {
                         for (uint32_t occupant : object.occupants)
-                            m_State.entryState[occupant] = prev.state;
+                            m_State.entryState[occupant] = entry;
                     }
-                    Walk(object, unit, steps[g], items[g], prev, hasPredecessor);
-                    if (firstUnit)
-                    {
-                        for (uint32_t occupant : object.occupants)
-                            m_State.entryState[occupant] = m_State.entryState[object.record];
-                    }
+                    if (!m_State.IsImplicit())
+                        m_State.entryUnits.push_back(CompileState::EntryUnit{ object.record, unit, entry });
                 }
             }
         }

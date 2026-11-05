@@ -397,6 +397,7 @@ namespace donut::render
         uint64_t heapBytes = 0;
         uint64_t pooledBytes = 0;
         uint64_t framesExecuted = 0;
+        uint64_t objectsCreated = 0;      // every create* call the registry and the executor made (10.3: 0 per steady frame)
     };
 
     // What survives between frames: persistent resources and their cross-frame states, the plan cache, transient

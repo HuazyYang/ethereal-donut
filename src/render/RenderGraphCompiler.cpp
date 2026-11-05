@@ -236,6 +236,14 @@ namespace donut::render::rdg
                     }
                     if (access.hasClear && has(Access::DepthWrite | Access::StencilWrite) && !profile.depthClears)
                         state.Error(where + ": the profile has no depth clears (CUDA, 6.9)");
+                    if (access.hasClear)
+                    {
+                        // nvrhi clears a texture through an RTV, a DSV or a UAV, and a buffer through a UAV.
+                        const bool clearable = record.isBuffer ? record.buffer.canHaveUAVs
+                                                               : (record.texture.isRenderTarget || record.texture.isUAV);
+                        if (!clearable)
+                            state.Error(where + ": a Clear needs a render target or UAV texture, or a buffer with canHaveUAVs");
+                    }
                 }
             }
         }
@@ -423,6 +431,7 @@ namespace donut::render::rdg
                     const uint32_t resource = state.accessResource[a];
                     const ResourceRecord& record = graph.GetResource(resource);
                     PlanUse use{};
+                    use.accessIndex = a;
                     use.resource = resource;
                     use.access = access.access;
                     use.stages = access.stages;
@@ -1155,6 +1164,7 @@ namespace donut::render::rdg
                 resource.isBuffer = record.isBuffer;
                 resource.hasDepth = record.hasDepth;
                 resource.hasStencil = record.hasStencil;
+                resource.isRenderTarget = !record.isBuffer && record.texture.isRenderTarget;
                 resource.extracted = record.extracted;
                 resource.standIn = record.standIn;
                 resource.crossQueue = structure->resourceCrossQueue[r] != 0;
@@ -1187,6 +1197,30 @@ namespace donut::render::rdg
                 resource.exit = record.exit;
                 resource.creation = resource.entry;
                 resource.descHash = record.descHash;
+            }
+
+            // Frame-start states, one region per (resource, state).
+            {
+                std::vector<CompileState::EntryUnit>& entries = state.entryUnits;
+                std::stable_sort(entries.begin(), entries.end(), [](const CompileState::EntryUnit& a, const CompileState::EntryUnit& b) {
+                    if (a.resource != b.resource) return a.resource < b.resource;
+                    return uint32_t(a.state) < uint32_t(b.state);
+                });
+                std::vector<UnitKey> groupUnits;
+                std::vector<nvrhi::SubresourceRegion> groupRegions;
+                size_t first = 0;
+                while (first < entries.size())
+                {
+                    size_t end = first;
+                    groupUnits.clear();
+                    while (end < entries.size() && entries[end].resource == entries[first].resource &&
+                        entries[end].state == entries[first].state)
+                        groupUnits.push_back(entries[end++].unit);
+                    MergeUnits(graph.GetResource(entries[first].resource), state.profile, groupUnits, groupRegions);
+                    for (const nvrhi::SubresourceRegion& region : groupRegions)
+                        plan->m_EntryStates.push_back(PlanEntryState{ entries[first].resource, region, entries[first].state });
+                    first = end;
+                }
             }
 
             // Barriers: drop the begin halves of joined splits, then sort and merge (6.10).

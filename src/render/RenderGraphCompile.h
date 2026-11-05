@@ -115,6 +115,13 @@ namespace donut::render::rdg
         std::vector<std::array<LoadOp, 9>> load;     // per schedule index
         std::vector<std::array<StoreOp, 9>> store;
         std::vector<uint32_t> clearMask;
+        struct EntryUnit
+        {
+            uint32_t resource;              // the physical resource's first occupant, or the history layer
+            UnitKey unit;
+            nvrhi::ResourceStates state;
+        };
+        std::vector<EntryUnit> entryUnits;  // frame-start state of every unit the plan touches
         uint32_t transitionCount = 0;
         uint32_t transferCount = 0;
 
