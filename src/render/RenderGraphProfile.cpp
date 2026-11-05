@@ -383,7 +383,11 @@ namespace donut::render
         case nvrhi::GraphicsAPI::D3D12:
             result = GetReferenceProfile(device->queryFeatureSupport(nvrhi::Feature::EnhancedBarriers)
                 ? ReferenceProfile::D3D12Enhanced : ReferenceProfile::D3D12Legacy, &profile);
-            // The heap tier is not queried yet: tier 2, every heap class in one heap. The Placed tier's probe is P1.6.
+            // The Placed tier's probe (7.5): heaps, and the heap tier. On tier 1 a heap holds render-target and
+            // depth-stencil textures only, and the other classes stay pooled.
+            profile.maxMemoryTier = device->queryFeatureSupport(nvrhi::Feature::VirtualResources)
+                ? MemoryTier::Placed : MemoryTier::Pooled;
+            profile.resourceHeapTier = device->queryFeatureSupport(nvrhi::Feature::MixedResourceHeaps) ? 2 : 1;
             break;
         case nvrhi::GraphicsAPI::VULKAN:
             result = GetReferenceProfile(ReferenceProfile::Vulkan, &profile);

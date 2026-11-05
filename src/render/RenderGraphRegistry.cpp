@@ -75,6 +75,7 @@ namespace donut::render::rdg
         FinalizeLastPlan(*this);
         ClearPlanCache();
         m_Runtime.instances.clear();
+        m_Runtime.retired.clear();
         m_Runtime.freePool.clear();
         m_Runtime.extractPool.clear();
         // 13.1: the passes drop the framebuffers and binding sets that point at those resources. Cached plans hold no
@@ -126,6 +127,15 @@ namespace donut::render::rdg
         for (const PersistentEntry& entry : m_Persistent)
             out.persistentResources += entry.live ? 1 : 0;
         out.pooledResources = uint32_t(m_Runtime.freePool.size());
+        auto countHeaps = [&out](const StructureInstance& instance) {
+            for (const nvrhi::AutoPtr<nvrhi::IHeap>& heap : instance.heaps)
+                out.heaps += heap ? 1 : 0;
+            out.heapBytes += instance.heapBytes;
+        };
+        for (const std::unique_ptr<StructureInstance>& instance : m_Runtime.instances)
+            countHeaps(*instance);
+        for (const RegistryRuntime::RetiredInstance& retired : m_Runtime.retired)
+            countHeaps(*retired.instance);   // still allocated until the GPU is done
         out.framesExecuted = m_Runtime.framesExecuted;
         out.objectsCreated = m_Runtime.objectsCreated;
     }

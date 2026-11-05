@@ -577,6 +577,11 @@ namespace donut::render::rdg
         bool fresh = true;                // never used: in the backend's creation state
         uint64_t stateOwner = 0;
         uint64_t lastUsedFrame = 0;
+        // The Placed tier (7.5): bound to a heap of its structure instance at an offset; never pooled.
+        bool placed = false;
+        uint32_t heap = ~0u;
+        uint64_t heapOffset = 0;
+        uint64_t heapSize = 0;
     };
 
     // The physical resources of one structure (one memory plan), shared by the plans of all its masks.
@@ -584,6 +589,8 @@ namespace donut::render::rdg
     {
         std::shared_ptr<const StructurePlan> structure;
         std::vector<std::unique_ptr<PhysicalResource>> physicals;   // per PhysicalObject
+        std::vector<nvrhi::AutoPtr<nvrhi::IHeap>> heaps;            // the Placed tier: per planned heap
+        uint64_t heapBytes = 0;
     };
 
     // A resource of the frame being executed.
@@ -599,6 +606,15 @@ namespace donut::render::rdg
     {
         std::vector<std::unique_ptr<StructureInstance>> instances;
         std::vector<std::unique_ptr<PhysicalResource>> freePool;     // transient memory of retired structures
+        // 7.5 heap retirement: collected instances with heaps or placed resources, kept until every queue's fence
+        // passes the values of the last frame before their collection. Barrier arrays hold raw pointers, and nvrhi's
+        // explicit barriers keep no references, so the registry holds them until then.
+        struct RetiredInstance
+        {
+            std::unique_ptr<StructureInstance> instance;
+            std::array<uint64_t, 3> values;
+        };
+        std::vector<RetiredInstance> retired;
         std::vector<std::unique_ptr<PhysicalResource>> extractPool;
         std::array<nvrhi::AutoPtr<nvrhi::IFence>, 3> fences;
         std::array<uint64_t, 3> fenceValues = {};

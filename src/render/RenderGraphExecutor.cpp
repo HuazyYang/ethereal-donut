@@ -424,6 +424,225 @@ namespace donut::render::rdg
 
     // ------------------------------------------------------------------------------------------------ instances
 
+    // 7.5, the Placed tier. The compiler placed estimated sizes; here the virtual resources report their actual memory
+    // requirements (the probe), and a first-fit placement per planned heap uses those. Two objects share bytes only
+    // where the plan placed them sharing bytes, so that its aliasing barriers cover every actual overlap. Then the
+    // heaps are created and the resources bound. On D3D12 resource heap tier 1 only render-target and depth-stencil
+    // textures are placed; the other classes stay pooled. Returns false when a heap or a binding fails.
+    static bool PlaceStructure(StructureInstance& instance, const CompiledRenderGraph& plan, const RenderGraph& graph,
+                               RegistryRuntime& runtime, nvrhi::IDevice* device)
+    {
+        const StructurePlan& structure = *plan.m_Structure;
+        const size_t count = structure.physicals.size();
+
+        std::vector<uint32_t> first(count, ~0u);
+        std::vector<uint32_t> last(count, 0);
+        for (size_t r = 0; r < structure.resourcePhysical.size(); ++r)
+        {
+            const uint32_t p = structure.resourcePhysical[r];
+            if (p == c_None || p >= count || structure.resourceFirst[r] == c_None)
+                continue;
+            first[p] = std::min(first[p], structure.resourceFirst[r]);
+            last[p] = std::max(last[p], structure.resourceLast[r]);
+        }
+
+        struct Candidate
+        {
+            uint32_t physical;
+            uint64_t size;
+            uint64_t alignment;
+            uint64_t offset;
+        };
+        std::vector<Candidate> candidates;
+        for (uint32_t p = 0; p < count; ++p)
+        {
+            const PhysicalObject& object = structure.physicals[p];
+            if (object.kind != PhysicalKind::Placed || object.heap >= structure.heaps.size() || first[p] == ~0u)
+                continue;
+            const ResourceRecord& record = graph.GetResource(object.firstResource);
+            if (plan.m_Profile.resourceHeapTier < 2 && (record.isBuffer || !(record.texture.isRenderTarget || record.hasDepth)))
+                continue;
+
+            auto physical = std::make_unique<PhysicalResource>();
+            physical->isBuffer = record.isBuffer;
+            physical->descHash = record.descHash;
+            nvrhi::MemoryRequirements requirements;
+            if (record.isBuffer)
+            {
+                nvrhi::BufferDesc desc = MakeBufferDesc(record);
+                desc.isVirtual = true;
+                if (device->createBuffer(desc, physical->buffer.ReleaseAndGetAddressOf()) != nvrhi::FS_OK)
+                    return false;
+                physical->resource = physical->buffer.Get();
+                device->getBufferMemoryRequirements(requirements, physical->buffer);
+            }
+            else
+            {
+                nvrhi::TextureDesc desc = MakeTextureDesc(record);
+                desc.isVirtual = true;
+                if (device->createTexture(desc, physical->texture.ReleaseAndGetAddressOf()) != nvrhi::FS_OK)
+                    return false;
+                physical->resource = physical->texture.Get();
+                device->getTextureMemoryRequirements(requirements, physical->texture);
+            }
+            ++runtime.objectsCreated;
+            if (requirements.size == 0)
+                return false;
+            physical->planes = UnitPlaneCount(record, plan.m_Profile);
+            physical->mips = MipCount(record);
+            physical->slices = SliceCount(record);
+            physical->states.assign(size_t(physical->planes) * physical->mips * physical->slices, ResourceStates::Unknown);
+            physical->fresh = true;
+            physical->placed = true;
+            physical->heap = object.heap;
+            physical->heapSize = requirements.size;
+            instance.physicals[p] = std::move(physical);
+            candidates.push_back(Candidate{ p, requirements.size, std::max<uint64_t>(requirements.alignment, 1), 0 });
+        }
+
+        // The plan's byte sharing: the only overlaps the placement may produce.
+        auto plannedOverlap = [&](uint32_t a, uint32_t b) {
+            const PhysicalObject& x = structure.physicals[a];
+            const PhysicalObject& y = structure.physicals[b];
+            return x.heap == y.heap && x.offset < y.offset + y.size && y.offset < x.offset + x.size;
+        };
+        std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            return a.size > b.size;
+        });
+        std::vector<uint64_t> heapEnd(structure.heaps.size(), 0);
+        std::vector<uint64_t> offsets;
+        for (size_t i = 0; i < candidates.size(); ++i)
+        {
+            Candidate& c = candidates[i];
+            const uint32_t heap = structure.physicals[c.physical].heap;
+            offsets.assign(1, 0);
+            for (size_t j = 0; j < i; ++j)
+            {
+                if (structure.physicals[candidates[j].physical].heap == heap)
+                    offsets.push_back(candidates[j].offset + candidates[j].size);
+            }
+            std::sort(offsets.begin(), offsets.end());
+            for (uint64_t start : offsets)
+            {
+                const uint64_t offset = (start + c.alignment - 1) / c.alignment * c.alignment;
+                bool fits = true;
+                for (size_t j = 0; j < i && fits; ++j)
+                {
+                    const Candidate& q = candidates[j];
+                    if (structure.physicals[q.physical].heap != heap || offset >= q.offset + q.size || q.offset >= offset + c.size)
+                        continue;
+                    const bool disjoint = last[c.physical] < first[q.physical] || last[q.physical] < first[c.physical];
+                    fits = disjoint && plannedOverlap(c.physical, q.physical);
+                }
+                if (fits)
+                {
+                    c.offset = offset;
+                    break;
+                }
+            }
+            heapEnd[heap] = std::max(heapEnd[heap], c.offset + c.size);
+        }
+
+        instance.heaps.resize(structure.heaps.size());
+        for (size_t h = 0; h < structure.heaps.size(); ++h)
+        {
+            if (heapEnd[h] == 0)
+                continue;
+            if (device->createHeap(nvrhi::HeapDesc().setCapacity(heapEnd[h]).setType(nvrhi::HeapType::DeviceLocal)
+                    .setDebugName("render graph heap"), instance.heaps[h].ReleaseAndGetAddressOf()) != nvrhi::FS_OK)
+                return false;
+            ++runtime.objectsCreated;
+            instance.heapBytes += heapEnd[h];
+        }
+        for (const Candidate& c : candidates)
+        {
+            PhysicalResource& physical = *instance.physicals[c.physical];
+            nvrhi::IHeap* heap = instance.heaps[physical.heap];
+            physical.heapOffset = c.offset;
+            const bool bound = physical.isBuffer ? device->bindBufferMemory(physical.buffer, heap, c.offset)
+                                                 : device->bindTextureMemory(physical.texture, heap, c.offset);
+            if (!bound)
+                return false;
+        }
+        return true;
+    }
+
+    static bool ActuallyOverlap(const PhysicalResource& a, const PhysicalResource& b)
+    {
+        return a.placed && b.placed && &a != &b && a.heap == b.heap &&
+            a.heapOffset < b.heapOffset + b.heapSize && b.heapOffset < a.heapOffset + a.heapSize;
+    }
+
+    // The plan's aliasing barriers name the outgoing resource the plan overlapped with the incoming one. After the
+    // actual placement the incoming one may be unplaced: the barrier has no `after` then, and RecordBatch skips it.
+    // Or the two may not overlap: the barrier names no `before`, which orders any aliasing in its heap (nvrhi rejects
+    // a named pair that does not overlap).
+    //
+    // Then the check of the actual placement (6.7): every resource of this plan whose bytes another placed resource of
+    // the instance shares starts with an aliasing barrier, across masks and the frame boundary alike. D3D12's debug
+    // layer and GBV do not track aliasing, so this is what detects a missing barrier on the GPU (11.4,
+    // SkipAliasingBarriers). Returns the number of uncovered resources, each reported as an error.
+    static uint32_t MatchAliasingBarriers(PlanInstance& instance, const StructureInstance& structure,
+                                          const CompiledRenderGraph& plan, nvrhi::IDevice* device)
+    {
+        auto find = [&](nvrhi::IResource* resource) -> const PhysicalResource* {
+            for (const std::unique_ptr<PhysicalResource>& physical : structure.physicals)
+            {
+                if (physical && physical->resource == resource)
+                    return physical.get();
+            }
+            return nullptr;
+        };
+        for (nvrhi::ResourceBarrier& barrier : instance.lowered)
+        {
+            if (barrier.type != nvrhi::BarrierType::Aliasing)
+                continue;
+            const PhysicalResource* after = barrier.aliasing.after ? find(barrier.aliasing.after) : nullptr;
+            const PhysicalResource* before = barrier.aliasing.before ? find(barrier.aliasing.before) : nullptr;
+            if (!after || !after->placed)
+            {
+                barrier.aliasing.before = nullptr;
+                barrier.aliasing.after = nullptr;
+                continue;
+            }
+            if (before && !ActuallyOverlap(*before, *after))
+                barrier.aliasing.before = nullptr;
+        }
+
+        uint32_t uncovered = 0;
+        for (uint32_t r = 0; r < uint32_t(plan.m_Resources.size()); ++r)
+        {
+            const PlanResource& resource = plan.m_Resources[r];
+            if (resource.firstPass == c_None || resource.physical == c_None || resource.physical >= structure.physicals.size())
+                continue;
+            const PhysicalResource* physical = structure.physicals[resource.physical].get();
+            if (!physical || !physical->placed)
+                continue;
+            bool shared = false;
+            for (const std::unique_ptr<PhysicalResource>& other : structure.physicals)
+                shared = shared || (other && ActuallyOverlap(*physical, *other));
+            if (!shared)
+                continue;
+            const LoweredBatch& batch = instance.batches[size_t(resource.firstPass) * c_SlotCount + uint32_t(BatchSlot::Prologue)];
+            bool covered = false;
+            for (uint32_t b = batch.explicitBegin; b < batch.explicitBegin + batch.explicitCount && !covered; ++b)
+            {
+                const nvrhi::ResourceBarrier& barrier = instance.lowered[b];
+                covered = barrier.type == nvrhi::BarrierType::Aliasing && barrier.aliasing.after == physical->resource;
+            }
+            if (covered)
+                continue;
+            ++uncovered;
+            if (nvrhi::IMessageCallback* callback = device->getMessageCallback())
+            {
+                const std::string text = std::string("render graph: placed resource '") + plan.GetName(resource.nameOffset) +
+                    "' shares heap memory with another resource but has no aliasing barrier at its first use";
+                callback->message(nvrhi::MessageSeverity::Error, text.c_str());
+            }
+        }
+        return uncovered;
+    }
+
     static StructureInstance* AcquireStructureInstance(const CompiledRenderGraph& plan, const RenderGraph& graph,
                                                        RegistryRuntime& runtime, nvrhi::IDevice* device)
     {
@@ -437,8 +656,21 @@ namespace donut::render::rdg
         instance->structure = plan.m_Structure;
         const StructurePlan& structure = *plan.m_Structure;
         instance->physicals.resize(structure.physicals.size());
+        if (structure.tier == MemoryTier::Placed && !PlaceStructure(*instance, plan, graph, runtime, device))
+        {
+            // 7.5: no heaps after all; every object is dedicated, and the aliasing barriers lose their resources.
+            for (std::unique_ptr<PhysicalResource>& physical : instance->physicals)
+                physical.reset();
+            instance->heaps.clear();
+            instance->heapBytes = 0;
+            if (nvrhi::IMessageCallback* callback = device->getMessageCallback())
+                callback->message(nvrhi::MessageSeverity::Warning,
+                    "render graph: the Placed tier failed to place a plan's resources; they are dedicated instead");
+        }
         for (size_t p = 0; p < structure.physicals.size(); ++p)
         {
+            if (instance->physicals[p])
+                continue;   // placed
             const ResourceRecord& record = graph.GetResource(structure.physicals[p].firstResource);
             // Persistent resources and history layers live in the registry's records; extracted textures in a pool.
             if (record.kind == ResourceKind::Persistent || record.kind == ResourceKind::History || record.extracted)
@@ -454,6 +686,21 @@ namespace donut::render::rdg
     // Structure instances that no plan uses any more give their memory to the pool; long-unused pool entries go.
     static void CollectInstances(RegistryRuntime& runtime)
     {
+        // 7.5: retired heaps and placed resources go when the GPU has passed the frame they were retired after.
+        for (size_t i = 0; i < runtime.retired.size();)
+        {
+            bool done = true;
+            for (uint32_t q = 0; q < 3 && done; ++q)
+            {
+                const uint64_t value = runtime.retired[i].values[q];
+                done = !value || !runtime.fences[q] || runtime.fences[q]->getCompletedValue() >= value;
+            }
+            if (done)
+                runtime.retired.erase(runtime.retired.begin() + ptrdiff_t(i));
+            else
+                ++i;
+        }
+
         for (size_t i = 0; i < runtime.instances.size();)
         {
             StructureInstance& instance = *runtime.instances[i];
@@ -462,11 +709,16 @@ namespace donut::render::rdg
                 ++i;
                 continue;
             }
+            bool placed = !instance.heaps.empty();
             for (std::unique_ptr<PhysicalResource>& physical : instance.physicals)
             {
-                if (physical)
+                if (physical && physical->placed)
+                    placed = true;
+                else if (physical)
                     runtime.freePool.push_back(std::move(physical));
             }
+            if (placed)
+                runtime.retired.push_back(RegistryRuntime::RetiredInstance{ std::move(runtime.instances[i]), runtime.lastFrameValues });
             runtime.instances.erase(runtime.instances.begin() + ptrdiff_t(i));
         }
         constexpr uint64_t c_PoolAge = 120;
@@ -828,7 +1080,21 @@ namespace donut::render::rdg
             list->commitBarriers();
         }
         if (batch.explicitCount)
-            list->barriers(&instance.lowered[batch.explicitBegin], batch.explicitCount);
+        {
+            // An aliasing barrier without `after` names a resource the Placed tier left dedicated (7.5): skipped.
+            const nvrhi::ResourceBarrier* barriers = &instance.lowered[batch.explicitBegin];
+            uint32_t run = 0;
+            for (uint32_t i = 0; i < batch.explicitCount; ++i)
+            {
+                if (barriers[i].type != nvrhi::BarrierType::Aliasing || barriers[i].aliasing.after)
+                    continue;
+                if (i > run)
+                    list->barriers(barriers + run, i - run);
+                run = i + 1;
+            }
+            if (batch.explicitCount > run)
+                list->barriers(barriers + run, batch.explicitCount - run);
+        }
     }
 
     static void RecordClears(ExecutorFrame& frame, nvrhi::ICommandList* list, uint32_t sched)
@@ -1224,8 +1490,6 @@ namespace donut::render::rdg
             return nvrhi::FE_UNSUPPORTED;
         if (device->getGraphicsAPI() != profile.api)
             return nvrhi::FE_INVALID_ARGS;
-        if (plan.m_Structure->tier == MemoryTier::Placed)
-            return nvrhi::FE_UNSUPPORTED;   // the Placed tier is P1.6
 
         try
         {
@@ -1334,6 +1598,7 @@ namespace donut::render::rdg
             if (!instance.fixedResolved)
             {
                 PatchSlots(instance.fixedSlots, instance, runtime);
+                MatchAliasingBarriers(instance, *structure, plan, device);
                 instance.fixedResolved = true;
             }
             PatchSlots(instance.frameSlots, instance, runtime);

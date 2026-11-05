@@ -748,12 +748,16 @@ namespace
             {
                 if (kind == ReferenceProfile::CUDA && graph.raster)
                     continue;
-                const BackendProfile profile = Profile(kind);
-                for (int placed = 0; placed < (profile.maxMemoryTier == MemoryTier::Placed ? 2 : 1); ++placed)
+                // The Placed tier on both D3D12 resource heap tiers (7.5): placed 1 is tier 2, placed 2 tier 1.
+                for (int placed = 0; placed < (Profile(kind).maxMemoryTier == MemoryTier::Placed ? 3 : 1); ++placed)
                 {
+                    BackendProfile profile = Profile(kind);
+                    if (placed == 2)
+                        profile.resourceHeapTier = 1;
                     CompileOptions options;
                     options.placedResources = placed != 0;
-                    const std::string where = std::string(graph.name) + " on " + ProfileName(kind) + (placed ? " (placed)" : "");
+                    const std::string where = std::string(graph.name) + " on " + ProfileName(kind) +
+                        (placed == 1 ? " (placed)" : placed == 2 ? " (placed, heap tier 1)" : "");
 
                     Fixture f;
                     Builder b(f.graph);
@@ -832,6 +836,67 @@ namespace
                 EXPECT(!report.empty() && Contains(report, "aliasing barrier"), "SkipAliasingBarriers is detected: " + report);
             else
                 EXPECT(report.empty() && stats.aliasingBarriers > 0, "the aliasing chain aliases: " + report);
+        }
+    }
+
+    // 7.5, design 16: heaps per queue, and per class on resource heap tier 1. A resource that crosses queues stays
+    // pooled.
+    void TestHeapCount()
+    {
+        auto record = [](Builder& b) {
+            ResourceId out = b.Import("Out", 256, 256, Format::RGBA8_UNORM, ResourceStates::ShaderResource, ResourceStates::ShaderResource);
+            ResourceId target = b.Texture("Target", 256, 256, Format::RGBA8_UNORM, true, false);
+            ResourceId image = b.Texture("Image", 256, 256, Format::RGBA8_UNORM, false, true);
+            ResourceId buffer = b.Buffer("Buffer", 65536, true);
+            ResourceId asyncImage = b.Texture("AsyncImage", 256, 256, Format::RGBA8_UNORM, false, true);
+            ResourceId asyncBuffer = b.Buffer("AsyncBuffer", 65536, true);
+            ResourceId shared = b.Buffer("Shared", 65536, true);
+            b.Pass("Raster", PassType::Raster, PassFlags::None, [&](ISetupContext* c) {
+                target = c->SetColorTarget(0, target, {}, AccessFlags::FullWrite, nullptr);
+            });
+            b.Pass("Compute", PassType::Compute, PassFlags::None, [&](ISetupContext* c) {
+                Read(c, target, Access::ShaderRead);
+                image = Write(c, image, Access::UAVWrite);
+                buffer = Write(c, buffer, Access::UAVWrite);
+            });
+            b.Pass("Async1", PassType::Compute, PassFlags::AsyncCompute, [&](ISetupContext* c) {
+                asyncImage = Write(c, asyncImage, Access::UAVWrite);
+                asyncBuffer = Write(c, asyncBuffer, Access::UAVWrite);
+            });
+            b.Pass("Async2", PassType::Compute, PassFlags::AsyncCompute, [&](ISetupContext* c) {
+                Read(c, asyncImage, Access::ShaderRead);
+                Read(c, asyncBuffer, Access::ShaderRead);
+                shared = Write(c, shared, Access::UAVWrite);
+            });
+            b.Pass("Final", PassType::Compute, PassFlags::None, [&](ISetupContext* c) {
+                Read(c, image, Access::ShaderRead);
+                Read(c, buffer, Access::ShaderRead);
+                Read(c, shared, Access::ShaderRead);
+                out = Write(c, out, Access::UAVWrite);
+            });
+        };
+        for (ReferenceProfile kind : { ReferenceProfile::D3D12Legacy, ReferenceProfile::D3D12Enhanced })
+        {
+            for (uint8_t tier = 1; tier <= 2; ++tier)
+            {
+                Fixture f;
+                Builder b(f.graph);
+                record(b);
+                BackendProfile profile = Profile(kind);
+                profile.resourceHeapTier = tier;
+                CompileOptions options;
+                options.placedResources = true;
+                auto plan = Compile(f.graph, profile, options);
+                EXPECT(plan, "compile");
+                EXPECT(VerifyOrReport(plan, f.graph).empty(), "verify");
+                PlanStatistics stats;
+                plan->GetStatistics(stats);
+                // Tier 2: one heap per queue. Tier 1: graphics holds a target, an image and a buffer (three classes),
+                // compute an image and a buffer (two).
+                const uint32_t expected = tier == 2 ? 2u : 5u;
+                EXPECT(stats.heaps == expected, std::string(ProfileName(kind)) + ", heap tier " + std::to_string(tier) + ": " +
+                       std::to_string(stats.heaps) + " heaps, expected " + std::to_string(expected) + "\n" + Listing(b, plan));
+            }
         }
     }
 
@@ -1056,6 +1121,7 @@ namespace
         { "corpus", TestCorpus },
         { "strict_validation", TestStrictValidation },
         { "skip_aliasing_barriers_fails", TestSkipAliasingBarriersFails },
+        { "heap_count", TestHeapCount },
         { "split_barriers", TestSplitBarriers },
         { "uav_order", TestUavOrder },
         { "planes_and_mips", TestPlanesAndMips },

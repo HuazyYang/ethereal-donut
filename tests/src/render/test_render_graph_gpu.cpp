@@ -160,11 +160,26 @@ namespace
 
         unsigned errors = 0;
         unsigned expectedErrorsSeen = 0;
+        unsigned vvlEventFalsePositives = 0;   // testVvlEventWitness
         bool expecting = false;
+
+        // The VVL false positive testVvlEventWitness records, by the synchronization validation's message properties:
+        // a write-after-read on the layout transition of vkCmdWaitEvents2, found at submit time.
+        static bool IsVvlEventFalsePositive(const char* text)
+        {
+            return std::strstr(text, "command = vkCmdWaitEvents2") && std::strstr(text, "hazard_type = WRITE_AFTER_READ") &&
+                std::strstr(text, "access = SYNC_IMAGE_LAYOUT_TRANSITION") && std::strstr(text, "submit_index = ");
+        }
 
         void message(nvrhi::MessageSeverity severity, const char* text) noexcept override
         {
             const bool error = severity == nvrhi::MessageSeverity::Error || severity == nvrhi::MessageSeverity::Fatal;
+            if (error && IsVvlEventFalsePositive(text))
+            {
+                if (vvlEventFalsePositives++ == 0)
+                    std::printf("  (set aside, the VVL false positive of testVvlEventWitness) NVRHI: %.200s...\n", text);
+                return;
+            }
             if (error && expecting)
             {
                 ++expectedErrorsSeen;
@@ -261,6 +276,15 @@ namespace
                 nvrhi::string diagnostics;
                 graph->GetDiagnostics(diagnostics);
                 throw std::runtime_error(std::string("compile failed:\n") + diagnostics.c_str());
+            }
+            // RDG_GPU_DUMP=1 prints every newly compiled plan.
+            if (std::getenv("RDG_GPU_DUMP"))
+            {
+                PlanStatistics compiledStats;
+                plan->GetStatistics(compiledStats);
+                nvrhi::string dump;
+                if (!compiledStats.cacheHit && plan->WriteDump(DumpFormat::Json, dump) == nvrhi::FS_OK)
+                    std::printf("%s\n", dump.c_str());
             }
             ExecuteDesc execute;
             execute.timers = timers;
@@ -727,10 +751,10 @@ namespace
             .setIsUAV(true).setDebugName(name);
     }
 
-    nvrhi::AutoPtr<nvrhi::ITexture> CreateImported(Env& env, const char* name)
+    nvrhi::AutoPtr<nvrhi::ITexture> CreateImported(Env& env, const char* name, uint32_t size = 16)
     {
         nvrhi::AutoPtr<nvrhi::ITexture> texture;
-        env.device->createTexture(ColorDesc(name), texture.ReleaseAndGetAddressOf());
+        env.device->createTexture(ColorDesc(name).setWidth(size).setHeight(size), texture.ReleaseAndGetAddressOf());
         check(texture != nullptr, name);
         InitialState(env, texture, ResourceStates::CopySource);
         return texture;
@@ -1000,6 +1024,325 @@ namespace
         check(env.messages->expectedErrorsSeen > 0, "synchronization validation reports a hazard (it is loaded)");
     }
 
+    // ------------------------------------------------------------------------------------------ the Placed tier
+
+    // 7.5: transients whose lifetimes do not meet share heap memory. Two buffers and two colour targets alias in
+    // pairs on the graphics queue; a buffer used only by async passes lives in a compute-queue heap; a buffer that
+    // crosses queues stays pooled. Every value is read back.
+    struct PlacedFrame
+    {
+        nvrhi::AutoPtr<nvrhi::IBuffer> readback;      // X, Y and W at 0, 64 and 128 bytes
+        nvrhi::AutoPtr<nvrhi::ITexture> resultA, resultB;
+        uint32_t x[16], y[16], z[16];
+        uint32_t clearA = 0, clearB = 0;
+    };
+
+    void RecordPlacedFrame(Env& env, IRenderGraph* graph, PlacedFrame& f, uint32_t frame)
+    {
+        for (uint32_t i = 0; i < 16; ++i)
+        {
+            f.x[i] = frame * 1000u + i;
+            f.y[i] = frame * 1000u + 100u + i;
+            f.z[i] = frame * 1000u + 200u + i;
+        }
+        const uint32_t* x = f.x;
+        const uint32_t* y = f.y;
+        const uint32_t* z = f.z;
+        ResourceId out = graph->ImportBuffer(f.readback, ResourceStates::CopyDest, ResourceStates::CopyDest);
+
+        ResourceId bx = graph->CreateBuffer(GraphBufferDesc("X", 256), ResourceFlags::None);
+        AddPass(graph, "FillX", PassType::Copy, PassFlags::None,
+            [&](ISetupContext* s) { bx = Write(s, bx, Access::CopyDest); },
+            [bx, x](IPassContext* context) { context->GetCommandList()->writeBuffer(context->GetBuffer(bx), x, 64); });
+        AddPass(graph, "SaveX", PassType::Copy, PassFlags::None,
+            [&](ISetupContext* s) { Read(s, bx, Access::CopySource); out = Write(s, out, Access::CopyDest); },
+            [bx, out](IPassContext* context) { context->GetCommandList()->copyBuffer(context->GetBuffer(out), 0, context->GetBuffer(bx), 0, 64); });
+        ResourceId by = graph->CreateBuffer(GraphBufferDesc("Y", 256), ResourceFlags::None);
+        AddPass(graph, "FillY", PassType::Copy, PassFlags::None,
+            [&](ISetupContext* s) { by = Write(s, by, Access::CopyDest); },
+            [by, y](IPassContext* context) { context->GetCommandList()->writeBuffer(context->GetBuffer(by), y, 64); });
+        AddPass(graph, "SaveY", PassType::Copy, PassFlags::None,
+            [&](ISetupContext* s) { Read(s, by, Access::CopySource); out = Write(s, out, Access::CopyDest); },
+            [by, out](IPassContext* context) { context->GetCommandList()->copyBuffer(context->GetBuffer(out), 64, context->GetBuffer(by), 0, 64); });
+
+        ResourceId bz = graph->CreateBuffer(GraphBufferDesc("Z", 256), ResourceFlags::None);
+        ResourceId bw = graph->CreateBuffer(GraphBufferDesc("W", 256), ResourceFlags::None);
+        AddPass(graph, "FillZ", PassType::Compute, PassFlags::AsyncCompute,
+            [&](ISetupContext* s) { bz = Write(s, bz, Access::CopyDest); },
+            [bz, z](IPassContext* context) { context->GetCommandList()->writeBuffer(context->GetBuffer(bz), z, 64); });
+        AddPass(graph, "CopyZW", PassType::Compute, PassFlags::AsyncCompute,
+            [&](ISetupContext* s) { Read(s, bz, Access::CopySource); bw = Write(s, bw, Access::CopyDest); },
+            [bz, bw](IPassContext* context) { context->GetCommandList()->copyBuffer(context->GetBuffer(bw), 0, context->GetBuffer(bz), 0, 64); });
+        AddPass(graph, "SaveW", PassType::Copy, PassFlags::None,
+            [&](ISetupContext* s) { Read(s, bw, Access::CopySource); out = Write(s, out, Access::CopyDest); },
+            [bw, out](IPassContext* context) { context->GetCommandList()->copyBuffer(context->GetBuffer(out), 128, context->GetBuffer(bw), 0, 64); });
+
+        if (!env.raster)
+            return;
+        f.clearA = 10u + (frame % 8) * 20u;
+        f.clearB = 15u + (frame % 8) * 20u;
+        const ClearValue clearA = { { float(f.clearA) / 255.0f, 0.f, 0.f, 1.f }, 0.f, 0 };
+        const ClearValue clearB = { { float(f.clearB) / 255.0f, 0.f, 0.f, 1.f }, 0.f, 0 };
+        for (int t = 0; t < 2; ++t)
+        {
+            ResourceId target = graph->CreateTexture(ColorDesc(t ? "B" : "A").setWidth(64).setHeight(64), ResourceFlags::None);
+            ResourceId result = graph->ImportTexture(t ? f.resultB : f.resultA, ResourceStates::CopySource, ResourceStates::CopySource);
+            const ClearValue* clear = t ? &clearB : &clearA;
+            AddPass(graph, t ? "ClearB" : "ClearA", PassType::Raster, PassFlags::None,
+                [&](ISetupContext* s) { target = s->SetColorTarget(0, target, nvrhi::SubresourceRegion(), AccessFlags::Clear, clear); },
+                [](IPassContext*) { });
+            AddPass(graph, t ? "SaveB" : "SaveA", PassType::Copy, PassFlags::None,
+                [&](ISetupContext* s) { Read(s, target, Access::CopySource); result = Write(s, result, Access::CopyDest); },
+                [target, result](IPassContext* context) {
+                    context->GetCommandList()->copyTexture1(context->GetTexture(result), nvrhi::TextureSlice(), context->GetTexture(target), nvrhi::TextureSlice());
+                });
+        }
+    }
+
+    void CheckPlacedFrame(Env& env, PlacedFrame& f, const std::string& what)
+    {
+        env.device->waitForIdle();
+        const uint32_t* data = static_cast<const uint32_t*>(env.device->mapBuffer(f.readback, nvrhi::CpuAccessMode::Read));
+        check(data != nullptr, "map readback");
+        bool good = true;
+        for (uint32_t i = 0; i < 16; ++i)
+            good = good && data[i] == f.x[i] && data[16 + i] == f.y[i] && data[32 + i] == f.z[i];
+        if (!good)
+            std::printf("  read X %u Y %u W %u, expected %u %u %u\n", data[0], data[16], data[32], f.x[0], f.y[0], f.z[0]);
+        env.device->unmapBuffer(f.readback);
+        check(good, what + ": buffers X, Y and W");
+        if (!env.raster)
+            return;
+        const uint32_t a = ReadTexel(env, f.resultA);
+        const uint32_t b = ReadTexel(env, f.resultB);
+        check((a & 0xff) == f.clearA && (b & 0xff) == f.clearB, what + ": targets A and B (" + Hex(a) + ", " + Hex(b) + ")");
+    }
+
+    // VVL 1.4.357 reports, at submit time, the layout transition of a vkCmdWaitEvents2 as racing a read in an earlier
+    // submission, even when a full ALL_COMMANDS -> ALL_COMMANDS barrier separates them. By the specification the wait's
+    // first scope is everything before its vkCmdSetEvent2 in submission order, and execution dependencies chain across
+    // submissions, so nothing races. The witness records that pattern on raw nvrhi, outside the graph; Messages sets
+    // exactly these reports aside. When the witness sees none, VVL is fixed and the exemption goes.
+    void testVvlEventWitness(Env& env)
+    {
+        nvrhi::AutoPtr<nvrhi::ITexture> a, r;
+        env.device->createTexture(ColorDesc("witnessA").setWidth(512).setHeight(512), a.ReleaseAndGetAddressOf());
+        env.device->createTexture(ColorDesc("witnessR").setWidth(512).setHeight(512), r.ReleaseAndGetAddressOf());
+        check(a && r, "witness textures");
+        InitialState(env, a, ResourceStates::CopySource);
+        InitialState(env, r, ResourceStates::CopySource);
+        const unsigned before = env.messages->vvlEventFalsePositives;
+        for (int frame = 0; frame < 2; ++frame)
+        {
+            nvrhi::AutoPtr<nvrhi::ICommandList> list = CreateList(env.device);
+            list->open();
+            list->setEnableAutomaticBarriers(false);
+            const nvrhi::ResourceBarrier start[] = {
+                nvrhi::ResourceBarrier::Uav(nullptr),   // ALL_COMMANDS -> ALL_COMMANDS: orders every earlier command
+                nvrhi::ResourceBarrier::Transition(a, ResourceStates::CopySource, ResourceStates::CopyDest, nvrhi::SubresourceRegion(),
+                    nvrhi::BarrierFlags::Discard),
+            };
+            list->barriers(start, 2);
+            list->clearTextureFloat(a, nvrhi::AllSubresources, nvrhi::Color(0.5f));
+            const nvrhi::ResourceBarrier toTarget = nvrhi::ResourceBarrier::Transition(a, ResourceStates::CopyDest, ResourceStates::RenderTarget);
+            list->barriers(&toTarget, 1);
+            const nvrhi::ResourceBarrier begin = nvrhi::ResourceBarrier::Transition(a, ResourceStates::RenderTarget, ResourceStates::CopySource,
+                nvrhi::SubresourceRegion(), nvrhi::BarrierFlags::SplitBegin);
+            list->barriers(&begin, 1);
+            const nvrhi::ResourceBarrier ends[] = {
+                nvrhi::ResourceBarrier::Transition(a, ResourceStates::RenderTarget, ResourceStates::CopySource, nvrhi::SubresourceRegion(),
+                    nvrhi::BarrierFlags::SplitEnd),
+                nvrhi::ResourceBarrier::Transition(r, ResourceStates::CopySource, ResourceStates::CopyDest),
+            };
+            list->barriers(ends, 2);
+            list->copyTexture1(r, nvrhi::TextureSlice(), a, nvrhi::TextureSlice());
+            const nvrhi::ResourceBarrier exit = nvrhi::ResourceBarrier::Transition(r, ResourceStates::CopyDest, ResourceStates::CopySource);
+            list->barriers(&exit, 1);
+            list->close();
+            nvrhi::ICommandList* lists[] = { list };
+            env.device->submit(nvrhi::SubmitDesc().setCommandLists(lists, 1));   // no wait: the next frame follows it
+        }
+        env.device->waitForIdle();
+        env.device->runGarbageCollection();
+        check(env.messages->vvlEventFalsePositives > before,
+              "VVL still reports a split barrier's wait against an earlier submission after a full barrier (" +
+              std::to_string(env.messages->vvlEventFalsePositives - before) + " reports); if not, drop the exemption");
+    }
+
+    // 6.4: a transition split around two passes, on every backend that splits (Vulkan splits layout transitions of
+    // resources of 1 MiB or more). Consecutive frames overlap on the GPU; the frame boundary meets the split's states.
+    void testSplitBarriers(Env& env)
+    {
+        GraphOnDevice g(env.device);
+        nvrhi::AutoPtr<nvrhi::ITexture> results[2];
+        for (int i = 0; i < 2; ++i)
+        {
+            env.device->createTexture(ColorDesc(i ? "resultY" : "resultA").setWidth(512).setHeight(512), results[i].ReleaseAndGetAddressOf());
+            check(results[i] != nullptr, "split result");
+            InitialState(env, results[i], ResourceStates::CopySource);
+        }
+        for (uint32_t frame = 0; frame < 8; ++frame)
+        {
+            const uint32_t valueA = 20u + frame * 10u;
+            const uint32_t valueY = 25u + frame * 10u;
+            const ClearValue clearA = { { float(valueA) / 255.0f, 0.f, 0.f, 1.f }, 0.f, 0 };
+            const ClearValue clearX = { { 0.5f, 0.5f, 0.5f, 1.f }, 0.f, 0 };
+            const ClearValue clearY = { { float(valueY) / 255.0f, 0.f, 0.f, 1.f }, 0.f, 0 };
+            g.graph->Reset();
+            ResourceId a = g.graph->CreateTexture(ColorDesc("A").setWidth(512).setHeight(512), ResourceFlags::None);
+            ResourceId x = g.graph->CreateTexture(ColorDesc("X").setWidth(512).setHeight(512), ResourceFlags::None);
+            ResourceId y = g.graph->CreateTexture(ColorDesc("Y").setWidth(512).setHeight(512), ResourceFlags::None);
+            ResourceId outA = g.graph->ImportTexture(results[0], ResourceStates::CopySource, ResourceStates::CopySource);
+            ResourceId outY = g.graph->ImportTexture(results[1], ResourceStates::CopySource, ResourceStates::CopySource);
+            AddPass(g.graph, "WriteA", PassType::Raster, PassFlags::None,
+                [&](ISetupContext* s) { a = s->SetColorTarget(0, a, nvrhi::SubresourceRegion(), AccessFlags::Clear, &clearA); },
+                [](IPassContext*) { });
+            AddPass(g.graph, "WriteX", PassType::Raster, PassFlags::None,
+                [&](ISetupContext* s) { x = s->SetColorTarget(0, x, nvrhi::SubresourceRegion(), AccessFlags::Clear, &clearX); },
+                [](IPassContext*) { });
+            AddPass(g.graph, "WriteY", PassType::Raster, PassFlags::None,
+                [&](ISetupContext* s) {
+                    Read(s, x, Access::ShaderRead, nvrhi::ShaderType::Pixel);
+                    y = s->SetColorTarget(0, y, nvrhi::SubresourceRegion(), AccessFlags::Clear, &clearY);
+                },
+                [](IPassContext*) { });
+            AddPass(g.graph, "Save", PassType::Copy, PassFlags::None,
+                [&](ISetupContext* s) {
+                    Read(s, a, Access::CopySource);
+                    Read(s, y, Access::CopySource);
+                    outA = Write(s, outA, Access::CopyDest);
+                    outY = Write(s, outY, Access::CopyDest);
+                },
+                [a, y, outA, outY](IPassContext* context) {
+                    nvrhi::ICommandList* list = context->GetCommandList();
+                    list->copyTexture1(context->GetTexture(outA), nvrhi::TextureSlice(), context->GetTexture(a), nvrhi::TextureSlice());
+                    list->copyTexture1(context->GetTexture(outY), nvrhi::TextureSlice(), context->GetTexture(y), nvrhi::TextureSlice());
+                });
+            const PlanStatistics stats = g.Run();
+            if (frame == 0)
+            {
+                std::printf("  split barriers: %u splits, %u barriers\n", stats.splitBarriers, stats.barriers);
+                check(!g.profile.splitBarriers || stats.splitBarriers >= 1, "A's transition is split (" + std::to_string(stats.splitBarriers) + ")");
+            }
+            if (frame % 4 == 3)
+            {
+                const uint32_t texelA = ReadTexel(env, results[0]);
+                const uint32_t texelY = ReadTexel(env, results[1]);
+                check((texelA & 0xff) == valueA && (texelY & 0xff) == valueY,
+                      "split barriers, frame " + std::to_string(frame) + " (" + Hex(texelA) + ", " + Hex(texelY) + ")");
+            }
+        }
+        checkClean(env, "split barriers");
+    }
+
+    // `heapTier`: 0 keeps the device's tier; 1 compiles for D3D12 resource heap tier 1 on any device, so that the
+    // executor places the render targets only and leaves the buffers pooled.
+    void testPlaced(Env& env, uint32_t heapTier)
+    {
+        GraphOnDevice g(env.device);
+        const bool placedTier = g.profile.maxMemoryTier == MemoryTier::Placed;
+        if (heapTier)
+            g.profile.resourceHeapTier = heapTier;
+        const std::string prefix = std::string("placed") + (heapTier == 1 ? " (heap tier 1)" : "") + ": ";
+        PlacedFrame f;
+        f.readback = CreateReadback(env.device);
+        if (env.raster)
+        {
+            f.resultA = CreateImported(env, "resultA", 64);
+            f.resultB = CreateImported(env, "resultB", 64);
+        }
+        CompileOptions options;
+        options.placedResources = true;
+        for (uint32_t frame = 0; frame < 12; ++frame)
+        {
+            // Frames 8 and 9 place without overlap (NoAliasing): a second structure instance, then back.
+            options.debugFlags = frame == 8 || frame == 9 ? DebugFlags::NoAliasing : DebugFlags::None;
+            g.graph->Reset();
+            RecordPlacedFrame(env, g.graph, f, frame);
+            const PlanStatistics stats = g.Run(options);
+            if (frame == 0 || frame == 8)
+            {
+                std::printf("  %s%u heaps, %u aliasing barriers, %llu placed bytes (estimate), %u segments\n", prefix.c_str(),
+                            stats.heaps, stats.aliasingBarriers, (unsigned long long)stats.placedPeakBytes, stats.segments);
+                if (!placedTier)
+                    check(stats.heaps == 0 && stats.aliasingBarriers == 0, prefix + "the profile has no Placed tier: pooled");
+                else if (frame == 8)
+                    check(stats.aliasingBarriers == 0, prefix + "NoAliasing: no aliasing barriers");
+                else
+                {
+                    // Heaps per queue (7.5): graphics and compute on tier 2; per class on tier 1 (render targets and
+                    // buffers on graphics, buffers on compute).
+                    const uint32_t heaps = env.raster && heapTier == 1 ? 3u : 2u;
+                    check(stats.heaps == heaps && stats.aliasingBarriers >= (env.raster ? 4u : 2u),
+                          prefix + std::to_string(stats.heaps) + " heaps (expected " + std::to_string(heaps) + "), " +
+                          std::to_string(stats.aliasingBarriers) + " aliasing barriers");
+                }
+            }
+            // Consecutive frames overlap on the GPU; every third one is read back.
+            if (frame % 3 == 2 || frame == 8)
+                CheckPlacedFrame(env, f, prefix + "frame " + std::to_string(frame));
+        }
+        RegistryStatistics registry;
+        g.registry->GetRegistryStatistics(registry);
+        std::printf("  %sregistry: %u heaps, %llu heap bytes, %u pooled\n", prefix.c_str(), registry.heaps,
+                    (unsigned long long)registry.heapBytes, registry.pooledResources);
+
+        // 7.5 heap retirement: one cached plan, two placements in turn. Every frame evicts the other plan, whose
+        // heaps and placed resources the registry retires while the earlier frames are still in flight.
+        options.maxCachedPlans = 1;
+        for (uint32_t frame = 12; frame < 20; ++frame)
+        {
+            options.debugFlags = frame % 2 ? DebugFlags::NoAliasing : DebugFlags::None;
+            g.graph->Reset();
+            RecordPlacedFrame(env, g.graph, f, frame);
+            g.Run(options);
+        }
+        CheckPlacedFrame(env, f, prefix + "retirement, frame 19");
+        if (placedTier)
+        {
+            // Two structure instances (with and without NoAliasing). On tier 1 only the targets' heap is created.
+            const bool any = registry.heaps >= (heapTier == 1 && env.raster ? 1u : 2u) && registry.heapBytes > 0;
+            check(any, prefix + "the registry holds the heaps");
+        }
+        checkClean(env, prefix + "aliasing chains");
+    }
+
+    // 11.4: the negative test. Without aliasing barriers the executor's check of the actual placement reports every
+    // resource that starts on memory another one used; D3D12's debug layer and GBV do not track aliasing.
+    void testSkipAliasingBarriers(Env& env)
+    {
+        GraphOnDevice g(env.device);
+        if (g.profile.maxMemoryTier != MemoryTier::Placed)
+            return;
+        PlacedFrame f;
+        f.readback = CreateReadback(env.device);
+        if (env.raster)
+        {
+            f.resultA = CreateImported(env, "resultA", 64);
+            f.resultB = CreateImported(env, "resultB", 64);
+        }
+        for (int skip = 0; skip < 2; ++skip)
+        {
+            CompileOptions options;
+            options.placedResources = true;
+            options.debugFlags = skip ? DebugFlags::SkipAliasingBarriers : DebugFlags::None;
+            env.messages->expecting = true;
+            env.messages->expectedErrorsSeen = 0;
+            g.graph->Reset();
+            RecordPlacedFrame(env, g.graph, f, uint32_t(skip));
+            const PlanStatistics stats = g.Run(options);
+            env.device->waitForIdle();
+            env.messages->expecting = false;
+            if (skip)
+                check(stats.aliasingBarriers == 0 && env.messages->expectedErrorsSeen > 0,
+                      "SkipAliasingBarriers: the aliasing check reports " + std::to_string(env.messages->expectedErrorsSeen) + " resources");
+            else
+                check(stats.aliasingBarriers > 0 && env.messages->expectedErrorsSeen == 0,
+                      "with aliasing barriers the aliasing check is clean (" + std::to_string(stats.aliasingBarriers) + " barriers)");
+        }
+        checkClean(env, "SkipAliasingBarriers");
+    }
+
     // ------------------------------------------------------------------------------------------ donut's passes
 
     std::filesystem::path ExecutableDirectory()
@@ -1082,28 +1425,33 @@ namespace
 
     void runAll(Env& env)
     {
-        if (env.api == nvrhi::GraphicsAPI::VULKAN)
-            testSyncValidationIsLoaded(env);
-        testBufferChains(env);
-        testPlanSwitches(env);
-        testTrackedAndRestore(env);
-        testDebugSwitches(env);
-        testPersistent(env);
-        testPrepare(env);
-        if (env.raster)
-        {
-            testTargets(env, false);
-            testHistory(env);
-            testExtract(env);
-        }
-        if (env.explicitScopes)
-            testTrackerFallback(env);
-        if (env.explicitScopes)
-            testNativeGuard(env);
-        if (env.raster)
-            testDonutPasses(env);
+        // RDG_GPU_ONLY=<substring> runs the tests whose names contain it.
+        const char* only = std::getenv("RDG_GPU_ONLY");
+        auto run = [&](const char* name, bool applies, const std::function<void()>& test) {
+            if (applies && (!only || std::strstr(name, only)))
+                test();
+        };
+        const bool vulkan = env.api == nvrhi::GraphicsAPI::VULKAN;
+        run("sync_validation_loaded", vulkan, [&] { testSyncValidationIsLoaded(env); });
+        run("buffer_chains", true, [&] { testBufferChains(env); });
+        run("plan_switches", true, [&] { testPlanSwitches(env); });
+        run("tracked_and_restore", true, [&] { testTrackedAndRestore(env); });
+        run("debug_switches", true, [&] { testDebugSwitches(env); });
+        run("persistent", true, [&] { testPersistent(env); });
+        run("prepare", true, [&] { testPrepare(env); });
+        run("targets", env.raster, [&] { testTargets(env, false); });
+        run("history", env.raster, [&] { testHistory(env); });
+        run("extract", env.raster, [&] { testExtract(env); });
+        run("tracker_fallback", env.explicitScopes, [&] { testTrackerFallback(env); });
+        run("native_guard", env.explicitScopes, [&] { testNativeGuard(env); });
+        run("vvl_event_witness", vulkan, [&] { testVvlEventWitness(env); });
+        run("split_barriers", env.raster, [&] { testSplitBarriers(env); });
+        run("placed", true, [&] { testPlaced(env, 0); });
+        run("placed_heap_tier_1", env.api == nvrhi::GraphicsAPI::D3D12, [&] { testPlaced(env, 1); });
+        run("skip_aliasing_barriers", true, [&] { testSkipAliasingBarriers(env); });
+        run("donut_passes", env.raster, [&] { testDonutPasses(env); });
         checkClean(env, "all graphs");
-        testSteadyState(env);
+        run("steady_state", true, [&] { testSteadyState(env); });
     }
 
     template <typename TFactory>
@@ -1157,7 +1505,8 @@ int main(int argc, char** argv)
             nvrhi::d3d12::GraphicsFactoryDesc factoryDesc;
             factoryDesc.messageCallback = messages;
             factoryDesc.enableDebugRuntime = true;
-            factoryDesc.enableGPUValidation = true;
+            // RDG_D3D12_NO_GBV=1 isolates a fault from GPU-based validation.
+            factoryDesc.enableGPUValidation = std::getenv("RDG_D3D12_NO_GBV") == nullptr;
             // The Agility SDK in .\D3D12\, when its exact version is given: it brings enhanced barriers to Windows 10.
             if (const char* sdkVersion = std::getenv("NVRHI_TEST_AGILITY_SDK_VERSION"))
             {
@@ -1223,7 +1572,15 @@ int main(int argc, char** argv)
                 infoQueue->ClearStoredMessages();
                 return errors;
             };
-            runAll(env);
+            try
+            {
+                runAll(env);
+            }
+            catch (...)
+            {
+                env.nativeErrors();   // a run that dies prints the debug layer's stored messages
+                throw;
+            }
         }
         else
 #endif
@@ -1233,6 +1590,8 @@ int main(int argc, char** argv)
             // Synchronization validation.
 #ifdef _WIN32
             _putenv_s("VK_LAYER_VALIDATE_SYNC", "1");
+            // Structured hazard properties, by which Messages recognises the VVL false positive (testVvlEventWitness).
+            _putenv_s("VK_KHRONOS_VALIDATION_SYNCVAL_MESSAGE_EXTRA_PROPERTIES", "true");
 #endif
             nvrhi::vulkan::GraphicsFactoryDesc factoryDesc;
             factoryDesc.messageCallback = messages;
@@ -1265,6 +1624,7 @@ int main(int argc, char** argv)
             env.rawDevice = device;
             env.explicitScopes = true;
             runAll(env);
+            std::printf("  VVL false positives set aside (testVvlEventWitness's pattern): %u\n", messages->vvlEventFalsePositives);
             validation = nullptr;
             device->waitForIdle();
         }
