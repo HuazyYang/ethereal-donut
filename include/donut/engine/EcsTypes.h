@@ -120,7 +120,10 @@ namespace donut::engine
     template <> struct EnableEcsFlagOperators<ComponentFlags> : std::true_type { };
 
     // Lifecycle hooks: C function pointers, so that a component type can be registered from any module. A null hook
-    // means the trivial operation (zero-fill, nothing, memcpy, memcpy).
+    // means the trivial operation (zero-fill, nothing, memcpy, memcpy), where a memcpy copy needs a Relocatable type.
+    // Registration enforces (D14): a Relocatable type has no destruct, relocate or copy hook; a type with a destruct
+    // hook has a relocate hook; a type that is neither Relocatable nor has a copy hook is never copied (copies and
+    // Instantiate fail with FE_UNSUPPORTED).
     typedef void (*PFN_ComponentConstruct)(void* dst, uint32_t count);
     typedef void (*PFN_ComponentDestruct)(void* dst, uint32_t count);
     typedef void (*PFN_ComponentRelocate)(void* dst, void* src, uint32_t count);   // move, then destroy the source

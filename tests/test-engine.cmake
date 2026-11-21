@@ -44,6 +44,15 @@ endforeach()
 target_compile_definitions(test_scene_graph_trace PRIVATE
     DONUT_TEST_GOLDEN_DIR="${CMAKE_CURRENT_LIST_DIR}/src/engine/golden")
 
+# The ECS tests reach the world's internals (allocation counters, chunk layout, entity table) through the private
+# headers in src/engine (EcsWorldImpl.h and the ones beside it).
+foreach(test_src ${donut_engine_tests})
+    get_filename_component(test_name "${test_src}" NAME_WE)
+    if(test_name MATCHES "^test_ecs_")
+        target_include_directories("${test_name}" PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
+    endif()
+endforeach()
+
 # Baseline timings of the scene graph (aggregate docs/plans/2026-11-21-donut-ecs.md, step E0.4). The glob above skips
 # it; ctest runs it only in its short smoke mode, the Release numbers come from `bench_scene_graph`.
 add_executable(bench_scene_graph src/engine/bench_scene_graph.cpp)
