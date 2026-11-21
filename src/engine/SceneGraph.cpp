@@ -26,6 +26,11 @@
 #include <sstream>
 #include <donut/engine/ShadowMap.h>
 
+#include "SceneGraphStore.h"
+
+#include <algorithm>
+#include <cassert>
+
 using namespace donut::engine;
 
 const std::string& SceneGraphLeaf::GetName() const
@@ -243,22 +248,292 @@ bool OrthographicCamera::SetProperty(const std::string& name, const dm::float4& 
     return SceneGraphLeaf::SetProperty(name, value);
 }
 
-void SceneGraphNode::UpdateLocalTransform()
+// ------------------------------------------------------------------------- leaf type descriptors (D19)
+
+namespace
 {
-    dm::daffine3 transform = dm::scaling(m_Scaling);
-    transform *= m_Rotation.toAffine();
-    transform *= dm::translation(m_Translation);
-    m_LocalTransform = transform;
+    // One descriptor per leaf class (the class is part of the template's identity, so classes with the same tags do
+    // not share one).
+    template <typename Leaf, typename... Tags>
+    const LeafTypeDesc& MakeLeafTypeDesc() noexcept
+    {
+        static const ComponentTypeDesc* const s_Tags[] = { &ComponentTraits<Tags>::Desc()... };
+        static const LeafTypeDesc s_Desc{ nvrhi::uuid_of<Leaf>(), s_Tags, uint32_t(sizeof...(Tags)), nullptr, 0 };
+        return s_Desc;
+    }
 }
 
-void SceneGraphNode::PropagateDirtyFlags(DirtyFlags flags)
+const LeafTypeDesc& SceneGraphLeaf::GetTypeDesc() const
 {
-    SceneGraphWalker walker(this, nullptr);
-    while (walker)
+    static const LeafTypeDesc s_Desc{ IID_SceneGraphLeaf, nullptr, 0, nullptr, 0 };
+    return s_Desc;
+}
+
+const LeafTypeDesc& MeshInstance::GetTypeDesc() const
+{
+    return MakeLeafTypeDesc<MeshInstance, MeshInstanceLeaf>();
+}
+
+const LeafTypeDesc& SkinnedMeshInstance::GetTypeDesc() const
+{
+    return MakeLeafTypeDesc<SkinnedMeshInstance, MeshInstanceLeaf, SkinnedMeshInstanceLeaf>();
+}
+
+const LeafTypeDesc& SkinnedMeshReference::GetTypeDesc() const
+{
+    return MakeLeafTypeDesc<SkinnedMeshReference, SkinnedMeshReferenceLeaf>();
+}
+
+const LeafTypeDesc& SceneCamera::GetTypeDesc() const
+{
+    return MakeLeafTypeDesc<SceneCamera, CameraLeaf>();
+}
+
+const LeafTypeDesc& PerspectiveCamera::GetTypeDesc() const
+{
+    return MakeLeafTypeDesc<PerspectiveCamera, CameraLeaf, PerspectiveCameraLeaf>();
+}
+
+const LeafTypeDesc& OrthographicCamera::GetTypeDesc() const
+{
+    return MakeLeafTypeDesc<OrthographicCamera, CameraLeaf, OrthographicCameraLeaf>();
+}
+
+const LeafTypeDesc& Light::GetTypeDesc() const
+{
+    return MakeLeafTypeDesc<Light, LightLeaf>();
+}
+
+const LeafTypeDesc& DirectionalLight::GetTypeDesc() const
+{
+    return MakeLeafTypeDesc<DirectionalLight, LightLeaf, DirectionalLightLeaf>();
+}
+
+const LeafTypeDesc& SpotLight::GetTypeDesc() const
+{
+    return MakeLeafTypeDesc<SpotLight, LightLeaf, SpotLightLeaf>();
+}
+
+const LeafTypeDesc& PointLight::GetTypeDesc() const
+{
+    return MakeLeafTypeDesc<PointLight, LightLeaf, PointLightLeaf>();
+}
+
+const LeafTypeDesc& SceneGraphAnimation::GetTypeDesc() const
+{
+    return MakeLeafTypeDesc<SceneGraphAnimation, AnimationLeaf>();
+}
+
+// ------------------------------------------------------------------------------- nodes as handles (5.2)
+
+OrphanRecord& SceneGraphNode::EnsureRecord()
+{
+    assert(!m_Store);
+    if (!m_Record)
+        m_Record = OrphanRecord::Create();
+    return *m_Record;
+}
+
+dm::dquat SceneGraphNode::GetRotation() const
+{
+    if (m_Record)
+        return m_Record->local.rotation;
+    if (m_Store)
     {
-        walker->m_Dirty |= flags;
-        walker.Up();
+        if (const LocalTransform* local = m_Store->GetOf<LocalTransform>(this, SceneGraphStore::SlotLocal))
+            return local->rotation;
     }
+    return dm::dquat::identity();
+}
+
+dm::double3 SceneGraphNode::GetScaling() const
+{
+    if (m_Record)
+        return m_Record->local.scaling;
+    if (m_Store)
+    {
+        if (const LocalTransform* local = m_Store->GetOf<LocalTransform>(this, SceneGraphStore::SlotLocal))
+            return local->scaling;
+    }
+    return dm::double3(1.0);
+}
+
+dm::double3 SceneGraphNode::GetTranslation() const
+{
+    if (m_Record)
+        return m_Record->local.translation;
+    if (m_Store)
+    {
+        if (const LocalTransform* local = m_Store->GetOf<LocalTransform>(this, SceneGraphStore::SlotLocal))
+            return local->translation;
+    }
+    return dm::double3(0.0);
+}
+
+dm::daffine3 SceneGraphNode::GetLocalToParentTransform() const
+{
+    const LocalTransform* local = nullptr;
+    if (m_Record)
+        local = m_Record->hasLocal ? &m_Record->local : nullptr;
+    else if (m_Store)
+        local = m_Store->GetOf<LocalTransform>(this, SceneGraphStore::SlotLocal);
+    if (!local)
+        return dm::daffine3::identity();
+    dm::daffine3 transform = dm::scaling(local->scaling);
+    transform *= local->rotation.toAffine();
+    transform *= dm::translation(local->translation);
+    return transform;
+}
+
+dm::daffine3 SceneGraphNode::GetLocalToWorldTransform() const
+{
+    if (m_Record)
+        return m_Record->world.transform;
+    if (m_Store)
+    {
+        if (const WorldTransform* world = m_Store->GetOf<WorldTransform>(this, SceneGraphStore::SlotWorld))
+            return world->transform;
+    }
+    return dm::daffine3::identity();
+}
+
+dm::affine3 SceneGraphNode::GetLocalToWorldTransformFloat() const
+{
+    return dm::affine3(GetLocalToWorldTransform());
+}
+
+dm::box3 SceneGraphNode::GetGlobalBoundingBox() const
+{
+    if (m_Store && !m_Record)
+    {
+        if (m_CacheEpoch.load(std::memory_order_acquire) != m_Store->GetEpoch())
+            m_Store->ComputeSubgraphCache(this);
+        return m_CachedBounds;
+    }
+    // a node in no graph: computed on every call
+    std::vector<SceneGraphStore::CacheFrame> stack;
+    dm::box3 bounds;
+    SceneContentFlags leafContent, content;
+    SceneGraphStore::ComputeSubgraph(this, stack, 0, false, bounds, leafContent, content);
+    return bounds;
+}
+
+SceneContentFlags SceneGraphNode::GetLeafContentFlags() const
+{
+    if (m_Store && !m_Record && m_CacheEpoch.load(std::memory_order_acquire) == m_Store->GetEpoch())
+        return m_CachedLeafContent;
+    SceneGraphLeaf* leaf = GetLeaf();
+    return leaf ? leaf->GetContentFlags() : SceneContentFlags::None;
+}
+
+SceneContentFlags SceneGraphNode::GetSubgraphContentFlags() const
+{
+    if (m_Store && !m_Record)
+    {
+        if (m_CacheEpoch.load(std::memory_order_acquire) != m_Store->GetEpoch())
+            m_Store->ComputeSubgraphCache(this);
+        return m_CachedSubgraphContent;
+    }
+    std::vector<SceneGraphStore::CacheFrame> stack;
+    dm::box3 bounds;
+    SceneContentFlags leafContent, content;
+    SceneGraphStore::ComputeSubgraph(this, stack, 0, false, bounds, leafContent, content);
+    return content;
+}
+
+SceneGraphNode::DirtyFlags SceneGraphNode::GetDirtyFlags() const
+{
+    if (m_Store && !m_Record)
+    {
+        DirtyFlags flags = DirtyFlags::None;
+        if (m_Store->HasPendingStructureChanges())
+            flags |= DirtyFlags::SubgraphStructure;
+        if (m_Store->HasPendingTransformChanges())
+            flags |= DirtyFlags::SubgraphTransforms;
+        return flags;
+    }
+    // a node in no graph is new structure for the graph it joins
+    DirtyFlags flags = DirtyFlags::SubgraphStructure;
+    if (m_Record && m_Record->hasLocal)
+        flags |= DirtyFlags::LocalTransform | DirtyFlags::SubgraphTransforms;
+    return flags;
+}
+
+SceneGraphNode* SceneGraphNode::GetParent() const
+{
+    if (m_Record)
+        return m_Record->parent;
+    if (m_Store)
+    {
+        if (const Parent* parent = m_Store->GetOf<Parent>(this, SceneGraphStore::SlotParent))
+            return m_Store->NodeOf(parent->entity);
+    }
+    return nullptr;
+}
+
+SceneGraphNode* SceneGraphNode::GetFirstChild() const
+{
+    if (m_Record)
+        return m_Record->firstChild.Get();
+    if (m_Store)
+    {
+        if (const SceneLinks* links = m_Store->GetOf<SceneLinks>(this, SceneGraphStore::SlotLinks))
+            return m_Store->NodeOf(links->firstChild);
+    }
+    return nullptr;
+}
+
+SceneGraphNode* SceneGraphNode::GetLastChild() const
+{
+    if (m_Record)
+        return m_Record->lastChild;
+    if (m_Store)
+    {
+        if (const SceneLinks* links = m_Store->GetOf<SceneLinks>(this, SceneGraphStore::SlotLinks))
+            return m_Store->NodeOf(links->lastChild);
+    }
+    return nullptr;
+}
+
+SceneGraphNode* SceneGraphNode::GetNextSibling() const
+{
+    if (m_Record)
+        return m_Record->nextSibling.Get();
+    if (m_Store)
+    {
+        if (const SceneLinks* links = m_Store->GetOf<SceneLinks>(this, SceneGraphStore::SlotLinks))
+            return m_Store->NodeOf(links->nextSibling);
+    }
+    return nullptr;
+}
+
+SceneGraphNode* SceneGraphNode::GetPrevSibling() const
+{
+    if (m_Record)
+        return m_Record->prevSibling;
+    if (m_Store)
+    {
+        if (const SceneLinks* links = m_Store->GetOf<SceneLinks>(this, SceneGraphStore::SlotLinks))
+            return m_Store->NodeOf(links->prevSibling);
+    }
+    return nullptr;
+}
+
+SceneGraphLeaf* SceneGraphNode::GetLeaf() const
+{
+    if (m_Record)
+        return m_Record->leaf.Get();
+    if (m_Store)
+    {
+        if (const LeafObject* leaf = m_Store->GetOf<LeafObject>(this, SceneGraphStore::SlotLeaf))
+            return leaf->object;
+    }
+    return nullptr;
+}
+
+SceneGraph* SceneGraphNode::GetGraph() const
+{
+    return m_Store ? m_Store->GetGraph() : nullptr;
 }
 
 std::filesystem::path SceneGraphNode::GetPath() const
@@ -277,18 +552,23 @@ std::filesystem::path SceneGraphNode::GetPath() const
 
 void SceneGraphNode::InvalidateContent()
 {
-    PropagateDirtyFlags(DirtyFlags::SubgraphContentUpdate);
+    if (m_Store && !m_Record)
+        m_Store->InvalidateContent(this);
 }
 
 void SceneGraphNode::SetTransform(const dm::double3* translation, const dm::dquat* rotation, const dm::double3* scaling)
 {
-    if (scaling) m_Scaling = *scaling;
-    if (rotation) m_Rotation = *rotation;
-    if (translation) m_Translation = *translation;
+    if (m_Store && !m_Record)
+    {
+        m_Store->SetTransform(this, translation, rotation, scaling);
+        return;
+    }
 
-    m_Dirty |= DirtyFlags::LocalTransform;
-    m_HasLocalTransform = true;
-    PropagateDirtyFlags(DirtyFlags::SubgraphTransforms);
+    OrphanRecord& record = EnsureRecord();
+    if (scaling) record.local.scaling = *scaling;
+    if (rotation) record.local.rotation = *rotation;
+    if (translation) record.local.translation = *translation;
+    record.hasLocal = true;
 }
 
 void SceneGraphNode::SetScaling(const dm::double3& scaling)
@@ -308,22 +588,18 @@ void SceneGraphNode::SetTranslation(const dm::double3& translation)
 
 void SceneGraphNode::SetLeaf(SceneGraphLeaf* leaf)
 {
-    auto graph = m_Graph.Lock();
-
-    if (m_Leaf)
+    if (m_Store && !m_Record)
     {
-        m_Leaf->m_Node.Reset();
-        if (graph)
-            graph->UnregisterLeaf(m_Leaf);
+        m_Store->SetLeaf(this, leaf);
+        return;
     }
 
-    m_Leaf = leaf;
-    leaf->m_Node = nvrhi::WeakPtr<SceneGraphNode>(this);
-    if (graph)
-        graph->RegisterLeaf(leaf);
-
-    m_Dirty |= DirtyFlags::Leaf;
-    PropagateDirtyFlags(DirtyFlags::SubgraphStructure);
+    OrphanRecord& record = EnsureRecord();
+    if (record.leaf)
+        record.leaf->m_Node.Reset();
+    record.leaf = leaf;
+    if (leaf)
+        leaf->m_Node = nvrhi::WeakPtr<SceneGraphNode>(this);
 }
 
 void SceneGraphNode::SetName(const std::string& name)
@@ -333,66 +609,27 @@ void SceneGraphNode::SetName(const std::string& name)
 
 SceneGraphNode::~SceneGraphNode()
 {
+    // A node dies attached only when its graph's world releases it; its state went with the row. A node in no graph
+    // owns its children through its record.
+    if (!m_Record)
+        return;
+
     // Release the children one at a time, cutting every sibling link first, so that no destructor owns the
     // next sibling and the destructors never nest per sibling. Destroying a node with N children then costs
     // stack proportional to the depth of its subgraph, not to N (see NVIDIAGameWorks/donut#18).
-    nvrhi::AutoPtr<SceneGraphNode> child = std::move(m_FirstChild);
+    nvrhi::AutoPtr<SceneGraphNode> child = std::move(m_Record->firstChild);
     while (child)
     {
         // A child that someone else still references outlives this node as a root of its own subgraph.
-        child->m_Parent = nullptr;
-        child->m_PrevSibling = nullptr;
+        OrphanRecord& childRecord = *child->m_Record;
+        childRecord.parent = nullptr;
+        childRecord.prevSibling = nullptr;
 
         // Releases the previous child, which no longer owns a sibling
-        child = std::move(child->m_NextSibling);
+        child = std::move(childRecord.nextSibling);
     }
-}
-
-void SceneGraphNode::AppendChild(SceneGraphNode* child)
-{
-    assert(child);
-#ifndef NDEBUG
-    // linking a node under itself or under one of its descendants would make a cycle
-    for (SceneGraphNode* ancestor = this; ancestor; ancestor = ancestor->m_Parent)
-        assert(ancestor != child);
-#endif
-
-    // A node is linked into at most one child list: a node that moves brings the reference its old list
-    // held, any other node gets a new one.
-    nvrhi::AutoPtr<SceneGraphNode> link;
-    if (child->m_Parent)
-        link = child->m_Parent->RemoveChild(child);
-    if (!link)
-        link = child;
-    assert(!child->m_NextSibling && !child->m_PrevSibling);
-
-    child->m_Parent = this;
-    child->m_PrevSibling = m_LastChild;
-    (m_LastChild ? m_LastChild->m_NextSibling : m_FirstChild) = std::move(link);
-    m_LastChild = child;
-}
-
-nvrhi::AutoPtr<SceneGraphNode> SceneGraphNode::RemoveChild(SceneGraphNode* child)
-{
-    if (!child || child->m_Parent != this)
-        return nullptr;
-
-    SceneGraphNode* prev = child->m_PrevSibling;
-    nvrhi::AutoPtr<SceneGraphNode>& link = prev ? prev->m_NextSibling : m_FirstChild;
-    assert(link.Get() == child);
-
-    // Take the list's reference to the child, and close the gap with the child's next sibling
-    nvrhi::AutoPtr<SceneGraphNode> removed = std::move(link);
-    link = std::move(child->m_NextSibling);
-
-    if (link)
-        link->m_PrevSibling = prev;
-    else
-        m_LastChild = prev;
-
-    child->m_Parent = nullptr;
-    child->m_PrevSibling = nullptr;
-    return removed;
+    OrphanRecord::Destroy(m_Record);
+    m_Record = nullptr;
 }
 
 int SceneGraphWalker::Next(bool allowChildren)
@@ -574,11 +811,59 @@ bool SceneGraphAnimation::IsVald() const
     return true;
 }
 
+SceneGraph::SceneGraph()
+{
+    m_Store = new SceneGraphStore(this);
+}
+
+SceneGraph::~SceneGraph()
+{
+    // The graph's own reference to its root goes first, so that the store sees which nodes are referenced elsewhere.
+    m_Root.Reset();
+    delete m_Store;
+    m_Store = nullptr;
+}
+
+IWorld* SceneGraph::GetWorld() const
+{
+    return m_Store->GetWorld();
+}
+
+Entity SceneGraph::GetEntity(const SceneGraphNode* node) const
+{
+    return node && node->m_Store == m_Store && !node->m_Record ? node->m_Entity : Entity::Null;
+}
+
+SceneGraphNode* SceneGraph::GetNode(Entity entity) const
+{
+    return m_Store->NodeOf(entity);
+}
+
+IScheduler* SceneGraph::GetScheduler() const
+{
+    return m_Store->GetScheduler();
+}
+
+void SceneGraph::SetJobSystem(IJobSystem* jobSystem)
+{
+    m_Store->SetJobSystem(jobSystem);
+}
+
+bool SceneGraph::HasPendingStructureChanges() const
+{
+    return m_Store->HasPendingStructureChanges();
+}
+
+bool SceneGraph::HasPendingTransformChanges() const
+{
+    return m_Store->HasPendingTransformChanges();
+}
+
 void SceneGraph::RegisterLeaf(SceneGraphLeaf *leaf)
 {
     if (!leaf)
         return;
-    
+
     auto meshInstance = query_cast<MeshInstance>(leaf);
     if (meshInstance)
     {
@@ -623,7 +908,7 @@ void SceneGraph::RegisterLeaf(SceneGraphLeaf *leaf)
 
         return;
     }
-    
+
     auto animation = query_cast<SceneGraphAnimation>(leaf);
     if (animation)
     {
@@ -650,6 +935,23 @@ void SceneGraph::UnregisterLeaf(SceneGraphLeaf *leaf)
 {
     if (!leaf)
         return;
+
+    // Removes the leaf's first entry from a vector, keeping the order of the rest: at once, or, during a Detach, by
+    // counting a mark on the leaf (once per call), so that CompactLeafVectors removes as many first entries from each
+    // vector in one pass at the Detach's end. Until then the vectors still hold the leaves unregistered before it.
+    if (m_DeferLeafRemoval)
+    {
+        if (leaf->m_RemovalPending++ == 0)
+            m_RemovalMarked.push_back(leaf);
+    }
+    auto removeLeaf = [this](auto& items, auto* item)
+    {
+        if (m_DeferLeafRemoval)
+            return;
+        auto it = std::find(items.begin(), items.end(), item);
+        if (it != items.end())
+            items.erase(it);
+    };
 
     auto meshInstance = query_cast<MeshInstance>(leaf);
     if (meshInstance)
@@ -681,18 +983,13 @@ void SceneGraph::UnregisterLeaf(SceneGraphLeaf *leaf)
             }
         }
 
-        auto it = std::find(m_MeshInstances.begin(), m_MeshInstances.end(), meshInstance);
-        if (it != m_MeshInstances.end())
-            m_MeshInstances.erase(it);
+        // A Detach removes its leaves in one pass at its end (CompactLeafVectors); the order of the rest is kept.
+        removeLeaf(m_MeshInstances, meshInstance);
 
         // a skinned instance is a mesh instance as well: RegisterLeaf put it into both vectors
         auto skinnedInstance = query_cast<SkinnedMeshInstance>(meshInstance);
         if (skinnedInstance)
-        {
-            auto skinnedIt = std::find(m_SkinnedMeshInstances.begin(), m_SkinnedMeshInstances.end(), skinnedInstance);
-            if (skinnedIt != m_SkinnedMeshInstances.end())
-                m_SkinnedMeshInstances.erase(skinnedIt);
-        }
+            removeLeaf(m_SkinnedMeshInstances, skinnedInstance);
 
         return;
     }
@@ -700,29 +997,58 @@ void SceneGraph::UnregisterLeaf(SceneGraphLeaf *leaf)
     auto animation = query_cast<SceneGraphAnimation>(leaf);
     if (animation)
     {
-        auto it = std::find(m_Animations.begin(), m_Animations.end(), animation);
-        if (it != m_Animations.end())
-            m_Animations.erase(it);
+        removeLeaf(m_Animations, animation);
         return;
     }
 
     auto camera = query_cast<SceneCamera>(leaf);
     if (camera)
     {
-        auto it = std::find(m_Cameras.begin(), m_Cameras.end(), camera);
-        if (it != m_Cameras.end())
-            m_Cameras.erase(it);
+        removeLeaf(m_Cameras, camera);
         return;
     }
 
     auto light = query_cast<Light>(leaf);
     if (light)
     {
-        auto it = std::find(m_Lights.begin(), m_Lights.end(), light);
-        if (it != m_Lights.end())
-            m_Lights.erase(it);
+        removeLeaf(m_Lights, light);
         return;
     }
+}
+
+void SceneGraph::CompactLeafVectors()
+{
+    if (m_RemovalMarked.empty())
+        return;
+    // Drops, per vector, as many first entries of each marked leaf as it was unregistered (the old erase of the first
+    // entry, once per call), keeping the order of the rest.
+    auto compact = [this](auto& items)
+    {
+        size_t kept = 0;
+        for (size_t i = 0; i < items.size(); ++i)
+        {
+            SceneGraphLeaf* leaf = items[i].Get();
+            if (leaf->m_RemovalTaken < leaf->m_RemovalPending)
+            {
+                ++leaf->m_RemovalTaken;
+                continue;
+            }
+            if (kept != i)
+                items[kept] = std::move(items[i]);
+            ++kept;
+        }
+        items.resize(kept);
+        for (const auto& leaf : m_RemovalMarked)
+            leaf->m_RemovalTaken = 0;
+    };
+    compact(m_MeshInstances);
+    compact(m_SkinnedMeshInstances);
+    compact(m_Animations);
+    compact(m_Cameras);
+    compact(m_Lights);
+    for (const auto& leaf : m_RemovalMarked)
+        leaf->m_RemovalPending = 0;
+    m_RemovalMarked.clear();
 }
 
 nvrhi::AutoPtr<SceneGraphNode> SceneGraph::SetRootNode(SceneGraphNode *root)
@@ -737,175 +1063,34 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::SetRootNode(SceneGraphNode *root)
 }
 
 nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneGraphNode* child) {
-    auto parentGraph = parent ? parent->m_Graph.Lock() : nvrhi::AutoPtr<SceneGraph>(this);
-    auto childGraph = child->m_Graph.Lock();
+    SceneGraph* parentGraph = parent ? parent->GetGraph() : this;
+    SceneGraph* childGraph = child->GetGraph();
 
     if (!parentGraph && !childGraph)
     {
         // operating on an orphaned subgraph - do not copy or register anything
-
         assert(parent);
-        parent->AppendChild(child);
-
-        // keep the subgraph's dirty flags consistent, so that a Refresh reaches every node of the subgraph
-        // once it is attached to a graph
-        child->PropagateDirtyFlags(SceneGraphNode::DirtyFlags::SubgraphStructure
-            | (child->m_Dirty & SceneGraphNode::DirtyFlags::SubgraphMask));
+        SceneGraphStore::AppendOrphan(parent, child);
         return child;
     }
 
     assert(parentGraph == this);
     nvrhi::AutoPtr<SceneGraphNode> attachedChild;
-    
+
     if (childGraph)
     {
-        // attaching a subgraph that already belongs to a graph - this one or another
-        // copy the subgraph first. The copy is assembled unlinked and attached to the parent at the end, so the
-        // walker never reaches the copies (the parent may lie inside the copied subgraph), and the dirty flags
-        // that SetTransform and SetLeaf propagate stay within the copy.
-
-        // keep a mapping of old nodes to new nodes to patch the copied animations
-        std::unordered_map<SceneGraphNode*, nvrhi::AutoPtr<SceneGraphNode>> nodeMap;
-
-        SceneGraphNode* currentParent = nullptr;
-        SceneGraphWalker walker(child);
-        while (walker)
-        {
-            // make a copy of the current node
-            auto copy = MAKE_RC_OBJ_PTR(SceneGraphNode);
-            nodeMap[walker.Get()] = copy;
-
-            copy->m_Name = walker->m_Name;
-            copy->m_Graph = nvrhi::WeakPtr<SceneGraph>(this);
-            // every copied node is new structure that the next Refresh has to visit
-            copy->m_Dirty = walker->m_Dirty | SceneGraphNode::DirtyFlags::SubgraphStructure;
-
-            // link the copy under its copied parent before SetTransform and SetLeaf propagate their flags
-            if (currentParent)
-            {
-                currentParent->AppendChild(copy);
-            }
-
-            if (walker->m_HasLocalTransform)
-            {
-                copy->SetTransform(&walker->m_Translation, &walker->m_Rotation, &walker->m_Scaling);
-            }
-
-            if (walker->m_Leaf)
-            {
-                auto leafCopy = walker->m_Leaf->Clone();
-                copy->SetLeaf(leafCopy);
-            }
-
-            // if it's the first node we copied, store it as the new root
-            if (!attachedChild)
-                attachedChild = copy;
-
-            // go to the next node
-            int deltaDepth = walker.Next(true);
-
-            if (deltaDepth > 0)
-            {
-                currentParent = copy;
-            }
-            else
-            {
-                while (deltaDepth++ < 0)
-                {
-                    // go up the new tree
-                    currentParent = currentParent->m_Parent;
-                }
-            }
-        }
-
-        // go over the new nodes and patch the cloned animations and skinned groups to use the *new* nodes
-        walker = SceneGraphWalker(attachedChild);
-        while (walker)
-        {
-            if (auto animation = query_cast<SceneGraphAnimation>(walker->m_Leaf.Get()))
-            {
-                for (const auto& channel : animation->GetChannels())
-                {
-                    auto newNode = nodeMap[channel->GetTargetNode()];
-                    if (newNode)
-                    {
-                        channel->SetTargetNode(newNode);
-                    }
-                }
-            }
-            else if (auto skinnedInstance = query_cast<SkinnedMeshInstance>(walker->m_Leaf.Get()))
-            {
-                for (auto& joint : skinnedInstance->joints)
-                {
-                    auto jointNode = joint.node.Lock();
-                    auto newNode = nodeMap[jointNode.Get()];
-                    if (newNode)
-                    {
-                        joint.node = newNode;
-                    }
-                }
-            }
-            else if (auto meshReference = query_cast<SkinnedMeshReference>(walker->m_Leaf.Get()))
-            {
-                auto instance = meshReference->m_Instance.Lock();
-                if (instance)
-                {
-                    auto oldNode = instance->GetNode();
-
-                    auto newNode = nodeMap[oldNode];
-                    if (newNode)
-                        meshReference->m_Instance = query_cast<SkinnedMeshInstance>(newNode->m_Leaf.Get());
-                    else
-                        meshReference->m_Instance.Reset();
-                }
-            }
-
-            walker.Next(true);
-        }
-
-        // link the finished copy into this graph
-        if (parent)
-        {
-            parent->AppendChild(attachedChild);
-        }
-        else
-        {
-            m_Root = attachedChild;
-        }
+        // attaching a subgraph that already belongs to a graph - this one or another: a deep copy (design 5.3)
+        attachedChild = m_Store->AttachCopy(parent, child, childGraph->m_Store);
     }
     else
     {
-        // attaching a subgraph that has been detached from another graph (or never attached)
-
-        SceneGraphWalker walker(child);
-        while (walker)
-        {
-            walker->m_Graph = this;
-            // every node is new structure that the next Refresh has to visit: a subgraph that was refreshed in a
-            // graph before has clean dirty flags, and its world transforms and bounds belong to its old place
-            walker->m_Dirty |= SceneGraphNode::DirtyFlags::SubgraphStructure;
-            auto leaf = walker->GetLeaf();
-            if (leaf)
-                RegisterLeaf(leaf);
-            walker.Next(true);
-        }
-
-        if (parent)
-        {
-            parent->AppendChild(child);
-        }
-        else
-        {
-            // a node taken out of an orphaned subgraph must not stay in its old parent's child list
-            nvrhi::AutoPtr<SceneGraphNode> unlinked = child->m_Parent ? child->m_Parent->RemoveChild(child) : nullptr;
-            m_Root = child;
-        }
-
-        attachedChild = child;
+        // attaching a subgraph that has been detached from another graph (or never attached): its records move into
+        // rows, in pre-order
+        attachedChild = m_Store->AttachOrphan(parent, child);
     }
 
-    attachedChild->PropagateDirtyFlags(SceneGraphNode::DirtyFlags::SubgraphStructure
-        | (attachedChild->m_Dirty & SceneGraphNode::DirtyFlags::SubgraphMask));
+    if (!parent && attachedChild)
+        m_Root = attachedChild;
 
     return attachedChild;
 }
@@ -922,41 +1107,22 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::AttachLeafNode(SceneGraphNode *parent
 
 nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Detach(SceneGraphNode* node, bool /* preserveOrder */)
 {
-    auto nodeGraph = node->m_Graph.Lock();
-
-    if (nodeGraph)
-    {
-        assert(nodeGraph == this);
-
-        // unregister all leaves in the subgraph, detach all nodes from the graph
-        SceneGraphWalker walker(node);
-        while (walker)
-        {
-            walker->m_Graph.Reset();
-            auto leaf = walker->GetLeaf();
-            if (leaf)
-                UnregisterLeaf(leaf);
-            walker.Next(true);
-        }
-    }
-
-    // remove the node from its parent, taking over the reference the parent's child list held
     nvrhi::AutoPtr<SceneGraphNode> detached;
-    if (SceneGraphNode* parent = node->m_Parent)
+    if (node->m_Store)
     {
-        parent->PropagateDirtyFlags(SceneGraphNode::DirtyFlags::SubgraphStructure);
-
-        detached = parent->RemoveChild(node);
-
-        // if the graph is correct, the parent always contains this node
-        assert(detached);
+        assert(node->m_Store == m_Store);
+        // the subgraph's rows move into records and its entities go; the leaf observer unregisters the leaves
+        detached = m_Store->Detach(node);
+    }
+    else
+    {
+        // a node of an orphaned subgraph leaves its parent's child list, handing over the reference the list held
+        detached = SceneGraphStore::UnlinkOrphan(node);
+        if (!detached)
+            detached = node;
     }
 
-    if (!detached)
-        detached = node;
-    node->m_Parent = nullptr;
-
-    if (m_Root == node)
+    if (m_Root == node && !node->m_Store)
     {
         m_Root = MAKE_RC_OBJ_PTR(SceneGraphNode);
     }
@@ -1013,142 +1179,10 @@ SceneGraphNode* SceneGraph::FindNode(const std::filesystem::path& path, SceneGra
 
 void SceneGraph::Refresh(uint32_t frameIndex)
 {
-    struct StackItem
-    {
-        bool supergraphTransformUpdated = false;
-        bool supergraphContentUpdate = false;
-    };
+    // TransformPropagation and Bounds (design 5.7), when anything changed since the last call.
+    const bool structureDirty = m_Store->Refresh(frameIndex);
 
-    bool structureDirty = HasPendingStructureChanges();
-
-    StackItem context;
-    std::vector<StackItem> stack;
-
-    SceneGraphWalker walker(m_Root);
-    while (walker)
-    {
-        auto current = walker.Get();
-        auto parent = current->m_Parent;
-
-        // save the current local/global transforms as previous
-        current->m_PrevLocalTransform = current->m_LocalTransform;
-        current->m_PrevGlobalTransform = current->m_GlobalTransform;
-        current->m_PrevGlobalTransformFloat = current->m_GlobalTransformFloat;
-
-        bool currentTransformUpdated = (current->m_Dirty & SceneGraphNode::DirtyFlags::LocalTransform) != 0;
-        bool currentContentUpdated = (current->m_Dirty & SceneGraphNode::DirtyFlags::SubgraphContentUpdate) != 0;
-
-        if (currentTransformUpdated)
-        {
-            current->UpdateLocalTransform();
-        }
-
-        // update the global transform of the current node
-        if (parent)
-        {
-            current->m_GlobalTransform = current->m_HasLocalTransform
-                ? current->m_LocalTransform * parent->m_GlobalTransform
-                : parent->m_GlobalTransform;
-        }
-        else
-        {
-            current->m_GlobalTransform = current->m_LocalTransform;
-        }
-        current->m_GlobalTransformFloat = dm::affine3(current->m_GlobalTransform);
-
-        // initialize the global bbox of the current node, start with the leaf (or an empty box if there is no leaf)
-        if ((current->m_Dirty & (SceneGraphNode::DirtyFlags::SubgraphStructure | SceneGraphNode::DirtyFlags::SubgraphTransforms)) != 0 || context.supergraphTransformUpdated)
-        {
-            current->m_GlobalBoundingBox = dm::box3::empty();
-            if (current->m_Leaf)
-            {
-                dm::box3 localBoundingBox = current->m_Leaf->GetLocalBoundingBox();
-                if (!localBoundingBox.isempty())
-                    current->m_GlobalBoundingBox = localBoundingBox * current->m_GlobalTransformFloat;
-            }
-        }
-
-        // initialize the content flags of the current node
-        if (context.supergraphContentUpdate || (current->m_Dirty & (SceneGraphNode::DirtyFlags::SubgraphStructure | SceneGraphNode::DirtyFlags::SubgraphContentUpdate)) != 0)
-        {
-            if (current->m_Leaf)
-                current->m_LeafContent = current->m_Leaf->GetContentFlags();
-            else
-                current->m_LeafContent = SceneContentFlags::None;
-
-            current->m_SubgraphContent = current->m_LeafContent;
-        }
-
-        // store the update frame number for skinned groups
-        if (auto meshReference = query_cast<SkinnedMeshReference>(current->m_Leaf.Get()))
-        {
-            if ((current->m_Dirty & SceneGraphNode::DirtyFlags::LocalTransform) != 0)
-            {
-                auto instance = meshReference->m_Instance.Lock();
-                if (instance)
-                {
-                    instance->m_LastUpdateFrameIndex = frameIndex;
-                }
-            }
-        }
-
-        // advance to the next node
-        bool subgraphNeedsRefresh = (current->m_Dirty & SceneGraphNode::DirtyFlags::SubgraphMask) != 0;
-        int deltaDepth = walker.Next(subgraphNeedsRefresh || context.supergraphTransformUpdated || context.supergraphContentUpdate);
-
-        // save the dirty flag to update the same nodes' previous transforms on the next frame
-        current->m_Dirty = (currentTransformUpdated || context.supergraphTransformUpdated)
-            ? SceneGraphNode::DirtyFlags::PrevTransform
-            : SceneGraphNode::DirtyFlags::None;
-        
-        if (deltaDepth > 0)
-        {
-            // going down the tree
-            stack.push_back(context);
-            context.supergraphTransformUpdated |= currentTransformUpdated;
-            context.supergraphContentUpdate |= currentContentUpdated;
-        }
-        else
-        {
-            // sibling or going up. done with our bbox, update the parent.
-            if (parent)
-            {
-                parent->m_GlobalBoundingBox |= current->m_GlobalBoundingBox;
-                if ((current->m_Dirty & SceneGraphNode::DirtyFlags::PrevTransform) != 0)
-                    parent->m_Dirty |= SceneGraphNode::DirtyFlags::SubgraphPrevTransforms;
-                parent->m_Dirty |= current->m_Dirty & SceneGraphNode::DirtyFlags::SubgraphMask;
-                parent->m_SubgraphContent |= current->m_SubgraphContent;
-            }
-
-            // going up the tree, potentially multiple levels
-            while (deltaDepth++ < 0)
-            {
-                if (stack.empty())
-                {
-                    context = StackItem(); // should only happen once when we reach the top
-                }
-                else
-                {
-                    // we're moving up to node 'parent' whose parent is 'newParent'
-                    // update 'newParent's bbox with the finished bbox of 'parent'
-                    assert(parent);
-                    current = parent;
-                    parent = current->m_Parent;
-
-                    if (parent)
-                    {
-                        parent->m_GlobalBoundingBox |= current->m_GlobalBoundingBox;
-                        parent->m_Dirty |= current->m_Dirty & SceneGraphNode::DirtyFlags::SubgraphMask;
-                        parent->m_SubgraphContent |= current->m_SubgraphContent;
-                    }
-
-                    context = stack.back();
-                    stack.pop_back();
-                }
-            }
-        }
-    }
-
+    // Until step E4 (stable slots), the indices are renumbered after structural changes, in leaf-vector order.
     if (structureDirty)
     {
         int instanceIndex = 0;

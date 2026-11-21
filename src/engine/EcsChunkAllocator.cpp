@@ -28,6 +28,7 @@
 #include <nvrhi/core/memory.h>
 
 #include <atomic>
+#include <mutex>
 
 namespace donut::engine::ecs
 {
@@ -36,6 +37,27 @@ namespace donut::engine::ecs
         std::atomic<uint64_t> g_HeapAllocations{ 0 };
         std::atomic<int64_t> g_HeapLiveBlocks{ 0 };
         std::atomic<int64_t> g_FailureCountdown{ -1 };   // SetHeapFailureCountdown; negative when disarmed
+
+        // The shared slabs, by size (PagePool::ShareSlabs). Never destroyed: worlds may be released during static
+        // destruction. Its blocks stay counted as live heap blocks while it holds them.
+        struct SharedSlab
+        {
+            void* memory;
+            size_t bytes;
+        };
+        struct SlabCache
+        {
+            std::mutex mutex;
+            SharedSlab* slabs = nullptr;   // a plain HeapAllocate block, so that the cache counts like the storage
+            uint32_t count = 0;
+            uint32_t capacity = 0;
+            uint64_t bytes = 0;
+        };
+        SlabCache& GetSlabCache() noexcept
+        {
+            static SlabCache* const s_Cache = new SlabCache();
+            return *s_Cache;
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------- heap
@@ -107,7 +129,26 @@ namespace donut::engine::ecs
             m_Slabs = slabs;
             m_SlabCapacity = capacity;
         }
-        uint8_t* slab = static_cast<uint8_t*>(HeapAllocate(size_t(m_PageSize) * m_PagesPerSlab, c_ColumnAlignment));
+        const size_t slabBytes = size_t(m_PageSize) * m_PagesPerSlab;
+        uint8_t* slab = nullptr;
+        if (m_Shared)
+        {
+            // the most recently given back slab of this size: the one most likely to be in the caches
+            SlabCache& cache = GetSlabCache();
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            for (uint32_t i = cache.count; i-- > 0;)
+            {
+                if (cache.slabs[i].bytes == slabBytes)
+                {
+                    slab = static_cast<uint8_t*>(cache.slabs[i].memory);
+                    cache.slabs[i] = cache.slabs[--cache.count];
+                    cache.bytes -= slabBytes;
+                    break;
+                }
+            }
+        }
+        if (!slab)
+            slab = static_cast<uint8_t*>(HeapAllocate(slabBytes, c_ColumnAlignment));
         if (!slab)
             return false;
         m_Slabs[m_SlabCount++] = slab;
@@ -151,14 +192,66 @@ namespace donut::engine::ecs
     void PagePool::Release() noexcept
     {
         NVRHI_ASSERT(m_PagesInUse == 0);
-        for (uint32_t i = 0; i < m_SlabCount; ++i)
-            HeapFree(m_Slabs[i]);
+        uint32_t first = 0;
+        if (m_Shared && m_SlabCount != 0)
+        {
+            // given back in reverse, so that the next pool takes the slabs in this pool's order
+            const size_t slabBytes = size_t(m_PageSize) * m_PagesPerSlab;
+            SlabCache& cache = GetSlabCache();
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            const uint64_t room =
+                cache.bytes < c_MaxSharedSlabBytes ? (c_MaxSharedSlabBytes - cache.bytes) / slabBytes : 0;
+            const uint32_t kept = uint32_t(room < m_SlabCount ? room : m_SlabCount);
+            if (cache.count + kept > cache.capacity)
+            {
+                uint32_t capacity = cache.capacity != 0 ? cache.capacity : 64;
+                while (capacity < cache.count + kept)
+                    capacity *= 2;
+                SharedSlab* slabs =
+                    static_cast<SharedSlab*>(HeapAllocate(capacity * sizeof(SharedSlab), alignof(SharedSlab)));
+                if (slabs)
+                {
+                    if (cache.count != 0)
+                        std::memcpy(slabs, cache.slabs, cache.count * sizeof(SharedSlab));
+                    HeapFree(cache.slabs);
+                    cache.slabs = slabs;
+                    cache.capacity = capacity;
+                }
+            }
+            const uint32_t fits = cache.capacity - cache.count < kept ? cache.capacity - cache.count : kept;
+            for (uint32_t i = 0; i < fits; ++i)
+                cache.slabs[cache.count++] = SharedSlab{ m_Slabs[m_SlabCount - 1 - i], slabBytes };
+            cache.bytes += uint64_t(fits) * slabBytes;
+            first = fits;
+        }
+        for (uint32_t i = first; i < m_SlabCount; ++i)
+            HeapFree(m_Slabs[m_SlabCount - 1 - i]);
         HeapFree(m_Slabs);
         m_Slabs = nullptr;
         m_SlabCount = 0;
         m_SlabCapacity = 0;
         m_FreeList = nullptr;
         m_PagesInUse = 0;
+    }
+
+    uint64_t GetSharedSlabBytes() noexcept
+    {
+        SlabCache& cache = GetSlabCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        return cache.bytes;
+    }
+
+    void ReleaseSharedSlabs() noexcept
+    {
+        SlabCache& cache = GetSlabCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        for (uint32_t i = 0; i < cache.count; ++i)
+            HeapFree(cache.slabs[i].memory);
+        HeapFree(cache.slabs);
+        cache.slabs = nullptr;
+        cache.count = 0;
+        cache.capacity = 0;
+        cache.bytes = 0;
     }
 
     // ----------------------------------------------------------------------------------------------- chunk words

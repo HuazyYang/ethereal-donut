@@ -79,6 +79,16 @@ struct Scene::Resources
     std::vector<MaterialConstants> materialData;
     std::vector<GeometryData> geometryData;
     std::vector<InstanceData> instanceData;
+
+    // InstanceData::prevTransform: every instance's world transform as it was when RefreshSceneGraph started, before
+    // the graph refreshed: the old nodes' previous transforms (a node kept its world of the previous Refresh). Nodes
+    // keep no previous transforms since step E3 (design 5.7); until GpuScene keeps them per stable slot (E4), the
+    // scene does. By position in GetMeshInstances, which the graph's Refresh makes the instance index, with the
+    // instance's entity (index and generation: an address can be reused, an entity cannot). Valid for the
+    // RefreshBuffers calls that follow, however many.
+    std::vector<Entity> previousEntities;
+    std::vector<dm::affine3> previousTransforms;
+    bool previousValid = false;
 };
 
 Scene::Scene(
@@ -618,6 +628,23 @@ void Scene::RefreshSceneGraph(uint32_t frameIndex)
 {
     m_SceneStructureChanged = m_SceneGraph->HasPendingStructureChanges();
     m_SceneTransformsChanged = m_SceneGraph->HasPendingTransformChanges();
+
+    // the previous transforms of this frame's instance upload (Resources::previousTransforms)
+    Resources& resources = *m_Resources;
+    resources.previousValid = m_SceneStructureChanged || m_SceneTransformsChanged;
+    if (resources.previousValid)
+    {
+        const auto& instances = m_SceneGraph->GetMeshInstances();
+        resources.previousEntities.resize(instances.size());
+        resources.previousTransforms.resize(instances.size());
+        for (size_t i = 0; i < instances.size(); ++i)
+        {
+            const SceneGraphNode* node = instances[i]->GetNode();
+            resources.previousEntities[i] = node ? m_SceneGraph->GetEntity(node) : Entity::Null;
+            resources.previousTransforms[i] = node ? node->GetLocalToWorldTransformFloat() : dm::affine3::identity();
+        }
+    }
+
     m_SceneGraph->Refresh(frameIndex);
 }
 
@@ -1257,9 +1284,20 @@ void Scene::UpdateInstance(const MeshInstance* instance)
     if (!node)
         return;
 
-    InstanceData& idata = m_Resources->instanceData[instance->GetInstanceIndex()];
-    affineToColumnMajor(node->GetLocalToWorldTransformFloat(), idata.transform);
-    affineToColumnMajor(node->GetPrevLocalToWorldTransformFloat(), idata.prevTransform);
+    const size_t index = size_t(instance->GetInstanceIndex());
+    InstanceData& idata = m_Resources->instanceData[index];
+    const dm::affine3 transform = node->GetLocalToWorldTransformFloat();
+
+    // the transform this instance had before the last RefreshSceneGraph refreshed the graph; its current one when it
+    // was not there (or nothing moved, so that no snapshot was taken)
+    dm::affine3 prevTransform = transform;
+    const Resources& resources = *m_Resources;
+    if (resources.previousValid && index < resources.previousEntities.size() &&
+        resources.previousEntities[index] == m_SceneGraph->GetEntity(node))
+        prevTransform = resources.previousTransforms[index];
+
+    affineToColumnMajor(transform, idata.transform);
+    affineToColumnMajor(prevTransform, idata.prevTransform);
 
     const auto& mesh = instance->GetMesh();
     idata.firstGeometryInstanceIndex = instance->GetGeometryInstanceIndex();

@@ -24,6 +24,7 @@
 #include <nvrhi/core/foundation.h>
 #include <nvrhi/core/autoptr.h>
 #include <donut/engine/SceneTypes.h>
+#include <donut/engine/SceneComponents.h>
 #include <donut/engine/KeyframeAnimation.h>
 #include <donut/core/math/math.h>
 #include <donut/core/query_cast.h>
@@ -32,12 +33,17 @@
 #include <functional>
 #include <filesystem>
 #include <iterator>
+#include <atomic>
 
 namespace donut::engine
 {
     class SceneGraph;
     class SceneGraphNode;
     class SceneTypeFactory;
+    class SceneGraphStore;   // the graph's world and systems (src/engine/SceneGraphStore.h)
+    struct IWorld;
+    struct IJobSystem;
+    struct IScheduler;
 
     enum struct SceneContentFlags : uint32_t
     {
@@ -62,7 +68,11 @@ namespace donut::engine
 
     private:
         friend class SceneGraphNode;
+        friend class SceneGraph;
+        friend class SceneGraphStore;
         nvrhi::WeakPtr<SceneGraphNode> m_Node;
+        uint32_t m_RemovalPending = 0;   // unregistered this often in a Detach; SceneGraph compacts its vectors after it
+        uint32_t m_RemovalTaken = 0;
 
     protected:
 
@@ -73,6 +83,9 @@ namespace donut::engine
         [[nodiscard]] SceneGraphNode* GetNode() const { return m_Node.Lock(); }
         [[nodiscard]] virtual dm::box3 GetLocalBoundingBox() { return dm::box3::empty(); }
         [[nodiscard]] virtual nvrhi::AutoPtr<SceneGraphLeaf> Clone() = 0;
+        // What the class keeps in columns and the tags of its class chain (D19), read once when the leaf is attached.
+        // The default is an object-only leaf without tags; a subclass that does not override it gets its base's.
+        [[nodiscard]] virtual const LeafTypeDesc& GetTypeDesc() const;
         [[nodiscard]] virtual SceneContentFlags GetContentFlags() const { return SceneContentFlags::None; }
         [[nodiscard]] const std::string& GetName() const;
         void SetName(const std::string& name) const;
@@ -114,6 +127,7 @@ namespace donut::engine
         [[nodiscard]] int GetGeometryInstanceIndex() const { return m_GeometryInstanceIndex; }
         [[nodiscard]] dm::box3 GetLocalBoundingBox() override { return m_Mesh->objectSpaceBounds; }
         [[nodiscard]] nvrhi::AutoPtr<SceneGraphLeaf> Clone() override;
+        [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
         [[nodiscard]] SceneContentFlags GetContentFlags() const override;
         bool SetProperty(const std::string& name, const dm::float4& value) override;
     };
@@ -136,6 +150,7 @@ namespace donut::engine
         NVRHI_END_INTERFACE_TABLE()
     protected:
         friend class SceneGraph;
+        friend class SceneGraphStore;
         nvrhi::AutoPtr<MeshInfo> m_PrototypeMesh;
         uint32_t m_LastUpdateFrameIndex = 0;
         nvrhi::AutoPtr<SceneTypeFactory> m_SceneTypeFactory;
@@ -151,6 +166,7 @@ namespace donut::engine
         [[nodiscard]] const MeshInfo* GetPrototypeMesh() const { return m_PrototypeMesh; }
         [[nodiscard]] uint32_t GetLastUpdateFrameIndex() const { return m_LastUpdateFrameIndex; }
         [[nodiscard]] nvrhi::AutoPtr<SceneGraphLeaf> Clone() override;
+        [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
     };
 
     // This leaf is attached to the joint nodes for a skeleton, and it makes them point at the mesh.
@@ -168,11 +184,13 @@ namespace donut::engine
         NVRHI_END_INTERFACE_TABLE()
     private:
         friend class SceneGraph;
+        friend class SceneGraphStore;
         nvrhi::WeakPtr<SkinnedMeshInstance> m_Instance;
     public:
        explicit SkinnedMeshReference(SkinnedMeshInstance* instance)
            : m_Instance(instance) {}
        [[nodiscard]] nvrhi::AutoPtr<SceneGraphLeaf> Clone() override;
+       [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
     };
 
     NVRHI_CLASS_CLSID(SceneCamera, "b030d3bf-c8c8-453c-9570-2eede9086ebf")
@@ -187,6 +205,7 @@ namespace donut::engine
         NVRHI_END_INTERFACE_TABLE()
     public:
         [[nodiscard]] SceneContentFlags GetContentFlags() const override { return SceneContentFlags::Cameras; }
+        [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
 
         [[nodiscard]] dm::affine3 GetViewToWorldMatrix() const;
         [[nodiscard]] dm::affine3 GetWorldToViewMatrix() const;
@@ -213,6 +232,7 @@ namespace donut::engine
 
         using SceneCamera::SceneCamera;
         [[nodiscard]] nvrhi::AutoPtr<SceneGraphLeaf> Clone() override;
+        [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
         void Load(const Json::Value& node) override;
         bool SetProperty(const std::string& name, const dm::float4& value) override;
     };
@@ -235,6 +255,7 @@ namespace donut::engine
 
         using SceneCamera::SceneCamera;
         [[nodiscard]] nvrhi::AutoPtr<SceneGraphLeaf> Clone() override;
+        [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
         void Load(const Json::Value& node) override;
         bool SetProperty(const std::string& name, const dm::float4& value) override;
     };
@@ -257,6 +278,7 @@ namespace donut::engine
         dm::float3 color = dm::colors::white;
 
         [[nodiscard]] SceneContentFlags GetContentFlags() const override { return SceneContentFlags::Lights; }
+        [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
 
         [[nodiscard]] virtual int GetLightType() const = 0;
         virtual void FillLightConstants(LightConstants& lightConstants) const;
@@ -293,6 +315,7 @@ namespace donut::engine
         ~DirectionalLight() override;   // out of line: IShadowMap is only forward-declared here
         [[nodiscard]] nvrhi::AutoPtr<SceneGraphLeaf> Clone() override;
         [[nodiscard]] int GetLightType() const override { return LightType_Directional; }
+        [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
         void FillLightConstants(LightConstants& lightConstants) const override;
         void Load(const Json::Value& node) override;
         void Store(Json::Value& node) const override;
@@ -319,6 +342,7 @@ namespace donut::engine
         SpotLight();
         [[nodiscard]] nvrhi::AutoPtr<SceneGraphLeaf> Clone() override;
         [[nodiscard]] int GetLightType() const override { return LightType_Spot; }
+        [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
         void FillLightConstants(LightConstants& lightConstants) const override;
         void Load(const Json::Value& node) override;
         void Store(Json::Value& node) const override;
@@ -343,6 +367,7 @@ namespace donut::engine
         PointLight();
         [[nodiscard]] nvrhi::AutoPtr<SceneGraphLeaf> Clone() override;
         [[nodiscard]] int GetLightType() const override { return LightType_Point; }
+        [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
         void FillLightConstants(LightConstants& lightConstants) const override;
         void Load(const Json::Value& node) override;
         void Store(Json::Value& node) const override;
@@ -356,6 +381,8 @@ namespace donut::engine
         NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
         NVRHI_END_INTERFACE_TABLE()
 
+        // Deprecated (design 5.7): nodes no longer keep dirty flags. GetDirtyFlags answers from the graph's pending
+        // changes (see there); kept so that existing code compiles.
         enum struct DirtyFlags : uint32_t
         {
             None                    = 0,
@@ -371,65 +398,54 @@ namespace donut::engine
 
     private:
         friend class SceneGraph;
-        nvrhi::WeakPtr<SceneGraph> m_Graph;
+        friend class SceneGraphStore;
 
-        // Children form a singly linked list: a node owns its first child, and every child owns the sibling
-        // that follows it, so the parent keeps the whole chain alive. m_Parent, m_LastChild and m_PrevSibling
-        // are non-owning back/tail links that make Attach (append) and Detach O(1).
-        // The destructor releases the chain in a loop, so destroying a node with a huge number of children
-        // needs stack proportional to the depth of the subgraph, not to the number of siblings.
-        SceneGraphNode* m_Parent = nullptr;
-        nvrhi::AutoPtr<SceneGraphNode> m_FirstChild;
-        nvrhi::AutoPtr<SceneGraphNode> m_NextSibling;
-        SceneGraphNode* m_LastChild = nullptr;
-        SceneGraphNode* m_PrevSibling = nullptr;
-        nvrhi::AutoPtr<SceneGraphLeaf> m_Leaf;
-
+        // A node is a handle (design 5.2): while it is attached, its state lives in the columns of its entity in the
+        // graph's world (SceneComponents.h) and the world holds it through SceneNode; while it is in no graph, its
+        // state lives in an orphan record that it owns (5.3). A record also holds the node's leaf and, like the old
+        // node, its children: a node owns its first child and every child owns its next sibling.
+        SceneGraphStore* m_Store = nullptr;   // the graph's storage while attached
+        Entity m_Entity = Entity::Null;       // valid while attached
+        OrphanRecord* m_Record = nullptr;     // valid while in no graph (and while it is being attached)
+        // Where the row was last found: valid while the archetype's count of row moves equals m_HintMoves (~0 when
+        // unknown). Attach and the setters write it; getters only read it, so that threads may read nodes at once.
+        uint64_t m_HintMoves = ~uint64_t(0);
+        uint32_t m_HintArchetype = 0;
+        uint32_t m_HintChunk = 0;
+        uint32_t m_HintRow = 0;
         std::string m_Name;
-        dm::daffine3 m_LocalTransform = dm::daffine3::identity();
-        dm::daffine3 m_GlobalTransform = dm::daffine3::identity();
-        dm::affine3 m_GlobalTransformFloat = dm::affine3::identity();
-        dm::daffine3 m_PrevLocalTransform = dm::daffine3::identity();
-        dm::daffine3 m_PrevGlobalTransform = dm::daffine3::identity();
-        dm::affine3 m_PrevGlobalTransformFloat = dm::affine3::identity();
-        dm::dquat m_Rotation = dm::dquat::identity();
-        dm::double3 m_Scaling = 1.0;
-        dm::double3 m_Translation = 0.0;
-        dm::box3 m_GlobalBoundingBox = dm::box3::empty();
-        bool m_HasLocalTransform = false;
-        DirtyFlags m_Dirty = DirtyFlags::None;
-        SceneContentFlags m_LeafContent = SceneContentFlags::None;
-        SceneContentFlags m_SubgraphContent = SceneContentFlags::None;
 
-        void UpdateLocalTransform();
-        void PropagateDirtyFlags(SceneGraphNode::DirtyFlags flags);
+        // Derived state computed on demand (5.7): the subgraph's bounds and content flags and the leaf's content
+        // flags, valid while m_CacheEpoch equals the graph's epoch. Published with release order, so that threads that
+        // walk the graph at the same time (views rendered in parallel) may fill and read it.
+        mutable std::atomic<uint64_t> m_CacheEpoch{ 0 };
+        mutable dm::box3 m_CachedBounds = dm::box3::empty();
+        mutable SceneContentFlags m_CachedLeafContent = SceneContentFlags::None;
+        mutable SceneContentFlags m_CachedSubgraphContent = SceneContentFlags::None;
 
-        // Links a node as the last child of this node, taking it out of its current parent's list first.
-        void AppendChild(SceneGraphNode* child);
-        // Unlinks a child of this node, keeping the order of the remaining children, and hands the reference the
-        // list held over to the caller. Returns null if the node is not a child of this one.
-        nvrhi::AutoPtr<SceneGraphNode> RemoveChild(SceneGraphNode* child);
+        OrphanRecord& EnsureRecord();
 
     public:
        SceneGraphNode() {}
        /* non-virtual */ ~SceneGraphNode();
 
-       [[nodiscard]] const dm::dquat& GetRotation() const { return m_Rotation; }
-       [[nodiscard]] const dm::double3& GetScaling() const { return m_Scaling; }
-       [[nodiscard]] const dm::double3& GetTranslation() const { return m_Translation; }
+       // Getters return by value (5.2): no reference into a chunk that a structural change moves.
+       [[nodiscard]] dm::dquat GetRotation() const;
+       [[nodiscard]] dm::double3 GetScaling() const;
+       [[nodiscard]] dm::double3 GetTranslation() const;
 
-       [[nodiscard]] const dm::daffine3& GetLocalToParentTransform() const {
-           return m_LocalTransform;
-       }
-        [[nodiscard]] const dm::daffine3& GetLocalToWorldTransform() const { return m_GlobalTransform; }
-        [[nodiscard]] const dm::affine3& GetLocalToWorldTransformFloat() const { return m_GlobalTransformFloat; }
-        [[nodiscard]] const dm::daffine3& GetPrevLocalToParentTransform() const { return m_PrevLocalTransform; }
-        [[nodiscard]] const dm::daffine3& GetPrevLocalToWorldTransform() const { return m_PrevGlobalTransform; }
-        [[nodiscard]] const dm::affine3& GetPrevLocalToWorldTransformFloat() const { return m_PrevGlobalTransformFloat; }
-        [[nodiscard]] const dm::box3& GetGlobalBoundingBox() const { return m_GlobalBoundingBox; }
-        [[nodiscard]] DirtyFlags GetDirtyFlags() const { return m_Dirty; }
-        [[nodiscard]] SceneContentFlags GetLeafContentFlags() const { return m_LeafContent; }
-        [[nodiscard]] SceneContentFlags GetSubgraphContentFlags() const { return m_SubgraphContent; }
+       // scaling * rotation * translation of the local transform; the identity for a node without one
+       [[nodiscard]] dm::daffine3 GetLocalToParentTransform() const;
+        // As computed by the last SceneGraph::Refresh (or kept from the node's last graph while it is in none).
+        [[nodiscard]] dm::daffine3 GetLocalToWorldTransform() const;
+        [[nodiscard]] dm::affine3 GetLocalToWorldTransformFloat() const;
+        // The union of the leaf's bounds and the subgraph's, computed on demand and cached until the graph changes.
+        [[nodiscard]] dm::box3 GetGlobalBoundingBox() const;
+        // Deprecated: an approximation from the graph's pending changes (DirtyFlags). Not marked [[deprecated]],
+        // because test_scene_graph_nodes, which must stay unchanged through step E3, calls it.
+        [[nodiscard]] DirtyFlags GetDirtyFlags() const;
+        [[nodiscard]] SceneContentFlags GetLeafContentFlags() const;
+        [[nodiscard]] SceneContentFlags GetSubgraphContentFlags() const;
 
         // Forward iteration over the children of a node, in order:
         //     for (SceneGraphNode* child : node->GetChildren()) ...
@@ -447,7 +463,7 @@ namespace donut::engine
             explicit ChildIterator(SceneGraphNode* node) : m_Node(node) { }
 
             reference operator*() const { return m_Node; }
-            ChildIterator& operator++() { m_Node = m_Node->m_NextSibling.Get(); return *this; }
+            ChildIterator& operator++() { m_Node = m_Node->GetNextSibling(); return *this; }
             ChildIterator operator++(int) { ChildIterator previous = *this; ++*this; return previous; }
             bool operator==(const ChildIterator& other) const { return m_Node == other.m_Node; }
             bool operator!=(const ChildIterator& other) const { return m_Node != other.m_Node; }
@@ -463,16 +479,17 @@ namespace donut::engine
             [[nodiscard]] ChildIterator end() const { return ChildIterator(); }
         };
 
-        [[nodiscard]] SceneGraphNode* GetParent() const { return m_Parent; }
-        [[nodiscard]] ChildRange GetChildren() const { return ChildRange{ m_FirstChild.Get() }; }
-        [[nodiscard]] SceneGraphNode* GetFirstChild() const { return m_FirstChild.Get(); }
-        [[nodiscard]] SceneGraphNode* GetLastChild() const { return m_LastChild; }
-        [[nodiscard]] SceneGraphNode* GetNextSibling() const { return m_NextSibling.Get(); }
-        [[nodiscard]] SceneGraphNode* GetPrevSibling() const { return m_PrevSibling; }
-        [[nodiscard]] SceneGraphLeaf* GetLeaf() const { return m_Leaf; }
+        // The links read SceneLinks and Parent and map entities back to nodes through SceneNode (5.2).
+        [[nodiscard]] SceneGraphNode* GetParent() const;
+        [[nodiscard]] ChildRange GetChildren() const { return ChildRange{ GetFirstChild() }; }
+        [[nodiscard]] SceneGraphNode* GetFirstChild() const;
+        [[nodiscard]] SceneGraphNode* GetLastChild() const;
+        [[nodiscard]] SceneGraphNode* GetNextSibling() const;
+        [[nodiscard]] SceneGraphNode* GetPrevSibling() const;
+        [[nodiscard]] SceneGraphLeaf* GetLeaf() const;
 
         [[nodiscard]] const std::string& GetName() const { return m_Name; }
-        [[nodiscard]] SceneGraph* GetGraph() const { return m_Graph.Lock(); }
+        [[nodiscard]] SceneGraph* GetGraph() const;
 
         [[nodiscard]] std::filesystem::path GetPath() const;
 
@@ -492,6 +509,7 @@ namespace donut::engine
         SceneGraphNode& operator=(const SceneGraphNode&&) = delete;
     };
 
+    // Operators of the deprecated DirtyFlags.
     inline SceneGraphNode::DirtyFlags operator | (SceneGraphNode::DirtyFlags a, SceneGraphNode::DirtyFlags b) { return SceneGraphNode::DirtyFlags(uint32_t(a) | uint32_t(b)); }
     inline SceneGraphNode::DirtyFlags operator & (SceneGraphNode::DirtyFlags a, SceneGraphNode::DirtyFlags b) { return SceneGraphNode::DirtyFlags(uint32_t(a) & uint32_t(b)); }
     inline SceneGraphNode::DirtyFlags operator ~ (SceneGraphNode::DirtyFlags a) { return SceneGraphNode::DirtyFlags(~uint32_t(a)); }
@@ -616,6 +634,7 @@ namespace donut::engine
        [[nodiscard]] SceneContentFlags GetContentFlags() const override {
            return SceneContentFlags::Animations;
        }
+        [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
         [[nodiscard]] const std::vector<nvrhi::AutoPtr<SceneGraphAnimationChannel>>& GetChannels() const { return m_Channels; }
         [[nodiscard]] float GetDuration() const { return m_Duration; }
         [[nodiscard]] bool IsVald() const;
@@ -630,8 +649,15 @@ namespace donut::engine
     class ResourceTracker
     {
     private:
-        std::unordered_map<nvrhi::AutoPtr<T>, uint32_t> m_Map;
-        using UnderlyingConstIterator = typename std::unordered_map<nvrhi::AutoPtr<T>, uint32_t>::const_iterator;
+        // Keyed by the raw pointer, so that a lookup makes no AutoPtr (two atomic operations); the entry holds the
+        // reference. The hash of a pointer equals the hash of its AutoPtr, so the iteration order is unchanged.
+        struct Entry
+        {
+            nvrhi::AutoPtr<T> resource;
+            uint32_t count = 0;
+        };
+        std::unordered_map<T*, Entry> m_Map;
+        using UnderlyingConstIterator = typename std::unordered_map<T*, Entry>::const_iterator;
 
     public:
         class ConstIterator
@@ -652,8 +678,10 @@ namespace donut::engine
         bool AddRef(const T *resource)
         {
             if (!resource) return false;
-            uint32_t refCount = ++m_Map[const_cast<T *>(resource)];
-            return (refCount == 1);
+            Entry& entry = m_Map[const_cast<T *>(resource)];
+            if (entry.count++ == 0)
+                entry.resource = const_cast<T *>(resource);
+            return (entry.count == 1);
         }
 
         // Removes a reference from the specified resource.
@@ -668,12 +696,12 @@ namespace donut::engine
                 return false;
             }
 
-            if (it->second == 0)
+            if (it->second.count == 0)
                 assert(false); // zero-reference entries should not be possible; might indicate concurrency issues
             else
-                --it->second;
+                --it->second.count;
 
-            if (it->second == 0)
+            if (it->second.count == 0)
             {
                 m_Map.erase(it);
                 return true;
@@ -699,7 +727,9 @@ namespace donut::engine
 
     private:
         friend class SceneGraphNode;
+        friend class SceneGraphStore;
         nvrhi::AutoPtr<SceneGraphNode> m_Root;
+        SceneGraphStore* m_Store = nullptr;   // the world, its systems and observers (one world per graph, D18)
         ResourceTracker<Material> m_Materials;
         ResourceTracker<MeshInfo> m_Meshes;
         size_t m_GeometryCount = 0;
@@ -710,13 +740,24 @@ namespace donut::engine
         std::vector<nvrhi::AutoPtr<SceneGraphAnimation>> m_Animations;
         std::vector<nvrhi::AutoPtr<SceneCamera>> m_Cameras;
         std::vector<nvrhi::AutoPtr<Light>> m_Lights;
-        
+        bool m_DeferLeafRemoval = false;   // set while a Detach unregisters a subgraph: removal is one pass at its end
+        std::vector<nvrhi::AutoPtr<SceneGraphLeaf>> m_RemovalMarked;   // held: compaction may drop their last entry
+
+        void CompactLeafVectors();
+
     protected:
+        // Called by the graph's observer on LeafObject (design 5.5), in creation and destruction order, while the
+        // world changes structure: an override may read the graph and the leaf's node and write transforms of nodes
+        // that have one, but structural calls (Attach, Detach, SetLeaf, a first SetTransform) are refused there with a
+        // warning. An exception thrown from an override, or from OnMeshAdded and the other callbacks, is caught at
+        // the observer, logged, and the leaf skipped (the observer is noexcept). During a Detach the vectors keep the
+        // leaves unregistered before the current one until the Detach ends.
         virtual void RegisterLeaf(SceneGraphLeaf *leaf);
         virtual void UnregisterLeaf(SceneGraphLeaf *leaf);
 
     public:
-       SceneGraph() {}
+       SceneGraph();
+       ~SceneGraph() override;
 
        SceneResourceCallback<MeshInfo> OnMeshAdded;
        SceneResourceCallback<MeshInfo> OnMeshRemoved;
@@ -736,8 +777,23 @@ namespace donut::engine
         [[nodiscard]] const std::vector<nvrhi::AutoPtr<SceneGraphAnimation>>& GetAnimations() const { return m_Animations; }
         [[nodiscard]] const std::vector<nvrhi::AutoPtr<SceneCamera>>& GetCameras() const { return m_Cameras; }
         [[nodiscard]] const std::vector<nvrhi::AutoPtr<Light>>& GetLights() const { return m_Lights; }
-        [[nodiscard]] bool HasPendingStructureChanges() const { return m_Root && (m_Root->m_Dirty & SceneGraphNode::DirtyFlags::SubgraphStructure) != 0; }
-        [[nodiscard]] bool HasPendingTransformChanges() const { return m_Root && (m_Root->m_Dirty & (SceneGraphNode::DirtyFlags::SubgraphTransforms | SceneGraphNode::DirtyFlags::SubgraphPrevTransforms)) != 0; }
+        // Attach, Detach, SetRootNode or SetLeaf since the last Refresh.
+        [[nodiscard]] bool HasPendingStructureChanges() const;
+        // A transform set (or nodes with transforms attached) since the last Refresh, or the last Refresh moved
+        // something: then the next one is still pending for the previous-frame transforms.
+        [[nodiscard]] bool HasPendingTransformChanges() const;
+
+        // One world per graph (D18). Nodes are entities of it while they are attached.
+        [[nodiscard]] IWorld* GetWorld() const;
+        [[nodiscard]] Entity GetEntity(const SceneGraphNode* node) const;   // Null when not attached to this graph
+        [[nodiscard]] SceneGraphNode* GetNode(Entity entity) const;          // null for runtime-only entities; no AddRef
+        // The scheduler that runs the TransformPropagation and Bounds phases in Refresh, on the graph's job system.
+        [[nodiscard]] IScheduler* GetScheduler() const;
+        // The job system the phases run on: by default one that the process shares (hardware threads minus one
+        // workers), which is never released (its workers cannot be joined during static destruction): a DLL that
+        // links donut_engine and is unloaded gives its graphs a job system of its own and releases it first. Set it
+        // between frames; null returns to the shared one.
+        void SetJobSystem(IJobSystem* jobSystem);
 
         // Replaces the current root node of the graph with the new one.
         nvrhi::AutoPtr<SceneGraphNode> SetRootNode(SceneGraphNode *root);
@@ -761,6 +817,13 @@ namespace donut::engine
         // If multiple nodes within one parent have the same name matching that component of the path, only the first node will be considered.
         [[nodiscard]] SceneGraphNode* FindNode(const std::filesystem::path& path, SceneGraphNode* context = nullptr) const;
         
+        // Runs the TransformPropagation and Bounds phases (design 5.7) when anything changed since the last call, and
+        // numbers the mesh instances, geometries, meshes and materials after structural changes (until step E4).
+        // "Changed" means: a call of this API (structure, transforms, InvalidateContent), a structural change of the
+        // world, or a phase that ran on the world (its version moved). Writes into the graph's columns through
+        // GetWorld() outside phases (GetComponentForWrite with c_WorldVersion) do not move the version and are not
+        // seen: make them in a system of GetScheduler()'s phases, or through the node API. When the phases cannot
+        // run (inside a phase), the changes stay pending for the next call.
         void Refresh(uint32_t frameIndex);
     };
 

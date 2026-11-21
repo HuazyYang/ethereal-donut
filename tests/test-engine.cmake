@@ -51,10 +51,11 @@ target_compile_definitions(test_ecs_determinism PRIVATE
     DONUT_TEST_GOLDEN_DIR="${CMAKE_CURRENT_LIST_DIR}/src/engine/golden")
 
 # The ECS tests reach the world's internals (allocation counters, chunk layout, entity table) through the private
-# headers in src/engine (EcsWorldImpl.h and the ones beside it).
+# headers in src/engine (EcsWorldImpl.h and the ones beside it); so does the scene-graph storage test (step E3), for the
+# allocation counter.
 foreach(test_src ${donut_engine_tests})
     get_filename_component(test_name "${test_src}" NAME_WE)
-    if(test_name MATCHES "^test_ecs_")
+    if(test_name MATCHES "^test_ecs_" OR test_name STREQUAL "test_scene_graph_store")
         target_include_directories("${test_name}" PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
     endif()
 endforeach()

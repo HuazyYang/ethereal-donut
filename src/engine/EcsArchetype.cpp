@@ -539,6 +539,7 @@ namespace donut::engine::ecs
                 DestructValues(*column.type, chunk.memory + column.offset, 1);
         PoolFor(archetype.chunkSize).Free(chunk.memory);
         archetype.chunks.pop_back();
+        ++archetype.rowMoves;
     }
 
     void WorldImpl::StampChunk(const Archetype& archetype, uint32_t chunk, uint64_t version) noexcept
@@ -563,6 +564,7 @@ namespace donut::engine::ecs
         }
         --archetype.chunks[lastChunk].count;
         --archetype.entityCount;
+        ++archetype.rowMoves;
         if (archetype.chunks[lastChunk].count == 0)
             ReleaseLastChunk(archetype);
         ++m_StructuralVersion;

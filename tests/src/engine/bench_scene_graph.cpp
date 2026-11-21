@@ -1,7 +1,7 @@
 // bench_scene_graph: baseline timings of today's SceneGraph (aggregate docs/plans/2026-11-21-donut-ecs.md, step E0.4;
 // the cases of docs/ecs-design.md 10.1 that exist before the ECS).
 //
-//     bench_scene_graph [--smoke] [--rounds N]
+//     bench_scene_graph [--smoke] [--rounds N] [--workers N]
 //
 // Cases (the sizes are divided by 100 with --smoke, which ctest runs):
 //     refresh_flat_moved        Refresh, 100k dynamic instances under the root, 10 % of them moved
@@ -15,8 +15,11 @@
 // Protocol: every round runs every case once, in this order, so the rounds alternate the cases; a run repeats the
 // timed operation and keeps its median; the table shows the median of the run medians and their range.
 // The numbers are meaningful in Release builds only; Debug runs only prove that the cases work.
+// --workers N (step E3): the graphs refresh on a job system with N worker threads; the thread that calls Refresh also
+// takes ranges while it waits. Without it, graphs use the job system that the process shares (hardware threads - 1).
 
 #include <donut/engine/SceneGraph.h>
+#include <donut/engine/JobSystem.h>
 
 #include <algorithm>
 #include <chrono>
@@ -126,9 +129,13 @@ namespace
         }
     };
 
+    // The job system of --workers, or null for the shared one.
+    nvrhi::AutoPtr<IJobSystem> g_Jobs;
+
     nvrhi::AutoPtr<SceneGraph> NewGraph()
     {
         auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+        graph->SetJobSystem(g_Jobs);
         graph->SetRootNode(MAKE_RC_OBJ_PTR(SceneGraphNode));
         return graph;
     }
@@ -204,9 +211,13 @@ namespace
             DetachSubgraph();
         }
 
-        void Print(const char* build, int rounds) const
+        void Print(const char* build, int rounds, int workers) const
         {
-            std::printf("bench_scene_graph (%s build, %d rounds; median of the run medians, ms)\n", build, rounds);
+            if (workers > 0)
+                std::printf("bench_scene_graph (%s build, %d rounds, %d workers; median of the run medians, ms)\n",
+                            build, rounds, workers);
+            else
+                std::printf("bench_scene_graph (%s build, %d rounds; median of the run medians, ms)\n", build, rounds);
             std::printf("%-26s %9s %6s %12s %12s %12s\n", "case", "nodes", "iters", "median", "min run", "max run");
             for (const Result& r : m_Results)
             {
@@ -401,15 +412,18 @@ int main(int argc, char** argv)
 {
     bool smoke = false;
     int rounds = 5;
+    int workers = 0;
     for (int i = 1; i < argc; i++)
     {
         if (std::strcmp(argv[i], "--smoke") == 0)
             smoke = true;
         else if (std::strcmp(argv[i], "--rounds") == 0 && i + 1 < argc)
             rounds = std::max(1, std::atoi(argv[++i]));
+        else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc)
+            workers = std::max(1, std::atoi(argv[++i]));
         else
         {
-            std::fprintf(stderr, "usage: bench_scene_graph [--smoke] [--rounds N]\n");
+            std::fprintf(stderr, "usage: bench_scene_graph [--smoke] [--rounds N] [--workers N]\n");
             return 2;
         }
     }
@@ -439,12 +453,24 @@ int main(int argc, char** argv)
     const char* build = "Debug";
 #endif
 
+    if (workers > 0)
+    {
+        JobSystemDesc desc;
+        desc.debugName = "bench_scene_graph";
+        desc.workerThreadCount = uint32_t(workers);
+        if (NVRHI_FAILED(CreateJobSystem(desc, &g_Jobs)))
+        {
+            std::fprintf(stderr, "cannot create a job system with %d workers\n", workers);
+            return 1;
+        }
+    }
+
     Bench bench(sizes);
     for (int round = 0; round < rounds; round++)
     {
         bench.Round();
         std::fprintf(stderr, "round %d of %d done\n", round + 1, rounds);
     }
-    bench.Print(build, rounds);
+    bench.Print(build, rounds, workers);
     return 0;
 }

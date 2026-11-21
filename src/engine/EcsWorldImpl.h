@@ -91,10 +91,18 @@ namespace donut::engine::ecs
     // Fixed-size pages for chunks, carved from slabs of c_SlabBytes and kept on a free list: a chunk freed by one
     // structural change is reused by the next, so that steady-state changes allocate nothing (10.3). Growing the pool
     // fails softly: the slab and the slab list are plain HeapAllocate blocks.
+    //
+    // A pool that shares its slabs (ShareSlabs, before its first page; plan step E3) takes them from a process-wide
+    // cache first and gives them back to it on Release, so that a world made after another one was destroyed (a scene
+    // graph per loaded scene) reuses memory that is already committed instead of faulting fresh pages in. The cache
+    // keeps at most c_MaxSharedSlabBytes and frees the rest; worlds that do not share never touch it.
     class PagePool
     {
     public:
         static constexpr uint32_t c_SlabBytes = 256 * 1024;
+        static constexpr uint64_t c_MaxSharedSlabBytes = uint64_t(256) << 20;
+
+        void ShareSlabs() noexcept { m_Shared = true; }
 
         void Initialize(uint32_t pageSize) noexcept;
         void* Allocate() noexcept;              // null when out of memory
@@ -117,7 +125,12 @@ namespace donut::engine::ecs
         uint32_t m_PageSize = 0;
         uint32_t m_PagesPerSlab = 0;
         uint32_t m_PagesInUse = 0;
+        bool m_Shared = false;
     };
+
+    // The process-wide cache of shared slabs (PagePool::ShareSlabs): the bytes it holds, and freeing all of it.
+    uint64_t GetSharedSlabBytes() noexcept;
+    void ReleaseSharedSlabs() noexcept;
 
     // ------------------------------------------------------------------------------------------- chunk words
 
@@ -331,6 +344,10 @@ namespace donut::engine::ecs
         uint32_t sharedSize = 0;
         uint64_t hash = 0;
         uint8_t* sharedValues = nullptr;
+        // Counts the removals of rows (a swap-remove moves the archetype's last row into the hole) and the chunks
+        // released. A (chunk, row) of one of its entities, remembered with this count, is still that entity's place
+        // while the count is unchanged: appending rows moves nothing (plan step E3, the scene graph's row hints).
+        uint64_t rowMoves = 0;
         bool destructRows = false;      // some column needs work to destroy a row (hooks, spilled buffers)
         uint8_t reserved[7] = {};
         Vector<ComponentId> components; // sorted
@@ -483,6 +500,12 @@ namespace donut::engine::ecs
 
         const WorldDesc& GetDesc() const noexcept { return m_Desc; }
         bool IsValidationEnabled() const noexcept { return m_Desc.validation; }
+        // Chunk pages from the process-wide slab cache (PagePool::ShareSlabs); before the first entity is created.
+        void ShareChunkPages() noexcept
+        {
+            m_SmallPages.ShareSlabs();
+            m_LargePages.ShareSlabs();
+        }
         uint64_t GetValidationErrorCount() const noexcept
         {
             return m_ValidationErrors.load(std::memory_order_relaxed);
