@@ -46,8 +46,8 @@ namespace donut::render::rdg
         struct Event
         {
             bool valid = false;
-            uint32_t queue = 0;
-            uint64_t pos = 0;        // per queue, 1-based, increasing across frames
+            uint32_t queue = 0;      // the stream: StreamOf(queue, lane)
+            uint64_t pos = 0;        // per stream, 1-based, increasing across frames
             uint64_t segment = 0;    // global segment instance id
             uint32_t pass = c_None;  // schedule index
             uint32_t frame = 0;
@@ -71,7 +71,7 @@ namespace donut::render::rdg
             Event lastWrite;
             std::vector<Event> reads;
             Event lastStateChange;
-            std::array<uint64_t, 3> lastBarrier = { 0, 0, 0 };
+            std::array<uint64_t, c_MaxStreams> lastBarrier = {};
         };
 
         struct Identity
@@ -115,12 +115,13 @@ namespace donut::render::rdg
             std::string& m_Report;
             uint32_t m_Errors = 0;
             std::unordered_map<uint64_t, Identity> m_Identities;
-            std::array<uint64_t, 3> m_QueuePos = { 0, 0, 0 };
+            // Queues are streams here: every (queue, lane) pair is a queue of its own (nvrhi ADR 0016).
+            std::array<uint64_t, c_MaxStreams> m_QueuePos = {};
             uint64_t m_SegmentCounter = 0;
-            std::array<std::array<uint64_t, 3>, 3> m_Known = {};
-            std::vector<std::array<uint64_t, 3>> m_Snapshots = { {} };   // by global segment id; id 0 is "none"
-            std::vector<std::vector<uint64_t>> m_FrameSegments;          // [frame][segment] -> global id
-            std::array<uint64_t, 3> m_LastSegmentOfQueue = { 0, 0, 0 };
+            std::array<std::array<uint64_t, c_MaxStreams>, c_MaxStreams> m_Known = {};
+            std::vector<std::array<uint64_t, c_MaxStreams>> m_Snapshots = { {} };   // by global segment id; id 0 is "none"
+            std::vector<std::vector<uint64_t>> m_FrameSegments;                     // [frame][segment] -> global id
+            std::array<uint64_t, c_MaxStreams> m_LastSegmentOfQueue = {};
             // Aliasing (6.7), per frame.
             std::vector<uint64_t> m_AliasPos;
             std::vector<uint64_t> m_LastAccessPos;
@@ -138,6 +139,15 @@ namespace donut::render::rdg
                 m_Report += "verify: further violations omitted\n";
             }
             ++m_Errors;
+        }
+
+        // "Compute" for lane 0, "Compute lane 1" otherwise: lane 0 keeps the single-queue texts.
+        std::string StreamName(uint32_t stream)
+        {
+            std::string name = QueueName(QueueOfStream(stream));
+            if (LaneOfStream(stream) != 0)
+                name += " lane " + std::to_string(LaneOfStream(stream));
+            return name;
         }
 
         std::string Verifier::Where(const CompiledRenderGraph& plan, uint32_t sched) const
@@ -172,7 +182,7 @@ namespace donut::render::rdg
         // wait) is a full memory dependency on D3D12 and Vulkan.
         bool Verifier::RoundTrip(const Event& x, uint32_t queue) const
         {
-            for (uint32_t other = 0; other < 3; ++other)
+            for (uint32_t other = 0; other < c_MaxStreams; ++other)
             {
                 if (other == queue)
                     continue;
@@ -312,7 +322,7 @@ namespace donut::render::rdg
             const bool splitBegin = (barrier.flags & nvrhi::BarrierFlags::SplitBegin) != 0;
             const bool splitEnd = (barrier.flags & nvrhi::BarrierFlags::SplitEnd) != 0;
             const bool discard = (barrier.flags & nvrhi::BarrierFlags::Discard) != 0;
-            const CommandQueue commandQueue = CommandQueue(queue);
+            const CommandQueue commandQueue = QueueOfStream(queue);
 
             // 6.8: legal on the queue that executes it. A release names only its first scope, an acquire its second.
             if ((!acquire && !IsStateLegalOnQueue(barrier.before, commandQueue, profile)) ||
@@ -346,13 +356,13 @@ namespace donut::render::rdg
 
                 // The barrier's first scope must follow the accesses it replaces, on every queue.
                 if (element.lastWrite.valid && !HappensBefore(element.lastWrite, queue))
-                    report("transitions while a write on the " + std::string(QueueName(CommandQueue(element.lastWrite.queue))) +
+                    report("transitions while a write on the " + StreamName(element.lastWrite.queue) +
                         " queue (" + Where(plan, element.lastWrite.pass) + ") may still run: missing fence wait");
                 for (const Event& read : element.reads)
                 {
                     if (!HappensBefore(read, queue))
                     {
-                        report("transitions while a read on the " + std::string(QueueName(CommandQueue(read.queue))) +
+                        report("transitions while a read on the " + StreamName(read.queue) +
                             " queue (" + Where(plan, read.pass) + ") may still run: missing fence wait");
                         break;
                     }
@@ -365,13 +375,13 @@ namespace donut::render::rdg
                     // An owner that is still unknown is the first replayed frame: its release was in the frame before.
                     if (!element.patchPending && profile.queueOwnershipTransfer && (element.owner >= 0 || element.inTransfer))
                     {
-                        if (!element.inTransfer || element.transferTo != int8_t(queue))
+                        if (!element.inTransfer || element.transferTo != int8_t(QueueOfStream(queue)))
                             report("an acquire without a matching release to this queue");
                         else if (!HappensBefore(element.release, queue))
                             report("an acquire that may run before its release: missing fence wait");
                     }
                     element.inTransfer = false;
-                    element.owner = int8_t(queue);
+                    element.owner = int8_t(QueueOfStream(queue));
                 }
 
                 if (splitEnd)
@@ -387,7 +397,7 @@ namespace donut::render::rdg
                     if (element.known && !element.patchPending && !hostKept && element.state != barrier.before)
                         report("transition from " + StatesToString(barrier.before) + ", but the range is in " +
                             StatesToString(element.state));
-                    if (release && profile.queueOwnershipTransfer && element.owner >= 0 && element.owner != int8_t(queue) &&
+                    if (release && profile.queueOwnershipTransfer && element.owner >= 0 && element.owner != int8_t(QueueOfStream(queue)) &&
                         !element.patchPending)
                         report("a release on the " + std::string(QueueName(commandQueue)) + " queue while the " +
                             QueueName(CommandQueue(element.owner)) + " queue owns the range");
@@ -414,10 +424,10 @@ namespace donut::render::rdg
                 if (discard)
                 {
                     element.initialized = false;
-                    element.owner = int8_t(queue);
+                    element.owner = int8_t(QueueOfStream(queue));
                 }
                 if (!element.inTransfer && element.owner < 0)
-                    element.owner = int8_t(queue);
+                    element.owner = int8_t(QueueOfStream(queue));
                 element.lastStateChange = now;
                 element.lastBarrier[queue] = now.pos;
             });
@@ -485,7 +495,7 @@ namespace donut::render::rdg
                     element.state = required;
                     element.known = true;
                     element.patchPending = false;
-                    element.owner = int8_t(queue);
+                    element.owner = int8_t(QueueOfStream(queue));
                     element.inTransfer = false;
                 }
 
@@ -507,9 +517,9 @@ namespace donut::render::rdg
                             report(std::string(write ? "writes" : "reads") + " as " + StatesToString(required) +
                                 ", but the range is in " + StatesToString(element.state));
                     }
-                    if (checkHeldState && !IsStateLegalOnQueue(element.state, CommandQueue(queue), profile))
+                    if (checkHeldState && !IsStateLegalOnQueue(element.state, QueueOfStream(queue), profile))
                         report("the range is in " + StatesToString(element.state) + ", which the " +
-                            QueueName(CommandQueue(queue)) + " queue cannot hold (6.8)");
+                            QueueName(QueueOfStream(queue)) + " queue cannot hold (6.8)");
                 }
 
                 if (profile.queueOwnershipTransfer)
@@ -520,11 +530,11 @@ namespace donut::render::rdg
                         report("an access while the range is being transferred to another queue");
                     else if (element.owner < 0 || fullWrite)
                     {
-                        element.owner = int8_t(queue);
+                        element.owner = int8_t(QueueOfStream(queue));
                         element.inTransfer = false;
                     }
-                    else if (element.owner != int8_t(queue))
-                        report("an access on the " + std::string(QueueName(CommandQueue(queue))) + " queue while the " +
+                    else if (element.owner != int8_t(QueueOfStream(queue)))
+                        report("an access on the " + std::string(QueueName(QueueOfStream(queue))) + " queue while the " +
                             QueueName(CommandQueue(element.owner)) + " queue owns the range");
                 }
 
@@ -573,7 +583,7 @@ namespace donut::render::rdg
                 if (element.lastStateChange.valid && element.lastStateChange.queue != queue &&
                     !HappensBefore(element.lastStateChange, queue))
                     report("an access that may run before the transition on the " +
-                        std::string(QueueName(CommandQueue(element.lastStateChange.queue))) + " queue: missing fence wait");
+                        StreamName(element.lastStateChange.queue) + " queue: missing fence wait");
 
                 if (write)
                 {
@@ -613,13 +623,14 @@ namespace donut::render::rdg
                 }
             }
 
-            const std::array<uint64_t, 3> previousLast = m_LastSegmentOfQueue;
-            std::array<bool, 3> firstOfQueue = { true, true, true };
+            const std::array<uint64_t, c_MaxStreams> previousLast = m_LastSegmentOfQueue;
+            std::array<bool, c_MaxStreams> firstOfQueue;
+            firstOfQueue.fill(true);
 
             for (uint32_t s = 0; s < uint32_t(plan.m_Segments.size()); ++s)
             {
                 const PlanSegment& segment = plan.m_Segments[s];
-                const uint32_t queue = uint32_t(segment.queue);
+                const uint32_t queue = StreamOf(segment.queue, segment.lane);
                 const uint64_t id = ++m_SegmentCounter;
                 m_FrameSegments[frame][s] = id;
                 m_Snapshots.emplace_back();
@@ -638,17 +649,18 @@ namespace donut::render::rdg
                             " of frame " + std::to_string(int(wait.frameDelta)) + ", which is not submitted before it");
                         continue;
                     }
-                    for (uint32_t k = 0; k < 3; ++k)
+                    const uint32_t waited = StreamOf(wait.queue, wait.lane);
+                    for (uint32_t k = 0; k < c_MaxStreams; ++k)
                         m_Known[queue][k] = std::max(m_Known[queue][k], m_Snapshots[target][k]);
-                    m_Known[queue][uint32_t(wait.queue)] = std::max(m_Known[queue][uint32_t(wait.queue)], target);
+                    m_Known[queue][waited] = std::max(m_Known[queue][waited], target);
                 }
                 if (afterSwitch && firstOfQueue[queue])
                 {
-                    for (uint32_t k = 0; k < 3; ++k)
+                    for (uint32_t k = 0; k < c_MaxStreams; ++k)
                     {
                         m_Known[queue][k] = std::max(m_Known[queue][k], previousLast[k]);
                         if (previousLast[k])
-                            for (uint32_t j = 0; j < 3; ++j)
+                            for (uint32_t j = 0; j < c_MaxStreams; ++j)
                                 m_Known[queue][j] = std::max(m_Known[queue][j], m_Snapshots[previousLast[k]][j]);
                     }
                 }
@@ -661,9 +673,9 @@ namespace donut::render::rdg
                     if (!pass.enabled || pass.segment != s)
                         continue;
                     ++counted;
-                    if (pass.queue != segment.queue)
-                        Error(Where(plan, sched) + ": recorded on the " + QueueName(pass.queue) + " queue in a " +
-                            QueueName(segment.queue) + " segment");
+                    if (pass.queue != segment.queue || pass.lane != segment.lane)
+                        Error(Where(plan, sched) + ": recorded on the " + StreamName(StreamOf(pass.queue, pass.lane)) +
+                            " queue in a " + StreamName(queue) + " segment");
 
                     auto event = [&]() {
                         Event e;

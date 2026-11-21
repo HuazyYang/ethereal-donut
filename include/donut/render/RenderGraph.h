@@ -216,6 +216,9 @@ namespace donut::render
         bool computeQueue = true;
         bool copyQueue = true;
         bool queueOwnershipTransfer = false;    // Vulkan with a compute or copy family other than graphics
+        // Queues per CommandQueue type that run concurrently: the lanes of a type (nvrhi ADR 0016, CUDA queue pools).
+        // With more than one, independent passes of that type spread over the lanes, with fence waits between lanes.
+        uint8_t queueLanes[3] = { 1, 1, 1 };
         bool depthClears = true;                // false on CUDA (6.9)
         uint8_t resourceHeapTier = 2;           // D3D12 tier 1 keeps render-target/depth textures, other textures
                                                 // and buffers in separate heaps (7.5)
@@ -231,6 +234,7 @@ namespace donut::render
         VulkanSeparateComputeFamily,   // ownership transfers between graphics and compute
         D3D11,
         CUDA,
+        CUDAOverlapped,                // CUDA with queue pools: two Graphics lanes and two Compute lanes
     };
 
     // ------------------------------------------------------------------------------- compile and execute
@@ -335,6 +339,7 @@ namespace donut::render
         PassId pass = InvalidPassId;
         const char* name = nullptr;
         nvrhi::CommandQueue queue = nvrhi::CommandQueue::Graphics;
+        uint32_t lane = 0;            // the queue of its type it runs on (BackendProfile::queueLanes)
         uint32_t segment = 0;
         bool enabled = true;          // false: disabled by SetPassEnabled, or culled through a Cull policy
     };
@@ -361,6 +366,7 @@ namespace donut::render
         uint32_t uavBarriers = 0;
         uint32_t aliasingBarriers = 0;
         uint32_t queueTransfers = 0;      // release/acquire pairs
+        uint32_t streams = 0;             // the (queue, lane) pairs that run segments
         uint32_t fenceWaits = 0;
         uint32_t fenceSignals = 0;
         uint32_t heaps = 0;

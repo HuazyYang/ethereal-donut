@@ -394,7 +394,10 @@ namespace donut::render::rdg
             state.schedule.clear();
             state.scheduledLive.clear();
             state.schedQueue.clear();
+            state.schedLane.clear();
             state.scheduleOf.assign(passCount, c_None);
+            const std::vector<uint8_t>* passLanes = state.structure && !state.structure->passLanes.empty()
+                ? &state.structure->passLanes : nullptr;
             for (uint32_t p = 0; p < passCount; ++p)
             {
                 // Program order. Disabled passes stay in the schedule, without work, so that the plan can show them.
@@ -404,6 +407,7 @@ namespace donut::render::rdg
                 state.schedule.push_back(p);
                 state.scheduledLive.push_back(state.live[p]);
                 state.schedQueue.push_back(passQueues[p]);
+                state.schedLane.push_back(passLanes ? (*passLanes)[p] : uint8_t(0));
             }
         }
 
@@ -465,6 +469,7 @@ namespace donut::render::rdg
             state.first.assign(resourceCount, c_None);
             state.last.assign(resourceCount, c_None);
             state.queueMask.assign(resourceCount, 0);
+            state.streamMask.assign(resourceCount, 0);
             for (uint32_t s = 0; s < uint32_t(state.schedule.size()); ++s)
             {
                 for (uint32_t u = state.useBegin[s]; u < state.useBegin[s] + state.useCount[s]; ++u)
@@ -474,6 +479,7 @@ namespace donut::render::rdg
                         state.first[r] = s;
                     state.last[r] = s;
                     state.queueMask[r] |= uint8_t(1u << uint32_t(state.schedQueue[s]));
+                    state.streamMask[r] |= 1u << state.StreamOfSched(s);
                 }
             }
         }
@@ -598,6 +604,76 @@ namespace donut::render::rdg
             }
         }
 
+        // Queue lanes (BackendProfile::queueLanes, nvrhi ADR 0016). A pass of a type with more than one lane takes the
+        // lane of its latest producer of that type, so that a chain stays on one stream; a pass that depends on nothing
+        // of its type starts on the lane with the fewest passes so far. The dependencies are the superset's, by
+        // resource: the last writer, and for a write the readers since it. Empty when every type has one lane.
+        std::vector<uint8_t> AssignLanes(const RenderGraph& graph, const BackendProfile& profile,
+                                         const std::vector<CommandQueue>& passQueues)
+        {
+            std::vector<uint8_t> lanes;
+            std::array<uint32_t, 3> laneCount;
+            bool any = false;
+            for (uint32_t q = 0; q < 3; ++q)
+            {
+                laneCount[q] = std::min<uint32_t>(std::max<uint32_t>(profile.queueLanes[q], 1u), c_MaxQueueLanes);
+                any = any || laneCount[q] > 1;
+            }
+            if (!any)
+                return lanes;
+
+            const uint32_t passCount = graph.PassCount();
+            lanes.assign(passCount, 0);
+            std::array<std::array<uint32_t, c_MaxQueueLanes>, 3> load = {};
+            std::vector<uint32_t> lastWriter(graph.ResourceCount(), c_None);
+            std::vector<std::vector<uint32_t>> readers(graph.ResourceCount());
+            for (uint32_t p = 0; p < passCount; ++p)
+            {
+                const PassRecord& pass = graph.GetPass(p);
+                const uint32_t q = uint32_t(passQueues[p]);
+                uint32_t latest = c_None;
+                auto consider = [&](uint32_t producer) {
+                    if (producer != c_None && passQueues[producer] == passQueues[p] && (latest == c_None || producer > latest))
+                        latest = producer;
+                };
+                for (uint32_t a = pass.firstAccess; a < pass.firstAccess + pass.accessCount; ++a)
+                {
+                    const AccessRecord& access = graph.GetAccess(a);
+                    consider(lastWriter[access.resource]);
+                    if (access.isWrite)
+                    {
+                        for (uint32_t reader : readers[access.resource])
+                            consider(reader);
+                    }
+                }
+                uint32_t lane = 0;
+                if (latest != c_None)
+                    lane = lanes[latest];
+                else
+                {
+                    for (uint32_t l = 1; l < laneCount[q]; ++l)
+                    {
+                        if (load[q][l] < load[q][lane])
+                            lane = l;
+                    }
+                }
+                lanes[p] = uint8_t(lane);
+                ++load[q][lane];
+                for (uint32_t a = pass.firstAccess; a < pass.firstAccess + pass.accessCount; ++a)
+                {
+                    const AccessRecord& access = graph.GetAccess(a);
+                    if (access.isWrite)
+                    {
+                        lastWriter[access.resource] = p;
+                        readers[access.resource].clear();
+                    }
+                    else if (std::find(readers[access.resource].begin(), readers[access.resource].end(), p) == readers[access.resource].end())
+                        readers[access.resource].push_back(p);
+                }
+            }
+            return lanes;
+        }
+
         std::shared_ptr<StructurePlan> BuildStructure(const RenderGraph& graph, const BackendProfile& profile,
                                                       const CompileOptions& options, uint64_t key, std::string& diagnostics,
                                                       bool& failed)
@@ -680,11 +756,16 @@ namespace donut::render::rdg
                 }
             }
 
+            // Queue lanes (nvrhi ADR 0016), on the final queues. SerializeQueues keeps every pass on lane 0.
+            if (!serialize)
+                structure->passLanes = AssignLanes(graph, profile, structure->passQueues);
+
             // Superset lifetimes: every pass enabled. The schedule is program order, so schedule indices of the
             // superset are program indices of its live passes.
             {
                 StructurePlan provisional;
                 provisional.passQueues = structure->passQueues;
+                provisional.passLanes = structure->passLanes;
                 MakeDedicatedPlan(graph, provisional);
                 CompileState superset(graph, profile, options);
                 superset.structure = &provisional;
@@ -697,7 +778,8 @@ namespace donut::render::rdg
 
                 structure->resourceFirst.assign(resourceCount, c_None);
                 structure->resourceLast.assign(resourceCount, c_None);
-                std::vector<uint8_t> queueMask(resourceCount, 0);
+                // The streams of each resource: a resource used on more than one (queue, lane) crosses queues (7.4).
+                std::vector<uint32_t> streamMask(resourceCount, 0);
                 for (uint32_t r = 0; r < resourceCount; ++r)
                 {
                     if (superset.first[r] != c_None)
@@ -705,7 +787,7 @@ namespace donut::render::rdg
                         structure->resourceFirst[r] = superset.schedule[superset.first[r]];
                         structure->resourceLast[r] = superset.schedule[superset.last[r]];
                     }
-                    queueMask[r] = superset.queueMask[r];
+                    streamMask[r] = superset.streamMask[r];
                 }
 
                 // A substitute or passthrough input takes over the output's readers when the pass is off (13.5).
@@ -725,14 +807,15 @@ namespace donut::render::rdg
                         const uint32_t s = policy.substitute;
                         structure->resourceFirst[s] = std::min(structure->resourceFirst[s], pass);
                         structure->resourceLast[s] = structure->resourceLast[s] == c_None ? pass : std::max(structure->resourceLast[s], pass);
-                        queueMask[s] |= uint8_t(1u << uint32_t(structure->passQueues[pass]));
+                        streamMask[s] |= 1u << StreamOf(structure->passQueues[pass],
+                            structure->passLanes.empty() ? 0u : structure->passLanes[pass]);
                     }
                 }
 
                 structure->resourceCrossQueue.assign(resourceCount, 0);
                 for (uint32_t r = 0; r < resourceCount; ++r)
                 {
-                    const uint8_t mask = queueMask[r];
+                    const uint32_t mask = streamMask[r];
                     structure->resourceCrossQueue[r] = (mask & (mask - 1)) != 0 ? 1 : 0;
                 }
             }
@@ -840,7 +923,7 @@ namespace donut::render::rdg
             {
                 bool isBuffer;
                 uint64_t descHash;
-                CommandQueue queue;
+                uint32_t stream;
                 uint32_t last;
                 uint32_t physical;
             };
@@ -852,11 +935,12 @@ namespace donut::render::rdg
             for (uint32_t r : order)
             {
                 const ResourceRecord& record = graph.GetResource(r);
-                const CommandQueue queue = structure->passQueues[structure->resourceFirst[r]];
+                const uint32_t first = structure->resourceFirst[r];
+                const uint32_t stream = StreamOf(structure->passQueues[first], structure->passLanes.empty() ? 0u : structure->passLanes[first]);
                 Slot* chosen = nullptr;
                 for (Slot& slot : slots)
                 {
-                    if (slot.isBuffer == record.isBuffer && slot.descHash == record.descHash && slot.queue == queue &&
+                    if (slot.isBuffer == record.isBuffer && slot.descHash == record.descHash && slot.stream == stream &&
                         slot.last < structure->resourceFirst[r])
                     {
                         chosen = &slot;
@@ -872,7 +956,7 @@ namespace donut::render::rdg
                 else
                 {
                     structure->physicals[structure->resourcePhysical[r]].kind = PhysicalKind::PooledSlot;
-                    slots.push_back(Slot{ record.isBuffer, record.descHash, queue, structure->resourceLast[r],
+                    slots.push_back(Slot{ record.isBuffer, record.descHash, stream, structure->resourceLast[r],
                         structure->resourcePhysical[r] });
                 }
             }
@@ -887,21 +971,22 @@ namespace donut::render::rdg
             const uint32_t count = uint32_t(state.schedule.size());
             segOf.assign(count, c_None);
 
+            // Segments, waits and what each queue has observed are per stream: a (queue, lane) pair.
             std::vector<uint8_t> isProducer(count, 0);
             std::vector<std::vector<const WaitEdge*>> waitsOf(count);
             for (const WaitEdge& wait : state.waits)
             {
                 waitsOf[wait.waiter].push_back(&wait);
-                if (wait.frameDelta == 0 && state.schedQueue[wait.producer] != state.schedQueue[wait.waiter])
+                if (wait.frameDelta == 0 && state.StreamOfSched(wait.producer) != state.StreamOfSched(wait.waiter))
                     isProducer[wait.producer] = 1;
             }
 
-            // known[q][q2]: the latest segment of queue q2 whose completion queue q has observed this frame.
-            std::array<std::array<int32_t, 3>, 3> known;
+            // known[q][q2]: the latest segment of stream q2 whose completion stream q has observed this frame.
+            std::array<std::array<int32_t, c_MaxStreams>, c_MaxStreams> known;
             for (auto& row : known)
                 row.fill(-1);
-            std::vector<std::array<int32_t, 3>> segKnown;
-            struct PendingWait { uint32_t segment; CommandQueue queue; uint32_t producer; };
+            std::vector<std::array<int32_t, c_MaxStreams>> segKnown;
+            struct PendingWait { uint32_t segment; uint32_t stream; uint32_t producer; };
             std::vector<PendingWait> pending;
             std::vector<std::vector<SegmentWait>> segmentWaits;
 
@@ -914,16 +999,17 @@ namespace donut::render::rdg
                 if (!state.scheduledLive[s])
                     continue;
                 const CommandQueue queue = state.schedQueue[s];
-                const uint32_t q = uint32_t(queue);
+                const uint32_t q = state.StreamOfSched(s);
 
-                // This frame's waits that the queue has not observed yet.
-                std::array<int32_t, 3> needed = { -1, -1, -1 };
+                // This frame's waits that the stream has not observed yet.
+                std::array<int32_t, c_MaxStreams> needed;
+                needed.fill(-1);
                 bool need = false;
                 for (const WaitEdge* wait : waitsOf[s])
                 {
                     if (wait->frameDelta != 0)
                         continue;
-                    const uint32_t pq = uint32_t(state.schedQueue[wait->producer]);
+                    const uint32_t pq = state.StreamOfSched(wait->producer);
                     if (pq == q)
                         continue;
                     const int32_t producerSegment = int32_t(segOf[wait->producer]);
@@ -934,7 +1020,8 @@ namespace donut::render::rdg
                     }
                 }
 
-                const bool newSegment = current < 0 || plan.m_Segments[current].queue != queue ||
+                const bool newSegment = current < 0 ||
+                    StreamOf(plan.m_Segments[current].queue, plan.m_Segments[current].lane) != q ||
                     (granularity && plan.m_Segments[current].passCount >= granularity) ||
                     (previousLive != c_None && isProducer[previousLive]) || need;
                 if (newSegment)
@@ -942,19 +1029,20 @@ namespace donut::render::rdg
                     current = int32_t(plan.m_Segments.size());
                     PlanSegment segment{};
                     segment.queue = queue;
+                    segment.lane = state.schedLane[s];
                     segment.firstPass = s;
                     plan.m_Segments.push_back(segment);
                     segmentWaits.emplace_back();
                     segKnown.push_back(known[q]);
                 }
-                for (uint32_t pq = 0; pq < 3; ++pq)
+                for (uint32_t pq = 0; pq < c_MaxStreams; ++pq)
                 {
                     if (needed[pq] < 0)
                         continue;
-                    segmentWaits[current].push_back(SegmentWait{ CommandQueue(pq), uint32_t(needed[pq]), 0 });
-                    // What the producer's queue had observed comes with it.
+                    segmentWaits[current].push_back(SegmentWait{ QueueOfStream(pq), uint32_t(needed[pq]), 0, uint8_t(LaneOfStream(pq)) });
+                    // What the producer's stream had observed comes with it.
                     const auto& theirs = segKnown[needed[pq]];
-                    for (uint32_t k = 0; k < 3; ++k)
+                    for (uint32_t k = 0; k < c_MaxStreams; ++k)
                         known[q][k] = std::max(known[q][k], theirs[k]);
                     known[q][pq] = std::max(known[q][pq], needed[pq]);
                 }
@@ -963,9 +1051,9 @@ namespace donut::render::rdg
 
                 for (const WaitEdge* wait : waitsOf[s])
                 {
-                    if (wait->frameDelta == 0 || state.schedQueue[wait->producer] == queue)
+                    if (wait->frameDelta == 0 || state.StreamOfSched(wait->producer) == q)
                         continue;
-                    pending.push_back(PendingWait{ uint32_t(current), state.schedQueue[wait->producer], wait->producer });
+                    pending.push_back(PendingWait{ uint32_t(current), state.StreamOfSched(wait->producer), wait->producer });
                 }
 
                 ++plan.m_Segments[current].passCount;
@@ -973,7 +1061,7 @@ namespace donut::render::rdg
                 previousLive = s;
             }
 
-            // Previous-frame waits (6.12): the producer's segment of the previous frame; one per queue, the latest.
+            // Previous-frame waits (6.12): the producer's segment of the previous frame; one per stream, the latest.
             for (const PendingWait& wait : pending)
             {
                 const uint32_t producerSegment = segOf[wait.producer];
@@ -982,14 +1070,15 @@ namespace donut::render::rdg
                 bool merged = false;
                 for (SegmentWait& existing : segmentWaits[wait.segment])
                 {
-                    if (existing.queue == wait.queue && existing.frameDelta == -1)
+                    if (StreamOf(existing.queue, existing.lane) == wait.stream && existing.frameDelta == -1)
                     {
                         existing.segment = std::max(existing.segment, producerSegment);
                         merged = true;
                     }
                 }
                 if (!merged)
-                    segmentWaits[wait.segment].push_back(SegmentWait{ wait.queue, producerSegment, -1 });
+                    segmentWaits[wait.segment].push_back(SegmentWait{ QueueOfStream(wait.stream), producerSegment, -1,
+                        uint8_t(LaneOfStream(wait.stream)) });
             }
 
             for (uint32_t i = 0; i < uint32_t(plan.m_Segments.size()); ++i)
@@ -1331,6 +1420,7 @@ namespace donut::render::rdg
                 pass.program = program;
                 pass.nameOffset = record.name ? plan->AddName(record.name) : 0;
                 pass.queue = state.schedQueue[s];
+                pass.lane = state.schedLane[s];
                 pass.type = record.type;
                 pass.flags = record.flags;
                 pass.enabled = state.scheduledLive[s] != 0;
@@ -1419,8 +1509,14 @@ namespace donut::render::rdg
                 }
             }
             stats.fenceWaits = uint32_t(plan->m_SegmentWaits.size());
+            uint32_t streams = 0;
             for (const PlanSegment& segment : plan->m_Segments)
+            {
                 stats.fenceSignals += segment.signals ? 1 : 0;
+                streams |= 1u << StreamOf(segment.queue, segment.lane);
+            }
+            for (; streams; streams &= streams - 1)
+                ++stats.streams;
             stats.heaps = uint32_t(structure->heaps.size());
             stats.poolableTransientBytes = structure->poolableTransientBytes;
             stats.placedPeakBytes = structure->placedPeakBytes;
@@ -1489,6 +1585,7 @@ namespace donut::render::rdg
         out.pass = PassId(pass.program);
         out.name = GetName(pass.nameOffset);
         out.queue = pass.queue;
+        out.lane = pass.lane;
         out.segment = pass.segment;
         out.enabled = pass.enabled;
         return nvrhi::FS_OK;

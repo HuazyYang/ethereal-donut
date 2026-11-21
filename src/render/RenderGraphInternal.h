@@ -349,6 +349,15 @@ namespace donut::render::rdg
 
     constexpr uint32_t c_None = ~0u;
 
+    // Queue lanes (BackendProfile::queueLanes, nvrhi ADR 0016): the queues of one type on a device with queue pools. A
+    // stream is a (queue, lane) pair. Ordering, fence waits and the cross-queue rules of 7.4 key on streams; state
+    // legality keys on the queue. Lane 0 of a queue is stream StreamOf(queue, 0).
+    constexpr uint32_t c_MaxQueueLanes = 8;
+    constexpr uint32_t c_MaxStreams = 3 * c_MaxQueueLanes;
+    inline uint32_t StreamOf(nvrhi::CommandQueue queue, uint32_t lane) { return uint32_t(queue) * c_MaxQueueLanes + lane; }
+    inline nvrhi::CommandQueue QueueOfStream(uint32_t stream) { return nvrhi::CommandQueue(stream / c_MaxQueueLanes); }
+    inline uint32_t LaneOfStream(uint32_t stream) { return stream % c_MaxQueueLanes; }
+
     // Where the barriers of a scheduled pass sit: BatchSlot order.
     constexpr uint32_t c_SlotCount = 3;
 
@@ -365,6 +374,7 @@ namespace donut::render::rdg
         uint32_t program;                 // PassId
         uint32_t nameOffset;              // into CompiledRenderGraph::m_Names
         nvrhi::CommandQueue queue;
+        uint8_t lane;                     // of its queue (BackendProfile::queueLanes)
         PassType type;
         PassFlags flags;                  // as declared: Tracked, Restore, AsyncCompute (11.3 dumps)
         bool enabled;
@@ -402,6 +412,7 @@ namespace donut::render::rdg
         nvrhi::CommandQueue queue;
         uint32_t segment;
         int8_t frameDelta;
+        uint8_t lane = 0;                 // of the waited-for segment's queue
     };
 
     struct PlanSegment
@@ -412,6 +423,7 @@ namespace donut::render::rdg
         uint32_t waitBegin;
         uint32_t waitCount;
         bool signals;                     // another segment waits for it, in this frame or the next
+        uint8_t lane = 0;                 // of its queue (BackendProfile::queueLanes)
     };
 
     // One graph resource of the compiled frame.
@@ -489,6 +501,7 @@ namespace donut::render::rdg
         uint64_t key = 0;
         MemoryTier tier = MemoryTier::Pooled;
         std::vector<nvrhi::CommandQueue> passQueues;     // per program pass, after async placement
+        std::vector<uint8_t> passLanes;                  // per program pass: its lane of its queue (empty: all 0)
         std::vector<uint8_t> demoted;                    // per program pass: an async pass placed on graphics
         std::vector<uint32_t> resourcePhysical;          // per resource; c_None for imports
         std::vector<uint8_t> resourceAliased;

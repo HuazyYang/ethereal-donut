@@ -101,11 +101,13 @@ namespace donut::render::rdg
         std::vector<nvrhi::ResourceStates> useState;
         std::vector<nvrhi::ShaderType> useStages;   // shader stages for sync scopes; None without a shader access
         std::vector<nvrhi::CommandQueue> schedQueue;
+        std::vector<uint8_t> schedLane;     // per schedule index: the lane of its queue (StructurePlan::passLanes)
 
         // Per resource (mask level).
         std::vector<uint32_t> first;
         std::vector<uint32_t> last;
         std::vector<uint8_t> queueMask;
+        std::vector<uint32_t> streamMask;   // per resource: the (queue, lane) streams that use it (StreamOf bits)
         std::vector<nvrhi::ResourceStates> entryState;  // the state the plan assumes at frame start
 
         // Phase 6 output.
@@ -171,6 +173,7 @@ namespace donut::render::rdg
         }
 
         bool IsImplicit() const { return profile.barrierModel == BarrierModel::Implicit; }
+        uint32_t StreamOfSched(uint32_t sched) const { return StreamOf(schedQueue[sched], schedLane[sched]); }
     };
 
     // The planes of a resource that units distinguish: 2 for a depth-stencil format where the profile tracks planes,

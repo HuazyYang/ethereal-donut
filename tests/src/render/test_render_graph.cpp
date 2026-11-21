@@ -126,6 +126,7 @@ namespace
         case ReferenceProfile::VulkanSeparateComputeFamily: return "VulkanSeparateComputeFamily";
         case ReferenceProfile::D3D11: return "D3D11";
         case ReferenceProfile::CUDA: return "CUDA";
+        case ReferenceProfile::CUDAOverlapped: return "CUDAOverlapped";
         default: return "?";
         }
     }
@@ -133,7 +134,10 @@ namespace
     const ReferenceProfile c_AllProfiles[] = {
         ReferenceProfile::D3D12Legacy, ReferenceProfile::D3D12Enhanced, ReferenceProfile::Vulkan,
         ReferenceProfile::VulkanSeparateComputeFamily, ReferenceProfile::D3D11, ReferenceProfile::CUDA,
+        ReferenceProfile::CUDAOverlapped,
     };
+
+    bool IsCuda(ReferenceProfile kind) { return kind == ReferenceProfile::CUDA || kind == ReferenceProfile::CUDAOverlapped; }
 
     std::string Diagnostics(IRenderGraph* graph)
     {
@@ -250,7 +254,8 @@ namespace
         {
             ScheduledPass pass;
             plan->GetScheduledPass(i, pass);
-            text += std::to_string(i) + " " + pass.name + " (" + QueueText(pass.queue) + ", segment " +
+            text += std::to_string(i) + " " + pass.name + " (" + QueueText(pass.queue) +
+                (pass.lane ? " lane " + std::to_string(pass.lane) : std::string()) + ", segment " +
                 (pass.enabled ? std::to_string(pass.segment) : std::string("-")) + (pass.enabled ? "" : ", disabled") + ")\n";
             for (uint32_t slot = 0; slot < 3; ++slot)
             {
@@ -549,12 +554,124 @@ namespace
         const BackendProfile cuda = Profile(ReferenceProfile::CUDA);
         EXPECT((cuda.passTypes & PassTypeMask::Raster) == PassTypeMask::None && !cuda.depthClears &&
                cuda.barrierModel == BarrierModel::Implicit, "CUDA profile");
+        EXPECT(cuda.queueLanes[0] == 1 && cuda.queueLanes[1] == 1 && cuda.queueLanes[2] == 1, "CUDA profile: one lane per queue");
+        const BackendProfile overlapped = Profile(ReferenceProfile::CUDAOverlapped);
+        EXPECT(overlapped.barrierModel == BarrierModel::Implicit && overlapped.queueLanes[0] == 2 &&
+               overlapped.queueLanes[1] == 2 && overlapped.queueLanes[2] == 1, "CUDAOverlapped profile");
         const BackendProfile d3d11 = Profile(ReferenceProfile::D3D11);
         EXPECT(!d3d11.computeQueue && d3d11.recordingMode == RecordingMode::ImmediateSerial, "D3D11 profile");
         const BackendProfile vk = Profile(ReferenceProfile::VulkanSeparateComputeFamily);
         EXPECT(vk.queueOwnershipTransfer && vk.planeModel == PlaneModel::AspectMasks, "Vulkan profile");
         BackendProfile none;
         EXPECT(GetReferenceProfile(ReferenceProfile(99), &none) == nvrhi::FE_INVALID_ARGS, "unknown profile");
+    }
+
+    // The segment waits of a plan's JSON dump: { same frame, previous frame }.
+    std::pair<uint32_t, uint32_t> SegmentWaitCounts(ICompiledRenderGraph* plan)
+    {
+        const std::string dump = Dump(plan);
+        const size_t begin = dump.find("\"segments\": [");
+        const size_t end = dump.find("\"resources\": [", begin);
+        std::pair<uint32_t, uint32_t> counts = { 0, 0 };
+        if (begin == std::string::npos || end == std::string::npos)
+            return counts;
+        const std::string segments = dump.substr(begin, end - begin);
+        for (size_t at = segments.find("\"frame\": "); at != std::string::npos; at = segments.find("\"frame\": ", at + 1))
+        {
+            if (segments.compare(at + 9, 2, "0 ") == 0)
+                ++counts.first;
+            else if (segments.compare(at + 9, 3, "-1 ") == 0)
+                ++counts.second;
+        }
+        return counts;
+    }
+
+    // Queue lanes (nvrhi ADR 0016): two independent compute chains on a profile with two lanes per queue run on one
+    // lane each; the pass that joins them waits once, this frame, for the other lane.
+    void TestQueueLanes()
+    {
+        auto record = [](Builder& b) {
+            ResourceId out = b.ImportBuffer("Out", 4096, ResourceStates::UnorderedAccess, ResourceStates::UnorderedAccess);
+            ResourceId a = b.Buffer("A", 4096, true);
+            ResourceId a2 = b.Buffer("A2", 4096, true);
+            ResourceId c = b.Buffer("B", 4096, true);
+            ResourceId c2 = b.Buffer("B2", 4096, true);
+            b.Pass("A1", PassType::Compute, PassFlags::None, [&](ISetupContext* x) { a = Write(x, a, Access::UAVWrite); });
+            b.Pass("B1", PassType::Compute, PassFlags::None, [&](ISetupContext* x) { c = Write(x, c, Access::UAVWrite); });
+            b.Pass("A2", PassType::Compute, PassFlags::None, [&](ISetupContext* x) {
+                Read(x, a, Access::ShaderRead);
+                a2 = Write(x, a2, Access::UAVWrite);
+            });
+            b.Pass("B2", PassType::Compute, PassFlags::None, [&](ISetupContext* x) {
+                Read(x, c, Access::ShaderRead);
+                c2 = Write(x, c2, Access::UAVWrite);
+            });
+            b.Pass("Join", PassType::Compute, PassFlags::None, [&](ISetupContext* x) {
+                Read(x, a2, Access::ShaderRead);
+                Read(x, c2, Access::ShaderRead);
+                out = Write(x, out, Access::UAVWrite, AccessFlags::None);
+            });
+        };
+
+        Fixture f;
+        Builder b(f.graph);
+        record(b);
+        auto plan = Compile(f.graph, Profile(ReferenceProfile::CUDAOverlapped));
+        EXPECT(plan, "compile: " + Diagnostics(f.graph));
+        if (!plan)
+            return;
+        EXPECT(VerifyOrReport(plan, f.graph).empty(), "verify:\n" + VerifyOrReport(plan, f.graph) + Listing(b, plan));
+        uint32_t lanes[5] = {};
+        for (uint32_t i = 0; i < plan->GetScheduledPassCount() && i < 5; ++i)
+        {
+            ScheduledPass pass;
+            plan->GetScheduledPass(i, pass);
+            EXPECT(pass.queue == nvrhi::CommandQueue::Graphics, std::string(pass.name) + " runs on the graphics queue");
+            lanes[i] = pass.lane;
+        }
+        EXPECT(plan->GetScheduledPassCount() == 5, "five passes");
+        EXPECT(lanes[0] == 0 && lanes[1] == 1 && lanes[2] == 0 && lanes[3] == 1 && lanes[4] == 1,
+               "the chains take one lane each and the join the latest producer's:\n" + Listing(b, plan));
+        PlanStatistics stats;
+        plan->GetStatistics(stats);
+        EXPECT(stats.streams == 2, "two streams, got " + std::to_string(stats.streams));
+        const auto waits = SegmentWaitCounts(plan);
+        EXPECT(waits.first == 1, "one same-frame wait, at the join, got " + std::to_string(waits.first) + "\n" + Dump(plan));
+        // A2 crosses lanes (written on 0, read on 1): it stays out of the pooled slots of either lane.
+        EXPECT(Contains(Dump(plan), "\"lane\": 1"), "the dump names lane 1");
+
+        // The same graph without lanes: one stream, no waits this frame.
+        Fixture g;
+        Builder b2(g.graph);
+        record(b2);
+        auto single = Compile(g.graph, Profile(ReferenceProfile::CUDA));
+        EXPECT(single, "compile on CUDA");
+        if (single)
+        {
+            PlanStatistics singleStats;
+            single->GetStatistics(singleStats);
+            EXPECT(singleStats.streams == 1 && SegmentWaitCounts(single).first == 0, "CUDA: one stream, no waits");
+            EXPECT(!Contains(Dump(single), "\"lane\""), "single-lane dumps name no lane");
+        }
+
+        // SerializeQueues keeps every pass on lane 0.
+        Fixture h;
+        Builder b3(h.graph);
+        record(b3);
+        CompileOptions serial;
+        serial.debugFlags = DebugFlags::SerializeQueues;
+        auto serialized = Compile(h.graph, Profile(ReferenceProfile::CUDAOverlapped), serial);
+        EXPECT(serialized, "compile serialized");
+        if (serialized)
+        {
+            PlanStatistics serialStats;
+            serialized->GetStatistics(serialStats);
+            EXPECT(serialStats.streams == 1, "SerializeQueues: one stream, got " + std::to_string(serialStats.streams));
+        }
+
+        // The plan switch between one lane and two is verified (6.12).
+        EXPECT(VerifyOrReport(plan, f.graph, single).empty(), "switch from one lane to two:\n" +
+               VerifyOrReport(plan, f.graph, single));
     }
 
     // ------------------------------------------------------------------------------------------ culling and caching
@@ -740,13 +857,14 @@ namespace
         uint32_t verified = 0;
         uint32_t switches = 0;
         uint32_t graphs = 0;
+        uint32_t multiLane = 0;   // CUDAOverlapped plans that use a second lane
         std::string failures;
         for (const CorpusGraph& graph : GetCorpus())
         {
             ++graphs;
             for (ReferenceProfile kind : c_AllProfiles)
             {
-                if (kind == ReferenceProfile::CUDA && graph.raster)
+                if (IsCuda(kind) && graph.raster)
                     continue;
                 // The Placed tier on both D3D12 resource heap tiers (7.5): placed 1 is tier 2, placed 2 tier 1.
                 for (int placed = 0; placed < (Profile(kind).maxMemoryTier == MemoryTier::Placed ? 3 : 1); ++placed)
@@ -775,6 +893,16 @@ namespace
                         continue;
                     }
                     ++verified;
+                    for (uint32_t i = 0; kind == ReferenceProfile::CUDAOverlapped && i < planA->GetScheduledPassCount(); ++i)
+                    {
+                        ScheduledPass pass;
+                        planA->GetScheduledPass(i, pass);
+                        if (pass.lane != 0)
+                        {
+                            ++multiLane;
+                            break;
+                        }
+                    }
 
                     // The plan switch: the variant's plan after this one (6.12).
                     f.graph->Reset();
@@ -796,8 +924,10 @@ namespace
                 }
             }
         }
-        std::printf("  %u graphs, %u verified plans, %u verified plan switches\n", graphs, verified, switches);
+        std::printf("  %u graphs, %u verified plans, %u verified plan switches, %u plans on two lanes\n", graphs, verified,
+                    switches, multiLane);
         EXPECT(failures.empty(), failures);
+        EXPECT(multiLane > 0, "the corpus has plans on more than one lane under CUDAOverlapped");
         EXPECT(graphs >= 40 && verified >= 160, "the corpus covers at least 40 graphs x 4 profiles");
     }
 
@@ -1118,6 +1248,7 @@ namespace
         { "registry_one_graph", TestRegistryOneGraph },
         { "execute_device_free", TestExecuteDeviceFree },
         { "reference_profiles", TestReferenceProfiles },
+        { "queue_lanes", TestQueueLanes },
         { "culling", TestCulling },
         { "plan_cache", TestPlanCache },
         { "golden_deferred_frame", TestGoldenDeferredFrame },

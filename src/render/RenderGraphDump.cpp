@@ -274,8 +274,9 @@ namespace donut::render::rdg
             const PlanPass& pass = plan.m_Passes[s];
             out += "    { \"index\": " + std::to_string(s) + ", \"pass\": " + std::to_string(pass.program) +
                 ", \"name\": " + JsonString(plan.GetName(pass.nameOffset)) + ", \"type\": \"" + PassTypeName(pass.type) +
-                "\", \"queue\": \"" + QueueName(pass.queue) +
-                "\", \"segment\": " + (pass.segment == c_None ? std::string("null") : std::to_string(pass.segment)) +
+                "\", \"queue\": \"" + QueueName(pass.queue) + "\"" +
+                (pass.lane ? ", \"lane\": " + std::to_string(pass.lane) : std::string()) +
+                ", \"segment\": " + (pass.segment == c_None ? std::string("null") : std::to_string(pass.segment)) +
                 ", \"enabled\": " + (pass.enabled ? "true" : "false");
             const PassFlags modes = pass.flags & (PassFlags::Tracked | PassFlags::Restore | PassFlags::AsyncCompute);
             out += std::string(", \"mode\": \"") +
@@ -312,13 +313,16 @@ namespace donut::render::rdg
         for (size_t i = 0; i < plan.m_Segments.size(); ++i)
         {
             const PlanSegment& segment = plan.m_Segments[i];
-            out += "    { \"queue\": \"" + std::string(QueueName(segment.queue)) + "\", \"firstPass\": " +
+            // The lane only where it is not 0: single-queue plans dump as before.
+            out += "    { \"queue\": \"" + std::string(QueueName(segment.queue)) + "\"" +
+                (segment.lane ? ", \"lane\": " + std::to_string(segment.lane) : std::string()) + ", \"firstPass\": " +
                 std::to_string(segment.firstPass) + ", \"passCount\": " + std::to_string(segment.passCount) +
                 ", \"signals\": " + (segment.signals ? "true" : "false") + ", \"waits\": [";
             for (uint32_t w = 0; w < segment.waitCount; ++w)
             {
                 const SegmentWait& wait = plan.m_SegmentWaits[segment.waitBegin + w];
-                out += std::string(w ? ", " : "") + "{ \"queue\": \"" + QueueName(wait.queue) + "\", \"segment\": " +
+                out += std::string(w ? ", " : "") + "{ \"queue\": \"" + QueueName(wait.queue) + "\"" +
+                    (wait.lane ? ", \"lane\": " + std::to_string(wait.lane) : std::string()) + ", \"segment\": " +
                     std::to_string(wait.segment) + ", \"frame\": " + std::to_string(int(wait.frameDelta)) + " }";
             }
             out += "] }";
@@ -349,7 +353,8 @@ namespace donut::render::rdg
             ", \"barriers\": " + std::to_string(stats.barriers) + ", \"transitions\": " + std::to_string(stats.transitions) +
             ", \"splitBarriers\": " + std::to_string(stats.splitBarriers) + ", \"uavBarriers\": " +
             std::to_string(stats.uavBarriers) + ", \"aliasingBarriers\": " + std::to_string(stats.aliasingBarriers) +
-            ", \"queueTransfers\": " + std::to_string(stats.queueTransfers) + ", \"fenceWaits\": " +
+            ", \"queueTransfers\": " + std::to_string(stats.queueTransfers) + ", \"streams\": " +
+            std::to_string(stats.streams) + ", \"fenceWaits\": " +
             std::to_string(stats.fenceWaits) + ", \"fenceSignals\": " + std::to_string(stats.fenceSignals) +
             ", \"heaps\": " + std::to_string(stats.heaps) + ", \"poolableTransientBytes\": " +
             std::to_string(stats.poolableTransientBytes) + ", \"placedPeakBytes\": " + std::to_string(stats.placedPeakBytes) +

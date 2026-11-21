@@ -122,6 +122,8 @@ namespace donut::render::rdg
                                 const std::vector<Item>& items, Prev prev, bool hasPredecessor);
 
             bool Legal(ResourceStates state, CommandQueue queue) const { return IsStateLegalOnQueue(state, queue, m_Profile); }
+            // The (queue, lane) stream of a scheduled pass. Order and waits key on streams; legality on the queue.
+            uint32_t Stream(uint32_t sched) const { return m_State.StreamOfSched(sched); }
             void AddWait(uint32_t waiter, uint32_t producer, int8_t frameDelta);
             void CrossQueueWaits(const Prev& prev, const std::vector<Step>& steps, const Item& item);
             void Emit(uint32_t sched, uint8_t slot, CommandQueue queue, const PlanBarrier& barrier, const UnitKey& unit,
@@ -545,7 +547,7 @@ namespace donut::render::rdg
             {
                 for (const Acc& access : prev.accesses)
                 {
-                    if (access.queue != steps[k].queue)
+                    if (Stream(access.sched) != Stream(steps[k].sched))
                         AddWait(steps[k].sched, access.sched, access.frameDelta);
                 }
             }
@@ -634,18 +636,19 @@ namespace donut::render::rdg
             barrier.stagesBefore = StagesOf(prev.accesses);
             barrier.stagesAfter = consumerStages;
 
+            const uint32_t stream = Stream(sched);
             for (const Acc& access : prev.accesses)
             {
-                if (access.queue != queue)
+                if (Stream(access.sched) != stream)
                     AddWait(sched, access.sched, wrapped ? int8_t(0) : access.frameDelta);
             }
             for (uint32_t k = item.begin; k < item.end; ++k)
             {
-                if (steps[k].queue != queue)
+                if (Stream(steps[k].sched) != stream)
                     AddWait(steps[k].sched, sched, wrapped ? int8_t(-1) : int8_t(0));
             }
 
-            // 6.4: split when the begin and end points are far enough apart on one queue.
+            // 6.4: split when the begin and end points are far enough apart on one stream.
             bool split = false;
             uint32_t begin = 0;
             if (!wrapped && slot == c_Prologue && m_Profile.splitBarriers && !prev.accesses.empty())
@@ -653,7 +656,7 @@ namespace donut::render::rdg
                 bool sameQueueThisFrame = true;
                 for (const Acc& access : prev.accesses)
                 {
-                    if (access.frameDelta != 0 || access.queue != queue)
+                    if (access.frameDelta != 0 || Stream(access.sched) != stream)
                         sameQueueThisFrame = false;
                     else
                         begin = std::max(begin, access.sched);
@@ -741,7 +744,7 @@ namespace donut::render::rdg
             AddWait(consumer.sched, last->sched, last->frameDelta);
             for (const Acc& access : prev.accesses)
             {
-                if (access.queue != from && access.queue != consumer.queue)
+                if (Stream(access.sched) != Stream(last->sched) && Stream(access.sched) != Stream(consumer.sched))
                     AddWait(consumer.sched, access.sched, access.frameDelta);
             }
             ++m_State.transferCount;
@@ -789,7 +792,7 @@ namespace donut::render::rdg
             Emit(sched, c_Epilogue, queue, barrier, unit);
             for (const Acc& access : prev.accesses)
             {
-                if (access.queue != queue)
+                if (Stream(access.sched) != Stream(sched))
                     AddWait(sched, access.sched, 0);
             }
             ++m_State.transitionCount;
@@ -909,7 +912,7 @@ namespace donut::render::rdg
                     // Same state: the hazards that a state change would have covered (6.5).
                     bool sameQueuePrev = false;
                     for (const Acc& access : prev.accesses)
-                        sameQueuePrev = sameQueuePrev || access.queue == first.queue;
+                        sameQueuePrev = sameQueuePrev || Stream(access.sched) == Stream(first.sched);
                     if (sameQueuePrev)
                     {
                         if ((item.state & ResourceStates::UnorderedAccess) != 0 && prev.uavAny)

@@ -267,6 +267,8 @@ namespace donut::render::rdg
         hash = HashCombine(hash, uint64_t(lattice.transition) | (uint64_t(lattice.generalLayout) << 16) |
             (uint64_t(lattice.queueTransfer) << 32) | (uint64_t(lattice.asyncOverlapGain) << 48));
         hash = HashCombine(hash, uint64_t(lattice.splitMinGap) | (uint64_t(lattice.splitLayoutTransitionsOnly) << 8));
+        hash = HashCombine(hash, uint64_t(profile.queueLanes[0]) | (uint64_t(profile.queueLanes[1]) << 8) |
+            (uint64_t(profile.queueLanes[2]) << 16));
         hash = HashCombine(hash, lattice.splitMinBytes);
         return hash;
     }
@@ -353,6 +355,7 @@ namespace donut::render
             break;
 
         case ReferenceProfile::CUDA:
+        case ReferenceProfile::CUDAOverlapped:
             profile.api = nvrhi::GraphicsAPI::CUDA;
             profile.barrierModel = BarrierModel::Implicit;
             profile.planeModel = PlaneModel::Ignored;
@@ -362,6 +365,11 @@ namespace donut::render
             profile.splitBarriers = false;
             profile.aliasingBarriers = false;
             profile.depthClears = false;
+            if (kind == ReferenceProfile::CUDAOverlapped)
+            {
+                profile.queueLanes[uint32_t(nvrhi::CommandQueue::Graphics)] = 2;
+                profile.queueLanes[uint32_t(nvrhi::CommandQueue::Compute)] = 2;
+            }
             break;
 
         default:
@@ -412,6 +420,12 @@ namespace donut::render
         {
             profile.computeQueue = device->queryFeatureSupport(nvrhi::Feature::ComputeQueue);
             profile.copyQueue = device->queryFeatureSupport(nvrhi::Feature::CopyQueue);
+        }
+        // The lanes: the queues of each type (nvrhi ADR 0016). Only CUDA devices with queue pools have more than one.
+        for (uint32_t q = 0; q < 3; ++q)
+        {
+            const uint32_t count = device->getCommandQueueCount(nvrhi::CommandQueue(q));
+            profile.queueLanes[q] = uint8_t(std::min<uint32_t>(std::max<uint32_t>(count, 1u), rdg::c_MaxQueueLanes));
         }
         *out = profile;
         return nvrhi::FS_OK;
