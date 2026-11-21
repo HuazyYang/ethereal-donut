@@ -1,6 +1,8 @@
 # RDG Design: Production Plan over the Existing FrameGraph
 
-- Status: Accepted
+- Status: Superseded by aggregate ADR 0003 (`docs/adr/0003-render-graph-for-donut.md`) and the design
+  `docs/rdg-design.md`, accepted 2026-11-05. Kept as history; nothing from the `framegraph` branches
+  is reused.
 - Date: 2026-10-12
 - Scope: Ethereal Donut pass composition and execution over NVRHI
 - Related: aggregate plan [2026-10-04-framegraph.md](../../docs/plans/2026-10-04-framegraph.md);

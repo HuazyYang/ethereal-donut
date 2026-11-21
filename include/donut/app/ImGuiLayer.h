@@ -1,5 +1,5 @@
-#ifndef IMGUIRENDERPASS_H
-#define IMGUIRENDERPASS_H
+#ifndef IMGUILAYER_H
+#define IMGUILAYER_H
 #include <donut/app/DeviceManager.h>
 #include <donut/engine/ShaderFactory.h>
 #include <imgui.h>
@@ -10,11 +10,11 @@ class ShaderFactory;
 
 namespace donut::app {
 
-class ImGuiRenderPass : public IRenderPass {
+class ImGuiLayer : public IAppLayer {
     NVRHI_INHERIT_INTERFACE_TABLE()
  public:
-    ImGuiRenderPass(DeviceManager *deviceManager);
-    ~ImGuiRenderPass();
+    ImGuiLayer(DeviceManager *deviceManager);
+    ~ImGuiLayer();
 
     bool Init(engine::ShaderFactory *pShaderFactory);
     ImGuiContext *GetImContext();
@@ -44,4 +44,4 @@ class ImGuiRenderPass : public IRenderPass {
 
 } // namespace donut::app
 
-#endif /* IMGUIRENDERPASS_H */
+#endif /* IMGUILAYER_H */

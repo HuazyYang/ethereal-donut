@@ -23,6 +23,7 @@
 #pragma once
 
 #include <donut/engine/View.h>
+#include <donut/render/RenderGraph.h>
 #include <nvrhi/nvrhi.h>
 
 namespace donut::engine
@@ -55,13 +56,56 @@ namespace donut::render
     class GeometryPassContext
     {
     };
-    
-    class IGeometryPass: public nvrhi::ObjectImpl<nvrhi::IObject>
+
+    // A geometry pass in a render graph (design 13.2, 13.3): one use per child view of `view`, drawn into that
+    // view's subresources of the targets. The targets are contiguous colour slots from 0 and an optional depth
+    // target. `view`, `viewPrev`, `rootNode`, `drawStrategy` and `passContext` must stay valid until the graph
+    // has executed.
+    struct GeometryGraphInputs
+    {
+        const char* name = "Geometry";
+        const engine::ICompositeView* view = nullptr;
+        const engine::ICompositeView* viewPrev = nullptr;
+        engine::SceneGraphNode* rootNode = nullptr;
+        IDrawStrategy* drawStrategy = nullptr;
+        GeometryPassContext* passContext = nullptr;
+        ResourceId colorTargets[8] = { InvalidResourceId, InvalidResourceId, InvalidResourceId, InvalidResourceId,
+                                       InvalidResourceId, InvalidResourceId, InvalidResourceId, InvalidResourceId };
+        uint32_t colorTargetCount = 0;
+        ResourceId depth = InvalidResourceId;
+        bool depthWrite = true;
+        // Clears every target of each use first (the targets of transients must be cleared or fully written).
+        bool clearTargets = false;
+        ClearValue colorClear = { { 0.f, 0.f, 0.f, 0.f }, 0.f, 0 };
+        ClearValue depthClear = { { 0.f, 0.f, 0.f, 0.f }, 0.f, 0 };
+        // Textures the shaders sample (a shadow map for forward shading), read in the pixel shader.
+        ResourceId shaderReads[4] = { InvalidResourceId, InvalidResourceId, InvalidResourceId, InvalidResourceId };
+        uint32_t shaderReadCount = 0;
+        bool materialEvents = false;
+    };
+
+    struct GeometryGraphOutputs
+    {
+        ResourceId colorTargets[8];
+        ResourceId depth;
+    };
+
+    // The base of the geometry passes. Its IGpuPass implementation draws one view per use, in Tracked mode: the
+    // scene's buffers and material textures stay under nvrhi's automatic barriers (13.3).
+    class IGeometryPass: public nvrhi::ObjectImpl<IGpuPass>
     {
     public:
         NVRHI_BEGIN_INTERFACE_TABLE_INLINE(IGeometryPass)
+        NVRHI_IMPLEMENTS_INTERFACE(IGpuPass)
         NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IObject)
         NVRHI_END_INTERFACE_TABLE()
+
+        GeometryGraphOutputs AddToGraph(IRenderGraph* graph, const GeometryGraphInputs& inputs);
+
+        nvrhi::FRESULT Setup(ISetupContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Prepare(IPrepareContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Execute(IPassContext* context, const void* data) noexcept override;
+        void OnResourcesReleased() noexcept override;
 
         [[nodiscard]] virtual engine::ViewType::Enum GetSupportedViewTypes() const = 0;
         virtual void SetupView(GeometryPassContext& context, nvrhi::ICommandList* commandList, const engine::IView* view, const engine::IView* viewPrev) = 0;

@@ -39,6 +39,7 @@ add_definitions(-DDONUT_TEST_BINARY_DIR="${CMAKE_CURRENT_BINARY_DIR}")
 
 include(test-core.cmake)
 
-if (DONUT_WITH_NVRHI) 
+if (DONUT_WITH_NVRHI)
     include(test-engine.cmake)
+    include(test-render.cmake)
 endif()

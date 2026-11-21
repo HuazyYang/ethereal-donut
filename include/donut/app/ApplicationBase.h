@@ -38,7 +38,7 @@ namespace donut::engine
 
 namespace donut::app
 {
-    class ApplicationBase : public IRenderPass
+    class ApplicationBase : public IAppLayer
     {
         NVRHI_INHERIT_INTERFACE_TABLE()
     private:
@@ -46,7 +46,7 @@ namespace donut::app
         bool m_AllTexturesFinalized;
 
     protected:
-        typedef IRenderPass Super;
+        typedef IAppLayer Super;
 
         nvrhi::AutoPtr<engine::TextureCache> m_TextureCache;
         nvrhi::MonoPtr<std::thread> m_SceneLoadingThread;

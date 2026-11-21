@@ -1,4 +1,4 @@
-#include <donut/app/ImGuiRenderPass.h>
+#include <donut/app/ImGuiLayer.h>
 #include <backends/imgui_impl_glfw.h>
 
 namespace donut::app {
@@ -483,16 +483,16 @@ void ImGui_ImplNVRHI_RenderDrawData(ImDrawData *draw_data, nvrhi::IFramebuffer *
 
 }
 
-ImGuiRenderPass::ImGuiRenderPass(DeviceManager *deviceManager): IRenderPass(deviceManager) {
+ImGuiLayer::ImGuiLayer(DeviceManager *deviceManager): IAppLayer(deviceManager) {
 }
 
-ImGuiRenderPass::~ImGuiRenderPass() {
+ImGuiLayer::~ImGuiLayer() {
     ImGui_ImplNVRHI_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext(m_imContext);
 }
 
-bool ImGuiRenderPass::Init(engine::ShaderFactory *pShaderFactory) {
+bool ImGuiLayer::Init(engine::ShaderFactory *pShaderFactory) {
 
     m_imContext = ImGui::CreateContext();
 
@@ -514,56 +514,56 @@ bool ImGuiRenderPass::Init(engine::ShaderFactory *pShaderFactory) {
     return true;
 }
 
-ImGuiContext *ImGuiRenderPass::GetImContext() { return m_imContext; }
+ImGuiContext *ImGuiLayer::GetImContext() { return m_imContext; }
 
-bool ImGuiRenderPass::KeyboardUpdate(int key, int scancode, int action, int mods) {
+bool ImGuiLayer::KeyboardUpdate(int key, int scancode, int action, int mods) {
 
     ImGui_ImplGlfw_KeyCallback(GetDeviceManager()->GetWindow(), key, scancode, action, mods);
     return ImGui::GetIO().WantCaptureKeyboard;
 }
 
-// void ImGuiRenderPass::WindowFocused(int focused) {
+// void ImGuiLayer::WindowFocused(int focused) {
 //     ImGui_ImplGlfw_WindowFocusCallback(GetDeviceManager()->GetWindow(), focused);
 // }
 
-bool ImGuiRenderPass::KeyboardCharInput(unsigned int unicode, int mods) {
+bool ImGuiLayer::KeyboardCharInput(unsigned int unicode, int mods) {
     ImGui_ImplGlfw_CharCallback(GetDeviceManager()->GetWindow(), unicode);
     return ImGui::GetIO().WantCaptureKeyboard;
 }
 
 // Workaround: X11 seems to send spurious Leave/Enter events which would make us lose our position,
 // so we back it up and restore on Leave/Enter (see https://github.com/ocornut/imgui/issues/4984)
-// bool ImGuiRenderPass::CursorEnter(int entered) {
+// bool ImGuiLayer::CursorEnter(int entered) {
 //     ImGui_ImplGlfw_CursorEnterCallback(GetDeviceManager()->GetWindow(), entered);
 //     return false;
 // }
 
-bool ImGuiRenderPass::MousePosUpdate(double xpos, double ypos) {
+bool ImGuiLayer::MousePosUpdate(double xpos, double ypos) {
     ImGui_ImplGlfw_CursorPosCallback(GetDeviceManager()->GetWindow(), xpos, ypos);
     auto &io = ImGui::GetIO();
     return io.WantCaptureMouse;
 }
 
-bool ImGuiRenderPass::MouseScrollUpdate(double xoffset, double yoffset) {
+bool ImGuiLayer::MouseScrollUpdate(double xoffset, double yoffset) {
     ImGui_ImplGlfw_ScrollCallback(GetDeviceManager()->GetWindow(), xoffset, yoffset);
     auto &io = ImGui::GetIO();
     return io.WantCaptureMouse;
 }
 
-bool ImGuiRenderPass::MouseButtonUpdate(int button, int action, int mods) {
+bool ImGuiLayer::MouseButtonUpdate(int button, int action, int mods) {
     ImGui_ImplGlfw_MouseButtonCallback(GetDeviceManager()->GetWindow(), button, action, mods);
     auto &io = ImGui::GetIO();
     return io.WantCaptureMouse;
 }
 
-void ImGuiRenderPass::Animate(float elapsedTimeSeconds) {
+void ImGuiLayer::Animate(float elapsedTimeSeconds) {
     ImGui_ImplNVRHI_NewFrame();
     ImGui_ImplGlfw_NewFrame();
 
     ImGui::NewFrame();
 }
 
-void ImGuiRenderPass::Render(nvrhi::IFramebuffer *framebuffer) {
+void ImGuiLayer::Render(nvrhi::IFramebuffer *framebuffer) {
 
     BuildUI();
 
@@ -576,12 +576,12 @@ void ImGuiRenderPass::Render(nvrhi::IFramebuffer *framebuffer) {
     GetDevice()->executeCommandList(m_commandList);
 }
 
-void ImGuiRenderPass::DisplayScaleChanged(float scaleX, float scaleY) {
+void ImGuiLayer::DisplayScaleChanged(float scaleX, float scaleY) {
     // Clear the ImGui font atlas and invalidate the font texture
     // to re-register and re-rasterize all fonts on the next frame (see Animate)
 }
 
-void ImGuiRenderPass::BeginFullScreenWindow() {
+void ImGuiLayer::BeginFullScreenWindow() {
     ImGuiIO const &io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(0.f, 0.f), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x / io.DisplayFramebufferScale.x,
@@ -594,7 +594,7 @@ void ImGuiRenderPass::BeginFullScreenWindow() {
                      ImGuiWindowFlags_NoScrollbar);
 }
 
-void ImGuiRenderPass::DrawScreenCenteredText(const char *text) {
+void ImGuiLayer::DrawScreenCenteredText(const char *text) {
     ImGuiIO const &io = ImGui::GetIO();
     ImVec2 textSize = ImGui::CalcTextSize(text);
     ImGui::SetCursorPosX((io.DisplaySize.x / io.DisplayFramebufferScale.x - textSize.x) *
@@ -604,7 +604,7 @@ void ImGuiRenderPass::DrawScreenCenteredText(const char *text) {
     ImGui::TextUnformatted(text);
 }
 
-void ImGuiRenderPass::EndFullScreenWindow() {
+void ImGuiLayer::EndFullScreenWindow() {
     ImGui::End();
     ImGui::PopStyleVar();
 }

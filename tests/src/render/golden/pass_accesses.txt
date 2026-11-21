@@ -1,0 +1,80 @@
+ShadowDepth [raster, tracked, graphics]
+    ShadowMap DepthWrite Clear mips=0+1 slices=0+1 depthTarget
+ShadowDepth [raster, tracked, graphics]
+    ShadowMap DepthWrite Clear mips=0+1 slices=1+1 depthTarget
+ShadowDepth [raster, tracked, graphics]
+    ShadowMap DepthWrite Clear mips=0+1 slices=2+1 depthTarget
+ShadowDepth [raster, tracked, graphics]
+    ShadowMap DepthWrite Clear mips=0+1 slices=3+1 depthTarget
+GBufferFill [raster, tracked, graphics]
+    #4 ColorTarget Clear mips=0+1 slices=0+1 colorTarget0
+    #5 ColorTarget Clear mips=0+1 slices=0+1 colorTarget1
+    #6 ColorTarget Clear mips=0+1 slices=0+1 colorTarget2
+    #7 ColorTarget Clear mips=0+1 slices=0+1 colorTarget3
+    #8 DepthWrite|StencilWrite Clear mips=0+1 slices=0+1 depthTarget
+SSAO [compute, restore, graphics]
+    #8 ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    #6 ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    #10 UAVWrite stages=0x0020 FullWrite mips=0+1 slices=0+16
+    #11 UAVWrite stages=0x0020 FullWrite mips=0+1 slices=0+16
+    #9 UAVWrite stages=0x0020 FullWrite mips=0+1 slices=0+1
+DeferredLighting [compute, native, graphics]
+    #8 ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    #6 ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    #4 ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    #5 ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    #7 ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    #9 ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    ShadowMap ShaderRead stages=0x0020 mips=0+1 slices=0+4
+    #12 UAVWrite stages=0x0020 FullWrite mips=0+1 slices=0+1
+Sky [raster, native, graphics]
+    #12 ColorTarget mips=0+1 slices=0+1 colorTarget0
+    #8 DepthRead|StencilRead mips=0+1 slices=0+1 depthTarget
+EnvironmentMap [raster, native, graphics]
+    EnvironmentMap ShaderRead stages=0x0010 mips=0+1 slices=0+6
+    #12 ColorTarget mips=0+1 slices=0+1 colorTarget0
+    #8 DepthRead|StencilRead mips=0+1 slices=0+1 depthTarget
+ForwardShading [raster, tracked, graphics]
+    ShadowMap ShaderRead stages=0x0010 mips=0+1 slices=0+4
+    #12 ColorTarget mips=0+1 slices=0+1 colorTarget0
+    #8 DepthRead|StencilRead mips=0+1 slices=0+1 depthTarget
+Bloom/Downscale1 [raster, native, graphics]
+    #12 ShaderRead stages=0x0010 mips=0+1 slices=0+1
+    #13 ColorTarget FullWrite mips=0+1 slices=0+1 colorTarget0
+Bloom/Downscale2 [raster, native, graphics]
+    #13 ShaderRead stages=0x0010 mips=0+1 slices=0+1
+    #14 ColorTarget FullWrite mips=0+1 slices=0+1 colorTarget0
+Bloom/BlurH [raster, native, graphics]
+    #14 ShaderRead stages=0x0010 mips=0+1 slices=0+1
+    #15 ColorTarget FullWrite mips=0+1 slices=0+1 colorTarget0
+Bloom/BlurV [raster, native, graphics]
+    #15 ShaderRead stages=0x0010 mips=0+1 slices=0+1
+    #16 ColorTarget FullWrite mips=0+1 slices=0+1 colorTarget0
+Bloom/Apply [raster, native, graphics]
+    #16 ShaderRead stages=0x0010 mips=0+1 slices=0+1
+    #12 ColorTarget mips=0+1 slices=0+1 colorTarget0
+MotionVectors [raster, native, graphics]
+    #8 ShaderRead stages=0x0010 mips=0+1 slices=0+1
+    #17 ColorTarget FullWrite mips=0+1 slices=0+1 colorTarget0
+TemporalAA [compute, native, graphics]
+    #12 ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    #17 ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    donut.TemporalAntiAliasingPass.Feedback#1[1] ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    #18 UAVWrite stages=0x0020 FullWrite mips=0+1 slices=0+1
+    donut.TemporalAntiAliasingPass.Feedback#1[0] UAVWrite stages=0x0020 FullWrite mips=0+1 slices=0+1
+ToneMapping/Histogram [compute, native, graphics]
+    #18 ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    ToneMapping/Histogram UAVWrite stages=0x0020 Clear mips=0+1 slices=0+1
+ToneMapping/Exposure [compute, native, graphics]
+    ToneMapping/Histogram ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    ToneMapping/Exposure UAVWrite stages=0x0020 mips=0+1 slices=0+1
+ToneMapping [raster, native, graphics]
+    #18 ShaderRead stages=0x0010 mips=0+1 slices=0+1
+    ToneMapping/Exposure ShaderRead stages=0x0010 mips=0+1 slices=0+1
+    #21 ColorTarget FullWrite mips=0+1 slices=0+1 colorTarget0
+Blit [raster, native, graphics]
+    #21 ShaderRead stages=0x0010 mips=0+1 slices=0+1
+    BackBuffer ColorTarget FullWrite mips=0+1 slices=0+1 colorTarget0
+MipMapGen [compute, restore, graphics]
+    MipChain ShaderRead stages=0x0020 mips=0+1 slices=0+1
+    MipChain UAVWrite stages=0x0020 FullWrite mips=1+6 slices=0+1

@@ -23,6 +23,8 @@
 #pragma once
 
 #include <nvrhi/nvrhi.h>
+#include <nvrhi/core/foundation.h>
+#include <donut/render/RenderGraph.h>
 #include <nvrhi/core/autoptr.h>
 #include <donut/core/math/math.h>
 #include <donut/render/Manipulator.h>
@@ -41,8 +43,22 @@ namespace donut::render
 {
     // Rasterizes a Manipulator into a framebuffer (planar viewport)
 
-    class ManipulatorPass
+    class ManipulatorPass : public nvrhi::ObjectImpl<IGpuPass>
     {
+    public:
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(ManipulatorPass)
+        NVRHI_IMPLEMENTS_INTERFACE(IGpuPass)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IObject)
+        NVRHI_END_INTERFACE_TABLE()
+
+        // Not in a render graph yet (design 13.3): AddPass fails with a diagnostic naming the pass, and the caller
+        // runs the pass outside the graph and imports its results.
+        nvrhi::FRESULT Setup(ISetupContext*, void*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
+        nvrhi::FRESULT Prepare(IPrepareContext*, void*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
+        nvrhi::FRESULT Execute(IPassContext*, const void*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
+        void OnResourcesReleased() noexcept override { }
+
+    private:
     public:
 
         // The pass caches it at construction; if the client switches buffering depth at run-time it is
