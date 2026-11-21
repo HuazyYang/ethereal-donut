@@ -164,8 +164,12 @@ namespace donut::engine::ecs
     // Sets or clears the bits [first, first + count); structural changes only (not atomic).
     void SetMaskRange(uint64_t* words, uint32_t first, uint32_t count, bool value) noexcept;
 
-    // What GetComponent returns for a tag the entity has: an address, but no bytes to read or write.
-    alignas(64) inline uint8_t g_TagValue[64] = {};
+    // What GetComponent returns for a tag the entity has, and a query's column for a tag data term: an address, but no
+    // bytes to read or write. The typed layer forms `column + row` for its rows, so the array spans every row of a
+    // chunk (c_MaxSortKeyRow + 1) times c_MaxTagTypeSize, the size of an empty C++ type aligned to the component
+    // limit of 64. Zero-initialised and never written: it costs address space, not memory.
+    constexpr size_t c_MaxTagTypeSize = 64;
+    alignas(64) inline uint8_t g_TagValue[(size_t(c_MaxSortKeyRow) + 1) * c_MaxTagTypeSize] = {};
     // The presence mask of a chunk in which no row has a Sparse component.
     alignas(64) inline const uint64_t g_ZeroMask[c_MaxSortKeyRow / 64 + 1] = {};
 
@@ -465,6 +469,9 @@ namespace donut::engine::ecs
         {
             return m_ValidationErrors.load(std::memory_order_relaxed);
         }
+        // With validation on: counts the failure and reports it through log::warning. For the world's operations and
+        // the objects beside it (queries, command buffers, observers); printf format.
+        void ReportValidation(const char* operation, const char* format, ...) noexcept;
         // The version a write stamps: `writeVersion`, or the world's version for c_WorldVersion.
         uint64_t ResolveWriteVersion(uint64_t writeVersion) const noexcept
         {
@@ -485,6 +492,10 @@ namespace donut::engine::ecs
         const SparseSet* GetSparseSet(ComponentId component) const noexcept;
         // The presence mask of a Sparse component over a chunk's rows; an all-zero mask when no row has it.
         const uint64_t* GetSparsePresence(const SparseSet& set, uint32_t archetype, uint32_t chunk) const noexcept;
+        // Changes whenever a sparse set allocates a chunk's presence mask, after which GetSparsePresence returns
+        // another pointer for that chunk. It happens only in structural changes; queries rebuild their chunk lists on
+        // it.
+        uint64_t GetPresenceMaskVersion() const noexcept { return m_PresenceMaskVersion; }
 
         // Counters for tests and the inspector.
         struct Counters
@@ -628,7 +639,6 @@ namespace donut::engine::ecs
         EntityRecord* FindAliveRecord(Entity entity) noexcept;
         uint32_t AllocateIndex() noexcept;   // 0 when the table is exhausted
         void ReleaseIndex(uint32_t index) noexcept;
-        void ReportValidation(const char* operation, const char* format, ...) noexcept;
         void ReportStale(const char* operation, Entity entity) noexcept;
         void* ComponentPointer(Entity entity, const EntityRecord& record, const ComponentType& type,
                                uint32_t* outColumn) const noexcept;
@@ -681,6 +691,14 @@ namespace donut::engine::ecs
         // Sparse sets (EcsArchetype.cpp).
         void* SparseInsert(SparseSet& set, Entity entity, EntityRecord& record) noexcept;   // uninitialized slot
         void SparseErase(SparseSet& set, Entity entity, EntityRecord& record) noexcept;    // destroys the value
+        // Setting a presence bit allocates the chunk's mask on first use. Structural changes secure every mask they
+        // will set before they change anything, so that running out of memory fails them with nothing changed:
+        // SecurePresence for one set, SecureRowPresence for every Sparse component of an entity in a chunk, and
+        // SecureHoleFill for the archetype's last row, which RemoveRow moves into a hole in `chunk`. False when out of
+        // memory.
+        bool SecurePresence(SparseSet& set, uint32_t archetype, uint32_t chunk) noexcept;
+        bool SecureRowPresence(Entity entity, uint32_t archetype, uint32_t chunk) noexcept;
+        bool SecureHoleFill(const Archetype& archetype, uint32_t chunk) noexcept;
         void SetPresence(SparseSet& set, uint32_t archetype, uint32_t chunk, uint32_t row, bool present) noexcept;
         void MoveSparsePresence(Entity entity, uint32_t fromArchetype, uint32_t fromChunk, uint32_t fromRow,
                                 uint32_t toArchetype, uint32_t toChunk, uint32_t toRow) noexcept;
@@ -712,6 +730,7 @@ namespace donut::engine::ecs
         // Versions and state.
         uint64_t m_Version = 1;
         uint64_t m_StructuralVersion = 1;
+        uint64_t m_PresenceMaskVersion = 0;      // GetPresenceMaskVersion
         bool m_InPhase = false;
         uint32_t m_ExclusiveDepth = 0;
         uint32_t m_ObserverDepth = 0;            // E1.4: observers running

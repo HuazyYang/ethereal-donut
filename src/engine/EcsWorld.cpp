@@ -24,6 +24,7 @@
 // docs/ecs-design.md 4.1, 4.2, 4.9, 4.10, 9.1, 11.3; plan step E1.1).
 
 #include "EcsWorldImpl.h"
+#include "EcsQueryImpl.h"
 
 #include <donut/core/log.h>
 
@@ -1131,6 +1132,11 @@ namespace donut::engine::ecs
             Archetype& archetype = *m_Archetypes[record->archetype];
             const uint32_t chunk = record->chunk;
             const uint32_t row = record->row;
+            if (!SecureHoleFill(archetype, chunk))
+            {
+                KeepFirstFailure(result, nvrhi::FE_OUT_OF_MEMORY);   // nothing changed for this entity
+                continue;
+            }
             ObserveRowsRemoving(archetype.index, chunk, row, 1, c_NoArchetype);
             if (record->sparseCount != 0)
             {
@@ -1893,10 +1899,7 @@ namespace donut::engine::ecs
 
     nvrhi::FRESULT WorldImpl::CreateQuery(const QueryDesc& desc, IQuery** ppQuery) noexcept
     {
-        (void)desc;
-        if (ppQuery)
-            *ppQuery = nullptr;
-        return nvrhi::FE_NOT_IMPLEMENT;   // E1.2
+        return CreateQueryObject(*this, desc, QueryWorldReference::Held, ppQuery);   // EcsQuery.cpp
     }
 
     nvrhi::FRESULT WorldImpl::CreateCommandBuffer(ICommandBuffer** ppBuffer) noexcept

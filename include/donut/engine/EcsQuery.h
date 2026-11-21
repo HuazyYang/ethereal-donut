@@ -72,8 +72,10 @@ namespace donut::engine
         // points and immediate structural changes; it does not change while a phase runs.
         virtual uint32_t GetChunkCount() noexcept = 0;
         // Examines the matched chunks [first, first + capacity) and writes, in order, the views of those that pass the
-        // Changed and Added filters; returns how many it wrote. Advance `first` by `capacity`. Handing out a chunk
-        // stamps its Write columns with request.writeVersion. Row filters are not applied (ChunkView).
+        // Changed and Added filters and have at least one row that passes the row filters (Enabled, Disabled, and
+        // With and Without on Sparse components); returns how many it wrote. Advance `first` by `capacity`. Handing out
+        // a chunk stamps its Write columns with request.writeVersion; a chunk that is not handed out is not stamped.
+        // Within a chunk handed out, rows are not filtered (ChunkView).
         virtual uint32_t GetChunks(uint32_t first, const ChunkRequest& request, uint32_t capacity,
                                    _Out_writes_to_(capacity, return) ChunkView* views) noexcept = 0;
         // Rows in the matched chunks; ignores the Changed and Added filters and the row filters.
@@ -208,10 +210,10 @@ namespace donut::engine
         explicit operator bool() const noexcept { return m_Query.Get() != nullptr; }
         [[nodiscard]] uint32_t CountEntities() const noexcept { return m_Query->CountEntities(); }
 
-        // f(const ChunkView&, Pointer...) for each chunk that passes the Changed and Added filters, in chunk order. One
-        // pointer per data term: const T* for reads, T* for Write, BufferHeader* for BufferOf terms, and the chunk's one
-        // value for per-chunk terms. Rows are not filtered: test RowPasses(view, row) where the query has Enabled,
-        // Disabled or Sparse terms.
+        // f(const ChunkView&, Pointer...) for each chunk IQuery::GetChunks hands out, in chunk order. One pointer
+        // per data term: const T* for reads, T* for Write, BufferHeader* for BufferOf terms, and the chunk's one value
+        // for per-chunk terms. Rows are not filtered: test RowPasses(view, row) where the query has Enabled, Disabled
+        // or Sparse terms.
         template <typename F>
         void ForEachChunk(ISystemContext* context, F&& f) const
         {

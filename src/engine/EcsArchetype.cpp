@@ -645,7 +645,10 @@ namespace donut::engine::ecs
         const uint32_t srcRow = record.row;
 
         // The target's chunk is secured first, so that nothing is reported for a move that cannot happen; the report
-        // comes before any row changes, and the append below cannot fail.
+        // comes before any row changes, and the append below cannot fail. So are the presence masks of the entity's
+        // Sparse components in its new chunk, and of the row that the swap-remove moves into the hole it leaves.
+        if (!SecureRowPresence(entity, target, to.entityCount / to.rowsPerChunk) || !SecureHoleFill(from, srcChunk))
+            return nvrhi::FE_OUT_OF_MEMORY;
         if (!ReserveRows(to, 1, version))
             return nvrhi::FE_OUT_OF_MEMORY;
         ObserveRowsRemoving(from.index, srcChunk, srcRow, 1, to.index);
@@ -835,6 +838,9 @@ namespace donut::engine::ecs
 
     void* WorldImpl::SparseInsert(SparseSet& set, Entity entity, EntityRecord& record) noexcept
     {
+        // The row's presence mask first: running out of memory then changes nothing.
+        if (!SecurePresence(set, record.archetype, record.chunk))
+            return nullptr;
         const uint32_t index = GetEntityIndex(entity);
         const uint32_t page = index >> c_SparsePageBits;
         if (page >= set.pages.size())
@@ -896,33 +902,62 @@ namespace donut::engine::ecs
         SetPresence(set, record.archetype, record.chunk, record.row, false);
     }
 
-    void WorldImpl::SetPresence(SparseSet& set, uint32_t archetype, uint32_t chunk, uint32_t row, bool present) noexcept
+    bool WorldImpl::SecurePresence(SparseSet& set, uint32_t archetype, uint32_t chunk) noexcept
     {
         if (archetype >= set.presence.size())
-        {
-            if (!present)
-                return;
             set.presence.resize(archetype + 1);
-        }
         Vector<uint64_t*>& chunks = set.presence[archetype];
         if (chunk >= chunks.size())
-        {
-            if (!present)
-                return;
             chunks.resize(chunk + 1, nullptr);
-        }
         uint64_t*& mask = chunks[chunk];
         if (!mask)
         {
-            if (!present)
-                return;
+            // The chunk need not exist yet: a mask outlives its chunk and serves the next chunk at that index.
             const size_t bytes = size_t(m_Archetypes[archetype]->maskWords) * sizeof(uint64_t);
             mask = static_cast<uint64_t*>(HeapAllocate(bytes, c_ColumnAlignment));
             if (!mask)
-                return;
+                return false;
             std::memset(mask, 0, bytes);
+            ++m_PresenceMaskVersion;   // GetSparsePresence returns another pointer for this chunk now
         }
-        SetMaskBit(mask, row, present);
+        return true;
+    }
+
+    bool WorldImpl::SecureRowPresence(Entity entity, uint32_t archetype, uint32_t chunk) noexcept
+    {
+        const uint32_t index = GetEntityIndex(entity);
+        if (m_Entities[index].sparseCount == 0)
+            return true;
+        for (SparseSet* set : m_SparseSets)
+            if (set->Find(index) != HashIndex::c_NotFound && !SecurePresence(*set, archetype, chunk))
+                return false;
+        return true;
+    }
+
+    bool WorldImpl::SecureHoleFill(const Archetype& archetype, uint32_t chunk) noexcept
+    {
+        const uint32_t last = archetype.entityCount - 1;
+        const uint32_t lastChunk = last / archetype.rowsPerChunk;
+        if (lastChunk == chunk)
+            return true;   // the last row stays in its chunk, whose masks it already has
+        return SecureRowPresence(archetype.Entities(lastChunk)[last % archetype.rowsPerChunk], archetype.index, chunk);
+    }
+
+    void WorldImpl::SetPresence(SparseSet& set, uint32_t archetype, uint32_t chunk, uint32_t row, bool present) noexcept
+    {
+        if (present)
+        {
+            // The structural changes secure the mask before they change anything; this allocation cannot fail for
+            // them. Others (LoadSnapshot) check the mask afterwards.
+            if (SecurePresence(set, archetype, chunk))
+                SetMaskBit(set.presence[archetype][chunk], row, true);
+            return;
+        }
+        if (archetype >= set.presence.size())
+            return;
+        const Vector<uint64_t*>& chunks = set.presence[archetype];
+        if (chunk < chunks.size() && chunks[chunk])
+            SetMaskBit(chunks[chunk], row, false);
     }
 
     void WorldImpl::MoveSparsePresence(Entity entity, uint32_t fromArchetype, uint32_t fromChunk, uint32_t fromRow,

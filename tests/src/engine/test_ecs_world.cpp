@@ -2260,6 +2260,100 @@ void test_out_of_memory()
         ecs::SetHeapFailureCountdown(-1);
     }
     CHECK(payload.refs == 0 && g_Hooks.Live() == start.Live());
+
+    // Sparse presence masks (E1.2 review): a change that needs a chunk's first mask and cannot allocate it fails with
+    // FE_OUT_OF_MEMORY and changes nothing; it used to succeed and leave the row out of the mask, so queries with a
+    // With term on the component never saw it. The presence vectors are sized beforehand, so that the mask is the
+    // block that fails.
+    {
+        auto world = MakeWorld(true);
+        ecs::WorldImpl& impl = Impl(world);
+        const ComponentId position = RegisterComponent<Position>(world);
+        const ComponentId velocity = RegisterComponent<Velocity>(world);
+        const ComponentId selected = RegisterComponent<Selected>(world);
+        const ecs::SparseSet& set = *impl.GetSparseSet(selected);
+        auto present = [&](Entity entity) {
+            const ecs::EntityRecord& record = Record(world, entity);
+            return ecs::GetMaskBit(impl.GetSparsePresence(set, record.archetype, record.chunk), record.row);
+        };
+        auto lastRow = [&](uint32_t archetype) {
+            const ecs::Archetype& a = impl.GetArchetypeStorage(archetype);
+            const uint32_t chunk = a.GetChunkCount() - 1;
+            return a.Entities(chunk)[a.chunks[chunk].count - 1];
+        };
+
+        // {Position}: four chunks; a selected row in the last one sizes the vectors and leaves only that mask.
+        const Entity first = Create(world, { position });
+        const uint32_t rows = InfoOf(world, first).rowsPerChunk;
+        const uint32_t p = ArchetypeOf(world, first);
+        std::vector<Entity> plain(3 * rows + 10);
+        CHECK(world->CreateEntities(CreateDesc({ position }, {}, uint32_t(plain.size())), plain.data()) ==
+              nvrhi::FS_OK);
+        CHECK(InfoOf(world, first).chunkCount == 4);
+        CHECK(world->AddComponent(plain.back(), selected, nullptr) == nvrhi::FS_OK);
+        CHECK(world->RemoveComponent(plain.back(), selected) == nvrhi::FS_OK);
+
+        // Adding the component.
+        const Entity a = plain[0];
+        const uint64_t masks = impl.GetPresenceMaskVersion();
+        ecs::SetHeapFailureCountdown(0);
+        CHECK(world->AddComponent(a, selected, nullptr) == nvrhi::FE_OUT_OF_MEMORY);
+        CHECK(!world->HasComponent(a, selected) && set.GetCount() == 0 && Record(world, a).sparseCount == 0);
+        CHECK(impl.GetSparsePresence(set, p, 0) == ecs::g_ZeroMask && impl.GetPresenceMaskVersion() == masks);
+        CHECK(world->AddComponent(a, selected, nullptr) == nvrhi::FS_OK && present(a));
+
+        // A move into a chunk without the mask. {Position, Velocity}: a selected row once in its second chunk, then
+        // only part of the first chunk left; the edge from {Position} is cached by a move without Sparse components.
+        const Entity pvFirst = Create(world, { position, velocity });
+        const uint32_t pvRows = InfoOf(world, pvFirst).rowsPerChunk;
+        const uint32_t pv = ArchetypeOf(world, pvFirst);
+        std::vector<Entity> moved(pvRows + 4);
+        CHECK(world->CreateEntities(CreateDesc({ position, velocity }, {}, uint32_t(moved.size())), moved.data()) ==
+              nvrhi::FS_OK);
+        CHECK(InfoOf(world, pvFirst).chunkCount == 2);
+        CHECK(world->AddComponent(moved.back(), selected, nullptr) == nvrhi::FS_OK);
+        CHECK(world->RemoveComponent(moved.back(), selected) == nvrhi::FS_OK);
+        CHECK(world->DestroyEntities(moved.data() + pvRows - 11, 15) == nvrhi::FS_OK);
+        CHECK(world->AddComponent(plain[5], velocity, nullptr) == nvrhi::FS_OK);
+        CHECK(InfoOf(world, pvFirst).chunkCount == 1 && InfoOf(world, pvFirst).entityCount == pvRows - 9);
+        const uint64_t removing = impl.GetCounters().rowsRemovingReports;
+        ecs::SetHeapFailureCountdown(0);
+        CHECK(world->AddComponent(a, velocity, nullptr) == nvrhi::FE_OUT_OF_MEMORY);
+        CHECK(ArchetypeOf(world, a) == p && world->HasComponent(a, selected) && present(a));
+        CHECK(impl.GetCounters().rowsRemovingReports == removing);
+        CHECK(world->AddComponent(a, velocity, nullptr) == nvrhi::FS_OK);
+        CHECK(ArchetypeOf(world, a) == pv && Record(world, a).chunk == 0 && present(a));
+
+        // A move whose swap-remove brings a selected last row into a chunk without the mask.
+        const Entity last = lastRow(p);
+        CHECK(Record(world, last).chunk == 3 && world->AddComponent(last, selected, nullptr) == nvrhi::FS_OK);
+        const Entity mover = plain[rows + 3];
+        CHECK(Record(world, mover).chunk == 1);
+        ecs::SetHeapFailureCountdown(0);
+        CHECK(world->AddComponent(mover, velocity, nullptr) == nvrhi::FE_OUT_OF_MEMORY);
+        CHECK(ArchetypeOf(world, mover) == p && Record(world, last).chunk == 3 && present(last));
+        CHECK(impl.GetCounters().rowsRemovingReports == removing + 1);
+        CHECK(world->AddComponent(mover, velocity, nullptr) == nvrhi::FS_OK);
+        CHECK(Record(world, last).chunk == 1 && present(last));
+
+        // A destruction whose swap-remove does the same.
+        const Entity last2 = lastRow(p);
+        CHECK(Record(world, last2).chunk == 3 && world->AddComponent(last2, selected, nullptr) == nvrhi::FS_OK);
+        const Entity victim = plain[2 * rows + 3];
+        CHECK(Record(world, victim).chunk == 2);
+        ecs::SetHeapFailureCountdown(0);
+        CHECK(world->DestroyEntities(&victim, 1) == nvrhi::FE_OUT_OF_MEMORY);
+        CHECK(world->IsAlive(victim) && Record(world, last2).chunk == 3 && present(last2));
+        CHECK(world->DestroyEntities(&victim, 1) == nvrhi::FS_OK);
+        CHECK(!world->IsAlive(victim) && Record(world, last2).chunk == 2 && present(last2));
+
+        // Every member of the set is in its chunk's mask.
+        CHECK(set.GetCount() == 3);
+        for (const Entity entity : set.entities)
+            CHECK(present(entity));
+        ecs::SetHeapFailureCountdown(-1);
+        CHECK(impl.GetValidationErrorCount() == 0);
+    }
 }
 
 // Review items 6 and 7: CopyEntitiesFrom checks that every copy fits before it takes an id or makes a row, and its
@@ -2313,7 +2407,7 @@ void test_unimplemented_seams()
     auto world = MakeWorld();
     const QueryDesc queryDesc{};
     IQuery* query = nullptr;
-    CHECK(world->CreateQuery(queryDesc, &query) == nvrhi::FE_NOT_IMPLEMENT && !query);
+    CHECK(world->CreateQuery(queryDesc, &query) == nvrhi::FE_INVALID_ARGS && !query);   // E1.2: no terms
     ICommandBuffer* buffer = nullptr;
     CHECK(world->CreateCommandBuffer(&buffer) == nvrhi::FE_NOT_IMPLEMENT && !buffer);
     CHECK(world->Playback(nullptr, 0) == nvrhi::FE_NOT_IMPLEMENT);
