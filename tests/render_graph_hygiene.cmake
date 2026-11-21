@@ -4,7 +4,10 @@
 #
 # The graph code stays generic: include/donut/render/RenderGraph*.h and src/render/RenderGraph*.{h,cpp} may include
 # only nvrhi/ headers, donut/core/ headers, other RenderGraph* headers and the standard library. It fails when one
-# of them includes any other donut/render/ or donut/engine/ header, or any other project header.
+# of them includes any other donut/render/ or donut/engine/ header, or any other project header. One exception: the
+# host's worker pool, RenderGraphWorkerPool.h, is a client of the engine's job system (aggregate docs/ecs-design.md,
+# D10) and includes donut/engine/JobSystem.h; the graph code itself still reaches threads only through
+# ExecuteDesc::parallelFor.
 
 if(NOT DONUT_SOURCE_DIR)
     message(FATAL_ERROR "render_graph_hygiene.cmake: set DONUT_SOURCE_DIR")
@@ -28,6 +31,10 @@ foreach(file IN LISTS files)
             set(header "${CMAKE_MATCH_1}")
             if(header MATCHES "^nvrhi/" OR header MATCHES "^donut/core/" OR header MATCHES "^donut/render/RenderGraph[A-Za-z]*\\.h$"
                OR header MATCHES "^RenderGraph[A-Za-z]*\\.h$")
+                continue()
+            endif()
+            if(header STREQUAL "donut/engine/JobSystem.h"
+               AND file MATCHES "/include/donut/render/RenderGraphWorkerPool\\.h$")
                 continue()
             endif()
             # The standard library: a bare name without a path or an extension.

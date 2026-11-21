@@ -84,11 +84,16 @@ namespace donut::engine
         virtual uint32_t GetCurrentWorkerIndex() noexcept = 0;
 
         // The job starts when every dependency has finished; Null dependencies are ignored. FE_OUT_OF_MEMORY when the
-        // job table is full (nothing runs then); `outJob` is Null on failure.
+        // job table is full (nothing runs then); `outJob` is Null on failure. Capacity, allocated by CreateJobSystem:
+        // 4096 jobs, each held from Schedule until it has finished and no thread holds a ticket of it, and 16384
+        // dependencies on jobs that have not finished.
         virtual nvrhi::FRESULT Schedule(const JobDesc& job, _In_reads_(dependencyCount) const JobHandle* dependencies,
                                         uint32_t dependencyCount, JobHandle& outJob) noexcept = 0;
         // Runs tasks, of this job or others, until the job has finished. A finished job's handle is stale and returns
-        // at once.
+        // at once. Since a waiting thread runs other jobs on its own stack, a job may wait only for jobs it scheduled
+        // (directly or through the jobs it scheduled) and for its own ParallelFor: waiting for a running job scheduled
+        // elsewhere can deadlock. A Wait for a job with a range running lower on the calling thread's stack, which
+        // could never finish, returns at once without waiting (Debug builds log a warning).
         virtual void Wait(JobHandle job) noexcept = 0;
         virtual bool IsComplete(JobHandle job) noexcept = 0;
 
@@ -97,6 +102,9 @@ namespace donut::engine
                                  void* context) noexcept = 0;
     };
 
+    // FE_INVALID_ARGS unless maxExternalThreads is 1 to 64 and workerThreadCount at most 256. The last Release runs the
+    // jobs still scheduled, with the releasing thread's help, then stops the workers; it must not come from inside a
+    // call or a job of the same system.
     nvrhi::FRESULT CreateJobSystem(const JobSystemDesc& desc, IJobSystem** ppJobSystem) noexcept;
 
     // An adapter with the shape of the render graph's ParallelForFunction (rdg design 10.1): set

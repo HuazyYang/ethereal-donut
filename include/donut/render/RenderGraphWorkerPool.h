@@ -21,9 +21,11 @@
 */
 
 // A host task scheduler for ExecuteDesc::parallelFor (design 10.1), for applications without a task system of their
-// own: the samples, the render graph's tests and rdg_bench. Fixed worker threads, and the calling thread works too.
-// A call allocates nothing. Workers spin briefly before they sleep, so that a frame's recording does not wait for a
-// thread to wake.
+// own: the samples, the render graph's tests and rdg_bench. It owns a job system (donut/engine/JobSystem.h; aggregate
+// docs/ecs-design.md, D10) with `threads` workers and runs the graph's tasks on it through JobSystemParallelFor; the
+// calling thread works too. A call allocates nothing. Workers spin briefly before they sleep, so that a frame's
+// recording does not wait for a thread to wake. An application that has an IJobSystem already sets
+// ExecuteDesc::parallelFor = &donut::engine::JobSystemParallelFor and schedulerContext to it instead.
 //
 //     RenderGraphWorkerPool pool(3);                      // three workers and the caller
 //     execute.parallelFor = &RenderGraphWorkerPool::ParallelFor;
@@ -32,44 +34,39 @@
 
 #pragma once
 
+#include <donut/engine/JobSystem.h>
 #include <donut/render/RenderGraph.h>
 
-#include <atomic>
-#include <condition_variable>
 #include <cstdint>
-#include <mutex>
-#include <thread>
-#include <vector>
 
 namespace donut::render
 {
     class RenderGraphWorkerPool
     {
     public:
-        // `threads` workers besides the caller.
+        // `threads` workers besides the caller. With none, or if the job system cannot start, the caller records alone.
         explicit RenderGraphWorkerPool(uint32_t threads)
         {
-            for (uint32_t i = 0; i < threads; ++i)
-                m_Threads.emplace_back([this] { Work(); });
+            if (threads == 0)
+                return;
+            donut::engine::JobSystemDesc desc;
+            desc.debugName = "RenderGraphWorkerPool";
+            desc.workerThreadCount = threads;
+            if (donut::engine::CreateJobSystem(desc, &m_JobSystem) == nvrhi::FS_OK)
+                m_Workers = threads;
         }
 
         ~RenderGraphWorkerPool()
         {
-            {
-                std::lock_guard<std::mutex> lock(m_Mutex);
-                m_Quit = true;
-                m_Generation.fetch_add(1, std::memory_order_release);
-            }
-            m_Wake.notify_all();
-            for (std::thread& thread : m_Threads)
-                thread.join();
+            if (m_JobSystem)
+                m_JobSystem->Release();
         }
 
         RenderGraphWorkerPool(const RenderGraphWorkerPool&) = delete;
         RenderGraphWorkerPool& operator=(const RenderGraphWorkerPool&) = delete;
 
         // The threads that run tasks: the workers and the caller.
-        uint32_t ThreadCount() const { return uint32_t(m_Threads.size()) + 1; }
+        uint32_t ThreadCount() const { return m_Workers + 1; }
 
         // A ParallelForFunction; `pool` is the RenderGraphWorkerPool.
         static void ParallelFor(void* pool, uint32_t count, TaskFunction task, void* taskContext)
@@ -79,78 +76,17 @@ namespace donut::render
 
         void Run(uint32_t count, TaskFunction task, void* taskContext)
         {
-            if (m_Threads.empty() || count < 2)
+            if (!m_JobSystem || count < 2)
             {
                 for (uint32_t i = 0; i < count; ++i)
                     task(taskContext, i);
                 return;
             }
-            {
-                std::lock_guard<std::mutex> lock(m_Mutex);
-                m_Task = task;
-                m_Context = taskContext;
-                m_Count = count;
-                m_Next.store(0, std::memory_order_relaxed);
-                m_Active.store(uint32_t(m_Threads.size()), std::memory_order_relaxed);
-                m_Generation.fetch_add(1, std::memory_order_release);
-            }
-            m_Wake.notify_all();
-            Drain();
-            // The workers finish the tasks they took.
-            while (m_Active.load(std::memory_order_acquire) != 0)
-                std::this_thread::yield();
+            donut::engine::JobSystemParallelFor(m_JobSystem, count, task, taskContext);
         }
 
     private:
-        void Drain()
-        {
-            for (;;)
-            {
-                const uint32_t index = m_Next.fetch_add(1, std::memory_order_relaxed);
-                if (index >= m_Count)
-                    return;
-                m_Task(m_Context, index);
-            }
-        }
-
-        void Work()
-        {
-            uint64_t seen = 0;
-            for (;;)
-            {
-                // Spin a little: the next frame's call usually comes soon.
-                uint64_t generation = m_Generation.load(std::memory_order_acquire);
-                for (int spin = 0; generation == seen && spin < 4096; ++spin)
-                {
-                    std::this_thread::yield();
-                    generation = m_Generation.load(std::memory_order_acquire);
-                }
-                if (generation == seen)
-                {
-                    std::unique_lock<std::mutex> lock(m_Mutex);
-                    m_Wake.wait(lock, [&] { return m_Generation.load(std::memory_order_acquire) != seen; });
-                    generation = m_Generation.load(std::memory_order_acquire);
-                }
-                seen = generation;
-                {
-                    std::lock_guard<std::mutex> lock(m_Mutex);   // the job's fields, published under the lock
-                    if (m_Quit)
-                        return;
-                }
-                Drain();
-                m_Active.fetch_sub(1, std::memory_order_acq_rel);
-            }
-        }
-
-        std::vector<std::thread> m_Threads;
-        std::mutex m_Mutex;
-        std::condition_variable m_Wake;
-        std::atomic<uint64_t> m_Generation{ 0 };
-        std::atomic<uint32_t> m_Next{ 0 };
-        std::atomic<uint32_t> m_Active{ 0 };
-        TaskFunction m_Task = nullptr;
-        void* m_Context = nullptr;
-        uint32_t m_Count = 0;
-        bool m_Quit = false;
+        donut::engine::IJobSystem* m_JobSystem = nullptr;
+        uint32_t m_Workers = 0;
     };
 }
