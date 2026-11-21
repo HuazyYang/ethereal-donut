@@ -1763,7 +1763,13 @@ namespace donut::engine::ecs
                 world.ObserveSparseAdded(sparse.type->id, Entity(LoadU64(sparse.entities + size_t(i) * 8)));
 
         ++world.m_StructuralVersion;
-        return world.FlushObservers();
+        // The content is replaced: the load succeeded. What the observers and their cascade fail at afterwards is
+        // reported through validation, not returned (EcsWorld.h).
+        const nvrhi::FRESULT observers = world.FlushObservers();
+        if (NVRHI_FAILED(observers))
+            world.ReportValidation("LoadSnapshot", "the load succeeded; its observers failed with 0x%08x",
+                                   uint32_t(observers));
+        return nvrhi::FS_OK;
     }
 
     nvrhi::FRESULT WorldSnapshot::Load(WorldImpl& world, IStateReader* reader) noexcept

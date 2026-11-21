@@ -2409,13 +2409,15 @@ void test_unimplemented_seams()
     IQuery* query = nullptr;
     CHECK(world->CreateQuery(queryDesc, &query) == nvrhi::FE_INVALID_ARGS && !query);   // E1.2: no terms
     ICommandBuffer* buffer = nullptr;
-    CHECK(world->CreateCommandBuffer(&buffer) == nvrhi::FE_NOT_IMPLEMENT && !buffer);
-    CHECK(world->Playback(nullptr, 0) == nvrhi::FE_NOT_IMPLEMENT);
+    CHECK(world->CreateCommandBuffer(&buffer) == nvrhi::FS_OK && buffer);   // E1.3: test_ecs_commands
+    CHECK(buffer->GetCommandCount() == 0);
+    buffer->Release();
+    CHECK(world->Playback(nullptr, 0) == nvrhi::FS_OK);
     const ObserverDesc observerDesc{};
     ObserverId observer = ObserverId(0);
-    CHECK(world->AddObserver(observerDesc, nullptr, observer) == nvrhi::FE_NOT_IMPLEMENT);
+    CHECK(world->AddObserver(observerDesc, nullptr, observer) == nvrhi::FE_INVALID_ARGS);   // E1.4: no IObserver
     CHECK(observer == ObserverId::Invalid);
-    CHECK(world->RemoveObserver(ObserverId(0)) == nvrhi::FE_NOT_IMPLEMENT);
+    CHECK(world->RemoveObserver(ObserverId(0)) == nvrhi::FE_INVALID_ARGS);   // test_ecs_observers
     CHECK(world->SaveSnapshot(nullptr) == nvrhi::FE_INVALID_ARGS);   // E1.5: test_ecs_snapshot
     CHECK(world->LoadSnapshot(nullptr) == nvrhi::FE_INVALID_ARGS);
     CHECK(world->ComputeHash() != 0);

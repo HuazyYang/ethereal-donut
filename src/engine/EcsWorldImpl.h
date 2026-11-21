@@ -31,7 +31,7 @@
 //   Sparse terms read GetSparsePresence. GetStructuralVersion changes with every structural change.
 // - E1.3 playback: the *Internal batch operations take an explicit version and do no phase or observer checks; entity
 //   lists may come from the caller's buffers. AllocateEntityIds hands out reserved ids for placeholders.
-// - E1.4 observers: every structural change reports its rows through the Observe* functions (no-ops in E1.1) and the
+// - E1.4 observers: every structural change reports its rows through the Observe* functions (EcsObserver.cpp) and the
 //   IWorld entry points call FlushObservers before they return. m_ObserverDepth makes structural calls fail while an
 //   observer runs.
 // - E1.5 snapshots and hashes: ComponentType::fieldBytes are the bytes to hash; archetypes, chunks and rows, sparse
@@ -413,6 +413,17 @@ namespace donut::engine::ecs
 
     // -------------------------------------------------------------------------------------------------- the world
 
+    // The world's command-buffer state (EcsCommandBufferImpl.h, plan step E1.3): the placeholder counter, the
+    // placeholder tables, the playback's scratch. WorldImpl::Initialize creates it, ~WorldImpl destroys it.
+    class CommandPlayback;
+    CommandPlayback* CreateCommandPlayback() noexcept;   // null when out of memory
+    void DestroyCommandPlayback(CommandPlayback* playback) noexcept;
+
+    // The world's observers (EcsObserverImpl.h, plan step E1.4): registrations, the batch held for merging, the
+    // observers' command buffers. The first AddObserver makes it; ~WorldImpl destroys it before anything else.
+    class ObserverRegistry;
+    void DestroyObserverRegistry(ObserverRegistry* registry) noexcept;
+
     NVRHI_CLASS_CLSID(WorldImpl, "9dd22807-f2d4-43cc-a6f8-3ebf910603af")
     class WorldImpl final : public nvrhi::ObjectImpl<IWorld>
     {
@@ -457,7 +468,7 @@ namespace donut::engine::ecs
         nvrhi::FRESULT Playback(ICommandBuffer* const* buffers, uint32_t count) noexcept override;
         nvrhi::FRESULT AddObserver(const ObserverDesc& desc, IObserver* observer, ObserverId& outId) noexcept override;
         nvrhi::FRESULT RemoveObserver(ObserverId observer) noexcept override;
-        uint64_t GetVersion() noexcept override { return m_Version; }
+        uint64_t GetVersion() noexcept override { return GetStampVersion(); }
         uint64_t AdvanceVersion() noexcept override { return ++m_Version; }
         uint64_t GetStructuralVersion() noexcept override { return m_StructuralVersion; }
         bool IsInPhase() noexcept override { return m_InPhase; }
@@ -482,8 +493,13 @@ namespace donut::engine::ecs
         // The version a write stamps: `writeVersion`, or the world's version for c_WorldVersion.
         uint64_t ResolveWriteVersion(uint64_t writeVersion) const noexcept
         {
-            return writeVersion == c_WorldVersion ? m_Version : writeVersion;
+            return writeVersion == c_WorldVersion ? GetStampVersion() : writeVersion;
         }
+        // What immediate structural changes, playback and c_WorldVersion writes stamp: the world's version, or, while
+        // the scheduler runs an exclusive system inside a phase (its sync points included), that system's own version,
+        // so that the systems after it in the phase see its changes once, not again at their next run (E2.2).
+        uint64_t GetStampVersion() const noexcept { return m_StampVersion != 0 ? m_StampVersion : m_Version; }
+        void SetStampVersion(uint64_t version) noexcept { m_StampVersion = version; }   // 0: the world's version
 
         const ComponentType* GetType(ComponentId component) const noexcept
         {
@@ -503,6 +519,9 @@ namespace donut::engine::ecs
         // another pointer for that chunk. It happens only in structural changes; queries rebuild their chunk lists on
         // it.
         uint64_t GetPresenceMaskVersion() const noexcept { return m_PresenceMaskVersion; }
+        // Command buffers (E1.3): placeholders, resolutions, playback scratch and counters. Recording threads take
+        // placeholders from it.
+        CommandPlayback& GetCommandPlayback() const noexcept { return *m_CommandPlayback; }
 
         // Counters for tests and the inspector.
         struct Counters
@@ -532,11 +551,29 @@ namespace donut::engine::ecs
         {
             return m_ObserverDepth == 0 && (!m_InPhase || m_ExclusiveDepth > 0);
         }
+        // What IWorld::Playback and the registration of a new component type return when !CanChangeStructure():
+        // nothing was done, the call belongs at a sync point (EcsWorld.h). Distinct from what a played command returns.
+        static constexpr nvrhi::FRESULT c_WrongTimeResult = nvrhi::FE_OUT_OF_DATE;
+        // The Debug access checks of 11.3 (E2.2): with validation, GetComponentForWrite and ResizeBuffer inside a phase
+        // hand the component and the write version, which names the system run, to the check that the scheduler sets
+        // for the duration of the phase.
+        using WriteAccessCheck = void (*)(void* context, ComponentId component, uint64_t writeVersion,
+                                          const char* operation) noexcept;
+        void SetWriteAccessCheck(WriteAccessCheck check, void* context) noexcept
+        {
+            m_WriteAccessCheck = check;
+            m_WriteAccessContext = context;
+        }
+        void CheckWriteAccess(ComponentId component, uint64_t writeVersion, const char* operation) noexcept
+        {
+            if (m_Desc.validation && m_InPhase && m_WriteAccessCheck)
+                m_WriteAccessCheck(m_WriteAccessContext, component, writeVersion, operation);
+        }
 
         // ------------------------------------------------------------------------- observer seam (E1.4)
 
         // Every structural change reports its rows here, in the order it applies them, and only once it is certain
-        // to happen (no report precedes a failure). No-ops in E1.1 apart from the counters.
+        // to happen (no report precedes a failure).
         // - ObserveRowsAdded: the rows are complete in `archetype` (values in place, Sparse components of a creation
         //   included). `fromArchetype` is c_NoArchetype for new entities, else the archetype the rows came from: OnAdd
         //   for the components only `archetype` has, OnMatch for queries only it matches.
@@ -545,25 +582,53 @@ namespace donut::engine::ecs
         //   target's chunk is already secured, so the target may end with an empty chunk at that moment.
         // - ObserveSparseAdded / ObserveSparseRemoving: a Sparse component after it was added, before it is destroyed.
         // - ObserveSet: a value written by a set (the OnSet of ICommandBuffer::SetComponents).
+        // - ObserveValueAccess: at the start of a batch operation that writes values before (or without) a report, or
+        //   copies existing values (Instantiate): delivers the batch the observers hold for merging, so that it reads
+        //   its rows as their reports left them and what its Write observers fill in is there before it is copied.
         // The rows that a swap-remove moves to fill a hole are not reported: their component sets do not change.
+        // E1.4 (EcsObserver.cpp): while no observer is registered, each is a test of m_ObserverCount.
         void ObserveRowsAdded(uint32_t archetype, uint32_t chunk, uint32_t firstRow, uint32_t count,
                               uint32_t fromArchetype) noexcept
         {
-            (void)archetype; (void)chunk; (void)firstRow; (void)count; (void)fromArchetype;
             ++m_Counters.rowsAddedReports;
+            if (m_ObserverCount != 0)
+                ReportRowsAdded(archetype, chunk, firstRow, count, fromArchetype);
         }
         void ObserveRowsRemoving(uint32_t archetype, uint32_t chunk, uint32_t firstRow, uint32_t count,
                                  uint32_t toArchetype) noexcept
         {
-            (void)archetype; (void)chunk; (void)firstRow; (void)count; (void)toArchetype;
             ++m_Counters.rowsRemovingReports;
+            if (m_ObserverCount != 0)
+                ReportRowsRemoving(archetype, chunk, firstRow, count, toArchetype);
         }
-        void ObserveSparseAdded(ComponentId component, Entity entity) noexcept { (void)component; (void)entity; }
-        void ObserveSparseRemoving(ComponentId component, Entity entity) noexcept { (void)component; (void)entity; }
-        void ObserveSet(ComponentId component, Entity entity) noexcept { (void)component; (void)entity; }
+        void ObserveSparseAdded(ComponentId component, Entity entity) noexcept
+        {
+            if (m_ObserverCount != 0)
+                ReportSparse(component, entity, true);
+        }
+        void ObserveSparseRemoving(ComponentId component, Entity entity) noexcept
+        {
+            if (m_ObserverCount != 0)
+                ReportSparse(component, entity, false);
+        }
+        void ObserveSet(ComponentId component, Entity entity) noexcept
+        {
+            if (m_ObserverCount != 0)
+                ReportSet(component, entity);
+        }
+        void ObserveValueAccess() noexcept
+        {
+            if (m_ObserverCount != 0 && m_ObserverDepth == 0)
+                DeliverHeldBatch();
+        }
         // Called by every IWorld entry point that changed structure, before it returns: delivers the observers'
         // batches and plays back their command buffers (the cascade of EcsWorld.h). Returns the first failure.
-        nvrhi::FRESULT FlushObservers() noexcept { return nvrhi::FS_OK; }
+        nvrhi::FRESULT FlushObservers() noexcept
+        {
+            return m_ObserverCount != 0 ? RunObserverCascade() : nvrhi::FS_OK;
+        }
+        // The observers' state; null before the first AddObserver.
+        ObserverRegistry* GetObserverRegistry() const noexcept { return m_ObserverRegistry; }
 
         // ------------------------------------------------------------------------- batch operations (E1.3)
 
@@ -623,6 +688,18 @@ namespace donut::engine::ecs
     private:
         // SaveSnapshot, LoadSnapshot and ComputeHash (EcsSnapshot.cpp) read and rebuild the whole storage.
         friend class WorldSnapshot;
+        // Observers (EcsObserver.cpp) run with m_ObserverDepth raised and count batches and played commands.
+        friend class ObserverRegistry;
+
+        // The observer seams' work while observers are registered (EcsObserver.cpp).
+        void ReportRowsAdded(uint32_t archetype, uint32_t chunk, uint32_t firstRow, uint32_t count,
+                             uint32_t fromArchetype) noexcept;
+        void ReportRowsRemoving(uint32_t archetype, uint32_t chunk, uint32_t firstRow, uint32_t count,
+                                uint32_t toArchetype) noexcept;
+        void ReportSparse(ComponentId component, Entity entity, bool added) noexcept;
+        void ReportSet(ComponentId component, Entity entity) noexcept;
+        void DeliverHeldBatch() noexcept;
+        nvrhi::FRESULT RunObserverCascade() noexcept;
 
         struct RowRun
         {
@@ -739,16 +816,22 @@ namespace donut::engine::ecs
 
         // Versions and state.
         uint64_t m_Version = 1;
+        uint64_t m_StampVersion = 0;             // E2.2: SetStampVersion
         uint64_t m_StructuralVersion = 1;
         uint64_t m_PresenceMaskVersion = 0;      // GetPresenceMaskVersion
         bool m_InPhase = false;
         uint32_t m_ExclusiveDepth = 0;
+        WriteAccessCheck m_WriteAccessCheck = nullptr;   // E2.2: SetWriteAccessCheck
+        void* m_WriteAccessContext = nullptr;
         uint32_t m_ObserverDepth = 0;            // E1.4: observers running
         std::atomic<uint64_t> m_ValidationErrors{ 0 };  // reports may come from parallel systems
         std::atomic<uint64_t> m_BufferHeapBytes{ 0 };   // ResizeBuffer may run in parallel
         uint64_t m_CommandsPlayedBack = 0;       // E1.3
         uint64_t m_ObserverBatches = 0;          // E1.4
         Counters m_Counters;
+        CommandPlayback* m_CommandPlayback = nullptr;   // E1.3: GetCommandPlayback
+        ObserverRegistry* m_ObserverRegistry = nullptr; // E1.4: made by the first AddObserver
+        uint32_t m_ObserverCount = 0;            // E1.4: registered observers; the seams do nothing while 0
 
         // Scratch storage, kept between calls so that steady-state operations allocate nothing.
         struct SortedTerm

@@ -46,6 +46,9 @@ target_compile_definitions(test_scene_graph_trace PRIVATE
 # The ECS world-hash corpus (ecs_world_hashes.txt), the same way.
 target_compile_definitions(test_ecs_snapshot PRIVATE
     DONUT_TEST_GOLDEN_DIR="${CMAKE_CURRENT_LIST_DIR}/src/engine/golden")
+# The scheduler's per-frame determinism hashes (ecs_scheduler_frames.txt), the same way.
+target_compile_definitions(test_ecs_determinism PRIVATE
+    DONUT_TEST_GOLDEN_DIR="${CMAKE_CURRENT_LIST_DIR}/src/engine/golden")
 
 # The ECS tests reach the world's internals (allocation counters, chunk layout, entity table) through the private
 # headers in src/engine (EcsWorldImpl.h and the ones beside it).

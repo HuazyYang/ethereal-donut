@@ -170,11 +170,19 @@ namespace donut::engine::ecs
         // Archetype 0 holds the entities without components.
         if (FindOrCreateArchetype(nullptr, 0, nullptr) != 0)
             return nvrhi::FE_OUT_OF_MEMORY;
+        // Before any buffer exists: recording threads take placeholders from it (EcsCommandBuffer.cpp).
+        m_CommandPlayback = CreateCommandPlayback();
+        if (!m_CommandPlayback)
+            return nvrhi::FE_OUT_OF_MEMORY;
         return nvrhi::FS_OK;
     }
 
     WorldImpl::~WorldImpl()
     {
+        // First, while the component types exist: the observers' buffers destroy unplayed values with their hooks.
+        DestroyObserverRegistry(m_ObserverRegistry);
+        m_ObserverRegistry = nullptr;
+        m_ObserverCount = 0;
         for (Archetype* archetype : m_Archetypes)
         {
             for (uint32_t chunk = 0; chunk < archetype->GetChunkCount(); ++chunk)
@@ -223,6 +231,7 @@ namespace donut::engine::ecs
         m_SmallPages.Release();
         m_LargePages.Release();
         HeapFree(m_ScratchBlock);
+        DestroyCommandPlayback(m_CommandPlayback);
     }
 
     // ------------------------------------------------------------------------------------------- validation
@@ -417,6 +426,13 @@ namespace donut::engine::ecs
             outId = ComponentId(existing);
             return nvrhi::FS_OK;
         }
+        // A new type grows the registry, which recording workers read during a phase (EcsCommandBuffer.cpp).
+        if (!CanChangeStructure())
+        {
+            ReportValidation("RegisterComponent", "%s: a new type is registered outside phases and observers, or in an "
+                             "exclusive system", NameOf(desc));
+            return c_WrongTimeResult;
+        }
         const nvrhi::FRESULT result = ValidateTypeDesc(desc);
         if (NVRHI_FAILED(result))
             return result;
@@ -443,6 +459,12 @@ namespace donut::engine::ecs
             }
             outId = ComponentId(existing);   // the value stays as it is
             return nvrhi::FS_OK;
+        }
+        if (!CanChangeStructure())
+        {
+            ReportValidation("RegisterResource", "%s: a new type is registered outside phases and observers, or in an "
+                             "exclusive system", NameOf(desc));
+            return c_WrongTimeResult;
         }
         const nvrhi::FRESULT result = ValidateTypeDesc(desc);
         if (NVRHI_FAILED(result))
@@ -653,6 +675,7 @@ namespace donut::engine::ecs
         if (writeVersion > m_Version)
             ReportValidation(operation, "version %llu has not been handed out yet (the world is at %llu)",
                              (unsigned long long)writeVersion, (unsigned long long)m_Version);
+        CheckWriteAccess(component, writeVersion, operation);
         uint32_t column = c_NoColumn;
         void* pointer = ComponentPointer(entity, *record, *type, &column);
         if (pointer && column != c_NoColumn)
@@ -667,13 +690,14 @@ namespace donut::engine::ecs
 
     nvrhi::FRESULT WorldImpl::SetEnabled(Entity entity, ComponentId component, bool enabled) noexcept
     {
-        return SetEnabledInternal(&entity, 1, component, enabled, m_Version);
+        return SetEnabledInternal(&entity, 1, component, enabled, GetStampVersion());
     }
 
     nvrhi::FRESULT WorldImpl::SetEnabledInternal(const Entity* entities, uint32_t count, ComponentId component,
                                                  bool enabled, uint64_t version) noexcept
     {
         const char* operation = "SetEnabled";
+        ObserveValueAccess();
         const ComponentType* type = GetType(component);
         if (!type || !type->enableable)
         {
@@ -731,6 +755,7 @@ namespace donut::engine::ecs
     nvrhi::FRESULT WorldImpl::ResizeBuffer(Entity entity, ComponentId component, uint32_t count,
                                            uint64_t writeVersion) noexcept
     {
+        CheckWriteAccess(component, writeVersion, "ResizeBuffer");
         return ResizeBufferInternal(entity, component, count, ResolveWriteVersion(writeVersion));
     }
 
@@ -771,6 +796,7 @@ namespace donut::engine::ecs
     {
         // `elements` must not point into the buffer itself: growing it may move the storage.
         const char* operation = "AppendToBuffer";
+        ObserveValueAccess();
         if (count == 0)
             return nvrhi::FS_OK;
         if (!elements)
@@ -1161,6 +1187,7 @@ namespace donut::engine::ecs
                                                     uint64_t version) noexcept
     {
         const char* operation = "AddComponent";
+        ObserveValueAccess();   // a component the entity has is overwritten without a report
         const ComponentType* type = GetType(component);
         if (!type || type->kind == StorageKind::Resource || (count != 0 && !entities))
         {
@@ -1342,6 +1369,7 @@ namespace donut::engine::ecs
                                                     uint64_t version) noexcept
     {
         const char* operation = "SetComponents";
+        ObserveValueAccess();   // each value is written before its report
         const ComponentType* type = GetType(component);
         if (!type || type->kind == StorageKind::Resource || type->kind == StorageKind::Buffer ||
             type->kind == StorageKind::Chunk || (count != 0 && !entities) || (!values && type->desc.size != 0))
@@ -1421,6 +1449,7 @@ namespace donut::engine::ecs
                                                   uint64_t version) noexcept
     {
         const char* operation = "Instantiate";
+        ObserveValueAccess();   // the prefab's values are copied: what observers write into them comes first
         const EntityRecord* found = FindAlive(prefab);
         if (!found)
         {
@@ -1577,7 +1606,7 @@ namespace donut::engine::ecs
             DiscardCreateValues(desc, 0);   // ValueTransfer::Relocate: the caller gave the values up
             return nvrhi::FE_INVALID_ARGS;
         }
-        nvrhi::FRESULT result = CreateEntitiesInternal(desc, outEntities, m_Version);
+        nvrhi::FRESULT result = CreateEntitiesInternal(desc, outEntities, GetStampVersion());
         KeepFirstFailure(result, FlushObservers());
         return result;
     }
@@ -1593,7 +1622,7 @@ namespace donut::engine::ecs
             return nvrhi::FE_INVALID_ARGS;
         // The list may be a chunk's Entity column, which the removals rewrite.
         m_ScratchEntities.assign(entities, entities + count);
-        nvrhi::FRESULT result = DestroyEntitiesInternal(m_ScratchEntities.data(), count, m_Version);
+        nvrhi::FRESULT result = DestroyEntitiesInternal(m_ScratchEntities.data(), count, GetStampVersion());
         KeepFirstFailure(result, FlushObservers());
         return result;
     }
@@ -1605,7 +1634,8 @@ namespace donut::engine::ecs
             ReportValidation("AddComponent", "structural changes are deferred inside phases and observers (3.3.3)");
             return nvrhi::FE_INVALID_ARGS;
         }
-        nvrhi::FRESULT result = AddComponentsInternal(&entity, 1, component, value, ValueTransfer::Copy, m_Version);
+        nvrhi::FRESULT result = AddComponentsInternal(&entity, 1, component, value, ValueTransfer::Copy,
+                                                      GetStampVersion());
         KeepFirstFailure(result, FlushObservers());
         return result;
     }
@@ -1617,7 +1647,7 @@ namespace donut::engine::ecs
             ReportValidation("RemoveComponent", "structural changes are deferred inside phases and observers (3.3.3)");
             return nvrhi::FE_INVALID_ARGS;
         }
-        nvrhi::FRESULT result = RemoveComponentsInternal(&entity, 1, component, m_Version);
+        nvrhi::FRESULT result = RemoveComponentsInternal(&entity, 1, component, GetStampVersion());
         KeepFirstFailure(result, FlushObservers());
         return result;
     }
@@ -1629,7 +1659,7 @@ namespace donut::engine::ecs
             ReportValidation("Instantiate", "structural changes are deferred inside phases and observers (3.3.3)");
             return nvrhi::FE_INVALID_ARGS;
         }
-        nvrhi::FRESULT result = InstantiateInternal(prefab, count, outEntities, m_Version);
+        nvrhi::FRESULT result = InstantiateInternal(prefab, count, outEntities, GetStampVersion());
         KeepFirstFailure(result, FlushObservers());
         return result;
     }
@@ -1647,7 +1677,7 @@ namespace donut::engine::ecs
             return nvrhi::FE_INVALID_ARGS;
         if (count == 0)
             return nvrhi::FS_OK;
-        const uint64_t version = m_Version;
+        const uint64_t version = GetStampVersion();
         // The list is read after the copies' ids are written, and the output may be the list itself.
         m_ScratchEntities.assign(entities, entities + count);
         const Entity* list = m_ScratchEntities.data();
@@ -1891,44 +1921,14 @@ namespace donut::engine::ecs
 
     // ------------------------------------------------------------------------------- later steps (E1.2-E1.5)
 
-    Entity WorldImpl::ResolvePlaceholder(Entity placeholder) noexcept
-    {
-        (void)placeholder;
-        return Entity::Null;   // E1.3
-    }
-
     nvrhi::FRESULT WorldImpl::CreateQuery(const QueryDesc& desc, IQuery** ppQuery) noexcept
     {
         return CreateQueryObject(*this, desc, QueryWorldReference::Held, ppQuery);   // EcsQuery.cpp
     }
 
-    nvrhi::FRESULT WorldImpl::CreateCommandBuffer(ICommandBuffer** ppBuffer) noexcept
-    {
-        if (ppBuffer)
-            *ppBuffer = nullptr;
-        return nvrhi::FE_NOT_IMPLEMENT;   // E1.3
-    }
+    // CreateCommandBuffer, Playback and ResolvePlaceholder are in EcsCommandBuffer.cpp (E1.3).
 
-    nvrhi::FRESULT WorldImpl::Playback(ICommandBuffer* const* buffers, uint32_t count) noexcept
-    {
-        (void)buffers;
-        (void)count;
-        return nvrhi::FE_NOT_IMPLEMENT;   // E1.3
-    }
-
-    nvrhi::FRESULT WorldImpl::AddObserver(const ObserverDesc& desc, IObserver* observer, ObserverId& outId) noexcept
-    {
-        (void)desc;
-        (void)observer;
-        outId = ObserverId::Invalid;
-        return nvrhi::FE_NOT_IMPLEMENT;   // E1.4
-    }
-
-    nvrhi::FRESULT WorldImpl::RemoveObserver(ObserverId observer) noexcept
-    {
-        (void)observer;
-        return nvrhi::FE_NOT_IMPLEMENT;   // E1.4
-    }
+    // AddObserver and RemoveObserver are in EcsObserver.cpp (E1.4).
 
     // SaveSnapshot, LoadSnapshot and ComputeHash are in EcsSnapshot.cpp (E1.5).
 

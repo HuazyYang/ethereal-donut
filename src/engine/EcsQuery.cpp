@@ -23,6 +23,7 @@
 // Cached queries (aggregate docs/ecs-design.md 4.5, 6.1, 11.3; plan step E1.2). See EcsQueryImpl.h.
 
 #include "EcsQueryImpl.h"
+#include "EcsSchedulerImpl.h"
 
 #include <thread>
 
@@ -449,6 +450,32 @@ namespace donut::engine::ecs
                                    "passes its own version (MakeChunkRequest)", m_DebugName.c_str());
         if (!views && capacity != 0)
             world.ReportValidation(operation, "query '%s': views is null", m_DebugName.c_str());
+        if (request.system)
+            ValidateSystemAccess(request.system);
+    }
+
+    void QueryImpl::ValidateSystemAccess(ISystemContext* system) noexcept
+    {
+        // Contexts of this module's scheduler only; an exclusive system runs alone and may access anything.
+        SystemAccessInfo info{};
+        if (!GetSystemAccessInfo(system, info) || info.exclusive || info.world != static_cast<IWorld*>(m_World))
+            return;
+        // Once per query and system run (the run's version names it), not per batch of chunks.
+        if (m_AccessCheckedVersion.exchange(info.version, std::memory_order_relaxed) == info.version)
+            return;
+        for (const Term& term : m_Terms)
+        {
+            if (!term.data)
+                continue;   // filters (With, Without) read no column
+            const Access declared = FindDeclaredAccess(info, term.component);
+            if (declared == Access::Write || (declared == Access::Read && term.access == Access::Read))
+                continue;
+            m_World->ReportValidation("IQuery::GetChunks", "system '%s', query '%s': %s '%s', but the system declared "
+                                      "%s (11.3)", info.name, m_DebugName.c_str(),
+                                      term.access == Access::Write ? "writes" : "reads",
+                                      NameOf(*m_World->GetType(term.component)),
+                                      declared == Access::Read ? "Read access only" : "no access to it");
+        }
     }
 
     uint32_t QueryImpl::GetChunks(uint32_t first, const ChunkRequest& request, uint32_t capacity,

@@ -66,22 +66,34 @@ namespace donut::engine
         ComponentId component;          // the observed component; Invalid for OnMatch/OnUnmatch
         ObserverEvent event;
         Access access;                  // to the observed component's column: Read, or Write for observers that fill
-                                        // in derived values (a GPU slot, an engine index)
+                                        // in derived values (a GPU slot, an engine index); Filter (no column) only
+                                        // for a tag. Ignored for OnMatch/OnUnmatch
         uint8_t reserved[6];
     };
     static_assert(sizeof(void*) != 8 || sizeof(ObserverDesc) == 32, "ObserverDesc layout");
 
     // Delivery: single-threaded, in playback order (or at once for an immediate structural change), one batch per run of
-    // rows in a chunk.
+    // rows in a chunk. Removals (OnRemove, OnUnmatch) are delivered before each row changes, so a destruction or a move
+    // gives one batch per entity; a LoadSnapshot removes whole chunks.
+    //
+    // AddObserver fails with FE_INVALID_ARGS (and a validation report) for: filter terms on Sparse components, Changed,
+    // Added, Enabled and Disabled terms (filters match per archetype), a filter that excludes the observed component,
+    // OnSet on Buffer and Chunk components, Write on a Shared component, Filter access on a component with data,
+    // OnMatch/OnUnmatch with a component or without terms. AddObserver and RemoveObserver fail with FE_INVALID_ARGS
+    // inside a phase (unless an exclusive system runs) and while an observer runs.
     //
     // Re-entrancy: inside OnEntities an observer may read the world (IsAlive, HasComponent, GetComponent, GetResource,
     // queries), write the batch's Write columns and, with GetComponentForWrite, values of other entities, and record
-    // into `commands`. Immediate structural changes, Playback, snapshots, and adding or removing observers fail with
-    // FE_INVALID_ARGS while an observer runs.
+    // into `commands`. Immediate structural changes, snapshots, and adding or removing observers fail with
+    // FE_INVALID_ARGS while an observer runs; Playback and registering a new component type fail with FE_OUT_OF_DATE.
     //
-    // `commands` is played back after every observer of the triggering change has run: before an immediate structural
-    // call returns, or before the sync point ends. Its changes may trigger further observers; the cascade repeats in
-    // order until no commands remain, and fails with FE_GENERIC_ERROR after 64 rounds.
+    // `commands` is valid only during the callback. It is played back after every observer of the triggering change has
+    // run: before an immediate structural call returns, or before the sync point ends. Its changes may trigger further
+    // observers; the cascade repeats in order until no commands remain, and fails with FE_GENERIC_ERROR after 64
+    // rounds.
+    // After a LoadSnapshot, observer and cascade failures are reported through validation, not returned: the load has
+    // already replaced the content. Commands that OnRemove observers record while a load clears the world are played
+    // back after the load, against the loaded entities.
     NVRHI_IID(IObserver, "6603d0ec-8699-4cb9-a992-1e64923ae188")
     struct IObserver : nvrhi::IObject
     {
@@ -157,7 +169,9 @@ namespace donut::engine
         NVRHI_DECLARE_UUID_TRAITS(IWorld)
 
         // Component types (4.2). Registering a GUID again returns its id when the layout matches, FE_INVALID_ARGS when
-        // it does not. See ComponentTypeDesc for what must outlive the world.
+        // it does not. A new type (here and in RegisterResource) is refused with FE_OUT_OF_DATE inside a phase, unless
+        // an exclusive system runs, and while an observer runs: systems may be reading the registry. See
+        // ComponentTypeDesc for what must outlive the world.
         virtual nvrhi::FRESULT RegisterComponent(const ComponentTypeDesc& desc, ComponentId& outId) noexcept = 0;
         virtual ComponentId FindComponent(const nvrhi::GUID& uuid) noexcept = 0;
         virtual const ComponentTypeDesc* GetComponentTypeDesc(ComponentId component) noexcept = 0;   // not owned
@@ -211,7 +225,13 @@ namespace donut::engine
         virtual nvrhi::FRESULT CreateQuery(const QueryDesc& desc, IQuery** ppQuery) noexcept = 0;
         virtual nvrhi::FRESULT CreateCommandBuffer(ICommandBuffer** ppBuffer) noexcept = 0;
         // Plays back the buffers of one system: merged by sort key, stable within a buffer (EcsCommandBuffer.h), then
-        // the observers' commands. Every buffer is reset. Returns the first failure; the other commands still apply.
+        // the observers' commands. Every buffer played back is reset. Returns the failure of the earliest failing
+        // command in merged order, as if the commands were applied one by one; the other commands still apply.
+        // - An entry that cannot be played back (null, a buffer of another world, listed again, or being recorded by
+        //   another thread) is skipped and left as it is, and the call returns FE_INVALID_ARGS; the other buffers still
+        //   apply and are reset. A buffer listed twice is played back once.
+        // - Inside a phase, unless an exclusive system runs, and while an observer runs, the call returns
+        //   FE_OUT_OF_DATE and does nothing: no command applies, no buffer is reset.
         virtual nvrhi::FRESULT Playback(_In_reads_(count) ICommandBuffer* const* buffers, uint32_t count) noexcept = 0;
         virtual nvrhi::FRESULT AddObserver(const ObserverDesc& desc, IObserver* observer,
                                            ObserverId& outId) noexcept = 0;
@@ -229,6 +249,8 @@ namespace donut::engine
         // NoSerialize); loading replaces the world's content and keeps entity ids, so references stay valid. Component
         // ids are matched by GUID. ComputeHash covers entities, archetypes and the field bytes of serialisable columns.
         virtual nvrhi::FRESULT SaveSnapshot(IStateWriter* writer) noexcept = 0;
+        // Observers see a load as the removal of every entity, then the addition of the snapshot's. Once the content is
+        // replaced the result is FS_OK: failures of observers and of their cascade are reported through validation.
         virtual nvrhi::FRESULT LoadSnapshot(IStateReader* reader) noexcept = 0;
         virtual uint64_t ComputeHash() noexcept = 0;
         virtual WorldStats& GetStats(WorldStats& retVal) noexcept = 0;
@@ -240,7 +262,7 @@ namespace donut::engine
 
     // ------------------------------------------------- typed helpers (header-only, outside the ABI surface)
 
-    // Registers T if needed; Invalid on a layout clash.
+    // Registers T if needed; Invalid on a layout clash, or for a new type where IWorld::RegisterComponent refuses one.
     template <typename T>
     ComponentId RegisterComponent(IWorld* world) noexcept
     {

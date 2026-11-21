@@ -93,6 +93,9 @@ namespace donut::engine::ecs
         // The matched archetypes in creation order, as of the last rebuild.
         uint32_t GetMatchedArchetypeCount() const noexcept { return uint32_t(m_Matched.size()); }
         uint32_t GetMatchedArchetype(uint32_t index) const noexcept { return m_Matched[index].archetype; }
+        // Whether the archetype has what the terms require and lacks what they exclude (Sparse terms aside): E1.4's
+        // observer filters test the archetypes of each report with it, without the chunk list.
+        bool Matches(const Archetype& archetype) const noexcept;
 
     private:
         struct Term
@@ -136,7 +139,6 @@ namespace donut::engine::ecs
             uint8_t reserved[2];
         };
 
-        bool Matches(const Archetype& archetype) const noexcept;
         void AddMatched(const Archetype& archetype) noexcept;
         void AddSlot(uint32_t first, uint32_t slot) noexcept;   // appends to m_Slots unless [first, end) has it
         // Rebuilds the chunk list if the world's structure changed since the last rebuild; thread-safe.
@@ -145,6 +147,8 @@ namespace donut::engine::ecs
         // Whether some row of chunk `index` passes every row filter: an AND of mask words, rows / 64 of them.
         bool AnyRowPasses(size_t index, uint32_t rows) const noexcept;
         void ValidateRequest(const ChunkRequest& request, uint32_t capacity, const ChunkView* views) noexcept;
+        // Design 11.3: every data term needs the running system's declared access (E2.2's scheduler contexts).
+        void ValidateSystemAccess(ISystemContext* system) noexcept;
 
         nvrhi::AutoPtr<IWorld> m_WorldReference;   // null for QueryWorldReference::NotHeld
         WorldImpl* m_World;
@@ -178,6 +182,7 @@ namespace donut::engine::ecs
         std::atomic<uint64_t> m_BuiltStructuralVersion{ 0 };
         std::atomic<uint64_t> m_BuiltPresenceVersion{ ~0ull };
         std::atomic<bool> m_RebuildLock{ false };
+        std::atomic<uint64_t> m_AccessCheckedVersion{ 0 };   // the system run whose accesses were checked last
         Counters m_Counters;
     };
 }
