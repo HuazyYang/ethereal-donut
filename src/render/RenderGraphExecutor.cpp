@@ -101,7 +101,7 @@ namespace donut::render::rdg
         std::vector<nvrhi::FramebufferInfoEx> framebufferInfos;
         std::vector<uint64_t> segmentValue;          // this frame's fence value of each segment
         std::vector<uint64_t> previousSegmentValue;
-        std::vector<uint32_t> segmentOrdinal;        // per segment: its index among its queue's segments
+        std::vector<uint32_t> segmentOrdinal;        // per segment: its index among its stream's segments
 
         // Recording (10.1), sized once per plan instance: each segment's list, context and result, each pass's timer
         // slot, and the tasks of a parallel recording (their segments, in plan order).
@@ -727,7 +727,7 @@ namespace donut::render::rdg
         for (size_t i = 0; i < runtime.retired.size();)
         {
             bool done = true;
-            for (uint32_t q = 0; q < 3 && done; ++q)
+            for (uint32_t q = 0; q < c_MaxStreams && done; ++q)
             {
                 const uint64_t value = runtime.retired[i].values[q];
                 done = !value || !runtime.fences[q] || runtime.fences[q]->getCompletedValue() >= value;
@@ -889,9 +889,9 @@ namespace donut::render::rdg
         instance.segmentValue.assign(plan.m_Segments.size(), 0);
         instance.previousSegmentValue.assign(plan.m_Segments.size(), 0);
         instance.segmentOrdinal.resize(plan.m_Segments.size());
-        uint32_t perQueue[3] = { 0, 0, 0 };
+        uint32_t perStream[c_MaxStreams] = {};
         for (size_t i = 0; i < plan.m_Segments.size(); ++i)
-            instance.segmentOrdinal[i] = perQueue[uint32_t(plan.m_Segments[i].queue)]++;
+            instance.segmentOrdinal[i] = perStream[StreamOf(plan.m_Segments[i].queue, plan.m_Segments[i].lane)]++;
     }
 
     static void PatchSlots(const std::vector<PatchSlot>& slots, PlanInstance& instance, const RegistryRuntime& runtime)
@@ -1397,18 +1397,34 @@ namespace donut::render::rdg
         return result;
     }
 
+    // A list of a stream. On a device with a queue pool (nvrhi ADR 0016) it is pinned to its lane's queue, so that
+    // open() does not pick another queue of the type; elsewhere the type's one queue takes it.
+    static nvrhi::FRESULT CreateStreamList(nvrhi::IDevice* device, CommandQueue queue, uint32_t lane, nvrhi::ICommandList** out)
+    {
+        const bool immediate = device->getGraphicsAPI() == nvrhi::GraphicsAPI::D3D11;
+        nvrhi::CommandListParameters params = nvrhi::CommandListParameters().setQueueType(queue).setEnableImmediateExecution(immediate);
+        nvrhi::AutoPtr<nvrhi::ICommandQueue> pinned;
+        if (device->getCommandQueueCount(queue) > 1)
+        {
+            const nvrhi::FRESULT result = device->getCommandQueue(queue, lane, pinned.ReleaseAndGetAddressOf());
+            if (result != nvrhi::FS_OK)
+                return result;
+            params.setCommandQueue(pinned.Get());
+        }
+        return device->createCommandList(params, out);
+    }
+
     static nvrhi::ICommandList* SegmentList(ExecutorFrame& frame, uint32_t segmentIndex)
     {
         RegistryRuntime& runtime = frame.runtime;
-        const CommandQueue queue = frame.plan.m_Segments[segmentIndex].queue;
-        std::vector<nvrhi::AutoPtr<nvrhi::ICommandList>>& lists = runtime.commandLists[uint32_t(queue)];
+        const PlanSegment& segment = frame.plan.m_Segments[segmentIndex];
+        const CommandQueue queue = segment.queue;
+        std::vector<nvrhi::AutoPtr<nvrhi::ICommandList>>& lists = runtime.commandLists[StreamOf(queue, segment.lane)];
         const uint32_t ordinal = frame.instance.segmentOrdinal[segmentIndex];
         while (lists.size() <= ordinal)
         {
             nvrhi::AutoPtr<nvrhi::ICommandList> list;
-            const bool immediate = frame.device->getGraphicsAPI() == nvrhi::GraphicsAPI::D3D11;
-            if (frame.device->createCommandList(nvrhi::CommandListParameters().setQueueType(queue).setEnableImmediateExecution(immediate),
-                                                list.ReleaseAndGetAddressOf()) != nvrhi::FS_OK)
+            if (CreateStreamList(frame.device, queue, segment.lane, list.ReleaseAndGetAddressOf()) != nvrhi::FS_OK)
                 return nullptr;
             ++runtime.objectsCreated;
             lists.push_back(list);
@@ -1667,7 +1683,8 @@ namespace donut::render::rdg
                 static const char* const c_Names[3] = { "render graph: graphics", "render graph: compute", "render graph: copy" };
                 for (uint32_t q = 0; q < 3 && runtime.fencesSupported; ++q)
                 {
-                    if (device->createFence(nvrhi::FenceDesc().setDebugName(c_Names[q]), runtime.fences[q].ReleaseAndGetAddressOf()) != nvrhi::FS_OK)
+                    nvrhi::AutoPtr<nvrhi::IFence>& fence = runtime.fences[StreamOf(CommandQueue(q), 0)];
+                    if (device->createFence(nvrhi::FenceDesc().setDebugName(c_Names[q]), fence.ReleaseAndGetAddressOf()) != nvrhi::FS_OK)
                         runtime.fencesSupported = false;
                     else
                         ++runtime.objectsCreated;
@@ -1691,9 +1708,8 @@ namespace donut::render::rdg
             }
             if (!runtime.prologueList)
             {
-                const bool immediate = device->getGraphicsAPI() == nvrhi::GraphicsAPI::D3D11;
-                if (device->createCommandList(nvrhi::CommandListParameters().setEnableImmediateExecution(immediate),
-                                              runtime.prologueList.ReleaseAndGetAddressOf()) != nvrhi::FS_OK)
+                // Graphics lane 0, the stream whose fence it signals.
+                if (CreateStreamList(device, CommandQueue::Graphics, 0, runtime.prologueList.ReleaseAndGetAddressOf()) != nvrhi::FS_OK)
                     return nvrhi::FE_OUT_OF_MEMORY;
                 ++runtime.objectsCreated;
             }
@@ -1704,6 +1720,24 @@ namespace donut::render::rdg
                 return nvrhi::FE_OUT_OF_MEMORY;
             if (!plan.m_Instance)
             {
+                // Queue lanes (nvrhi ADR 0016): every lane is a queue of the device's pool, with a fence of its own.
+                for (const PlanSegment& segment : plan.m_Segments)
+                {
+                    if (segment.lane == 0)
+                        continue;
+                    if (segment.lane >= device->getCommandQueueCount(segment.queue))
+                        return nvrhi::FE_INVALID_ARGS;   // a profile with more lanes than the device has queues
+                    const uint32_t stream = StreamOf(segment.queue, segment.lane);
+                    if (runtime.fencesSupported && !runtime.fences[stream])
+                    {
+                        const std::string name = std::string("render graph: ") + QueueName(segment.queue) + " lane " +
+                            std::to_string(segment.lane);
+                        if (device->createFence(nvrhi::FenceDesc().setDebugName(name.c_str()),
+                                                runtime.fences[stream].ReleaseAndGetAddressOf()) != nvrhi::FS_OK)
+                            return nvrhi::FE_OUT_OF_MEMORY;
+                        ++runtime.objectsCreated;
+                    }
+                }
                 plan.m_Instance = std::make_unique<PlanInstance>();
                 plan.m_Instance->structure = structure;
                 LowerPlan(plan, *plan.m_Instance);
@@ -1841,24 +1875,25 @@ namespace donut::render::rdg
             const bool fences = runtime.fencesSupported;
             const bool prologueNeeded = frame.prologueOpen;
             uint64_t prologueValue = 0;
+            constexpr uint32_t c_PrologueStream = 0;   // StreamOf(Graphics, 0)
             if (prologueNeeded)
             {
-                nvrhi::FenceValue waits[3];
+                nvrhi::FenceValue waits[c_MaxStreams];
                 uint32_t waitCount = 0;
                 if (fences && switched && !runtime.patches.empty())
                 {
-                    // The patch follows the previous frame on every queue.
-                    for (uint32_t q = 1; q < 3; ++q)
+                    // The patch follows the previous frame on every stream.
+                    for (uint32_t q = 0; q < c_MaxStreams; ++q)
                     {
-                        if (runtime.lastFrameValues[q])
+                        if (q != c_PrologueStream && runtime.lastFrameValues[q])
                             waits[waitCount++] = nvrhi::FenceValue{ runtime.fences[q], runtime.lastFrameValues[q] };
                     }
                 }
                 nvrhi::ICommandList* const lists[] = { prologue };
                 if (fences)
                 {
-                    prologueValue = ++runtime.fenceValues[0];
-                    const nvrhi::FenceValue signal{ runtime.fences[0], prologueValue };
+                    prologueValue = ++runtime.fenceValues[c_PrologueStream];
+                    const nvrhi::FenceValue signal{ runtime.fences[c_PrologueStream], prologueValue };
                     device->submit(nvrhi::SubmitDesc().setCommandLists(lists, 1).setQueue(CommandQueue::Graphics)
                         .setWaits(waits, waitCount).setSignals(&signal, 1));
                 }
@@ -1868,12 +1903,14 @@ namespace donut::render::rdg
                 }
             }
 
-            bool firstOfQueue[3] = { true, true, true };
+            // Per stream: a (queue, lane) pair. Segments of one stream run in order; streams order through fences.
+            std::array<bool, c_MaxStreams> firstOfQueue;
+            firstOfQueue.fill(true);
             uint32_t submissions = 0;
             for (uint32_t i = 0; i < segmentCount; )
             {
                 const PlanSegment& segment = plan.m_Segments[i];
-                const uint32_t q = uint32_t(segment.queue);
+                const uint32_t q = StreamOf(segment.queue, segment.lane);
                 if (!fences)
                 {
                     device->executeCommandList(runtime.commandLists[q][instance.segmentOrdinal[i]], segment.queue);
@@ -1882,7 +1919,7 @@ namespace donut::render::rdg
                     ++i;
                     continue;
                 }
-                // One submission for a run of segments, in plan order, on one queue: every segment after the first
+                // One submission for a run of segments, in plan order, on one stream: every segment after the first
                 // waits for nothing, and nothing waits for one before the last (PlanSegment::signals). Every wait and
                 // every signal that some segment waits for stays where separate submissions put it; the run's
                 // segments share its one fence value.
@@ -1894,8 +1931,9 @@ namespace donut::render::rdg
                     lists[end - i] = runtime.commandLists[q][instance.segmentOrdinal[end]];
                     ++end;
                 } while (end < segmentCount && end - i < c_MaxBatch && plan.m_Segments[end].queue == segment.queue &&
-                         plan.m_Segments[end].waitCount == 0 && !plan.m_Segments[end - 1].signals);
-                nvrhi::FenceValue waits[8];
+                         plan.m_Segments[end].lane == segment.lane && plan.m_Segments[end].waitCount == 0 &&
+                         !plan.m_Segments[end - 1].signals);
+                nvrhi::FenceValue waits[c_MaxStreams];
                 uint32_t waitCount = 0;
                 auto addWait = [&](uint32_t queue, uint64_t value) {
                     if (!value || queue == q)
@@ -1908,26 +1946,27 @@ namespace donut::render::rdg
                             return;
                         }
                     }
-                    if (waitCount < 8)
+                    if (waitCount < c_MaxStreams)
                         waits[waitCount++] = nvrhi::FenceValue{ runtime.fences[queue], value };
                 };
                 for (uint32_t w = 0; w < segment.waitCount; ++w)
                 {
                     const SegmentWait& wait = plan.m_SegmentWaits[segment.waitBegin + w];
+                    const uint32_t producer = StreamOf(wait.queue, wait.lane);
                     if (wait.frameDelta == 0)
-                        addWait(uint32_t(wait.queue), instance.segmentValue[wait.segment]);
+                        addWait(producer, instance.segmentValue[wait.segment]);
                     else if (!switched)
-                        addWait(uint32_t(wait.queue), instance.previousSegmentValue[wait.segment]);
+                        addWait(producer, instance.previousSegmentValue[wait.segment]);
                 }
                 if (firstOfQueue[q])
                 {
-                    // The prologue's patches and uploads come before every queue's work.
+                    // The prologue's patches and uploads come before every stream's work.
                     if (prologueNeeded)
-                        addWait(0, prologueValue);
+                        addWait(c_PrologueStream, prologueValue);
                     if (switched)
                     {
-                        // 6.12: after a plan switch the first segment of each queue follows the whole previous frame.
-                        for (uint32_t other = 0; other < 3; ++other)
+                        // 6.12: after a plan switch the first segment of each stream follows the whole previous frame.
+                        for (uint32_t other = 0; other < c_MaxStreams; ++other)
                             addWait(other, runtime.lastFrameValues[other]);
                     }
                 }
@@ -1965,8 +2004,7 @@ namespace donut::render::rdg
                 }
             }
 
-            for (uint32_t q = 0; q < 3; ++q)
-                runtime.lastFrameValues[q] = runtime.fenceValues[q];
+            runtime.lastFrameValues = runtime.fenceValues;
             instance.previousSegmentValue.swap(instance.segmentValue);
             // 11.3: the run statistics, and the timer set waits for the GPU.
             const auto submitEnd = std::chrono::steady_clock::now();

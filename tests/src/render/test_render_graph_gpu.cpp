@@ -22,7 +22,8 @@
 
 // Headless graphs executed on a device (aggregate plan, step P1.4), under the backend's validation:
 //
-//     test_render_graph_gpu d3d11 | d3d12 | vulkan | cuda
+//     test_render_graph_gpu d3d11 | d3d12 | vulkan | cuda | cuda-overlapped
+//     (cuda-overlapped: a CUDA device with queue pools of 2 graphics, 2 compute and 1 copy queue, nvrhi ADR 0016)
 //
 // The D3D12 debug layer with GPU-based validation and the Vulkan validation layer with synchronization validation are
 // confirmed loaded; the nvrhi validation layer wraps the device. Copies and clears only, so that no shader is needed:
@@ -63,6 +64,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -202,6 +204,7 @@ namespace
         nvrhi::IDevice* rawDevice = nullptr;   // the backend device under it
         Messages* messages = nullptr;
         bool raster = true;                    // CUDA has no raster passes
+        bool lanes = false;                    // a CUDA device with queue pools: the profile has queue lanes
         bool explicitScopes = false;           // D3D12 and Vulkan record real barriers in explicit-barrier scopes
         std::function<unsigned()> nativeErrors = [] { return 0u; };
     };
@@ -571,6 +574,9 @@ namespace
 #endif
 
         GraphOnDevice g(device);
+        // The baseline below records one list: the one-lane plan. queue_lanes measures a plan on two lanes.
+        for (uint8_t& lanes : g.profile.queueLanes)
+            lanes = 1;
         BufferChain chain;
         chain.readback = CreateReadback(device);
 
@@ -1725,6 +1731,318 @@ namespace
         checkClean(env, prefix);
     }
 
+    // ------------------------------------------------------------------------------------------ queue lanes
+
+    // Two independent chains (fill, copy) and a join that copies both into the readback. On a profile with two
+    // graphics lanes the chains take one lane each (nvrhi ADR 0016). `bulk` adds copies of `bulkBytes` to each chain's
+    // copy pass, for timing; they use buffers outside the graph, each only on its own chain's lane.
+    struct LaneChains
+    {
+        nvrhi::AutoPtr<nvrhi::IBuffer> readback;
+        uint32_t patternA[32];
+        uint32_t patternB[32];
+        nvrhi::AutoPtr<nvrhi::IBuffer> bulk[4];   // A source, A destination, B source, B destination
+        uint64_t bulkBytes = 0;
+        uint32_t bulkCopies = 0;
+    };
+
+    void RecordLaneChains(IRenderGraph* graph, LaneChains& chains, uint32_t frame)
+    {
+        for (uint32_t i = 0; i < 32; ++i)
+        {
+            chains.patternA[i] = 70000u + frame * 100u + i;
+            chains.patternB[i] = 80000u + frame * 100u + i;
+        }
+        ResourceId a = graph->CreateBuffer(GraphBufferDesc("A", 128), ResourceFlags::None);
+        ResourceId a2 = graph->CreateBuffer(GraphBufferDesc("A2", 128), ResourceFlags::None);
+        ResourceId b = graph->CreateBuffer(GraphBufferDesc("B", 128), ResourceFlags::None);
+        ResourceId b2 = graph->CreateBuffer(GraphBufferDesc("B2", 128), ResourceFlags::None);
+        ResourceId out = graph->ImportBuffer(chains.readback, ResourceStates::CopyDest, ResourceStates::CopyDest);
+        const uint32_t* patternA = chains.patternA;
+        const uint32_t* patternB = chains.patternB;
+        LaneChains* bulk = chains.bulkBytes ? &chains : nullptr;
+
+        AddPass(graph, "FillA", PassType::Compute, PassFlags::None,
+            [&](ISetupContext* s) { a = Write(s, a, Access::CopyDest); },
+            [a, patternA](IPassContext* context) { context->GetCommandList()->writeBuffer(context->GetBuffer(a), patternA, 128); });
+        AddPass(graph, "FillB", PassType::Compute, PassFlags::None,
+            [&](ISetupContext* s) { b = Write(s, b, Access::CopyDest); },
+            [b, patternB](IPassContext* context) { context->GetCommandList()->writeBuffer(context->GetBuffer(b), patternB, 128); });
+        auto copy = [bulk](IPassContext* context, ResourceId from, ResourceId to, uint32_t chain) {
+            nvrhi::ICommandList* list = context->GetCommandList();
+            if (bulk)
+            {
+                for (uint32_t k = 0; k < bulk->bulkCopies; ++k)
+                    list->copyBuffer(bulk->bulk[chain * 2 + 1], 0, bulk->bulk[chain * 2], 0, bulk->bulkBytes);
+            }
+            list->copyBuffer(context->GetBuffer(to), 0, context->GetBuffer(from), 0, 128);
+        };
+        AddPass(graph, "CopyA", PassType::Copy, PassFlags::None,
+            [&](ISetupContext* s) { Read(s, a, Access::CopySource); a2 = Write(s, a2, Access::CopyDest); },
+            [a, a2, copy](IPassContext* context) { copy(context, a, a2, 0); });
+        AddPass(graph, "CopyB", PassType::Copy, PassFlags::None,
+            [&](ISetupContext* s) { Read(s, b, Access::CopySource); b2 = Write(s, b2, Access::CopyDest); },
+            [b, b2, copy](IPassContext* context) { copy(context, b, b2, 1); });
+        AddPass(graph, "Join", PassType::Copy, PassFlags::None,
+            [&](ISetupContext* s) { Read(s, a2, Access::CopySource); Read(s, b2, Access::CopySource); out = Write(s, out, Access::CopyDest); },
+            [a2, b2, out](IPassContext* context) {
+                nvrhi::ICommandList* list = context->GetCommandList();
+                list->copyBuffer(context->GetBuffer(out), 0, context->GetBuffer(a2), 0, 128);
+                list->copyBuffer(context->GetBuffer(out), 128, context->GetBuffer(b2), 0, 128);
+            });
+    }
+
+    void CheckLaneChains(nvrhi::IDevice* device, LaneChains& chains, const std::string& what)
+    {
+        device->waitForIdle();
+        const uint32_t* data = static_cast<const uint32_t*>(device->mapBuffer(chains.readback, nvrhi::CpuAccessMode::Read));
+        check(data != nullptr, "map readback");
+        bool good = true;
+        for (uint32_t i = 0; i < 32; ++i)
+            good = good && data[i] == chains.patternA[i] && data[32 + i] == chains.patternB[i];
+        if (!good)
+            std::printf("  read %u ... %u, expected %u ... %u\n", data[0], data[32], chains.patternA[0], chains.patternB[0]);
+        device->unmapBuffer(chains.readback);
+        check(good, what);
+    }
+
+    // Queue lanes (nvrhi ADR 0016): the chains run on two lanes and the plan alternates with a one-lane plan of the
+    // same graph; every result is correct, and the steady state makes no create* call and allocates nothing.
+    void testQueueLanes(Env& env)
+    {
+        GraphOnDevice g(env.device);
+        check(g.profile.queueLanes[uint32_t(nvrhi::CommandQueue::Graphics)] == 2 &&
+              g.profile.queueLanes[uint32_t(nvrhi::CommandQueue::Compute)] == 2 &&
+              g.profile.queueLanes[uint32_t(nvrhi::CommandQueue::Copy)] == 1, "the profile has the device's queue counts as lanes");
+        const BackendProfile twoLanes = g.profile;
+        BackendProfile oneLane = g.profile;
+        oneLane.queueLanes[0] = oneLane.queueLanes[1] = oneLane.queueLanes[2] = 1;
+
+        LaneChains chains;
+        chains.readback = CreateReadback(env.device);
+        const uint32_t warmup = 8, measured = 16;
+        RegistryStatistics before{};
+        uint64_t own = 0, execute[2] = {}, executeFrames[2] = {};
+        for (uint32_t frame = 0; frame < warmup + measured; ++frame)
+        {
+            // Two frames on two lanes, two on one: a plan switch every other frame.
+            const bool lanes = (frame / 2) % 2 == 0;
+            g.profile = lanes ? twoLanes : oneLane;
+            const bool counted = frame >= warmup;
+            if (frame == warmup)
+                g.registry->GetRegistryStatistics(before);
+            g_Allocations = 0;
+            g_CountAllocations = counted;
+            g.graph->Reset();
+            RecordLaneChains(g.graph, chains, frame);
+            const uint64_t recorded = g_Allocations;
+            const PlanStatistics stats = g.Run();
+            g_CountAllocations = false;
+            env.device->runGarbageCollection();
+            if (counted)
+            {
+                own += recorded + g.compileAllocations;
+                execute[lanes ? 1 : 0] += g.executeAllocations;
+                ++executeFrames[lanes ? 1 : 0];
+            }
+            check(stats.streams == (lanes ? 2u : 1u), "lanes: " + std::to_string(stats.streams) + " streams, frame " + std::to_string(frame));
+            if (frame < 4)
+                std::printf("  %s: %u segments, %u fence waits, %u streams\n", lanes ? "two lanes" : "one lane", stats.segments,
+                            stats.fenceWaits, stats.streams);
+            // Every other frame is checked after a switch that was submitted without waiting for idle.
+            if (frame % 2 == 1)
+                CheckLaneChains(env.device, chains, std::string("lanes, frame ") + std::to_string(frame));
+        }
+        RegistryStatistics after{};
+        g.registry->GetRegistryStatistics(after);
+        check(after.objectsCreated == before.objectsCreated, "lanes: no create* call in " + std::to_string(measured) +
+              " frames with plan switches (" + std::to_string(after.objectsCreated) + " objects in all)");
+        check(own == 0, "lanes: recording and the cached compiles allocate nothing (" + std::to_string(own) + ")");
+        std::printf("  with plan switches, through the validation layer: execution allocates %.1f per frame on two lanes, "
+                    "%.1f on one\n", double(execute[1]) / double(std::max<uint64_t>(executeFrames[1], 1)),
+                    double(execute[0]) / double(std::max<uint64_t>(executeFrames[0], 1)));
+        checkClean(env, "lanes");
+
+        // The steady state of each plan on the raw device, without switches. nvrhi's CUDA lists allocate an instance
+        // per open and per submission, so execution is measured against the same nvrhi calls by hand (as in
+        // steady_state). RDG_ALLOC_TRACE=1 prints the stacks of one measured frame of each plan.
+        {
+            const bool trace = std::getenv("RDG_ALLOC_TRACE") != nullptr;
+#ifdef _WIN32
+            if (trace)
+            {
+                SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+            }
+#endif
+            auto median = [](std::vector<uint64_t> values) {
+                std::sort(values.begin(), values.end());
+                return values[values.size() / 2];
+            };
+            GraphOnDevice raw(env.rawDevice);
+            LaneChains rawChains;
+            rawChains.readback = CreateReadback(env.rawDevice);
+            uint64_t steady[2] = {};
+            uint32_t submissions[2] = {};
+            std::vector<uint64_t> graphTwoLanes;
+            // nvrhi's CUDA queues keep their submissions in a deque, which allocates blocks until it has cycled
+            // through its map: a long warm-up for each loop, so that neither measures the other's warm-up.
+            constexpr uint32_t c_Warm = 24, c_Steady = 16;
+            for (uint32_t lanes = 0; lanes < 2; ++lanes)
+            {
+                raw.profile = lanes ? twoLanes : oneLane;
+                for (uint32_t frame = 0; frame < c_Warm + c_Steady; ++frame)
+                {
+                    const bool counted = frame >= c_Warm;
+                    g_Allocations = 0;
+                    g_CountAllocations = counted;
+                    g_TraceAllocations = trace && frame == c_Warm + 2;
+                    if (g_TraceAllocations)
+                        std::printf("  -- allocations of a frame on %s\n", lanes ? "two lanes" : "one lane");
+                    raw.graph->Reset();
+                    RecordLaneChains(raw.graph, rawChains, frame);
+                    raw.Run();
+                    g_TraceAllocations = false;
+                    g_CountAllocations = false;
+                    env.rawDevice->waitForIdle();   // each frame starts idle, as by hand
+                    env.rawDevice->runGarbageCollection();
+                    if (counted)
+                    {
+                        steady[lanes] += raw.executeAllocations;
+                        if (lanes)
+                            graphTwoLanes.push_back(raw.executeAllocations);
+                    }
+                }
+                RunStatistics run;
+                raw.registry->GetRunStatistics(run);
+                submissions[lanes] = run.submissions;
+                CheckLaneChains(env.rawDevice, rawChains, lanes ? "raw device, two lanes" : "raw device, one lane");
+            }
+            std::printf("  steady state on the raw device: execution allocates %.1f per frame on two lanes (%u submissions), "
+                        "%.1f on one (%u submissions)\n", double(steady[1]) / c_Steady, submissions[1], double(steady[0]) / c_Steady,
+                        submissions[0]);
+
+            // The baseline: the two-lane plan's nvrhi calls by hand. A list per segment, pinned to its lane's queue,
+            // with a marker per pass; a submission per segment with a fence signal; the join waits for chain A's copy.
+            nvrhi::IDevice* device = env.rawDevice;
+            nvrhi::AutoPtr<nvrhi::ICommandQueue> queues[2];
+            for (uint32_t lane = 0; lane < 2; ++lane)
+                check(device->getCommandQueue(nvrhi::CommandQueue::Graphics, lane, queues[lane].ReleaseAndGetAddressOf()) == nvrhi::FS_OK,
+                      "graphics queue " + std::to_string(lane));
+            const uint32_t segmentLane[5] = { 0, 1, 0, 1, 1 };
+            nvrhi::AutoPtr<nvrhi::ICommandList> lists[5];
+            for (uint32_t s = 0; s < 5; ++s)
+            {
+                device->createCommandList(nvrhi::CommandListParameters().setCommandQueue(queues[segmentLane[s]].Get()),
+                                          lists[s].ReleaseAndGetAddressOf());
+                check(lists[s] != nullptr, "pinned list");
+            }
+            nvrhi::AutoPtr<nvrhi::IBuffer> buffers[4];   // A, A2, B, B2
+            for (uint32_t i = 0; i < 4; ++i)
+            {
+                device->createBuffer(GraphBufferDesc("hand", 128), buffers[i].ReleaseAndGetAddressOf());
+                check(buffers[i] != nullptr, "hand buffer");
+            }
+            nvrhi::AutoPtr<nvrhi::IFence> fences[2];
+            for (uint32_t lane = 0; lane < 2; ++lane)
+            {
+                device->createFence(nvrhi::FenceDesc(), fences[lane].ReleaseAndGetAddressOf());
+                check(fences[lane] != nullptr, "hand fence");
+            }
+            uint64_t fenceValues[2] = {};
+            std::vector<uint64_t> hand;
+            for (uint32_t frame = 0; frame < c_Warm + c_Steady; ++frame)
+            {
+                const bool counted = frame >= c_Warm;
+                for (uint32_t i = 0; i < 32; ++i)
+                {
+                    rawChains.patternA[i] = 70000u + frame * 100u + i;
+                    rawChains.patternB[i] = 80000u + frame * 100u + i;
+                }
+                g_Allocations = 0;
+                g_CountAllocations = counted;
+                g_TraceAllocations = trace && frame == c_Warm + 2;
+                if (g_TraceAllocations)
+                    std::printf("  -- allocations of a hand-made frame on two lanes\n");
+                uint64_t copyA = 0;
+                for (uint32_t s = 0; s < 5; ++s)
+                {
+                    nvrhi::ICommandList* list = lists[s];
+                    list->open();
+                    static const char* const c_Names[5] = { "FillA", "FillB", "CopyA", "CopyB", "Join" };
+                    list->beginMarker(c_Names[s]);
+                    switch (s)
+                    {
+                    case 0: list->writeBuffer(buffers[0], rawChains.patternA, 128); break;
+                    case 1: list->writeBuffer(buffers[2], rawChains.patternB, 128); break;
+                    case 2: list->copyBuffer(buffers[1], 0, buffers[0], 0, 128); break;
+                    case 3: list->copyBuffer(buffers[3], 0, buffers[2], 0, 128); break;
+                    default:
+                        list->copyBuffer(rawChains.readback, 0, buffers[1], 0, 128);
+                        list->copyBuffer(rawChains.readback, 128, buffers[3], 0, 128);
+                        break;
+                    }
+                    list->endMarker();
+                    list->close();
+                    const uint32_t lane = segmentLane[s];
+                    const nvrhi::FenceValue signal{ fences[lane], ++fenceValues[lane] };
+                    const nvrhi::FenceValue wait{ fences[0], copyA };
+                    nvrhi::ICommandList* const submitted[] = { list };
+                    device->submit(nvrhi::SubmitDesc().setCommandLists(submitted, 1).setWaits(&wait, s == 4 ? 1u : 0u)
+                        .setSignals(&signal, 1));
+                    if (s == 2)
+                        copyA = fenceValues[0];
+                }
+                g_TraceAllocations = false;
+                g_CountAllocations = false;
+                device->waitForIdle();
+                device->runGarbageCollection();
+                if (counted)
+                    hand.push_back(g_Allocations);
+            }
+            CheckLaneChains(device, rawChains, "the hand-made two-lane frames");
+            check(median(graphTwoLanes) <= median(hand), "lanes: execution on two lanes allocates no more than the same nvrhi "
+                  "calls by hand (" + std::to_string(median(graphTwoLanes)) + " and " + std::to_string(median(hand)) + " per frame)");
+        }
+
+        // Report only: GPU time of the chains with bulk copies, two lanes against one. The queues of a pool may not
+        // run concurrently on every platform (nvrhi ADR 0016 measured WDDM without hardware scheduling).
+        chains.bulkBytes = 32ull << 20;
+        chains.bulkCopies = 4;
+        for (uint32_t i = 0; i < 4; ++i)
+        {
+            env.device->createBuffer(nvrhi::BufferDesc().setByteSize(chains.bulkBytes).setCanHaveRawViews(true)
+                .setInitialState(ResourceStates::CopySource).setKeepInitialState(true).setDebugName("bulk"),
+                chains.bulk[i].ReleaseAndGetAddressOf());
+            check(chains.bulk[i] != nullptr, "bulk buffer");
+        }
+        double milliseconds[2] = {};
+        for (uint32_t round = 0; round < 2; ++round)
+        {
+            for (uint32_t lanes = 0; lanes < 2; ++lanes)
+            {
+                g.profile = lanes ? twoLanes : oneLane;
+                const uint32_t frames = 12;
+                env.device->waitForIdle();
+                const auto start = std::chrono::steady_clock::now();
+                for (uint32_t frame = 0; frame < frames; ++frame)
+                {
+                    g.graph->Reset();
+                    RecordLaneChains(g.graph, chains, 100 + frame);
+                    g.Run();
+                }
+                env.device->waitForIdle();
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() / frames;
+                if (round == 1)
+                    milliseconds[lanes] = ms;
+                CheckLaneChains(env.device, chains, lanes ? "bulk, two lanes" : "bulk, one lane");
+            }
+        }
+        std::printf("  bulk copies (2 x %u x %llu MiB per frame): %.2f ms per frame on two lanes, %.2f on one (report only)\n",
+                    chains.bulkCopies, (unsigned long long)(chains.bulkBytes >> 20), milliseconds[1], milliseconds[0]);
+        checkClean(env, "lanes, bulk");
+    }
+
     void runAll(Env& env)
     {
         // RDG_GPU_ONLY=<substring> runs the tests whose names contain it.
@@ -1757,6 +2075,7 @@ namespace
         run("binding_cache_concurrency", env.raster, [&] { testBindingCacheConcurrency(env); });
         run("blit_concurrency", env.raster && env.api != nvrhi::GraphicsAPI::D3D11, [&] { testBlitConcurrency(env); });
         run("donut_passes_parallel", env.raster, [&] { testDonutPasses(env, true); });
+        run("queue_lanes", env.lanes, [&] { testQueueLanes(env); });
         checkClean(env, "all graphs");
         run("steady_state", true, [&] { testSteadyState(env); });
     }
@@ -1780,7 +2099,7 @@ int main(int argc, char** argv)
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try
     {
-        check(argc == 2, "specify d3d11, d3d12, vulkan or cuda");
+        check(argc == 2, "specify d3d11, d3d12, vulkan, cuda or cuda-overlapped");
         const std::string backend = argv[1];
         nvrhi::AutoPtr<Messages> messages = MAKE_RC_OBJ_PTR(Messages);
         Env env;
@@ -1938,8 +2257,9 @@ int main(int argc, char** argv)
         else
 #endif
 #if TEST_CUDA
-        if (backend == "cuda")
+        if (backend == "cuda" || backend == "cuda-overlapped")
         {
+            const bool overlapped = backend == "cuda-overlapped";
             nvrhi::cuda::GraphicsFactoryDesc factoryDesc;
             factoryDesc.messageCallback = messages;
             nvrhi::cuda::GraphicsFactoryHandle factory = nvrhi::cuda::createGraphicsFactory(factoryDesc);
@@ -1950,6 +2270,12 @@ int main(int argc, char** argv)
             }
             nvrhi::cuda::DeviceDesc deviceDesc;
             deviceDesc.messageCallback = messages;
+            if (overlapped)
+            {
+                // Queue pools (nvrhi ADR 0016): every test runs on a profile with lanes.
+                deviceDesc.setQueueCount(nvrhi::CommandQueue::Graphics, 2);
+                deviceDesc.setQueueCount(nvrhi::CommandQueue::Compute, 2);
+            }
             nvrhi::cuda::DeviceHandle device;
             check(factory->createDevice(deviceDesc, &device) == nvrhi::FS_OK, "createDevice");
             nvrhi::DeviceHandle validation;
@@ -1958,6 +2284,7 @@ int main(int argc, char** argv)
             env.device = validation;
             env.rawDevice = device;
             env.raster = false;
+            env.lanes = overlapped;
             runAll(env);
         }
         else

@@ -621,22 +621,24 @@ namespace donut::render::rdg
     {
         std::vector<std::unique_ptr<StructureInstance>> instances;
         std::vector<std::unique_ptr<PhysicalResource>> freePool;     // transient memory of retired structures
-        // 7.5 heap retirement: collected instances with heaps or placed resources, kept until every queue's fence
+        // 7.5 heap retirement: collected instances with heaps or placed resources, kept until every stream's fence
         // passes the values of the last frame before their collection. Barrier arrays hold raw pointers, and nvrhi's
         // explicit barriers keep no references, so the registry holds them until then.
         struct RetiredInstance
         {
             std::unique_ptr<StructureInstance> instance;
-            std::array<uint64_t, 3> values;
+            std::array<uint64_t, c_MaxStreams> values;
         };
         std::vector<RetiredInstance> retired;
         std::vector<std::unique_ptr<PhysicalResource>> extractPool;
-        std::array<nvrhi::AutoPtr<nvrhi::IFence>, 3> fences;
-        std::array<uint64_t, 3> fenceValues = {};
-        std::array<uint64_t, 3> lastFrameValues = {};                // each queue's last signal of the last frame
+        // Fences, values and lists are per stream: a (queue, lane) pair, StreamOf. Lane 0 of each queue is made at the
+        // first Execute; the fences of other lanes when a plan first uses them (nvrhi ADR 0016).
+        std::array<nvrhi::AutoPtr<nvrhi::IFence>, c_MaxStreams> fences;
+        std::array<uint64_t, c_MaxStreams> fenceValues = {};
+        std::array<uint64_t, c_MaxStreams> lastFrameValues = {};     // each stream's last signal of the last frame
         bool fencesChecked = false;
         bool fencesSupported = false;
-        std::array<std::vector<nvrhi::AutoPtr<nvrhi::ICommandList>>, 3> commandLists;
+        std::array<std::vector<nvrhi::AutoPtr<nvrhi::ICommandList>>, c_MaxStreams> commandLists;
         nvrhi::AutoPtr<nvrhi::ICommandList> prologueList;
         // Without fences (D3D11, 8.3): one event query per frame, in a ring. A query's results are read before it is
         // ended again, as D3D11 expects; a query three frames old has normally completed.

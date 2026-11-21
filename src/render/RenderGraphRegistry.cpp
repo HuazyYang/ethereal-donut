@@ -51,9 +51,9 @@ namespace donut::render::rdg
             return;
         if (m_Runtime.fencesSupported)
         {
-            nvrhi::FenceValue values[3];
+            nvrhi::FenceValue values[rdg::c_MaxStreams];
             uint32_t count = 0;
-            for (uint32_t q = 0; q < 3; ++q)
+            for (uint32_t q = 0; q < rdg::c_MaxStreams; ++q)
             {
                 if (m_Runtime.fences[q] && m_Runtime.fenceValues[q])
                     values[count++] = nvrhi::FenceValue{ m_Runtime.fences[q], m_Runtime.fenceValues[q] };

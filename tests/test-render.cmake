@@ -108,9 +108,11 @@ endif()
 if(NVRHI_WITH_CUDA)
     target_compile_definitions(test_render_graph_gpu PRIVATE TEST_CUDA=1)
     add_test(NAME test_render_graph_gpu_cuda COMMAND test_render_graph_gpu cuda)
+    add_test(NAME test_render_graph_gpu_cuda_overlapped COMMAND test_render_graph_gpu cuda-overlapped)
 endif()
 # One GPU process at a time.
-set(_rdg_gpu_tests test_render_graph_gpu_d3d11 test_render_graph_gpu_d3d12 test_render_graph_gpu_vulkan test_render_graph_gpu_cuda)
+set(_rdg_gpu_tests test_render_graph_gpu_d3d11 test_render_graph_gpu_d3d12 test_render_graph_gpu_vulkan test_render_graph_gpu_cuda
+    test_render_graph_gpu_cuda_overlapped)
 foreach(_test ${_rdg_gpu_tests})
     if(TEST ${_test})
         set_tests_properties(${_test} PROPERTIES RUN_SERIAL TRUE LABELS gpu)
