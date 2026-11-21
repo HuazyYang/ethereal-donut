@@ -39,3 +39,16 @@ foreach(test_src ${donut_engine_tests})
 
 endforeach()
 
+# The scene-graph trace compares its records with golden files in the source tree; ECS_UPDATE_GOLDEN=1 rewrites them.
+# They live under src/ because the VFS test requires tests/ to hold only include/ and src/.
+target_compile_definitions(test_scene_graph_trace PRIVATE
+    DONUT_TEST_GOLDEN_DIR="${CMAKE_CURRENT_LIST_DIR}/src/engine/golden")
+
+# Baseline timings of the scene graph (aggregate docs/plans/2026-11-21-donut-ecs.md, step E0.4). The glob above skips
+# it; ctest runs it only in its short smoke mode, the Release numbers come from `bench_scene_graph`.
+add_executable(bench_scene_graph src/engine/bench_scene_graph.cpp)
+target_link_libraries(bench_scene_graph donut_app donut_engine donut_core)
+add_dependencies(donut_all_tests bench_scene_graph)
+add_test(NAME bench_scene_graph_smoke COMMAND bench_scene_graph --smoke)
+set_property(TARGET bench_scene_graph PROPERTY FOLDER "Donut/donut_tests/donut_engine_tests")
+

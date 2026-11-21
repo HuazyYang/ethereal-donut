@@ -684,15 +684,16 @@ void SceneGraph::UnregisterLeaf(SceneGraphLeaf *leaf)
         auto it = std::find(m_MeshInstances.begin(), m_MeshInstances.end(), meshInstance);
         if (it != m_MeshInstances.end())
             m_MeshInstances.erase(it);
-        return;
-    }
 
-    auto skinnedInstance = query_cast<SkinnedMeshInstance>(leaf);
-    if (skinnedInstance)
-    {
-        auto it = std::find(m_SkinnedMeshInstances.begin(), m_SkinnedMeshInstances.end(), skinnedInstance);
-        if (it != m_SkinnedMeshInstances.end())
-            m_SkinnedMeshInstances.erase(it);
+        // a skinned instance is a mesh instance as well: RegisterLeaf put it into both vectors
+        auto skinnedInstance = query_cast<SkinnedMeshInstance>(meshInstance);
+        if (skinnedInstance)
+        {
+            auto skinnedIt = std::find(m_SkinnedMeshInstances.begin(), m_SkinnedMeshInstances.end(), skinnedInstance);
+            if (skinnedIt != m_SkinnedMeshInstances.end())
+                m_SkinnedMeshInstances.erase(skinnedIt);
+        }
+
         return;
     }
 
@@ -880,6 +881,9 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
         while (walker)
         {
             walker->m_Graph = this;
+            // every node is new structure that the next Refresh has to visit: a subgraph that was refreshed in a
+            // graph before has clean dirty flags, and its world transforms and bounds belong to its old place
+            walker->m_Dirty |= SceneGraphNode::DirtyFlags::SubgraphStructure;
             auto leaf = walker->GetLeaf();
             if (leaf)
                 RegisterLeaf(leaf);
