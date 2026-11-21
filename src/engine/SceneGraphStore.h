@@ -32,7 +32,12 @@
 //   components, so that entity ids, row order and the leaf observer's order are deterministic (5.3, 5.5).
 // - Propagation and Bounds read the archetype storage directly (EcsWorldImpl.h): they test chunk versions per column
 //   (D9) and the parent's chunk version per row, which no public query exposes, and they stamp only the chunks they
-//   write. They run as systems of the graph's scheduler, in the TransformPropagation and Bounds phases.
+//   write. They run as systems of the graph's scheduler, in the TransformPropagation and Bounds phases. GpuScene reads
+//   the mesh-instance chunks the same way (plan step E4).
+// - Asset tables and slots (step E4): the leaf observer fills a mesh instance's MeshRef, RenderFlags and
+//   GpuInstanceSlot columns (table references, stable slots) before it calls RegisterLeaf, and releases them before it
+//   calls UnregisterLeaf. Every structural operation and InvalidateContent first advances the world's version, so that
+//   what they stamp is newer than any version a reader (GpuScene) took before them.
 
 #pragma once
 
@@ -84,7 +89,7 @@ namespace donut::engine
         enum Slot : uint32_t
         {
             SlotNode, SlotLinks, SlotParent, SlotLocal, SlotLocalMatrix, SlotWorld, SlotLeaf, SlotLocalBounds,
-            SlotWorldBounds, SlotChunkBounds, SlotCount
+            SlotWorldBounds, SlotChunkBounds, SlotMeshRef, SlotRenderFlags, SlotInstance, SlotCount
         };
         static constexpr uint8_t c_Absent = 0xff;
 
@@ -190,6 +195,9 @@ namespace donut::engine
                 ecs::StampVersion(row.archetype->Versions(row.chunk) + column, m_Impl->GetStampVersion());
         }
         SceneGraphNode* NodeOf(Entity entity) const noexcept;
+        // The GpuInstanceSlot of an attached mesh instance; null while it is in no graph or holds no slot (before the
+        // leaf observer reached it, after it released it): MeshInstance::GetInstanceIndex.
+        static const GpuInstanceSlot* InstanceSlotOf(const SceneGraphLeaf* leaf) noexcept;
 
         // ------------------------------------------------------------------------------- structure (5.3)
         // `child` is in no graph; `parent` is attached here, or null to make `child` the graph's root.
@@ -207,6 +215,9 @@ namespace donut::engine
         // ------------------------------------------------------------------------------ refresh (5.4, 5.7)
         // Runs the phases when anything changed; returns whether structure changed since the last refresh.
         bool Refresh(uint32_t frameIndex);
+        // After a Refresh that saw structural changes: the mesh table follows meshes edited in place (new geometry
+        // counts get new geometry slots, and so do the geometry-instance slots of their instances).
+        void ReconcileMeshes();
         bool HasPendingStructureChanges() const noexcept { return m_PendingStructure; }
         bool HasPendingTransformChanges() const noexcept { return m_PendingTransform || m_LastRefreshMoved; }
 
@@ -237,6 +248,18 @@ namespace donut::engine
         nvrhi::FRESULT RunPropagation(ISystemContext* context) noexcept;
         nvrhi::FRESULT RunBounds(ISystemContext* context) noexcept;
 
+        // ------------------------------------------------------------------------- GPU scene (step E4)
+        // Read by GpuScene (a friend), which walks the mesh-instance chunks through the archetype storage.
+        const SlotAllocator& GetInstanceSlots() const noexcept { return m_InstanceSlots; }
+        const SlotAllocator& GetGeometryInstanceSlots() const noexcept { return m_GeometryInstanceSlots; }
+        // Counts every Refresh call, also the ones with nothing to do: a GpuScene update after a new one is a new frame
+        // for the previous transforms.
+        uint64_t GetRefreshCalls() const noexcept { return m_RefreshCalls; }
+        // Counts the ReconcileMeshes calls that gave a mesh new geometry slots.
+        uint64_t GetLayoutSerial() const noexcept { return m_LayoutSerial; }
+        // Unique per store in the process (an address can be reused).
+        uint64_t GetSerial() const noexcept { return m_Serial; }
+
         // Test seams: entity ids of the graph's components, and counters.
         ComponentId GetComponentId(Slot slot) const noexcept { return m_Ids[slot]; }
         ComponentId GetDepthId() const noexcept { return m_DepthId; }
@@ -254,6 +277,9 @@ namespace donut::engine
         // Test seam: the CreateEntities call of attach number `calls` from now (0: the next) is refused by the world
         // as an out-of-memory failure would be (it consumes the values); negative disarms it.
         static void FailCreateAfter(int32_t calls) noexcept { s_FailCreateCountdown.store(calls); }
+        // Test seam: the mesh-instance acquisition number `calls` from now throws std::bad_alloc before it allocates
+        // anything (as the tables would out of memory); the leaf observer catches it. Negative disarms it.
+        static void FailAcquireAfter(int32_t calls) noexcept { s_FailAcquireCountdown.store(calls); }
 
     private:
         // A node of a subgraph that is being attached, in pre-order. Its values are read from its record.
@@ -271,8 +297,9 @@ namespace donut::engine
         struct LeafType
         {
             const LeafTypeDesc* desc;
-            uint32_t firstTag;         // in m_LeafTypeTags
+            uint32_t firstTag;         // in m_LeafTypeTags: the tags, then the columns
             uint32_t tagCount;
+            uint32_t columnCount;      // the class's columns (LeafTypeDesc::columns), after its tags
         };
 
         struct LevelArchetype
@@ -311,7 +338,14 @@ namespace donut::engine
         struct BoundsContext;
         struct DeepContext;
 
+        friend class GpuScene;
+
         void CreateSystems() noexcept;
+        // The leaf observer's work per leaf (OnAdd, OnRemove), and the mesh-instance columns it fills and releases.
+        void OnLeaf(Entity entity, SceneGraphLeaf* leaf, bool added);
+        void AcquireInstance(const RowRef& row, MeshInstance* instance, MeshTable::Changes& changes);
+        void ReleaseInstance(const RowRef& row, MeshTable::Changes& changes);
+        void RaiseAssetCallbacks(const MeshTable::Changes& changes);
         void SyncArchetypes() noexcept;
         uint32_t ResolveLeafType(SceneGraphLeaf* leaf);
         uint32_t DepthOf(Entity entity) const noexcept;
@@ -338,6 +372,7 @@ namespace donut::engine
         static void RunBoundsTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
 
         static std::atomic<int32_t> s_FailCreateCountdown;
+        static std::atomic<int32_t> s_FailAcquireCountdown;
 
         SceneGraph* m_Graph;
         nvrhi::AutoPtr<IWorld> m_World;
@@ -352,9 +387,17 @@ namespace donut::engine
         // Column indices per archetype, for the accessors; synchronised after structural changes.
         std::vector<std::array<uint8_t, SlotCount>> m_ArchetypeColumns;
 
-        // Leaf classes seen so far and their tag ids.
+        // Leaf classes seen so far and their tag and column ids.
         std::vector<LeafType> m_LeafTypes;
         std::vector<ComponentId> m_LeafTypeTags;
+
+        // Stable slots of the mesh instances (step E4): instance-buffer rows and geometry-instance ranges.
+        SlotAllocator m_InstanceSlots;
+        SlotAllocator m_GeometryInstanceSlots;
+        MeshTable::Changes m_Changes;      // the leaf observer's, kept for its capacity
+        uint64_t m_RefreshCalls = 0;
+        uint64_t m_LayoutSerial = 0;
+        uint64_t m_Serial = 0;
 
         // Structural scratch, kept for its capacity by the thread (SceneGraphStore.cpp), so that graphs that are made
         // and dropped (an importer's, a benchmark's) do not grow it again in fresh memory.

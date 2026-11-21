@@ -20,8 +20,8 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-// The scene graph over the world (plan step E3): storage, structural operations, the TransformPropagation and Bounds
-// systems and the leaf observer. See SceneGraphStore.h for the rules.
+// The scene graph over the world (plan steps E3, E4): storage, structural operations, the TransformPropagation and
+// Bounds systems, the leaf observer, and the mesh-instance columns and slots. See SceneGraphStore.h for the rules.
 
 #include "SceneGraphStore.h"
 
@@ -197,8 +197,9 @@ namespace donut::engine
             return *s_Pool;
         }
 
-        // The graph's observer on LeafObject (design 5.5): it maintains the leaf vectors through the virtual
-        // RegisterLeaf and UnregisterLeaf, in creation and destruction order.
+        // The graph's observer on LeafObject (design 5.5): it fills a mesh instance's columns (asset tables, slots)
+        // and maintains the leaf vectors through the virtual RegisterLeaf and UnregisterLeaf, in creation and
+        // destruction order.
         class LeafObserver final : public nvrhi::ObjectImpl<IObserver>
         {
         public:
@@ -206,10 +207,10 @@ namespace donut::engine
             NVRHI_IMPLEMENTS_INTERFACE(IObserver)
             NVRHI_END_INTERFACE_TABLE()
 
-            using Register = void (*)(SceneGraph* graph, SceneGraphLeaf* leaf, bool added);
+            using Register = void (*)(SceneGraphStore* store, Entity entity, SceneGraphLeaf* leaf, bool added);
 
-            LeafObserver(SceneGraph* graph, Register registerLeaf) noexcept
-                : m_Graph(graph), m_Register(registerLeaf) { }
+            LeafObserver(SceneGraphStore* store, Register registerLeaf) noexcept
+                : m_Store(store), m_Register(registerLeaf) { }
 
             nvrhi::FRESULT OnEntities(ObserverEvent event, const EntityBatch& batch, ICommandBuffer*) noexcept override
             {
@@ -222,7 +223,7 @@ namespace donut::engine
                     // RegisterLeaf overrides and the OnMeshAdded callbacks may throw; this boundary is noexcept
                     try
                     {
-                        m_Register(m_Graph, leaves[i].object, added);
+                        m_Register(m_Store, batch.entities[i], leaves[i].object, added);
                     }
                     catch (const std::exception& error)
                     {
@@ -239,9 +240,26 @@ namespace donut::engine
             }
 
         private:
-            SceneGraph* m_Graph;   // not a reference: the graph owns the world, which owns this observer
+            SceneGraphStore* m_Store;   // not a reference: the store owns the world, which owns this observer
             Register m_Register;
         };
+
+        // A process-wide serial per store (SceneGraphStore::GetSerial).
+        std::atomic<uint64_t> g_StoreSerial{ 0 };
+
+        RenderFlags MakeRenderFlags(MeshInstance* instance) noexcept
+        {
+            RenderFlags flags{ 0, uint32_t(instance->GetContentFlags()) };
+            if (const MeshInfo* mesh = instance->GetMesh())
+            {
+                // as Scene::UpdateInstance set InstanceData::flags
+                if (mesh->type == MeshType::CurveDisjointOrthogonalTriangleStrips)
+                    flags.instanceFlags |= c_InstanceFlagCurveDisjointOrthogonalTriangleStrips;
+                else if (mesh->type == MeshType::CurveLinearSweptSpheres)
+                    flags.instanceFlags |= c_InstanceFlagCurveLinearSweptSpheres;
+            }
+            return flags;
+        }
     }
 
     OrphanRecord* OrphanRecord::Create()
@@ -330,15 +348,17 @@ namespace donut::engine
         m_Ids[SlotLocalBounds] = RegisterComponent<LocalBounds>(m_World);
         m_Ids[SlotWorldBounds] = RegisterComponent<WorldBounds>(m_World);
         m_Ids[SlotChunkBounds] = RegisterComponent<ChunkWorldBounds>(m_World);
+        m_Ids[SlotMeshRef] = RegisterComponent<MeshRef>(m_World);
+        m_Ids[SlotRenderFlags] = RegisterComponent<RenderFlags>(m_World);
+        m_Ids[SlotInstance] = RegisterComponent<GpuInstanceSlot>(m_World);
         m_DepthId = RegisterComponent<HierarchyDepth>(m_World);
+        m_Serial = ++g_StoreSerial;
 
-        m_LeafObserver = MAKE_RC_OBJ_PTR(LeafObserver, graph, [](SceneGraph* g, SceneGraphLeaf* leaf, bool added)
-        {
-            if (added)
-                g->RegisterLeaf(leaf);
-            else
-                g->UnregisterLeaf(leaf);
-        });
+        m_LeafObserver = MAKE_RC_OBJ_PTR(LeafObserver, this,
+            [](SceneGraphStore* store, Entity entity, SceneGraphLeaf* leaf, bool added)
+            {
+                store->OnLeaf(entity, leaf, added);
+            });
         ObserverDesc observer{};
         observer.debugName = "SceneGraph leaves";
         observer.component = m_Ids[SlotLeaf];
@@ -531,7 +551,7 @@ namespace donut::engine
             if (m_LeafTypes[i].desc == &desc)
                 return i;
         }
-        LeafType type{ &desc, uint32_t(m_LeafTypeTags.size()), 0 };
+        LeafType type{ &desc, uint32_t(m_LeafTypeTags.size()), 0, 0 };
         for (uint32_t t = 0; t < desc.tagCount; ++t)
         {
             ComponentId id = ComponentId::Invalid;
@@ -544,6 +564,18 @@ namespace donut::engine
                 m_JointTag = id;
             m_LeafTypeTags.push_back(id);
             ++type.tagCount;
+        }
+        // The class's columns (D19), zero until something fills them (the mesh-instance columns: OnLeaf).
+        for (uint32_t c = 0; c < desc.columnCount; ++c)
+        {
+            ComponentId id = ComponentId::Invalid;
+            if (NVRHI_FAILED(m_World->RegisterComponent(*desc.columns[c], id)))
+            {
+                log::warning("SceneGraph: cannot register the leaf column %s", desc.columns[c]->name);
+                continue;
+            }
+            m_LeafTypeTags.push_back(id);
+            ++type.columnCount;
         }
         m_LeafTypes.push_back(type);
         return uint32_t(m_LeafTypes.size() - 1);
@@ -678,6 +710,7 @@ namespace donut::engine
         assert(!child->m_Store);
         if (!CanChangeStructure("Attach"))
             return nullptr;
+        m_World->AdvanceVersion();   // what this stamps is newer than any version read before it (GpuScene)
         ScratchScope scope(*this);
 
         // The reference that the subgraph's root brings: its old orphan parent's link, or a new one.
@@ -755,6 +788,7 @@ namespace donut::engine
     {
         if (!CanChangeStructure("Attach"))
             return nullptr;
+        m_World->AdvanceVersion();
         ScratchScope scope(*this);
 
         // The source subgraph as it is before the call (the parent may lie inside it), copied into new nodes in no
@@ -1006,8 +1040,8 @@ namespace donut::engine
                 add(m_Ids[SlotWorldBounds], nullptr);   // written by the Bounds system before anything reads it
                 add(m_Ids[SlotChunkBounds], nullptr);
                 const LeafType& type = m_LeafTypes[head.leafType];
-                for (uint32_t t = 0; t < type.tagCount; ++t)
-                    add(m_LeafTypeTags[type.firstTag + t], nullptr);
+                for (uint32_t t = 0; t < type.tagCount + type.columnCount; ++t)
+                    add(m_LeafTypeTags[type.firstTag + t], nullptr);   // columns: filled by the leaf observer
             }
 
             if (s_FailCreateCountdown.load(std::memory_order_relaxed) >= 0 &&
@@ -1258,6 +1292,7 @@ namespace donut::engine
         nvrhi::AutoPtr<SceneGraphNode> result(node);
         if (!CanChangeStructure("Detach"))
             return result;
+        m_World->AdvanceVersion();
         ScratchScope scope(*this);
 
         GatherSubgraph(node->m_Entity);
@@ -1282,6 +1317,7 @@ namespace donut::engine
     {
         if (!CanChangeStructure("SetLeaf"))
             return;
+        m_World->AdvanceVersion();
         const Entity entity = node->m_Entity;
         RowRef row;
         if (!Locate(entity, row))
@@ -1303,7 +1339,7 @@ namespace donut::engine
             if (old)
             {
                 const LeafType& type = m_LeafTypes[oldType];
-                for (uint32_t t = 0; t < type.tagCount; ++t)
+                for (uint32_t t = 0; t < type.tagCount + type.columnCount; ++t)
                     m_World->RemoveComponent(entity, m_LeafTypeTags[type.firstTag + t]);
                 if (!leaf)
                 {
@@ -1321,7 +1357,7 @@ namespace donut::engine
                     m_World->AddComponent(entity, m_Ids[SlotChunkBounds], nullptr);
                 }
                 const LeafType& type = m_LeafTypes[newType];
-                for (uint32_t t = 0; t < type.tagCount; ++t)
+                for (uint32_t t = 0; t < type.tagCount + type.columnCount; ++t)
                     m_World->AddComponent(entity, m_LeafTypeTags[type.firstTag + t], nullptr);
             }
         }
@@ -1365,6 +1401,7 @@ namespace donut::engine
             // the first transform of a node adds the component (a structural change, outside phases)
             if (!CanChangeStructure("SetTransform"))
                 return;
+            m_World->AdvanceVersion();
             static const OrphanRecord s_Defaults;
             LocalTransform value = s_Defaults.local;
             if (scaling) value.scaling = *scaling;
@@ -1386,19 +1423,207 @@ namespace donut::engine
             LocalBounds* bounds = static_cast<LocalBounds*>(Column(row, SlotLocalBounds));
             if (leaf && leaf->object && bounds)
             {
+                m_World->AdvanceVersion();   // the stamps below are newer than what GpuScene read
                 bounds->bounds = leaf->object->GetLocalBoundingBox();
                 Stamp(row, SlotLocalBounds);
                 Stamp(row, SlotLeaf);   // consumers that want to know see the leaf column changed (5.4)
+                // a mesh instance's material domains may have changed with its content
+                if (RenderFlags* flags = static_cast<RenderFlags*>(Column(row, SlotRenderFlags)))
+                {
+                    *flags = MakeRenderFlags(static_cast<MeshInstance*>(leaf->object));
+                    Stamp(row, SlotRenderFlags);
+                }
                 m_PendingContent = true;   // the next Refresh runs Bounds for it
             }
         }
         BumpEpoch();
     }
 
+    // ------------------------------------------------------------------------- mesh instances (step E4)
+
+    const GpuInstanceSlot* SceneGraphStore::InstanceSlotOf(const SceneGraphLeaf* leaf) noexcept
+    {
+        const SceneGraphNode* node = leaf->GetNode();
+        if (!node || !node->m_Store)
+            return nullptr;
+        const GpuInstanceSlot* slot = node->m_Store->GetOf<GpuInstanceSlot>(node, SlotInstance);
+        return slot && slot->instance != c_NoInstanceSlot ? slot : nullptr;
+    }
+
+    void SceneGraphStore::OnLeaf(Entity entity, SceneGraphLeaf* leaf, bool added)
+    {
+        // The asset tables and slots change first, and SceneGraph's callbacks run after them (they may throw), then
+        // the virtual RegisterLeaf or UnregisterLeaf: as RegisterLeaf raised OnMeshAdded before it added the leaf to
+        // its vectors.
+        m_Changes.Clear();
+        RowRef row;
+        if (Locate(entity, row) && ColumnIndex(*row.archetype, row.archetypeIndex, SlotMeshRef) != c_Absent)
+        {
+            // Only MeshInstance classes declare these columns (MeshInstance::GetTypeDesc, inherited by subclasses).
+            assert(query_cast<MeshInstance>(leaf));
+            if (added)
+                AcquireInstance(row, static_cast<MeshInstance*>(leaf), m_Changes);
+            else
+                ReleaseInstance(row, m_Changes);
+        }
+        RaiseAssetCallbacks(m_Changes);
+        m_Changes.Clear();
+        if (added)
+            m_Graph->RegisterLeaf(leaf);
+        else
+            m_Graph->UnregisterLeaf(leaf);
+    }
+
+    std::atomic<int32_t> SceneGraphStore::s_FailAcquireCountdown{ -1 };
+
+    void SceneGraphStore::AcquireInstance(const RowRef& row, MeshInstance* instance, MeshTable::Changes& changes)
+    {
+        // Until every slot is allocated, the row holds no slot (c_NoInstanceSlot): an exception from the table (out of
+        // memory) leaves nothing for ReleaseInstance to free.
+        // The same for the mesh reference: a row copied through the world (Instantiate) arrives with its source's
+        // MeshId, a reference it never took.
+        GpuInstanceSlot* slot = static_cast<GpuInstanceSlot*>(Column(row, SlotInstance));
+        if (slot)
+            *slot = GpuInstanceSlot{};
+        MeshRef* ref = static_cast<MeshRef*>(Column(row, SlotMeshRef));
+        ref->mesh = MeshId::Invalid;
+        if (s_FailAcquireCountdown.load(std::memory_order_relaxed) >= 0 &&
+            s_FailAcquireCountdown.fetch_sub(1, std::memory_order_relaxed) == 0)
+            throw std::bad_alloc();   // test seam (FailAcquireAfter)
+
+        SceneGraph& graph = *m_Graph;
+        const MeshId mesh = graph.m_Meshes.Acquire(instance->GetMesh(), graph.m_Materials, changes);
+        graph.m_MaxGeometryCountPerMesh = std::max(graph.m_MaxGeometryCountPerMesh, changes.geometriesAdded);
+        const uint32_t geometryCount =
+            mesh != MeshId::Invalid ? graph.m_Meshes.GetMeshRow(MeshTable::SlotOf(mesh)).geometryCount : 0;
+
+        // Written without a stamp: the row was just created or moved here, so its chunk's added version is newer than
+        // anything a reader saw.
+        ref->mesh = mesh;
+        if (RenderFlags* flags = static_cast<RenderFlags*>(Column(row, SlotRenderFlags)))
+            *flags = MakeRenderFlags(instance);
+        if (slot)
+        {
+            const uint32_t first = m_GeometryInstanceSlots.Allocate(geometryCount);
+            slot->instance = m_InstanceSlots.Allocate(1);
+            slot->firstGeometryInstance = first;
+            slot->geometryCount = geometryCount;
+        }
+    }
+
+    void SceneGraphStore::ReleaseInstance(const RowRef& row, MeshTable::Changes& changes)
+    {
+        GpuInstanceSlot* slot = static_cast<GpuInstanceSlot*>(Column(row, SlotInstance));
+        if (slot && slot->instance != c_NoInstanceSlot)
+        {
+            m_InstanceSlots.Free(slot->instance, 1);
+            m_GeometryInstanceSlots.Free(slot->firstGeometryInstance, slot->geometryCount);
+        }
+        if (slot)
+            *slot = GpuInstanceSlot{};   // the getters report -1 from here on (UnregisterLeaf overrides see that)
+        MeshRef* ref = static_cast<MeshRef*>(Column(row, SlotMeshRef));
+        const MeshId mesh = ref->mesh;
+        ref->mesh = MeshId::Invalid;
+        m_Graph->m_Meshes.Release(mesh, m_Graph->m_Materials, changes);
+    }
+
+    void SceneGraphStore::RaiseAssetCallbacks(const MeshTable::Changes& changes)
+    {
+        const SceneGraph& graph = *m_Graph;
+        for (const MeshTable::Change& change : changes.events)
+        {
+            if (change.mesh)
+            {
+                const auto& callback = change.added ? graph.OnMeshAdded : graph.OnMeshRemoved;
+                if (callback)
+                    callback(change.mesh);
+            }
+            else if (change.material)
+            {
+                const auto& callback = change.added ? graph.OnMaterialAdded : graph.OnMaterialRemoved;
+                if (callback)
+                    callback(change.material);
+            }
+        }
+    }
+
+    void SceneGraphStore::ReconcileMeshes()
+    {
+        SceneGraph& graph = *m_Graph;
+        MeshTable& meshes = graph.m_Meshes;
+        m_Changes.Clear();
+        std::vector<uint8_t> reranged;   // per mesh slot; empty while none was
+        const uint32_t slotEnd = meshes.GetSlotEnd();
+        for (uint32_t slot = 0; slot < slotEnd; ++slot)
+        {
+            if (meshes.GetRow(slot).object && meshes.Reconcile(slot, graph.m_Materials, m_Changes))
+            {
+                reranged.resize(slotEnd, 0);
+                reranged[slot] = 1;
+            }
+        }
+        // A material shared with another graph gets this graph's slot written back (Reconcile does it for meshes and
+        // geometries): the last graph refreshed wins, as with the old renumbering. GpuScene does not read the objects'
+        // slots; other consumers (MaterialConstants::materialID of shaders without bindless) do.
+        graph.m_Materials.WriteSlots();
+        if (!reranged.empty())
+        {
+            // The instances of a mesh with a new geometry count get geometry-instance ranges of that count; their
+            // chunks are stamped, so that GpuScene writes them again (as it writes every row after a layout change).
+            m_World->AdvanceVersion();
+            ++m_LayoutSerial;
+            SyncArchetypes();
+            const uint32_t archetypeCount = m_Impl->GetArchetypeStorageCount();
+            for (uint32_t a = 0; a < archetypeCount; ++a)
+            {
+                const Archetype& archetype = m_Impl->GetArchetypeStorage(a);
+                const uint8_t refColumn = ColumnIndex(archetype, a, SlotMeshRef);
+                const uint8_t slotColumn = ColumnIndex(archetype, a, SlotInstance);
+                if (refColumn == c_Absent || slotColumn == c_Absent)
+                    continue;
+                for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+                {
+                    const MeshRef* refs = reinterpret_cast<const MeshRef*>(ColumnBase(archetype, c, refColumn));
+                    GpuInstanceSlot* slots = reinterpret_cast<GpuInstanceSlot*>(ColumnBase(archetype, c, slotColumn));
+                    bool wrote = false;
+                    for (uint32_t r = 0; r < archetype.chunks[c].count; ++r)
+                    {
+                        const uint32_t mesh = MeshTable::SlotOf(refs[r].mesh);
+                        if (refs[r].mesh == MeshId::Invalid || mesh >= reranged.size() || !reranged[mesh] ||
+                            slots[r].instance == c_NoInstanceSlot)
+                            continue;
+                        const uint32_t count = meshes.GetMeshRow(mesh).geometryCount;
+                        m_GeometryInstanceSlots.Free(slots[r].firstGeometryInstance, slots[r].geometryCount);
+                        slots[r].firstGeometryInstance = m_GeometryInstanceSlots.Allocate(count);
+                        slots[r].geometryCount = count;
+                        wrote = true;
+                    }
+                    if (wrote)
+                        StampVersion(archetype.Versions(c) + slotColumn, m_Impl->GetStampVersion());
+                }
+            }
+        }
+        // Callbacks after the tables are consistent; an exception from one is reported, as the leaf observer does.
+        try
+        {
+            RaiseAssetCallbacks(m_Changes);
+        }
+        catch (const std::exception& error)
+        {
+            log::warning("SceneGraph::Refresh: an asset callback threw '%s'", error.what());
+        }
+        catch (...)
+        {
+            log::warning("SceneGraph::Refresh: an asset callback threw");
+        }
+        m_Changes.Clear();
+    }
+
     // ------------------------------------------------------------------------------------- refresh
 
     bool SceneGraphStore::Refresh(uint32_t frameIndex)
     {
+        ++m_RefreshCalls;
         SyncArchetypes();
         const bool structure = m_PendingStructure;
         const bool moved = m_PendingTransform;

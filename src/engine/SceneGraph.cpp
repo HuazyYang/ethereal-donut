@@ -261,6 +261,20 @@ namespace
         static const LeafTypeDesc s_Desc{ nvrhi::uuid_of<Leaf>(), s_Tags, uint32_t(sizeof...(Tags)), nullptr, 0 };
         return s_Desc;
     }
+
+    // Mesh instances keep their mesh reference, render flags and GPU slots in columns (plan step E4), which the
+    // graph's leaf observer fills when the leaf is attached.
+    template <typename Leaf, typename... Tags>
+    const LeafTypeDesc& MakeMeshLeafTypeDesc() noexcept
+    {
+        static const ComponentTypeDesc* const s_Tags[] = { &ComponentTraits<Tags>::Desc()... };
+        static const ComponentTypeDesc* const s_Columns[] = { &ComponentTraits<MeshRef>::Desc(),
+                                                              &ComponentTraits<RenderFlags>::Desc(),
+                                                              &ComponentTraits<GpuInstanceSlot>::Desc() };
+        static const LeafTypeDesc s_Desc{ nvrhi::uuid_of<Leaf>(), s_Tags, uint32_t(sizeof...(Tags)), s_Columns,
+                                          uint32_t(std::size(s_Columns)) };
+        return s_Desc;
+    }
 }
 
 const LeafTypeDesc& SceneGraphLeaf::GetTypeDesc() const
@@ -271,12 +285,24 @@ const LeafTypeDesc& SceneGraphLeaf::GetTypeDesc() const
 
 const LeafTypeDesc& MeshInstance::GetTypeDesc() const
 {
-    return MakeLeafTypeDesc<MeshInstance, MeshInstanceLeaf>();
+    return MakeMeshLeafTypeDesc<MeshInstance, MeshInstanceLeaf>();
 }
 
 const LeafTypeDesc& SkinnedMeshInstance::GetTypeDesc() const
 {
-    return MakeLeafTypeDesc<SkinnedMeshInstance, MeshInstanceLeaf, SkinnedMeshInstanceLeaf>();
+    return MakeMeshLeafTypeDesc<SkinnedMeshInstance, MeshInstanceLeaf, SkinnedMeshInstanceLeaf>();
+}
+
+int MeshInstance::GetInstanceIndex() const
+{
+    const GpuInstanceSlot* slot = SceneGraphStore::InstanceSlotOf(this);
+    return slot ? int(slot->instance) : -1;
+}
+
+int MeshInstance::GetGeometryInstanceIndex() const
+{
+    const GpuInstanceSlot* slot = SceneGraphStore::InstanceSlotOf(this);
+    return slot ? int(slot->firstGeometryInstance) : -1;
 }
 
 const LeafTypeDesc& SkinnedMeshReference::GetTypeDesc() const
@@ -864,40 +890,11 @@ void SceneGraph::RegisterLeaf(SceneGraphLeaf *leaf)
     if (!leaf)
         return;
 
+    // The asset tables were updated (and OnMeshAdded and OnMaterialAdded raised) by the leaf observer before this
+    // call, from the instance's MeshRef column (plan step E4).
     auto meshInstance = query_cast<MeshInstance>(leaf);
     if (meshInstance)
     {
-        const auto& mesh = meshInstance->GetMesh();
-        if (mesh)
-        {
-            size_t geometryCount = 0;
-            if (m_Meshes.AddRef(mesh))
-            {
-                geometryCount += mesh->geometries.size();
-                m_GeometryCount += mesh->geometries.size();
-                if (OnMeshAdded)
-                    OnMeshAdded(mesh);
-            }
-
-            for (const auto& geometry : mesh->geometries)
-            {
-                if (m_Materials.AddRef(geometry->material) && OnMaterialAdded)
-                    OnMaterialAdded(geometry->material);
-            }
-
-            if (mesh->skinPrototype)
-            {
-                if (m_Meshes.AddRef(mesh->skinPrototype))
-                {
-                    geometryCount += mesh->skinPrototype->geometries.size();
-                    m_GeometryCount += mesh->skinPrototype->geometries.size();
-                    if (OnMeshAdded)
-                        OnMeshAdded(mesh->skinPrototype);
-                }
-            }
-
-            m_MaxGeometryCountPerMesh = std::max(m_MaxGeometryCountPerMesh, geometryCount);
-        }
         m_MeshInstances.push_back(meshInstance);
 
         auto skinnedInstance = query_cast<SkinnedMeshInstance>(meshInstance);
@@ -953,36 +950,10 @@ void SceneGraph::UnregisterLeaf(SceneGraphLeaf *leaf)
             items.erase(it);
     };
 
+    // The leaf observer released the instance's mesh (and raised OnMeshRemoved and OnMaterialRemoved) before this call.
     auto meshInstance = query_cast<MeshInstance>(leaf);
     if (meshInstance)
     {
-        const auto& mesh = meshInstance->GetMesh();
-        if (mesh)
-        {
-            if (m_Meshes.Release(mesh))
-            {
-                m_GeometryCount -= mesh->geometries.size();
-                if (OnMeshRemoved)
-                    OnMeshRemoved(mesh);
-            }
-
-            for (const auto& geometry : mesh->geometries)
-            {
-                if (m_Materials.Release(geometry->material) && OnMaterialRemoved)
-                    OnMaterialRemoved(geometry->material);
-            }
-
-            if (mesh->skinPrototype)
-            {
-                if (m_Meshes.Release(mesh->skinPrototype))
-                {
-                    m_GeometryCount -= mesh->skinPrototype->geometries.size();
-                    if (OnMeshRemoved)
-                        OnMeshRemoved(mesh->skinPrototype);
-                }
-            }
-        }
-
         // A Detach removes its leaves in one pass at its end (CompactLeafVectors); the order of the rest is kept.
         removeLeaf(m_MeshInstances, meshInstance);
 
@@ -1182,45 +1153,20 @@ void SceneGraph::Refresh(uint32_t frameIndex)
     // TransformPropagation and Bounds (design 5.7), when anything changed since the last call.
     const bool structureDirty = m_Store->Refresh(frameIndex);
 
-    // Until step E4 (stable slots), the indices are renumbered after structural changes, in leaf-vector order.
+    // Slots are stable (step E4): nothing is renumbered. After structural changes, as the old renumbering did, the mesh
+    // table follows meshes whose geometries were edited in place since they were added.
     if (structureDirty)
-    {
-        int instanceIndex = 0;
-        int geometryInstanceIndex = 0;
-        for (const auto& instance : m_MeshInstances)
-        {
-            instance->m_InstanceIndex = instanceIndex;
-            ++instanceIndex;
+        m_Store->ReconcileMeshes();
+}
 
-            const auto& mesh = instance->GetMesh();
-            instance->m_GeometryInstanceIndex = geometryInstanceIndex;
-            geometryInstanceIndex += int(mesh->geometries.size());
-        }
-        m_GeometryInstancesCount = geometryInstanceIndex;
+const size_t SceneGraph::GetGeometryInstancesCount() const
+{
+    return m_Store->GetGeometryInstanceSlots().GetEnd();
+}
 
-        int meshIndex = 0;
-        int geometryIndex = 0;
-        for (const auto& mesh : m_Meshes)
-        {
-            for (const auto& geometry : mesh->geometries)
-            {
-                geometry->globalGeometryIndex = geometryIndex;
-                ++geometryIndex;
-            }
-
-            mesh->globalMeshIndex = meshIndex;
-            ++meshIndex;
-        }
-
-        assert(m_GeometryCount == geometryIndex);
-
-        int materialIndex = 0;
-        for (const auto& material : m_Materials)
-        {
-            material->materialID = materialIndex;
-            ++materialIndex;
-        }
-    }
+size_t SceneGraph::GetInstanceSlotCount() const
+{
+    return m_Store->GetInstanceSlots().GetEnd();
 }
 
 nvrhi::AutoPtr<SceneGraph> SceneTypeFactory::CreateGraph()

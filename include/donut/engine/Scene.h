@@ -24,6 +24,7 @@
 #include <nvrhi/core/foundation.h>
 #include <nvrhi/core/autoptr.h>
 #include <donut/engine/SceneGraph.h>
+#include <donut/engine/GpuScene.h>
 #include <nvrhi/nvrhi.h>
 #include <vector>
 #include <mutex>
@@ -67,10 +68,10 @@ namespace donut::engine
         std::vector<SceneImportResult> m_Models;
         bool m_EnableBindlessResources = false;
         bool m_UseResourceDescriptorHeapBindless = false;
-        
-        nvrhi::BufferHandle m_MaterialBuffer;
-        nvrhi::BufferHandle m_GeometryBuffer;
-        nvrhi::BufferHandle m_InstanceBuffer;
+
+        // The instance, geometry and material buffers and their CPU images (plan step E4): made at the first
+        // RefreshBuffers, from the flags above.
+        nvrhi::AutoPtr<GpuScene> m_GpuScene;
 
         nvrhi::DeviceHandle m_Device;
         nvrhi::ShaderHandle m_SkinningShader;
@@ -78,11 +79,7 @@ namespace donut::engine
         nvrhi::BindingLayoutHandle m_SkinningBindingLayout;
 
         bool m_RayTracingSupported = false;
-        bool m_SceneTransformsChanged = false;
         bool m_SceneStructureChanged = false;
-
-        struct Resources; // Hide the implementation to avoid including <material_cb.h> and <bindless.h> here
-        nvrhi::MonoPtr<Resources> m_Resources;
 
         void LoadModelAsync(
             uint32_t index,
@@ -96,22 +93,10 @@ namespace donut::engine
 
         void LoadSceneGraph(const Json::Value& nodeList, SceneGraphNode* parent);
         void LoadAnimations(const Json::Value& nodeList);
-        
-        void UpdateMaterial(const Material* material);
-        void UpdateGeometry(const MeshInfo* mesh);
-        void UpdateInstance(const MeshInstance* instance);
 
         void UpdateSkinnedMeshes(nvrhi::ICommandList* commandList, uint32_t frameIndex);
 
-        void WriteMaterialBuffer(nvrhi::ICommandList* commandList) const;
-        void WriteGeometryBuffer(nvrhi::ICommandList* commandList) const;
-        void WriteInstanceBuffer(nvrhi::ICommandList* commandList) const;
-
         virtual void CreateMeshBuffers(nvrhi::ICommandList* commandList);
-        virtual nvrhi::BufferHandle CreateMaterialBuffer();
-        virtual nvrhi::BufferHandle CreateGeometryBuffer();
-        virtual nvrhi::BufferHandle CreateInstanceBuffer();
-        virtual nvrhi::BufferHandle CreateMaterialConstantBuffer(const std::string& debugName);
 
         virtual bool LoadCustomData(Json::Value& rootNode, const std::filesystem::path& scenePath, ThreadPool* threadPool);
     public:
@@ -130,7 +115,11 @@ namespace donut::engine
         // Processes animations, transforms, bounding boxes etc.
         void RefreshSceneGraph(uint32_t frameIndex);
 
-        // Creates missing buffers, uploads vertex buffers, instance data, materials, etc.
+        // Creates missing buffers, uploads vertex buffers, instance data, materials, etc. The instance, geometry and
+        // material rows are GpuScene's: only the rows that changed are written (plan step E4).
+        // InstanceData::prevTransform is the transform a row was uploaded with by the last RefreshBuffers of an earlier
+        // frame (a frame being a SceneGraph::Refresh call): call it every frame that refreshes the graph, as before, or
+        // the first frame after a gap gets the transforms of the last frame it ran, not of the previous one.
         void RefreshBuffers(nvrhi::ICommandList* commandList, uint32_t frameIndex);
 
         // A combination of RefreshSceneGraph and RefreshBuffers
@@ -147,9 +136,10 @@ namespace donut::engine
 
         [[nodiscard]] SceneGraph* GetSceneGraph() const { return m_SceneGraph; }
         [[nodiscard]] nvrhi::IDescriptorTable* GetDescriptorTable() const { return m_DescriptorTable ? m_DescriptorTable->GetDescriptorTable() : nullptr; }
-        [[nodiscard]] nvrhi::IBuffer* GetMaterialBuffer() const { return m_MaterialBuffer; }
-        [[nodiscard]] nvrhi::IBuffer* GetGeometryBuffer() const { return m_GeometryBuffer; }
-        [[nodiscard]] nvrhi::IBuffer* GetInstanceBuffer() const { return m_InstanceBuffer; }
+        [[nodiscard]] nvrhi::IBuffer* GetMaterialBuffer() const { return m_GpuScene ? m_GpuScene->GetMaterialBuffer() : nullptr; }
+        [[nodiscard]] nvrhi::IBuffer* GetGeometryBuffer() const { return m_GpuScene ? m_GpuScene->GetGeometryBuffer() : nullptr; }
+        [[nodiscard]] nvrhi::IBuffer* GetInstanceBuffer() const { return m_GpuScene ? m_GpuScene->GetInstanceBuffer() : nullptr; }
+        [[nodiscard]] GpuScene* GetGpuScene() const { return m_GpuScene; }
 
         // Can return nullptr if not yet created (by Scene::RefreshBuffers)
         GeometryData* GetGeometryData(const MeshGeometry& geometry) const;

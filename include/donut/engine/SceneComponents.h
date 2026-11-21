@@ -20,7 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-// The scene graph's components (aggregate docs/ecs-design.md 4.6, 4.7, 4.11, 5.1 and 9.2; plan step E3). Every node
+// The scene graph's components (aggregate docs/ecs-design.md 4.6, 4.7, 4.11, 5.1 and 9.2; plan steps E3, E4). Every node
 // attached to a SceneGraph is one entity of the graph's world (one world per graph, D18), and these are its columns.
 // Module-private C++: SceneNode and LeafObject hold implementation classes, so nothing here crosses a module boundary.
 //
@@ -149,6 +149,52 @@ namespace donut::engine
         ~LeafObject();
     };
     DONUT_ECS_COMPONENT(LeafObject, "636cbb39-e668-4872-b6b0-a5f7378e5e01", DONUT_ECS_FIELDS())
+
+    // ------------------------------------------------------------------ mesh-instance columns (plan step E4)
+    //
+    //     node with a MeshInstance   ... plus MeshRef, RenderFlags and GpuInstanceSlot (MeshInstance's LeafTypeDesc
+    //                                columns), filled by the graph's leaf observer before RegisterLeaf runs
+    //
+    // They are derived from the leaf when it is attached (as LocalBounds is): the leaf keeps its mesh pointer, which
+    // nothing changes while it is attached, and a record needs none of them.
+
+    enum class MeshId : uint32_t;   // AssetTables.h
+
+    // The instance's mesh in its graph's mesh table (AssetTables.h). Holds one reference to the row.
+    struct MeshRef
+    {
+        MeshId mesh;
+    };
+    DONUT_ECS_COMPONENT(MeshRef, "62d2cc8a-b43a-44c9-be36-ce9abe270d8e", DONUT_ECS_FIELDS(mesh))
+
+    // What rendering needs to know about an instance without its objects: the InstanceData flags of its mesh type
+    // (bindless.h) and the material domains of its geometries (the mesh bits of SceneContentFlags). Taken at attach,
+    // SetLeaf and InvalidateContent.
+    struct RenderFlags
+    {
+        uint32_t instanceFlags;
+        uint32_t contentFlags;
+    };
+    DONUT_ECS_COMPONENT(RenderFlags, "c309ae37-c9f5-4a1a-bea6-824a128d0fbc",
+                        DONUT_ECS_FIELDS(instanceFlags, contentFlags))
+    // RenderFlags::instanceFlags bits: InstanceFlags_* of bindless.h (GpuScene.cpp checks that they match).
+    constexpr uint32_t c_InstanceFlagCurveDisjointOrthogonalTriangleStrips = 0x00000001u;
+    constexpr uint32_t c_InstanceFlagCurveLinearSweptSpheres = 0x00000002u;
+
+    // The instance's stable GPU slots (design 7.2): its row in the instance buffer (MeshInstance::GetInstanceIndex) and
+    // its range of geometry-instance slots (GetGeometryInstanceIndex), one per geometry of its mesh. Allocated when the
+    // leaf is attached, freed when it leaves; derived, so snapshots and hashes leave it out. A row starts, and returns
+    // when its slots are released, at c_NoInstanceSlot (0 is a real slot), which the getters report as -1.
+    constexpr uint32_t c_NoInstanceSlot = ~0u;
+    struct GpuInstanceSlot
+    {
+        uint32_t instance = c_NoInstanceSlot;
+        uint32_t firstGeometryInstance = c_NoInstanceSlot;
+        uint32_t geometryCount = 0;
+    };
+    DONUT_ECS_COMPONENT_EX(GpuInstanceSlot, "9a6a7dd2-8f26-4869-bc25-2a6f8a29c425",
+                           ::donut::engine::ComponentFlags::NoSerialize, 0,
+                           DONUT_ECS_FIELDS(instance, firstGeometryInstance, geometryCount))
 
     // One tag per leaf class in the class chain (4.11), so that queries select leaf kinds without casts. A SpotLight
     // gets LightLeaf and SpotLightLeaf; SceneGraphLeaf itself is LeafObject.

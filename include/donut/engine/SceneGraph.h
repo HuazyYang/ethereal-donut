@@ -25,6 +25,7 @@
 #include <nvrhi/core/autoptr.h>
 #include <donut/engine/SceneTypes.h>
 #include <donut/engine/SceneComponents.h>
+#include <donut/engine/AssetTables.h>
 #include <donut/engine/KeyframeAnimation.h>
 #include <donut/core/math/math.h>
 #include <donut/core/query_cast.h>
@@ -41,6 +42,7 @@ namespace donut::engine
     class SceneGraphNode;
     class SceneTypeFactory;
     class SceneGraphStore;   // the graph's world and systems (src/engine/SceneGraphStore.h)
+    class GpuScene;
     struct IWorld;
     struct IJobSystem;
     struct IScheduler;
@@ -109,12 +111,10 @@ namespace donut::engine
         NVRHI_IMPLEMENTS_CLASS(MeshInstance)
         NVRHI_IMPLEMENTS_ROUTE_PARENT(SceneGraphLeaf)
         NVRHI_END_INTERFACE_TABLE()
-    private:
-        friend class SceneGraph;
-        int m_InstanceIndex = -1;
-        int m_GeometryInstanceIndex = -1;
-
     protected:
+        // The authoring reference, set before the leaf is attached and not changed while it is (no setter exists):
+        // while attached, the instance's MeshRef column names the same mesh in the graph's mesh table, and its
+        // GpuInstanceSlot column holds its stable slots (plan step E4).
         nvrhi::AutoPtr<MeshInfo> m_Mesh;
 
     public:
@@ -123,8 +123,11 @@ namespace donut::engine
         { }
 
         [[nodiscard]] MeshInfo* GetMesh() const { return m_Mesh; }
-        [[nodiscard]] int GetInstanceIndex() const { return m_InstanceIndex; }
-        [[nodiscard]] int GetGeometryInstanceIndex() const { return m_GeometryInstanceIndex; }
+        // The stable slots of the attached instance (its GpuInstanceSlot column, design 7.2): its row in the instance
+        // buffer, and the first of its geometry-instance slots, one per geometry. They stay the same until the leaf
+        // leaves the graph; -1 while it is in none.
+        [[nodiscard]] int GetInstanceIndex() const;
+        [[nodiscard]] int GetGeometryInstanceIndex() const;
         [[nodiscard]] dm::box3 GetLocalBoundingBox() override { return m_Mesh->objectSpaceBounds; }
         [[nodiscard]] nvrhi::AutoPtr<SceneGraphLeaf> Clone() override;
         [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
@@ -728,13 +731,13 @@ namespace donut::engine
     private:
         friend class SceneGraphNode;
         friend class SceneGraphStore;
+        friend class GpuScene;
         nvrhi::AutoPtr<SceneGraphNode> m_Root;
         SceneGraphStore* m_Store = nullptr;   // the world, its systems and observers (one world per graph, D18)
-        ResourceTracker<Material> m_Materials;
-        ResourceTracker<MeshInfo> m_Meshes;
-        size_t m_GeometryCount = 0;
+        // The asset tables (design 4.8): stable slots and reference counts, filled by the leaf observer.
+        MaterialTable m_Materials;
+        MeshTable m_Meshes;
         size_t m_MaxGeometryCountPerMesh = 0;
-        size_t m_GeometryInstancesCount = 0;
         std::vector<nvrhi::AutoPtr<MeshInstance>> m_MeshInstances;
         std::vector<nvrhi::AutoPtr<SkinnedMeshInstance>> m_SkinnedMeshInstances;
         std::vector<nvrhi::AutoPtr<SceneGraphAnimation>> m_Animations;
@@ -765,13 +768,18 @@ namespace donut::engine
        SceneResourceCallback<Material> OnMaterialRemoved;
 
        [[nodiscard]] SceneGraphNode* GetRootNode() { return m_Root; }
-       [[nodiscard]] const ResourceTracker<Material>& GetMaterials() const {
-           return m_Materials;
-       }
-        [[nodiscard]] const ResourceTracker<MeshInfo>& GetMeshes() const { return m_Meshes; }
-        [[nodiscard]] const size_t GetGeometryCount() const { return m_GeometryCount; }
+        // The asset tables, iterated in slot order (Material::materialID, MeshInfo::globalMeshIndex); their size is the
+        // number of materials and meshes in use.
+        [[nodiscard]] const MaterialTable& GetMaterials() const { return m_Materials; }
+        [[nodiscard]] const MeshTable& GetMeshes() const { return m_Meshes; }
+        // The size of an array indexed by MeshGeometry::globalGeometryIndex: one past the highest geometry slot used
+        // (the number of geometries while no mesh has left the graph).
+        [[nodiscard]] const size_t GetGeometryCount() const { return m_Meshes.GetGeometryEnd(); }
         [[nodiscard]] const size_t GetMaxGeometryCountPerMesh() const { return m_MaxGeometryCountPerMesh; }
-        [[nodiscard]] const size_t GetGeometryInstancesCount() const { return m_GeometryInstancesCount; }
+        // The size of an array indexed by geometry-instance slot (MeshInstance::GetGeometryInstanceIndex), likewise.
+        [[nodiscard]] const size_t GetGeometryInstancesCount() const;
+        // The size of an array indexed by instance slot (MeshInstance::GetInstanceIndex), likewise.
+        [[nodiscard]] size_t GetInstanceSlotCount() const;
         [[nodiscard]] const std::vector<nvrhi::AutoPtr<MeshInstance>>& GetMeshInstances() const { return m_MeshInstances; }
         [[nodiscard]] const std::vector<nvrhi::AutoPtr<SkinnedMeshInstance>>& GetSkinnedMeshInstances() const { return m_SkinnedMeshInstances; }
         [[nodiscard]] const std::vector<nvrhi::AutoPtr<SceneGraphAnimation>>& GetAnimations() const { return m_Animations; }
@@ -817,8 +825,9 @@ namespace donut::engine
         // If multiple nodes within one parent have the same name matching that component of the path, only the first node will be considered.
         [[nodiscard]] SceneGraphNode* FindNode(const std::filesystem::path& path, SceneGraphNode* context = nullptr) const;
         
-        // Runs the TransformPropagation and Bounds phases (design 5.7) when anything changed since the last call, and
-        // numbers the mesh instances, geometries, meshes and materials after structural changes (until step E4).
+        // Runs the TransformPropagation and Bounds phases (design 5.7) when anything changed since the last call. Slots
+        // are stable (step E4): they are assigned when leaves are attached, not here; after structural changes it only
+        // brings the mesh table in line with meshes whose geometries were edited in place (MeshTable::Reconcile).
         // "Changed" means: a call of this API (structure, transforms, InvalidateContent), a structural change of the
         // world, or a phase that ran on the world (its version moved). Writes into the graph's columns through
         // GetWorld() outside phases (GetComponentForWrite with c_WorldVersion) do not move the version and are not

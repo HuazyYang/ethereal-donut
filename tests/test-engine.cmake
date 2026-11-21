@@ -51,11 +51,11 @@ target_compile_definitions(test_ecs_determinism PRIVATE
     DONUT_TEST_GOLDEN_DIR="${CMAKE_CURRENT_LIST_DIR}/src/engine/golden")
 
 # The ECS tests reach the world's internals (allocation counters, chunk layout, entity table) through the private
-# headers in src/engine (EcsWorldImpl.h and the ones beside it); so does the scene-graph storage test (step E3), for the
-# allocation counter.
+# headers in src/engine (EcsWorldImpl.h and the ones beside it); so do the scene-graph storage test (step E3) and the
+# GPU scene test (step E4), for the allocation counter.
 foreach(test_src ${donut_engine_tests})
     get_filename_component(test_name "${test_src}" NAME_WE)
-    if(test_name MATCHES "^test_ecs_" OR test_name STREQUAL "test_scene_graph_store")
+    if(test_name MATCHES "^test_ecs_" OR test_name STREQUAL "test_scene_graph_store" OR test_name STREQUAL "test_gpu_scene")
         target_include_directories("${test_name}" PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
     endif()
 endforeach()
@@ -68,3 +68,17 @@ add_dependencies(donut_all_tests bench_scene_graph)
 add_test(NAME bench_scene_graph_smoke COMMAND bench_scene_graph --smoke)
 set_property(TARGET bench_scene_graph PROPERTY FOLDER "Donut/donut_tests/donut_engine_tests")
 
+# The CPU cost of the instance upload (plan step E4): GpuScene against the old RefreshBuffers instance path, which the
+# same source measures when it is compiled against the E0 tree with BENCH_GPU_SCENE_E0=1. ctest runs the smoke mode.
+add_executable(bench_gpu_scene src/engine/bench_gpu_scene.cpp)
+target_link_libraries(bench_gpu_scene donut_app donut_engine donut_core)
+add_dependencies(donut_all_tests bench_gpu_scene)
+add_test(NAME bench_gpu_scene_smoke COMMAND bench_gpu_scene --smoke)
+set_property(TARGET bench_gpu_scene PROPERTY FOLDER "Donut/donut_tests/donut_engine_tests")
+
+# The A/B dump of plan step E4 (a GPU program, not a ctest test): the instance, geometry and material buffers read back
+# after Scene::Refresh, in GpuSceneDump.h's canonical form. The same source builds against the E0 tree from outside it.
+add_executable(gpu_scene_dump src/engine/gpu_scene_dump.cpp src/engine/GpuSceneDump.h)
+target_link_libraries(gpu_scene_dump donut_app donut_engine donut_core)
+add_dependencies(donut_all_tests gpu_scene_dump)
+set_property(TARGET gpu_scene_dump PROPERTY FOLDER "Donut/donut_tests/donut_engine_tests")

@@ -74,23 +74,6 @@ const SceneLoadingStats& Scene::GetLoadingStats()
     return g_LoadingStats;
 }
 
-struct Scene::Resources
-{
-    std::vector<MaterialConstants> materialData;
-    std::vector<GeometryData> geometryData;
-    std::vector<InstanceData> instanceData;
-
-    // InstanceData::prevTransform: every instance's world transform as it was when RefreshSceneGraph started, before
-    // the graph refreshed: the old nodes' previous transforms (a node kept its world of the previous Refresh). Nodes
-    // keep no previous transforms since step E3 (design 5.7); until GpuScene keeps them per stable slot (E4), the
-    // scene does. By position in GetMeshInstances, which the graph's Refresh makes the instance index, with the
-    // instance's entity (index and generation: an address can be reused, an entity cannot). Valid for the
-    // RefreshBuffers calls that follow, however many.
-    std::vector<Entity> previousEntities;
-    std::vector<dm::affine3> previousTransforms;
-    bool previousValid = false;
-};
-
 Scene::Scene(
     nvrhi::IDevice* device,
     ShaderFactory* shaderFactory,
@@ -104,8 +87,6 @@ Scene::Scene(
     , m_DescriptorTable(descriptorTable)
     , m_Device(device)
 {
-    m_Resources = nvrhi::MakeMono<Resources>();
-
     if (!m_SceneTypeFactory)
         m_SceneTypeFactory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
 
@@ -626,131 +607,45 @@ void Scene::FinishedLoading(uint32_t frameIndex)
 
 void Scene::RefreshSceneGraph(uint32_t frameIndex)
 {
+    // GpuScene keeps the previous transforms per instance slot (plan step E4) and finds what changed by itself.
     m_SceneStructureChanged = m_SceneGraph->HasPendingStructureChanges();
-    m_SceneTransformsChanged = m_SceneGraph->HasPendingTransformChanges();
-
-    // the previous transforms of this frame's instance upload (Resources::previousTransforms)
-    Resources& resources = *m_Resources;
-    resources.previousValid = m_SceneStructureChanged || m_SceneTransformsChanged;
-    if (resources.previousValid)
-    {
-        const auto& instances = m_SceneGraph->GetMeshInstances();
-        resources.previousEntities.resize(instances.size());
-        resources.previousTransforms.resize(instances.size());
-        for (size_t i = 0; i < instances.size(); ++i)
-        {
-            const SceneGraphNode* node = instances[i]->GetNode();
-            resources.previousEntities[i] = node ? m_SceneGraph->GetEntity(node) : Entity::Null;
-            resources.previousTransforms[i] = node ? node->GetLocalToWorldTransformFloat() : dm::affine3::identity();
-        }
-    }
-
     m_SceneGraph->Refresh(frameIndex);
 }
 
 void Scene::RefreshBuffers(nvrhi::ICommandList* commandList, uint32_t frameIndex)
 {
-    bool materialsChanged = false;
-
     if (m_SceneStructureChanged)
+    {
         CreateMeshBuffers(commandList);
-
-    const size_t allocationGranularity = 1024;
-    bool arraysAllocated = false;
-
-    if (m_EnableBindlessResources && m_SceneGraph->GetGeometryCount() > m_Resources->geometryData.size())
-    {
-        m_Resources->geometryData.resize(nvrhi::align<size_t>(m_SceneGraph->GetGeometryCount(), allocationGranularity));
-        m_GeometryBuffer = CreateGeometryBuffer();
-        arraysAllocated = true;
+        // The buffers and descriptors of meshes attached after the last update are made only now: their geometry rows
+        // are filled again (a mesh attached between RefreshSceneGraph and RefreshBuffers got rows without them).
+        if (m_GpuScene)
+            m_GpuScene->InvalidateAssets();
     }
 
-    if (m_SceneGraph->GetMaterials().size() > m_Resources->materialData.size())
+    // The instance, geometry and material rows: GpuScene writes the ones that changed (plan step E4).
+    if (!m_GpuScene)
     {
-        m_Resources->materialData.resize(nvrhi::align<size_t>(m_SceneGraph->GetMaterials().size(), allocationGranularity));
-        if (m_EnableBindlessResources)
-            m_MaterialBuffer = CreateMaterialBuffer();
-        arraysAllocated = true;
+        GpuSceneDesc desc;
+        desc.geometryAndMaterialBuffers = m_EnableBindlessResources;
+        desc.resourceDescriptorHeapBindless = m_UseResourceDescriptorHeapBindless;
+        // On DX11, a buffer cannot be both structured and vertex.
+        // On other APIs, a structured instance buffer can be used for rasterization.
+        desc.structuredInstanceBuffer = m_Device->getGraphicsAPI() != nvrhi::GraphicsAPI::D3D11;
+        desc.rowGranularity = 1024;
+        m_GpuScene = MAKE_RC_OBJ_PTR(GpuScene, m_Device, desc);
     }
+    nvrhi::IBuffer* previousInstanceBuffer = m_GpuScene->GetInstanceBuffer();
+    if (NVRHI_FAILED(m_GpuScene->Update(m_SceneGraph)) || NVRHI_FAILED(m_GpuScene->Upload(commandList)))
+        log::warning("Scene::RefreshBuffers: the GPU scene was not updated");
 
-    if (m_SceneGraph->GetMeshInstances().size() > m_Resources->instanceData.size())
-    {
-        m_Resources->instanceData.resize(nvrhi::align<size_t>(m_SceneGraph->GetMeshInstances().size(), allocationGranularity));
-        m_InstanceBuffer = CreateInstanceBuffer();
-        arraysAllocated = true;
-    }
-
-    for (const auto& material : m_SceneGraph->GetMaterials())
-    {
-        if (material->dirty || m_SceneStructureChanged || arraysAllocated)
-            UpdateMaterial(material);
-
-        if (!material->materialConstants)
-        {
-            material->materialConstants = CreateMaterialConstantBuffer(material->name);
-            material->dirty = true;
-        }
-
-        if (material->dirty)
-        {
-            commandList->writeBuffer(material->materialConstants,
-                &m_Resources->materialData[material->materialID],
-                sizeof(MaterialConstants));
-
-            material->dirty = false;
-            materialsChanged = true;
-        }
-    }
-
-    if (!m_Resources->geometryData.empty())
-    {
-        uint32_t geometryResourceIndex = 0;
-        for (const auto& mesh : m_SceneGraph->GetMeshes())
-        {
-            if (arraysAllocated)
-            {
-                break;
-            }
-
-            for (const auto& geometry : mesh->geometries)
-            {
-                if (geometry->numIndices != m_Resources->geometryData[geometryResourceIndex].numIndices)
-                {
-                    arraysAllocated = true;
-                    break;
-                }
-                ++geometryResourceIndex;
-            }
-        }
-    }
-
-    if (m_SceneStructureChanged || arraysAllocated)
+    if (m_SceneStructureChanged || m_GpuScene->GetInstanceBuffer() != previousInstanceBuffer)
     {
         for (const auto& mesh : m_SceneGraph->GetMeshes())
         {
-            mesh->buffers->instanceBuffer = m_InstanceBuffer;
-
-            if (m_EnableBindlessResources)
-                UpdateGeometry(mesh);
+            if (mesh->buffers)
+                mesh->buffers->instanceBuffer = m_GpuScene->GetInstanceBuffer();
         }
-
-        if (m_EnableBindlessResources)
-            WriteGeometryBuffer(commandList);
-    }
-
-    if (m_SceneStructureChanged || m_SceneTransformsChanged || arraysAllocated)
-    {
-        for (const auto& instance : m_SceneGraph->GetMeshInstances())
-        {
-            UpdateInstance(instance);
-        }
-
-        WriteInstanceBuffer(commandList);
-    }
-
-    if (m_EnableBindlessResources && (materialsChanged || m_SceneStructureChanged || arraysAllocated))
-    {
-        WriteMaterialBuffer(commandList);
     }
 
     UpdateSkinnedMeshes(commandList, frameIndex);
@@ -1147,173 +1042,10 @@ void Scene::CreateMeshBuffers(nvrhi::ICommandList* commandList)
     }
 }
 
-nvrhi::BufferHandle Scene::CreateMaterialBuffer()
-{
-    nvrhi::BufferDesc bufferDesc;
-    bufferDesc.byteSize = sizeof(MaterialConstants) * m_Resources->materialData.size();
-    bufferDesc.debugName = "BindlessMaterials";
-    bufferDesc.structStride = sizeof(MaterialConstants);
-    bufferDesc.canHaveRawViews = true;
-    bufferDesc.canHaveUAVs = true;
-    bufferDesc.initialState = nvrhi::ResourceStates::ShaderResource;
-    bufferDesc.keepInitialState = true;
-
-    nvrhi::BufferHandle buffer;
-    m_Device->createBuffer(bufferDesc, &buffer);
-    return buffer;
-}
-
-nvrhi::BufferHandle Scene::CreateGeometryBuffer()
-{
-    nvrhi::BufferDesc bufferDesc;
-    bufferDesc.byteSize = sizeof(GeometryData) * m_Resources->geometryData.size();
-    bufferDesc.debugName = "BindlessGeometry";
-    bufferDesc.structStride = sizeof(GeometryData);
-    bufferDesc.canHaveRawViews = true;
-    bufferDesc.canHaveUAVs = true;
-    bufferDesc.initialState = nvrhi::ResourceStates::ShaderResource;
-    bufferDesc.keepInitialState = true;
-
-    nvrhi::BufferHandle buffer;
-    m_Device->createBuffer(bufferDesc, &buffer);
-    return buffer;
-}
-
-nvrhi::BufferHandle Scene::CreateInstanceBuffer()
-{
-    // On DX11, a buffer cannot be both structured and vertex.
-    // On other APIs, a structured instance buffer can be used for rasterization.
-    bool const needStructuredBuffer = m_Device->getGraphicsAPI() != nvrhi::GraphicsAPI::D3D11;
-
-    nvrhi::BufferDesc bufferDesc;
-    bufferDesc.byteSize = sizeof(InstanceData) * m_Resources->instanceData.size();
-    bufferDesc.debugName = "Instances";
-    bufferDesc.structStride = needStructuredBuffer ? sizeof(InstanceData) : 0;
-    bufferDesc.canHaveRawViews = true;
-    bufferDesc.canHaveUAVs = true;
-    bufferDesc.isVertexBuffer = true;
-    bufferDesc.initialState = nvrhi::ResourceStates::ShaderResource;
-    bufferDesc.keepInitialState = true;
-
-    nvrhi::BufferHandle buffer;
-    m_Device->createBuffer(bufferDesc, &buffer);
-    return buffer;
-}
-
-nvrhi::BufferHandle Scene::CreateMaterialConstantBuffer(const std::string& debugName)
-{
-    nvrhi::BufferDesc bufferDesc;
-    bufferDesc.byteSize = sizeof(MaterialConstants);
-    bufferDesc.debugName = debugName;
-    bufferDesc.isConstantBuffer = true;
-    bufferDesc.initialState = nvrhi::ResourceStates::ConstantBuffer;
-    bufferDesc.keepInitialState = true;
-
-    nvrhi::BufferHandle buffer;
-    m_Device->createBuffer(bufferDesc, &buffer);
-    return buffer;
-}
-
-void Scene::WriteMaterialBuffer(nvrhi::ICommandList* commandList) const
-{
-    commandList->writeBuffer(m_MaterialBuffer, m_Resources->materialData.data(),
-        m_Resources->materialData.size() * sizeof(MaterialConstants));
-}
-
-void Scene::WriteGeometryBuffer(nvrhi::ICommandList* commandList) const
-{
-    commandList->writeBuffer(m_GeometryBuffer, m_Resources->geometryData.data(),
-        m_Resources->geometryData.size() * sizeof(GeometryData));
-}
-
-void Scene::WriteInstanceBuffer(nvrhi::ICommandList* commandList) const
-{
-    commandList->writeBuffer(m_InstanceBuffer, m_Resources->instanceData.data(), 
-        m_Resources->instanceData.size() * sizeof(InstanceData));
-}
-
-void Scene::UpdateMaterial(const Material* material)
-{
-    material->FillConstantBuffer(m_Resources->materialData[material->materialID], m_UseResourceDescriptorHeapBindless);
-}
-
-void Scene::UpdateGeometry(const MeshInfo* mesh)
-{
-    // TODO: support 64-bit buffer offsets in the CB.
-    for (const auto& geometry : mesh->geometries)
-    {
-        uint32_t indexOffset = mesh->indexOffset + geometry->indexOffsetInMesh;
-        uint32_t vertexOffset = mesh->vertexOffset + geometry->vertexOffsetInMesh;
-
-        GeometryData& gdata = m_Resources->geometryData[geometry->globalGeometryIndex];
-        gdata.numIndices = geometry->numIndices;
-        gdata.numVertices = geometry->numVertices;
-        gdata.indexBufferIndex = mesh->buffers->indexBufferDescriptor ? mesh->buffers->indexBufferDescriptor->Get() : -1;
-        gdata.indexOffset = indexOffset * sizeof(uint32_t);
-        gdata.vertexBufferIndex = mesh->buffers->vertexBufferDescriptor ? mesh->buffers->vertexBufferDescriptor->Get() : -1;
-        gdata.positionOffset = mesh->buffers->hasAttribute(VertexAttribute::Position)
-            ? uint32_t(vertexOffset * sizeof(float3) + mesh->buffers->getVertexBufferRange(VertexAttribute::Position).byteOffset) : ~0u;
-        gdata.prevPositionOffset = mesh->buffers->hasAttribute(VertexAttribute::PrevPosition)
-            ? uint32_t(vertexOffset * sizeof(float3) + mesh->buffers->getVertexBufferRange(VertexAttribute::PrevPosition).byteOffset) : ~0u;
-        gdata.texCoord1Offset = mesh->buffers->hasAttribute(VertexAttribute::TexCoord1)
-            ? uint32_t(vertexOffset * sizeof(float2) + mesh->buffers->getVertexBufferRange(VertexAttribute::TexCoord1).byteOffset) : ~0u;
-        gdata.texCoord2Offset = mesh->buffers->hasAttribute(VertexAttribute::TexCoord2)
-            ? uint32_t(vertexOffset * sizeof(float2) + mesh->buffers->getVertexBufferRange(VertexAttribute::TexCoord2).byteOffset) : ~0u;
-        gdata.normalOffset = mesh->buffers->hasAttribute(VertexAttribute::Normal)
-            ? uint32_t(vertexOffset * sizeof(uint32_t) + mesh->buffers->getVertexBufferRange(VertexAttribute::Normal).byteOffset) : ~0u;
-        gdata.tangentOffset = mesh->buffers->hasAttribute(VertexAttribute::Tangent)
-            ? uint32_t(vertexOffset * sizeof(uint32_t) + mesh->buffers->getVertexBufferRange(VertexAttribute::Tangent).byteOffset) : ~0u;
-        gdata.curveRadiusOffset = mesh->buffers->hasAttribute(VertexAttribute::CurveRadius)
-            ? uint32_t(vertexOffset * sizeof(float) + mesh->buffers->getVertexBufferRange(VertexAttribute::CurveRadius).byteOffset) : ~0u;
-        gdata.materialIndex = geometry->material ? geometry->material->materialID : ~0u;
-    }
-}
-
 GeometryData* Scene::GetGeometryData(const MeshGeometry& geometry) const
 {
-    if (m_Resources == nullptr || uint(geometry.globalGeometryIndex) >= m_Resources->geometryData.size() )
+    if (!m_GpuScene || geometry.globalGeometryIndex < 0)
         return nullptr;
 
-    return &m_Resources->geometryData[geometry.globalGeometryIndex];
-}
-
-
-void Scene::UpdateInstance(const MeshInstance* instance)
-{
-    SceneGraphNode* node = instance->GetNode();
-    if (!node)
-        return;
-
-    const size_t index = size_t(instance->GetInstanceIndex());
-    InstanceData& idata = m_Resources->instanceData[index];
-    const dm::affine3 transform = node->GetLocalToWorldTransformFloat();
-
-    // the transform this instance had before the last RefreshSceneGraph refreshed the graph; its current one when it
-    // was not there (or nothing moved, so that no snapshot was taken)
-    dm::affine3 prevTransform = transform;
-    const Resources& resources = *m_Resources;
-    if (resources.previousValid && index < resources.previousEntities.size() &&
-        resources.previousEntities[index] == m_SceneGraph->GetEntity(node))
-        prevTransform = resources.previousTransforms[index];
-
-    affineToColumnMajor(transform, idata.transform);
-    affineToColumnMajor(prevTransform, idata.prevTransform);
-
-    const auto& mesh = instance->GetMesh();
-    idata.firstGeometryInstanceIndex = instance->GetGeometryInstanceIndex();
-    idata.numGeometries = uint32_t(mesh->geometries.size());
-    idata.firstGeometryIndex = idata.numGeometries > 0 ? mesh->geometries[0]->globalGeometryIndex : -1;
-    idata.flags = 0u;
-
-    if (mesh->type == MeshType::CurveDisjointOrthogonalTriangleStrips)
-    {
-        idata.flags |= InstanceFlags_CurveDisjointOrthogonalTriangleStrips;
-    }
-    else if (mesh->type == MeshType::CurveLinearSweptSpheres)
-    {
-        // NVAPI does not support Vulkan, so NvRtIsLssHit() cannot be used to detect LSS hits.
-        // Instead, we explicitly mark each LSS instance with a flag and check this flag during hit processing.
-        // For consistency and completeness, this flag is also set for DX12.
-        idata.flags |= InstanceFlags_CurveLinearSweptSpheres;
-    }
+    return m_GpuScene->GetGeometryRow(uint32_t(geometry.globalGeometryIndex));
 }
