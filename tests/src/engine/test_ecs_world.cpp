@@ -2416,9 +2416,9 @@ void test_unimplemented_seams()
     CHECK(world->AddObserver(observerDesc, nullptr, observer) == nvrhi::FE_NOT_IMPLEMENT);
     CHECK(observer == ObserverId::Invalid);
     CHECK(world->RemoveObserver(ObserverId(0)) == nvrhi::FE_NOT_IMPLEMENT);
-    CHECK(world->SaveSnapshot(nullptr) == nvrhi::FE_NOT_IMPLEMENT);
-    CHECK(world->LoadSnapshot(nullptr) == nvrhi::FE_NOT_IMPLEMENT);
-    CHECK(world->ComputeHash() == 0);
+    CHECK(world->SaveSnapshot(nullptr) == nvrhi::FE_INVALID_ARGS);   // E1.5: test_ecs_snapshot
+    CHECK(world->LoadSnapshot(nullptr) == nvrhi::FE_INVALID_ARGS);
+    CHECK(world->ComputeHash() != 0);
     CHECK(world->ResolvePlaceholder(MakeEntity(1, c_PlaceholderGeneration)) == Entity::Null);
 }
 

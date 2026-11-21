@@ -89,7 +89,8 @@ namespace donut::engine::ecs
     using Vector = nvrhi::vector<T, Allocator>;
 
     // Fixed-size pages for chunks, carved from slabs of c_SlabBytes and kept on a free list: a chunk freed by one
-    // structural change is reused by the next, so that steady-state changes allocate nothing (10.3).
+    // structural change is reused by the next, so that steady-state changes allocate nothing (10.3). Growing the pool
+    // fails softly: the slab and the slab list are plain HeapAllocate blocks.
     class PagePool
     {
     public:
@@ -98,15 +99,21 @@ namespace donut::engine::ecs
         void Initialize(uint32_t pageSize) noexcept;
         void* Allocate() noexcept;              // null when out of memory
         void Free(void* page) noexcept;
+        // Adds slabs until at least `freePages` pages are free, so that as many Allocate calls cannot fail; false when
+        // out of memory (the slabs added stay free).
+        bool Reserve(uint32_t freePages) noexcept;
         void Release() noexcept;                // frees every slab; no page may be in use
         uint32_t GetPageSize() const noexcept { return m_PageSize; }
         uint32_t GetPagesInUse() const noexcept { return m_PagesInUse; }
-        uint32_t GetFreePageCount() const noexcept { return uint32_t(m_Slabs.size()) * m_PagesPerSlab - m_PagesInUse; }
+        uint32_t GetFreePageCount() const noexcept { return m_SlabCount * m_PagesPerSlab - m_PagesInUse; }
 
     private:
         struct FreePage { FreePage* next; };
+        bool AddSlab() noexcept;                // false, with nothing changed, when out of memory
         FreePage* m_FreeList = nullptr;
-        Vector<void*> m_Slabs;
+        void** m_Slabs = nullptr;
+        uint32_t m_SlabCount = 0;
+        uint32_t m_SlabCapacity = 0;
         uint32_t m_PageSize = 0;
         uint32_t m_PagesPerSlab = 0;
         uint32_t m_PagesInUse = 0;
@@ -614,6 +621,9 @@ namespace donut::engine::ecs
         bool RowFits(const ComponentId* components, uint32_t count) noexcept;
 
     private:
+        // SaveSnapshot, LoadSnapshot and ComputeHash (EcsSnapshot.cpp) read and rebuild the whole storage.
+        friend class WorldSnapshot;
+
         struct RowRun
         {
             uint32_t archetype;

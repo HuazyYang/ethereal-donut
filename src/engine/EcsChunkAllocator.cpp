@@ -93,22 +93,46 @@ namespace donut::engine::ecs
         m_PagesPerSlab = pageSize < c_SlabBytes ? c_SlabBytes / pageSize : 1;
     }
 
+    bool PagePool::AddSlab() noexcept
+    {
+        if (m_SlabCount == m_SlabCapacity)
+        {
+            const uint32_t capacity = m_SlabCapacity != 0 ? m_SlabCapacity * 2 : 8;
+            void** slabs = static_cast<void**>(HeapAllocate(size_t(capacity) * sizeof(void*), alignof(void*)));
+            if (!slabs)
+                return false;
+            if (m_SlabCount != 0)
+                std::memcpy(slabs, m_Slabs, size_t(m_SlabCount) * sizeof(void*));
+            HeapFree(m_Slabs);
+            m_Slabs = slabs;
+            m_SlabCapacity = capacity;
+        }
+        uint8_t* slab = static_cast<uint8_t*>(HeapAllocate(size_t(m_PageSize) * m_PagesPerSlab, c_ColumnAlignment));
+        if (!slab)
+            return false;
+        m_Slabs[m_SlabCount++] = slab;
+        // Pushed in reverse, so that the slab's pages are handed out in address order.
+        for (uint32_t i = m_PagesPerSlab; i-- > 0;)
+        {
+            FreePage* page = reinterpret_cast<FreePage*>(slab + size_t(i) * m_PageSize);
+            page->next = m_FreeList;
+            m_FreeList = page;
+        }
+        return true;
+    }
+
+    bool PagePool::Reserve(uint32_t freePages) noexcept
+    {
+        while (GetFreePageCount() < freePages)
+            if (!AddSlab())
+                return false;
+        return true;
+    }
+
     void* PagePool::Allocate() noexcept
     {
-        if (!m_FreeList)
-        {
-            uint8_t* slab = static_cast<uint8_t*>(HeapAllocate(size_t(m_PageSize) * m_PagesPerSlab, c_ColumnAlignment));
-            if (!slab)
-                return nullptr;
-            m_Slabs.push_back(slab);
-            // Pushed in reverse, so that the slab's pages are handed out in address order.
-            for (uint32_t i = m_PagesPerSlab; i-- > 0;)
-            {
-                FreePage* page = reinterpret_cast<FreePage*>(slab + size_t(i) * m_PageSize);
-                page->next = m_FreeList;
-                m_FreeList = page;
-            }
-        }
+        if (!m_FreeList && !AddSlab())
+            return nullptr;
         FreePage* page = m_FreeList;
         m_FreeList = page->next;
         ++m_PagesInUse;
@@ -127,10 +151,12 @@ namespace donut::engine::ecs
     void PagePool::Release() noexcept
     {
         NVRHI_ASSERT(m_PagesInUse == 0);
-        for (void* slab : m_Slabs)
-            HeapFree(slab);
-        m_Slabs.clear();
-        m_Slabs.shrink_to_fit();
+        for (uint32_t i = 0; i < m_SlabCount; ++i)
+            HeapFree(m_Slabs[i]);
+        HeapFree(m_Slabs);
+        m_Slabs = nullptr;
+        m_SlabCount = 0;
+        m_SlabCapacity = 0;
         m_FreeList = nullptr;
         m_PagesInUse = 0;
     }

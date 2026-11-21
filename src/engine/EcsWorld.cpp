@@ -1930,22 +1930,7 @@ namespace donut::engine::ecs
         return nvrhi::FE_NOT_IMPLEMENT;   // E1.4
     }
 
-    nvrhi::FRESULT WorldImpl::SaveSnapshot(IStateWriter* writer) noexcept
-    {
-        (void)writer;
-        return nvrhi::FE_NOT_IMPLEMENT;   // E1.5
-    }
-
-    nvrhi::FRESULT WorldImpl::LoadSnapshot(IStateReader* reader) noexcept
-    {
-        (void)reader;
-        return nvrhi::FE_NOT_IMPLEMENT;   // E1.5
-    }
-
-    uint64_t WorldImpl::ComputeHash() noexcept
-    {
-        return 0;   // E1.5
-    }
+    // SaveSnapshot, LoadSnapshot and ComputeHash are in EcsSnapshot.cpp (E1.5).
 
     // ----------------------------------------------------------------------------------------- diagnostics
 

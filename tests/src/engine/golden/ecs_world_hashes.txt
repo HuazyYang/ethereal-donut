@@ -1,0 +1,10 @@
+# ECS world-hash corpus (test_ecs_snapshot.cpp; ECS_UPDATE_GOLDEN=1 rewrites it)
+# script world-hash snapshot-xxh64 snapshot-bytes entities
+empty f5f65dc9f7fb9133 85a9aad390f7ba23 236 0
+flat bfa3d0bb9a7b6b51 b0d2636812f7635d 28876 874
+churn bbcf01eebd97bedd 3b4ead482465bd74 18024 472
+partitions 4de6eae809ce4d6e 4c37d2a4c90e7fea 54852 967
+buffers 565ed7265d2d22cc 18edc14a855dfe03 32116 604
+sparse 2f746ad73b974064 31da74a778c00622 35472 837
+large_rows 13a9e211b0658828 8bc6825958782c8d 73376 394
+mixed 20cd62c64585d69e ec0a90abac37f65f 387401 1759

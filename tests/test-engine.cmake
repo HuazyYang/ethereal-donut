@@ -43,6 +43,9 @@ endforeach()
 # They live under src/ because the VFS test requires tests/ to hold only include/ and src/.
 target_compile_definitions(test_scene_graph_trace PRIVATE
     DONUT_TEST_GOLDEN_DIR="${CMAKE_CURRENT_LIST_DIR}/src/engine/golden")
+# The ECS world-hash corpus (ecs_world_hashes.txt), the same way.
+target_compile_definitions(test_ecs_snapshot PRIVATE
+    DONUT_TEST_GOLDEN_DIR="${CMAKE_CURRENT_LIST_DIR}/src/engine/golden")
 
 # The ECS tests reach the world's internals (allocation counters, chunk layout, entity table) through the private
 # headers in src/engine (EcsWorldImpl.h and the ones beside it).
