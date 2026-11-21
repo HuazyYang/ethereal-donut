@@ -1,0 +1,169 @@
+#
+# Copyright (c) 2026, ethereal contributors. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+
+# The render graph's device-free tests (aggregate docs/rdg-design.md; plan step P1.3).
+
+add_library(donut_rdg_corpus STATIC src/render/rdg_corpus.cpp src/render/rdg_corpus.h
+    src/render/rdg_donut_frame.cpp src/render/rdg_donut_frame.h)
+target_link_libraries(donut_rdg_corpus PUBLIC donut_render donut_engine donut_core)
+set_property(TARGET donut_rdg_corpus PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
+# Recording, validation, culling, the plan cache, golden barrier lists and the verifier corpus.
+add_executable(test_render_graph src/render/test_render_graph.cpp)
+target_link_libraries(test_render_graph donut_rdg_corpus donut_render donut_engine donut_core donut_tests_utils)
+add_dependencies(donut_all_tests test_render_graph)
+add_test(NAME test_render_graph COMMAND test_render_graph)
+set_property(TARGET test_render_graph PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
+# donut's passes in a graph, device-free (plan step P1.5): golden access lists of every AddToGraph, per-view folding.
+add_executable(test_render_graph_passes src/render/test_render_graph_passes.cpp)
+target_link_libraries(test_render_graph_passes donut_rdg_corpus donut_render donut_engine donut_core)
+add_dependencies(donut_all_tests test_render_graph_passes)
+add_test(NAME test_render_graph_passes COMMAND test_render_graph_passes)
+set_property(TARGET test_render_graph_passes PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
+# The benchmark of design 10.3. The device-free budgets: a smoke run in ctest, measured in Release with
+# `rdg_bench --gate`. The parallel-recording budget needs a device (plan step P1.7): `rdg_bench --parallel d3d12|vulkan
+# --gate`, with GPU smoke runs in ctest.
+add_executable(rdg_bench src/render/rdg_bench.cpp src/render/rdg_bench_parallel.cpp)
+target_link_libraries(rdg_bench donut_rdg_corpus donut_render donut_engine donut_core)
+if(TARGET nvrhi_factory)
+    target_link_libraries(rdg_bench nvrhi_factory)
+endif()
+target_link_libraries(rdg_bench nvrhi)
+add_dependencies(donut_all_tests rdg_bench)
+add_test(NAME rdg_bench_smoke COMMAND rdg_bench --quick)
+if(DONUT_WITH_DX12)
+    if(TARGET Microsoft::DirectX-Headers)
+        target_link_libraries(rdg_bench Microsoft::DirectX-Headers)
+    endif()
+    target_link_libraries(rdg_bench dxguid)
+    target_compile_definitions(rdg_bench PRIVATE RDG_BENCH_D3D12=1)
+    add_test(NAME rdg_bench_parallel_d3d12 COMMAND rdg_bench --parallel d3d12 --quick)
+    set_tests_properties(rdg_bench_parallel_d3d12 PROPERTIES RUN_SERIAL TRUE LABELS gpu)
+endif()
+if(DONUT_WITH_VULKAN)
+    if(TARGET Vulkan-Headers)
+        target_link_libraries(rdg_bench Vulkan-Headers)
+    elseif(TARGET Vulkan::Headers)
+        target_link_libraries(rdg_bench Vulkan::Headers)
+    endif()
+    target_compile_definitions(rdg_bench PRIVATE RDG_BENCH_VULKAN=1)
+    add_test(NAME rdg_bench_parallel_vulkan COMMAND rdg_bench --parallel vulkan --quick)
+    set_tests_properties(rdg_bench_parallel_vulkan PROPERTIES RUN_SERIAL TRUE LABELS gpu)
+endif()
+set_property(TARGET rdg_bench PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
+# Headless graphs on a device, per backend, under the debug layers (plan step P1.4). The nvrhi backends are static
+# libraries linked through nvrhi_factory; a shared nvrhi build exports them from its DLL.
+add_executable(test_render_graph_gpu src/render/test_render_graph_gpu.cpp)
+target_link_libraries(test_render_graph_gpu donut_rdg_corpus donut_render donut_engine donut_core)
+if(TARGET nvrhi_factory)
+    target_link_libraries(test_render_graph_gpu nvrhi_factory)
+endif()
+target_link_libraries(test_render_graph_gpu nvrhi)
+if(WIN32)
+    target_link_libraries(test_render_graph_gpu dbghelp)   # RDG_ALLOC_TRACE
+endif()
+if(DONUT_WITH_DX11)
+    target_compile_definitions(test_render_graph_gpu PRIVATE TEST_D3D11=1)
+    add_test(NAME test_render_graph_gpu_d3d11 COMMAND test_render_graph_gpu d3d11)
+endif()
+if(DONUT_WITH_DX12)
+    if(TARGET Microsoft::DirectX-Headers)
+        target_link_libraries(test_render_graph_gpu Microsoft::DirectX-Headers)
+    endif()
+    target_link_libraries(test_render_graph_gpu dxguid)
+    target_compile_definitions(test_render_graph_gpu PRIVATE TEST_D3D12=1)
+    add_test(NAME test_render_graph_gpu_d3d12 COMMAND test_render_graph_gpu d3d12)
+endif()
+if(DONUT_WITH_VULKAN)
+    if(TARGET Vulkan-Headers)
+        target_link_libraries(test_render_graph_gpu Vulkan-Headers)
+    elseif(TARGET Vulkan::Headers)
+        target_link_libraries(test_render_graph_gpu Vulkan::Headers)
+    endif()
+    target_compile_definitions(test_render_graph_gpu PRIVATE TEST_VULKAN=1)
+    add_test(NAME test_render_graph_gpu_vulkan COMMAND test_render_graph_gpu vulkan)
+endif()
+if(NVRHI_WITH_CUDA)
+    target_compile_definitions(test_render_graph_gpu PRIVATE TEST_CUDA=1)
+    add_test(NAME test_render_graph_gpu_cuda COMMAND test_render_graph_gpu cuda)
+    add_test(NAME test_render_graph_gpu_cuda_overlapped COMMAND test_render_graph_gpu cuda-overlapped)
+endif()
+# One GPU process at a time.
+set(_rdg_gpu_tests test_render_graph_gpu_d3d11 test_render_graph_gpu_d3d12 test_render_graph_gpu_vulkan test_render_graph_gpu_cuda
+    test_render_graph_gpu_cuda_overlapped)
+foreach(_test ${_rdg_gpu_tests})
+    if(TEST ${_test})
+        set_tests_properties(${_test} PROPERTIES RUN_SERIAL TRUE LABELS gpu)
+    endif()
+endforeach()
+add_dependencies(donut_all_tests test_render_graph_gpu)
+set_property(TARGET test_render_graph_gpu PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
+# app::RenderGraphLayer on a headless DeviceManager (plan step P1.5).
+add_executable(test_render_graph_layer src/render/test_render_graph_layer.cpp)
+target_link_libraries(test_render_graph_layer donut_app donut_render donut_engine donut_core)
+foreach(_backend d3d11 d3d12 vulkan)
+    string(TOUPPER "${_backend}" _upper)
+    if((_backend STREQUAL "d3d11" AND DONUT_WITH_DX11) OR (_backend STREQUAL "d3d12" AND DONUT_WITH_DX12) OR
+       (_backend STREQUAL "vulkan" AND DONUT_WITH_VULKAN))
+        add_test(NAME test_render_graph_layer_${_backend} COMMAND test_render_graph_layer ${_backend})
+        set_tests_properties(test_render_graph_layer_${_backend} PROPERTIES RUN_SERIAL TRUE LABELS gpu)
+    endif()
+endforeach()
+add_dependencies(donut_all_tests test_render_graph_layer)
+set_property(TARGET test_render_graph_layer PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
+# Header hygiene (design 3.2): the RenderGraph* files include only nvrhi/, donut/core/, other RenderGraph* headers
+# and the standard library.
+add_test(NAME donut_render_graph_header_hygiene
+    COMMAND ${CMAKE_COMMAND} -DDONUT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/render_graph_hygiene.cmake)
+
+# Every public RenderGraph header is self-contained: one compile-only translation unit each, which includes it twice.
+set(_rdg_header_tus "")
+foreach(_header RenderGraph RenderGraphLambdaPass RenderGraphFrameData RenderGraphWorkerPool)
+    set(_tu "${CMAKE_CURRENT_BINARY_DIR}/render_graph_header_tus/${_header}.cpp")
+    file(WRITE "${_tu}.in" "#include <donut/render/${_header}.h>\n#include <donut/render/${_header}.h>\n")
+    configure_file("${_tu}.in" "${_tu}" COPYONLY)
+    list(APPEND _rdg_header_tus "${_tu}")
+endforeach()
+add_library(donut_render_graph_header_tus OBJECT ${_rdg_header_tus})
+target_link_libraries(donut_render_graph_header_tus PRIVATE donut_render)
+if(MSVC)
+    target_compile_options(donut_render_graph_header_tus PRIVATE /W4 /permissive-)
+endif()
+add_dependencies(donut_all_tests donut_render_graph_header_tus)
+set_property(TARGET donut_render_graph_header_tus PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
+# RenderGraph.h follows nvrhi's ABI rules (design 3.2): nvrhi's abi_lint with the nvrhi headers' types known.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND AND TARGET nvrhi)
+    get_target_property(_nvrhi_source_dir nvrhi SOURCE_DIR)
+    if(EXISTS "${_nvrhi_source_dir}/tests/abi_lint.py")
+        add_test(NAME donut_render_graph_abi_lint
+            COMMAND ${Python3_EXECUTABLE} -I ${_nvrhi_source_dir}/tests/abi_lint.py ${_nvrhi_source_dir}/include/nvrhi
+                --api-header ${CMAKE_CURRENT_SOURCE_DIR}/../include/donut/render/RenderGraph.h)
+    endif()
+endif()

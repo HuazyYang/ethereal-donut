@@ -24,6 +24,7 @@
 #include <nvrhi/core/foundation.h>
 #include <nvrhi/core/autoptr.h>
 #include <donut/engine/BindingCache.h>
+#include <donut/render/RenderGraph.h>
 #include <nvrhi/nvrhi.h>
 #include <unordered_map>
 
@@ -39,10 +40,27 @@ namespace donut::engine
 
 namespace donut::render
 {
-    class BloomPass : public nvrhi::ObjectImpl<nvrhi::IObject>
+    // The pass in a render graph (design 13.3), graph-native: per planar child view of `view`, two downscales, a
+    // horizontal and a vertical blur into transients, and a blended apply onto `color`. `view` must stay valid
+    // until the graph has executed.
+    struct BloomGraphInputs
+    {
+        const engine::ICompositeView* view = nullptr;
+        ResourceId color = InvalidResourceId;
+        float sigmaInPixels = 4.f;
+        float blendFactor = 0.05f;
+    };
+
+    struct BloomGraphOutputs
+    {
+        ResourceId color = InvalidResourceId;
+    };
+
+    class BloomPass : public nvrhi::ObjectImpl<IGpuPass>
     {
     public:
         NVRHI_BEGIN_INTERFACE_TABLE_INLINE(BloomPass)
+        NVRHI_IMPLEMENTS_INTERFACE(IGpuPass)
         NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IObject)
         NVRHI_END_INTERFACE_TABLE()
 
@@ -97,5 +115,24 @@ namespace donut::render
             nvrhi::ITexture* sourceDestTexture,
             float sigmaInPixels,
             float blendFactor);
+
+        // For a render graph: Prepare creates the shader and pipelines; the chain's textures are transients.
+        BloomPass(
+            nvrhi::IDevice* device,
+            engine::ShaderFactory *shaderFactory,
+            engine::CommonRenderPasses *commonPasses);
+
+        BloomGraphOutputs AddToGraph(IRenderGraph* graph, const BloomGraphInputs& inputs);
+
+        nvrhi::FRESULT Setup(ISetupContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Prepare(IPrepareContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Execute(IPassContext* context, const void* data) noexcept override;
+        void OnResourcesReleased() noexcept override;
+
+    private:
+        void CreateCommonObjects(engine::ShaderFactory* shaderFactory);
+
+        nvrhi::AutoPtr<engine::ShaderFactory> m_ShaderFactory;
+        nvrhi::GraphicsPipelineHandle m_GraphBlurPso;
     };
 }

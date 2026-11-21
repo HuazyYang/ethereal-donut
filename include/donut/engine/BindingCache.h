@@ -30,12 +30,14 @@ namespace donut::engine
 {
     /*
     BindingCache maintains a dictionary that maps binding set descriptors
-    into actual binding set objects. The binding sets are created on demand when 
+    into actual binding set objects. The binding sets are created on demand when
     GetOrCreateBindingSet(...) is called and the requested binding set does not exist.
     Created binding sets are stored for the lifetime of BindingCache, or until
     Clear() is called.
-    
-    All BindingCache methods are thread-safe.
+
+    All BindingCache methods are thread-safe. A missed set is created outside the lock, so that threads
+    recording in parallel do not wait on each other's creations; the first one inserted wins, and every
+    caller gets that one.
     */
     class BindingCache
     {

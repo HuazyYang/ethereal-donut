@@ -24,6 +24,7 @@
 #include <nvrhi/core/foundation.h>
 #include <nvrhi/core/autoptr.h>
 #include <donut/core/math/math.h>
+#include <donut/render/RenderGraph.h>
 #include <nvrhi/nvrhi.h>
 
 
@@ -34,6 +35,7 @@ namespace donut::engine
     class CommonRenderPasses;
     class FramebufferFactory;
     class ICompositeView;
+    class IView;
     class DirectionalLight;
 }
 
@@ -55,10 +57,28 @@ namespace donut::render
         float maxLightRadiance = 100.f; // clamp for light radiance derived from its angular size, 0 = no clamp
     };
 
-    class SkyPass : public nvrhi::ObjectImpl<nvrhi::IObject>
+    // The pass in a render graph (design 13.3): one raster use per planar child view of `view`, drawing into that
+    // view's subresources of `color`, depth-tested against `depth` (read-only) when it is valid. `view` and `light`
+    // must stay valid until the graph has executed.
+    struct SkyGraphInputs
+    {
+        const engine::ICompositeView* view = nullptr;
+        ResourceId color = InvalidResourceId;
+        ResourceId depth = InvalidResourceId;
+        const engine::DirectionalLight* light = nullptr;
+        SkyParameters params;
+    };
+
+    struct SkyGraphOutputs
+    {
+        ResourceId color = InvalidResourceId;
+    };
+
+    class SkyPass : public nvrhi::ObjectImpl<IGpuPass>
     {
     public:
         NVRHI_BEGIN_INTERFACE_TABLE_INLINE(SkyPass)
+        NVRHI_IMPLEMENTS_INTERFACE(IGpuPass)
         NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IObject)
         NVRHI_END_INTERFACE_TABLE()
 
@@ -68,8 +88,21 @@ namespace donut::render
         nvrhi::BindingLayoutHandle m_RenderBindingLayout;
         nvrhi::BindingSetHandle m_RenderBindingSet;
         nvrhi::GraphicsPipelineHandle m_RenderPso;
-        
+
         nvrhi::AutoPtr<engine::FramebufferFactory> m_FramebufferFactory;
+        nvrhi::AutoPtr<engine::CommonRenderPasses> m_CommonPasses;
+
+        // Graph construction: the objects are made in Prepare, one pipeline per depth convention.
+        nvrhi::DeviceHandle m_Device;
+        nvrhi::AutoPtr<engine::ShaderFactory> m_ShaderFactory;
+        nvrhi::GraphicsPipelineHandle m_GraphPso[2];
+
+        void CreateCommonObjects(nvrhi::IDevice* device, engine::ShaderFactory* shaderFactory);
+        nvrhi::GraphicsPipelineHandle CreatePipeline(nvrhi::IDevice* device, const nvrhi::FramebufferInfo& framebufferInfo,
+                                                     bool reverseDepth) const;
+        void RenderView(nvrhi::ICommandList* commandList, const engine::IView& view, nvrhi::IFramebuffer* framebuffer,
+                        nvrhi::IGraphicsPipeline* pipeline, const engine::DirectionalLight& light,
+                        const SkyParameters& params) const;
 
     public:
         SkyPass(
@@ -78,6 +111,12 @@ namespace donut::render
             engine::CommonRenderPasses* commonPasses,
             engine::FramebufferFactory* framebufferFactory,
             const engine::ICompositeView& compositeView);
+
+        // For a render graph: no target is bound; Prepare creates the objects from the graph's framebuffer.
+        SkyPass(
+            nvrhi::IDevice* device,
+            engine::ShaderFactory* shaderFactory,
+            engine::CommonRenderPasses* commonPasses);
 
         void Render(
             nvrhi::ICommandList* commandList,
@@ -89,5 +128,12 @@ namespace donut::render
             const engine::DirectionalLight& light,
             const SkyParameters& input,
             ProceduralSkyShaderParameters& output);
+
+        SkyGraphOutputs AddToGraph(IRenderGraph* graph, const SkyGraphInputs& inputs);
+
+        nvrhi::FRESULT Setup(ISetupContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Prepare(IPrepareContext* context, void* data) noexcept override;
+        nvrhi::FRESULT Execute(IPassContext* context, const void* data) noexcept override;
+        void OnResourcesReleased() noexcept override;
     };
 }

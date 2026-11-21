@@ -306,3 +306,82 @@ void DeferredLightingPass::ResetBindingCache()
 {
     m_BindingSets.Clear();
 }
+
+
+// ------------------------------------------------------------------------------------------ render graph (13.2)
+
+namespace
+{
+    struct DeferredLightingUse
+    {
+        DeferredLightingGraphInputs inputs;
+    };
+}
+
+DeferredLightingGraphOutputs DeferredLightingPass::AddToGraph(IRenderGraph* graph, const DeferredLightingGraphInputs& inputs)
+{
+    DeferredLightingUse* use = NewFrameData<DeferredLightingUse>(graph, inputs);
+    if (!use || graph->AddPass(PassDesc{ "DeferredLighting", PassType::Compute, PassFlags::None, 0 }, this, use, nullptr) != nvrhi::FS_OK)
+        return DeferredLightingGraphOutputs{ InvalidResourceId };
+    return DeferredLightingGraphOutputs{ use->inputs.output };
+}
+
+nvrhi::FRESULT DeferredLightingPass::Setup(ISetupContext* context, void* data) noexcept
+{
+    DeferredLightingGraphInputs& inputs = static_cast<DeferredLightingUse*>(data)->inputs;
+    if (!inputs.view)
+        return nvrhi::FE_INVALID_ARGS;
+    const ResourceId reads[] = { inputs.depth, inputs.gbufferNormals, inputs.gbufferDiffuse, inputs.gbufferSpecular,
+                                 inputs.gbufferEmissive, inputs.indirectDiffuse, inputs.indirectSpecular,
+                                 inputs.shadowChannels, inputs.ambientOcclusion, inputs.shadowMap };
+    for (ResourceId id : reads)
+    {
+        if (id != InvalidResourceId)
+            context->Read(id, Access::ShaderRead, nvrhi::ShaderType::Compute, nvrhi::SubresourceRegion());
+    }
+    inputs.output = context->Write(inputs.output, Access::UAVWrite, nvrhi::ShaderType::Compute, nvrhi::SubresourceRegion(),
+                                   AccessFlags::FullWrite);
+    return nvrhi::FS_OK;
+}
+
+nvrhi::FRESULT DeferredLightingPass::Prepare(IPrepareContext*, void*) noexcept
+{
+    return m_Pso ? nvrhi::FS_OK : nvrhi::FE_INVALID_ARGS;   // Init has not run
+}
+
+nvrhi::FRESULT DeferredLightingPass::Execute(IPassContext* context, const void* data) noexcept
+{
+    const DeferredLightingGraphInputs& use = static_cast<const DeferredLightingUse*>(data)->inputs;
+    Inputs inputs;
+    inputs.depth = context->GetTexture(use.depth);
+    inputs.gbufferNormals = context->GetTexture(use.gbufferNormals);
+    inputs.gbufferDiffuse = context->GetTexture(use.gbufferDiffuse);
+    inputs.gbufferSpecular = context->GetTexture(use.gbufferSpecular);
+    inputs.gbufferEmissive = context->GetTexture(use.gbufferEmissive);
+    inputs.indirectDiffuse = context->GetTexture(use.indirectDiffuse);
+    inputs.indirectSpecular = context->GetTexture(use.indirectSpecular);
+    inputs.shadowChannels = context->GetTexture(use.shadowChannels);
+    inputs.ambientOcclusion = context->GetTexture(use.ambientOcclusion);
+    inputs.output = context->GetTexture(use.output);
+    inputs.lights = use.lights;
+    inputs.lightProbes = use.lightProbes;
+    inputs.ambientColorTop = use.ambientColorTop;
+    inputs.ambientColorBottom = use.ambientColorBottom;
+    if (!inputs.depth || !inputs.gbufferNormals || !inputs.gbufferDiffuse || !inputs.gbufferSpecular ||
+        !inputs.gbufferEmissive || !inputs.output)
+        return nvrhi::FE_INVALID_ARGS;
+    try
+    {
+        Render(context->GetCommandList(), *use.view, inputs, use.randomOffset);
+    }
+    catch (...)
+    {
+        return nvrhi::FE_OUT_OF_MEMORY;
+    }
+    return nvrhi::FS_OK;
+}
+
+void DeferredLightingPass::OnResourcesReleased() noexcept
+{
+    ResetBindingCache();
+}

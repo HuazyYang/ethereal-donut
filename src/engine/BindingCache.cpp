@@ -60,21 +60,24 @@ nvrhi::BindingSetHandle BindingCache::GetOrCreateBindingSet(const nvrhi::Binding
     auto it = m_BindingSets.find(hash);
     if (it != m_BindingSets.end())
         result = it->second;
-    
+
     m_Mutex.unlock_shared();
 
     if (!result)
     {
+        // Created outside the lock (render graph design 10.1); a duplicate created by another thread meanwhile is
+        // dropped.
+        nvrhi::BindingSetHandle created;
+        m_Device->createBindingSet(desc, layout, created.ReleaseAndGetAddressOf());
+        if (!created)
+            return nullptr;
+
         m_Mutex.lock();
 
         nvrhi::BindingSetHandle& entry = m_BindingSets[hash];
         if (!entry)
-        {
-            m_Device->createBindingSet(desc, layout, &result);
-            entry = result;
-        }
-        else
-            result = entry;
+            entry = created;
+        result = entry;
 
         m_Mutex.unlock();
     }

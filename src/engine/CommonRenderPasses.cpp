@@ -257,9 +257,18 @@ void CommonRenderPasses::BlitTexture(nvrhi::ICommandList* commandList, const Bli
     default: assert(false);
     }
     
-    nvrhi::GraphicsPipelineHandle& pso = m_BlitPsoCache[PsoCacheKey{ fbinfo.getInfo(), shader, params.blendState }];
+    const PsoCacheKey psoKey{ fbinfo.getInfo(), shader, params.blendState };
+    nvrhi::GraphicsPipelineHandle pso;
+    {
+        std::shared_lock lock(m_BlitPsoMutex);
+        auto it = m_BlitPsoCache.find(psoKey);
+        if (it != m_BlitPsoCache.end())
+            pso = it->second;
+    }
     if (!pso)
     {
+        // Created outside the lock, so that recording threads do not wait on each other's pipeline creation; the
+        // first one inserted wins.
         nvrhi::GraphicsPipelineDesc psoDesc;
         psoDesc.bindingLayouts = { m_BlitBindingLayout };
         psoDesc.VS = m_RectVS;
@@ -270,7 +279,13 @@ void CommonRenderPasses::BlitTexture(nvrhi::ICommandList* commandList, const Bli
         psoDesc.renderState.depthStencilState.stencilEnable = false;
         psoDesc.renderState.blendState.targets[0] = params.blendState;
 
-        m_Device->createGraphicsPipeline1(psoDesc, fbinfo.getInfo(), &pso);
+        nvrhi::GraphicsPipelineHandle created;
+        m_Device->createGraphicsPipeline1(psoDesc, fbinfo.getInfo(), created.ReleaseAndGetAddressOf());
+        std::unique_lock lock(m_BlitPsoMutex);
+        nvrhi::GraphicsPipelineHandle& entry = m_BlitPsoCache[psoKey];
+        if (!entry)
+            entry = created;
+        pso = entry;
     }
     
     nvrhi::BindingSetDesc bindingSetDesc;

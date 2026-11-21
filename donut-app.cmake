@@ -78,7 +78,7 @@ endif()
 
 endif() #DONUT_WITH_STREAMLINE
 
-target_link_libraries(donut_app donut_core donut_engine glfw imgui)
+target_link_libraries(donut_app donut_core donut_engine donut_render glfw imgui)   # donut_render: RenderGraphLayer
 
 if(DONUT_WITH_DX11)
     target_sources(donut_app PRIVATE src/app/dx11/DeviceManager_DX11.cpp)

@@ -25,6 +25,9 @@
 #include <donut/engine/FramebufferFactory.h>
 #include <donut/render/DrawStrategy.h>
 
+#include <algorithm>
+#include <type_traits>
+
 using namespace donut::math;
 using namespace donut::engine;
 using namespace donut::render;
@@ -191,4 +194,124 @@ void donut::render::RenderCompositeView(
 
     if (passEvent)
         commandList->endMarker();
+}
+
+// ------------------------------------------------------------------------------------------ render graph (13.2)
+
+namespace
+{
+    // One use: one child view. Trivially destructible: it lives in the graph's frame arena.
+    struct GeometryGraphUse
+    {
+        const IView* view;
+        const IView* viewPrev;
+        SceneGraphNode* rootNode;
+        IDrawStrategy* drawStrategy;
+        GeometryPassContext* passContext;
+        const char* name;
+        donut::render::ResourceId colorTargets[8];
+        uint32_t colorTargetCount;
+        donut::render::ResourceId depth;
+        donut::render::ResourceId shaderReads[4];
+        uint32_t shaderReadCount;
+        nvrhi::SubresourceRegion region;
+        donut::render::ClearValue colorClear;
+        donut::render::ClearValue depthClear;
+        bool depthWrite;
+        bool clearTargets;
+        bool materialEvents;
+    };
+    static_assert(std::is_trivially_destructible_v<GeometryGraphUse>);
+}
+
+donut::render::GeometryGraphOutputs IGeometryPass::AddToGraph(IRenderGraph* graph, const GeometryGraphInputs& inputs)
+{
+    GeometryGraphOutputs outputs;
+    for (uint32_t i = 0; i < 8; ++i)
+        outputs.colorTargets[i] = inputs.colorTargets[i];
+    outputs.depth = inputs.depth;
+    if (!inputs.view || !inputs.drawStrategy || !inputs.passContext)
+        return outputs;
+
+    const ViewType::Enum supportedViewTypes = GetSupportedViewTypes();
+    const uint32_t viewCount = inputs.view->GetNumChildViews(supportedViewTypes);
+    for (uint32_t viewIndex = 0; viewIndex < viewCount; ++viewIndex)
+    {
+        GeometryGraphUse* use = NewFrameData<GeometryGraphUse>(graph);
+        if (!use)
+            break;
+        use->view = inputs.view->GetChildView(supportedViewTypes, viewIndex);
+        use->viewPrev = inputs.viewPrev ? inputs.viewPrev->GetChildView(supportedViewTypes, viewIndex) : nullptr;
+        use->rootNode = inputs.rootNode;
+        use->drawStrategy = inputs.drawStrategy;
+        use->passContext = inputs.passContext;
+        use->name = inputs.name;
+        use->colorTargetCount = std::min<uint32_t>(inputs.colorTargetCount, 8);
+        for (uint32_t i = 0; i < 8; ++i)
+            use->colorTargets[i] = outputs.colorTargets[i];
+        use->depth = outputs.depth;
+        use->shaderReadCount = std::min<uint32_t>(inputs.shaderReadCount, 4);
+        for (uint32_t i = 0; i < 4; ++i)
+            use->shaderReads[i] = inputs.shaderReads[i];
+        const nvrhi::TextureSubresourceSet subresources = use->view->GetSubresources();
+        use->region = nvrhi::SubresourceRegion().setMips(subresources.baseMipLevel, 1)
+            .setSlices(subresources.baseArraySlice, subresources.numArraySlices);
+        use->colorClear = inputs.colorClear;
+        use->depthClear = inputs.depthClear;
+        use->depthWrite = inputs.depthWrite;
+        use->clearTargets = inputs.clearTargets;
+        use->materialEvents = inputs.materialEvents;
+
+        // AddPass calls Setup, which writes the new versions into the use; the next view continues from them.
+        graph->AddPass(PassDesc{ inputs.name, PassType::Raster, PassFlags::Tracked, 0 }, this, use, nullptr);
+        for (uint32_t i = 0; i < use->colorTargetCount; ++i)
+            outputs.colorTargets[i] = use->colorTargets[i];
+        outputs.depth = use->depth;
+    }
+    return outputs;
+}
+
+nvrhi::FRESULT IGeometryPass::Setup(ISetupContext* context, void* data) noexcept
+{
+    GeometryGraphUse& use = *static_cast<GeometryGraphUse*>(data);
+    const AccessFlags clearFlag = use.clearTargets ? AccessFlags::Clear : AccessFlags::None;
+    for (uint32_t i = 0; i < use.shaderReadCount; ++i)
+    {
+        if (use.shaderReads[i] != InvalidResourceId)
+            context->Read(use.shaderReads[i], Access::ShaderRead, nvrhi::ShaderType::Pixel, nvrhi::SubresourceRegion());
+    }
+    for (uint32_t i = 0; i < use.colorTargetCount; ++i)
+    {
+        use.colorTargets[i] = context->SetColorTarget(i, use.colorTargets[i], use.region, clearFlag,
+                                                      use.clearTargets ? &use.colorClear : nullptr);
+    }
+    if (use.depth != InvalidResourceId)
+    {
+        const bool clearDepth = use.clearTargets && use.depthWrite;
+        use.depth = context->SetDepthTarget(use.depth, use.region, !use.depthWrite,
+                                            clearDepth ? AccessFlags::Clear : AccessFlags::None,
+                                            clearDepth ? &use.depthClear : nullptr);
+    }
+    return nvrhi::FS_OK;
+}
+
+nvrhi::FRESULT IGeometryPass::Prepare(IPrepareContext*, void*) noexcept
+{
+    return nvrhi::FS_OK;
+}
+
+nvrhi::FRESULT IGeometryPass::Execute(IPassContext* context, const void* data) noexcept
+{
+    const GeometryGraphUse& use = *static_cast<const GeometryGraphUse*>(data);
+    nvrhi::IFramebuffer* framebuffer = context->GetFramebuffer();
+    if (!framebuffer)
+        return nvrhi::FE_INVALID_ARGS;
+    use.drawStrategy->PrepareForView(use.rootNode, *use.view);
+    RenderView(context->GetCommandList(), use.view, use.viewPrev, framebuffer, *use.drawStrategy, *this,
+               *use.passContext, use.materialEvents);
+    return nvrhi::FS_OK;
+}
+
+void IGeometryPass::OnResourcesReleased() noexcept
+{
 }
