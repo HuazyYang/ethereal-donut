@@ -44,6 +44,7 @@ namespace donut::engine
 namespace donut::render
 {
     class GBufferRenderTargets;
+    struct ExtractedLight;
 
     // The pass in a render graph (design 13.2): one compute use over every planar child view of `view`. The ids
     // are textures of the graph; the optional ones may stay invalid and then bind the same defaults as Render.
@@ -68,6 +69,12 @@ namespace donut::render
         dm::float3 ambientColorTop = 0.f;
         dm::float3 ambientColorBottom = 0.f;
         dm::float2 randomOffset = dm::float2::zero();
+        // The snapshot's lights (RenderExtract.h; plan step E5, sub-plan item E5.6), used instead of `lights` when set.
+        // Each light's service shadow texture (ExtractedLight::shadowTexture) is read as `shadowMap` is. The pass binds
+        // one shadow texture, as with `lights`: all shadowed lights must share one texture, so at most one service
+        // shadow (one light) is supported. A second texture is an error, as Render treats it for the leaf vector.
+        const ExtractedLight* extractedLights = nullptr;
+        uint32_t extractedLightCount = 0;
     };
 
     struct DeferredLightingGraphOutputs
@@ -121,6 +128,11 @@ namespace donut::render
 
             dm::float3 ambientColorTop = 0.f;
             dm::float3 ambientColorBottom = 0.f;
+
+            // The snapshot's lights (RenderExtract.h; plan step E5, sub-plan item E5.6), used instead of `lights` when
+            // set.
+            const ExtractedLight* extractedLights = nullptr;
+            uint32_t extractedLightCount = 0;
 
             // Fills the GBuffer-related textures (depth, normals, etc.) from the provided structure.
             void SetGBuffer(const GBufferRenderTargets& targets);

@@ -45,6 +45,10 @@ namespace donut::app
         // Records the frame. `backBuffer` is the imported back buffer: host-kept where the swap chain keeps its
         // initial state, so it ends the frame in that state.
         virtual void BuildGraph(render::IRenderGraph* graph, render::FrameData& frameData, render::ResourceId backBuffer) = 0;
+        // Called once per Render after BuildGraph, when the frame is over: after Execute, whether it succeeded or not, or
+        // after a Compile that failed (`executed` false then, and after a failed Execute). The place for per-frame
+        // cleanup that must follow execution, such as render::RenderService::EndFrame. The default does nothing.
+        virtual void OnGraphExecuted(render::IRenderGraph* graph, bool executed) { (void)graph; (void)executed; }
 
         void Render(nvrhi::IFramebuffer* framebuffer) override;
         void BackBufferResizing() override;

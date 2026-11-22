@@ -157,6 +157,39 @@ endif()
 add_dependencies(donut_all_tests donut_render_graph_header_tus)
 set_property(TARGET donut_render_graph_header_tus PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
+# The render-extraction headers of ECS step E5 (aggregate docs/plans/2026-11-21-donut-ecs-e5.md, item E5.0) and the
+# headers it extends are self-contained too, the same way. Module-private C++ (they name scene-graph classes), so
+# they are not under the ABI lint; the scatter kernel's constants header is compiled as C++ the way donut's sources
+# include the shader headers (after `using namespace donut::math`). The new headers compile at /W4; the extended ones at
+# the libraries' level (their older inline code has unused parameters).
+set(_render_extract_header_tus "")
+set(_render_extract_w4_tus "")
+foreach(_header render/RenderExtract render/LightShadows render/GpuSceneUploadPass render/SkinningPass engine/GpuScene
+        render/DrawStrategy render/GeometryPasses render/DeferredLightingPass render/ForwardShadingPass
+        engine/Scene engine/SceneGraph)
+    string(REPLACE "/" "_" _name "${_header}")
+    set(_tu "${CMAKE_CURRENT_BINARY_DIR}/render_extract_header_tus/${_name}.cpp")
+    file(WRITE "${_tu}.in" "#include <donut/${_header}.h>\n#include <donut/${_header}.h>\n")
+    configure_file("${_tu}.in" "${_tu}" COPYONLY)
+    list(APPEND _render_extract_header_tus "${_tu}")
+    if(_header MATCHES "^render/(RenderExtract|LightShadows|GpuSceneUploadPass|SkinningPass)$|^engine/GpuScene$")
+        list(APPEND _render_extract_w4_tus "${_tu}")
+    endif()
+endforeach()
+set(_tu "${CMAKE_CURRENT_BINARY_DIR}/render_extract_header_tus/shaders_gpu_scene_scatter_cb.cpp")
+file(WRITE "${_tu}.in" "#include <donut/core/math/math.h>\nusing namespace donut::math;\n#include <donut/shaders/gpu_scene_scatter_cb.h>\n#include <donut/shaders/gpu_scene_scatter_cb.h>\nstatic_assert(sizeof(GpuSceneTransformRecord) == 64);\nstatic_assert(sizeof(GpuSceneRowRecord) == 128);\nstatic_assert(sizeof(GpuSceneScatterConstants) == 32);\n")
+configure_file("${_tu}.in" "${_tu}" COPYONLY)
+list(APPEND _render_extract_header_tus "${_tu}")
+list(APPEND _render_extract_w4_tus "${_tu}")
+add_library(donut_render_extract_header_tus OBJECT ${_render_extract_header_tus})
+target_link_libraries(donut_render_extract_header_tus PRIVATE donut_render)
+if(MSVC)
+    target_compile_options(donut_render_extract_header_tus PRIVATE /permissive-)
+    set_source_files_properties(${_render_extract_w4_tus} PROPERTIES COMPILE_OPTIONS "/W4")
+endif()
+add_dependencies(donut_all_tests donut_render_extract_header_tus)
+set_property(TARGET donut_render_extract_header_tus PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
 # RenderGraph.h follows nvrhi's ABI rules (design 3.2): nvrhi's abi_lint with the nvrhi headers' types known.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND AND TARGET nvrhi)

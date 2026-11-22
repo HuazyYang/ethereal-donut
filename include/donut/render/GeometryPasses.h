@@ -82,6 +82,12 @@ namespace donut::render
         ResourceId shaderReads[4] = { InvalidResourceId, InvalidResourceId, InvalidResourceId, InvalidResourceId };
         uint32_t shaderReadCount = 0;
         bool materialEvents = false;
+        // Buffers the draws read (plan step E5, sub-plan item E5.3, open point 5): the scene's instance, geometry and
+        // material buffers and the skinned vertex buffers (SceneFrame::bufferReads), declared as vertex-buffer and SRV
+        // reads in the vertex and pixel stages, so that the graph orders the pass after the upload and skinning passes
+        // that write them. An array in the graph's arena; none by default.
+        const ResourceId* bufferReads = nullptr;
+        uint32_t bufferReadCount = 0;
     };
 
     struct GeometryGraphOutputs

@@ -476,6 +476,20 @@ void ForwardShadingPass::PrepareLights(
     commandList->writeBuffer(m_ForwardLightCB, &constants, sizeof(constants));
 }
 
+// Declared by plan step E5.0 so that the vtable links; implemented by step E5.6 (sub-plan
+// docs/plans/2026-11-21-donut-ecs-e5.md). Nothing calls it before then.
+void ForwardShadingPass::PrepareExtractedLights(
+    Context&,
+    nvrhi::ICommandList*,
+    const ExtractedLight*,
+    uint32_t,
+    float3,
+    float3,
+    const std::vector<nvrhi::AutoPtr<LightProbe>>&)
+{
+    log::warning("ForwardShadingPass::PrepareExtractedLights is not implemented yet (plan step E5.6)");
+}
+
 ViewType::Enum ForwardShadingPass::GetSupportedViewTypes() const
 {
     return m_SupportedViewTypes;

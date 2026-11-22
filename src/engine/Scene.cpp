@@ -614,6 +614,11 @@ void Scene::RefreshSceneGraph(uint32_t frameIndex)
 
 void Scene::RefreshBuffers(nvrhi::ICommandList* commandList, uint32_t frameIndex)
 {
+    // On the graph path (plan step E5) the render service updates the GpuScene and skins; an Update here would consume
+    // the scatter records.
+    if (IsOnGraphPath())
+        return;
+
     if (m_SceneStructureChanged)
     {
         CreateMeshBuffers(commandList);

@@ -33,6 +33,33 @@ namespace donut::engine
 namespace donut::render
 {
     struct DrawItem;
+    struct RenderSnapshot;
+    enum class DrawPacketPass : uint8_t;   // RenderExtract.h
+
+    // DrawItems from the draw packets of one pass of a render snapshot, for the view a PrepareForView names, in key
+    // order (plan step E5, sub-plan item E5.3; design 7.3: the strategies become adapters over packets). The view is
+    // found by its address among the snapshot's ExtractedView::view, so one bound strategy serves every child view of a
+    // composite view (IGeometryPass::AddToGraph hands one strategy to each child). `instance` is the packet's leaf,
+    // `mesh` the instance's MeshInfo from the snapshot (VisibleInstances::meshInfos), `geometry` and `material` by
+    // index, `buffers` the mesh's, `distanceToCamera` from a transparent key. Recording reads only the snapshot and the
+    // objects it points to. The items live in this object's storage, whose capacity is kept across frames.
+    class PacketDrawItems
+    {
+    public:
+        // Null `snapshot` unbinds.
+        void Bind(const RenderSnapshot* snapshot, DrawPacketPass pass) noexcept;
+        [[nodiscard]] bool IsBound() const noexcept { return m_Snapshot != nullptr; }
+        // Fills the items of `view` (PrepareForView). A view the snapshot does not hold logs a warning and gives no item.
+        void Prepare(const engine::IView& view);
+        // Null after the last item.
+        const DrawItem* Next() noexcept;
+
+    private:
+        const RenderSnapshot* m_Snapshot = nullptr;
+        DrawPacketPass m_Pass = DrawPacketPass(0);
+        std::vector<DrawItem> m_Items;
+        size_t m_ReadPtr = 0;
+    };
 
     class IDrawStrategy: public nvrhi::ObjectImpl<nvrhi::IObject>
     {
@@ -90,6 +117,13 @@ namespace donut::render
 
         [[nodiscard]] size_t GetChunkSize() const { return m_ChunkSize; }
         void SetChunkSize(size_t size) { m_ChunkSize = std::max<size_t>(size, 1u); }
+
+        // Binds the strategy to the opaque packets of `snapshot` (RenderExtract.h): PrepareForView then ignores its
+        // root node and takes the packets of the view it is given (found by address). Null returns it to the graph walk.
+        void SetPackets(const RenderSnapshot* snapshot);
+
+    private:
+        PacketDrawItems m_Packets;
     };
 
     class TransparentDrawStrategy : public IDrawStrategy
@@ -99,10 +133,35 @@ namespace donut::render
         std::vector<DrawItem> m_InstancesToDraw;
         std::vector<const DrawItem*> m_InstancePtrsToDraw;
         size_t m_ReadPtr = 0;
+        PacketDrawItems m_Packets;
 
     public:
+        // Bound to packets, the setting is ExtractDesc::drawDoubleSidedMaterialsSeparately instead.
         bool DrawDoubleSidedMaterialsSeparately = true;
         
+        void PrepareForView(
+            engine::SceneGraphNode* rootNode,
+            const engine::IView& view) override;
+
+        const DrawItem* GetNextItem() override;
+
+        // Binds the strategy to the transparent packets of `snapshot` (RenderExtract.h): PrepareForView then ignores
+        // its root node and takes the packets of the view it is given (found by address). Null returns it to the graph
+        // walk.
+        void SetPackets(const RenderSnapshot* snapshot);
+    };
+
+    // An IDrawStrategy over the packets of one pass of a snapshot (plan step E5, sub-plan item E5.3). PrepareForView
+    // ignores its root node and takes the packets of the view it is given (found by address); unbound, it draws nothing.
+    class PacketDrawStrategy : public IDrawStrategy
+    {
+        NVRHI_INHERIT_INTERFACE_TABLE()
+    private:
+        PacketDrawItems m_Packets;
+
+    public:
+        void SetPackets(const RenderSnapshot* snapshot, DrawPacketPass pass);
+
         void PrepareForView(
             engine::SceneGraphNode* rootNode,
             const engine::IView& view) override;

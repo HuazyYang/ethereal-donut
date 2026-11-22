@@ -41,6 +41,8 @@ namespace donut::engine
 
 namespace donut::render
 {
+    struct ExtractedLight;
+
     struct ForwardShadingPassPipelineKey
     {
         engine::MaterialDomain domain = engine::MaterialDomain::Opaque;
@@ -183,6 +185,20 @@ namespace donut::render
             Context& context,
             nvrhi::ICommandList* commandList,
             const std::vector<nvrhi::AutoPtr<engine::Light>>& lights,
+            dm::float3 ambientColorTop,
+            dm::float3 ambientColorBottom,
+            const std::vector<nvrhi::AutoPtr<engine::LightProbe>>& lightProbes);
+
+        // PrepareLights from the snapshot's lights (RenderExtract.h; plan step E5, sub-plan item E5.6): the same
+        // constants as the leaf vector gives, with each light's shadow map from the extracted light. A name of its own:
+        // virtuals are not overloaded. Otherwise it follows this class's own convention, not the COM ABI (not
+        // noexcept, a vector of light probes as PrepareLights takes); the ABI lint does not cover this header. One
+        // shadow texture is bound, as with PrepareLights.
+        virtual void PrepareExtractedLights(
+            Context& context,
+            nvrhi::ICommandList* commandList,
+            const ExtractedLight* lights,
+            uint32_t lightCount,
             dm::float3 ambientColorTop,
             dm::float3 ambientColorBottom,
             const std::vector<nvrhi::AutoPtr<engine::LightProbe>>& lightProbes);

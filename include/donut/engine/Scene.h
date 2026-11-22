@@ -41,6 +41,7 @@ namespace donut::vfs
 }
 
 struct GeometryData;
+struct SkinningConstants;   // donut/shaders/skinning_cb.h
 
 namespace donut::engine
 {
@@ -50,6 +51,12 @@ namespace donut::engine
     class ThreadPool;
     class DescriptorTableManager;
     struct ISceneImporter;
+    struct MeshInfo;
+
+    // The skinning dispatch's constants of a skinned mesh made from `prototype`: Scene::UpdateSkinnedMeshes and the
+    // render graph's SkinningPass both call it (plan step E5, sub-plan item E5.5).
+    void FillSkinningConstants(const MeshInfo& prototype, const MeshInfo& skinned, bool firstFrame,
+                               SkinningConstants& constants);
 
     class Scene: public nvrhi::ObjectImpl<nvrhi::IObject>
     {
@@ -72,6 +79,8 @@ namespace donut::engine
         // The instance, geometry and material buffers and their CPU images (plan step E4): made at the first
         // RefreshBuffers, from the flags above.
         nvrhi::AutoPtr<GpuScene> m_GpuScene;
+        // Scatter: the render-graph path (plan step E5; SetGpuSceneUploadMode).
+        GpuSceneUploadMode m_GpuSceneUploadMode = GpuSceneUploadMode::CpuRows;
 
         nvrhi::DeviceHandle m_Device;
         nvrhi::ShaderHandle m_SkinningShader;
@@ -120,6 +129,7 @@ namespace donut::engine
         // InstanceData::prevTransform is the transform a row was uploaded with by the last RefreshBuffers of an earlier
         // frame (a frame being a SceneGraph::Refresh call): call it every frame that refreshes the graph, as before, or
         // the first frame after a gap gets the transforms of the last frame it ran, not of the previous one.
+        // Does nothing on the render-graph path (IsOnGraphPath, below): the render service updates the GpuScene there.
         void RefreshBuffers(nvrhi::ICommandList* commandList, uint32_t frameIndex);
 
         // A combination of RefreshSceneGraph and RefreshBuffers
@@ -143,6 +153,44 @@ namespace donut::engine
 
         // Can return nullptr if not yet created (by Scene::RefreshBuffers)
         GeometryData* GetGeometryData(const MeshGeometry& geometry) const;
+
+        // ------------------------------------------------------------------------------------ the render-graph path
+        //
+        // Plan step E5 (sub-plan item E5.4, open point 9): a donut::render::RenderService drives the GpuScene in its
+        // frame instead of RefreshBuffers. The scene keeps owning the GpuScene and the mesh buffers. Module-private.
+
+        // The GpuScene's upload mode, a creation option: set it before Load / LoadWithThreadPool (before the GpuScene is
+        // made), so that nothing is replaced later; FE_INVALID_ARGS once a GpuScene of another mode exists. Scatter puts
+        // the scene on the graph path: RefreshBuffers then does nothing (FinishedLoading still makes and writes the
+        // loaded meshes' buffers), and the service calls the functions below each frame. Applications call
+        // RefreshSceneGraph each frame, as before.
+        nvrhi::FRESULT SetGpuSceneUploadMode(GpuSceneUploadMode mode) noexcept
+        {
+            if (m_GpuScene && m_GpuScene->GetUploadMode() != mode)
+                return nvrhi::FE_INVALID_ARGS;
+            m_GpuSceneUploadMode = mode;
+            return nvrhi::FS_OK;
+        }
+        [[nodiscard]] GpuSceneUploadMode GetGpuSceneUploadMode() const noexcept { return m_GpuSceneUploadMode; }
+        [[nodiscard]] bool IsOnGraphPath() const noexcept { return m_GpuSceneUploadMode == GpuSceneUploadMode::Scatter; }
+        // The GpuScene in the scene's mode, made from the scene's flags as RefreshBuffers makes it; null when it cannot be.
+        GpuScene* EnsureGpuScene() noexcept;
+        // The last RefreshSceneGraph saw structural changes: mesh buffers may be due and the meshes' instance buffer
+        // must be bound again (BindMeshInstanceBuffers).
+        [[nodiscard]] bool HasStructureChanged() const noexcept { return m_SceneStructureChanged; }
+        // At extraction, without a command list: creates the buffer objects and descriptors of meshes that have none,
+        // and the skinned instances' BufferGroups, vertex buffers, joint buffers and skinning binding sets, as
+        // CreateMeshBuffers would, without writing any data; then GpuScene::InvalidateAssets when it made anything.
+        // Returns whether it made anything (their data is due: WriteMeshBufferData). The virtual CreateMeshBuffers is
+        // not called on the graph path (no class in the tree overrides it).
+        bool CreateMeshBufferObjects();
+        // In the upload pass's Prepare, on the graph's upload list: writes the data of the buffers CreateMeshBufferObjects
+        // made and gives them their permanent states, as CreateMeshBuffers does.
+        void WriteMeshBufferData(nvrhi::ICommandList* commandList);
+        // Points every mesh's BufferGroup::instanceBuffer at the GpuScene's instance buffer (after it was made or
+        // replaced, or after structural changes), before any recording reads it. A replaced buffer is reported to the
+        // application (SceneFrame::sceneBuffersReplaced): passes that cache binding sets need ResetBindingCache.
+        void BindMeshInstanceBuffers();
 
     };
 }

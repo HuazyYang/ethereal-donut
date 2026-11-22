@@ -803,6 +803,15 @@ namespace donut::engine
         // between frames; null returns to the shared one.
         void SetJobSystem(IJobSystem* jobSystem);
 
+        // The render service's isolation guard (plan step E5, sub-plan item E5.1, open point 12), module-private. Between
+        // BeginRenderRead and EndRenderRead (RenderService::Extract and EndFrame) a frame's snapshot points at this
+        // graph's leaves and assets: in Debug builds every write through this API (structural calls, transforms,
+        // SetLeaf, InvalidateContent) logs a warning there, beside the phase check of design 5.6, and still applies.
+        // Release builds check nothing. Scopes nest.
+        void BeginRenderRead() noexcept;
+        void EndRenderRead() noexcept;
+        [[nodiscard]] bool IsInRenderRead() const noexcept;
+
         // Replaces the current root node of the graph with the new one.
         nvrhi::AutoPtr<SceneGraphNode> SetRootNode(SceneGraphNode *root);
         

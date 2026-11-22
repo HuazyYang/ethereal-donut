@@ -91,16 +91,20 @@ void RenderGraphLayer::Render(nvrhi::IFramebuffer*)
         nvrhi::string diagnostics;
         m_Graph->GetDiagnostics(diagnostics);
         log::error("The render graph does not compile:\n%s", diagnostics.c_str());
+        OnGraphExecuted(m_Graph, false);
         return;
     }
     m_LastPlan = nvrhi::TakeOver(plan);
     m_LastStructuralHash = structuralHash;
+    bool executed = true;
     if (m_Graph->Execute(m_LastPlan, m_ExecuteDesc) != nvrhi::FS_OK)
     {
         nvrhi::string diagnostics;
         m_Graph->GetDiagnostics(diagnostics);
         log::error("The render graph failed to execute:\n%s", diagnostics.c_str());
+        executed = false;
     }
+    OnGraphExecuted(m_Graph, executed);
 }
 
 void RenderGraphLayer::BackBufferResizing()
