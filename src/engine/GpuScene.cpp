@@ -31,13 +31,18 @@
 #include "SceneGraphStore.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
+#include <memory>
 #include <new>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
 using namespace donut::math;
 #include <donut/shaders/material_cb.h>
 #include <donut/shaders/bindless.h>
+#include <donut/shaders/gpu_scene_scatter_cb.h>
 
 namespace donut::engine
 {
@@ -46,12 +51,22 @@ namespace donut::engine
     static_assert(InstanceFlags_CurveLinearSweptSpheres == c_InstanceFlagCurveLinearSweptSpheres,
                   "RenderFlags::instanceFlags follows bindless.h");
     static_assert(sizeof(InstanceData) == 112 && sizeof(GeometryData) == 64, "layouts of bindless.h");
+    // The scatter kernel's view of InstanceData (gpu_scene_scatter_cb.h).
+    static_assert(sizeof(InstanceData) == GPU_SCENE_INSTANCE_ROW_WORDS * 4, "gpu_scene_scatter_cb.h row size");
+    static_assert(offsetof(InstanceData, transform) == GPU_SCENE_ROW_TRANSFORM_WORD * 4, "gpu_scene_scatter_cb.h");
+    static_assert(offsetof(InstanceData, prevTransform) == GPU_SCENE_ROW_PREV_TRANSFORM_WORD * 4, "gpu_scene_scatter_cb.h");
+    static_assert(sizeof(float3x4) == GPU_SCENE_TRANSFORM_WORDS * 4, "gpu_scene_scatter_cb.h transform size");
+    static_assert(sizeof(GpuSceneTransformRecord) == 64 && sizeof(GpuSceneRowRecord) == 128, "record sizes");
 
     namespace
     {
         using namespace ecs;
 
         constexpr uint32_t c_BufferCount = uint32_t(GpuSceneBuffer::Count);
+        // The head of an InstanceData row: flags, firstGeometryInstanceIndex, firstGeometryIndex, numGeometries.
+        constexpr size_t c_HeadBytes = offsetof(InstanceData, transform);
+        // Scatter mode: candidate rows below this count are classified on the calling thread.
+        constexpr uint32_t c_ScatterParallelRows = 4096;
 
         struct Run
         {
@@ -68,6 +83,80 @@ namespace donut::engine
         {
             return std::memcmp(&a, &b, sizeof(float3x4)) == 0;
         }
+
+        // An array of trivial elements that keeps its capacity and does not initialise what it grows by (the scatter
+        // records are rewritten every update; std::vector::resize would zero them first).
+        template <typename T>
+        class PodArray
+        {
+        public:
+            static_assert(std::is_trivially_copyable_v<T> && std::is_trivially_destructible_v<T>);
+            // Throws std::bad_alloc; the contents up to the old size are kept.
+            void Resize(size_t size)
+            {
+                if (size > m_Capacity)
+                {
+                    const size_t capacity = std::max(size, std::max<size_t>(m_Capacity * 2, 64));
+                    std::unique_ptr<T[]> data(new T[capacity]);
+                    if (m_Size)
+                        std::memcpy(data.get(), m_Data.get(), m_Size * sizeof(T));
+                    m_Data = std::move(data);
+                    m_Capacity = capacity;
+                }
+                m_Size = size;
+            }
+            void Clear() noexcept { m_Size = 0; }
+            void Swap(PodArray& other) noexcept
+            {
+                std::swap(m_Data, other.m_Data);
+                std::swap(m_Size, other.m_Size);
+                std::swap(m_Capacity, other.m_Capacity);
+            }
+            [[nodiscard]] T* Data() noexcept { return m_Data.get(); }
+            [[nodiscard]] const T* Data() const noexcept { return m_Data.get(); }
+            [[nodiscard]] size_t Size() const noexcept { return m_Size; }
+            T& operator[](size_t i) noexcept { return m_Data[i]; }
+            const T& operator[](size_t i) const noexcept { return m_Data[i]; }
+
+        private:
+            std::unique_ptr<T[]> m_Data;
+            size_t m_Size = 0;
+            size_t m_Capacity = 0;
+        };
+
+        // Scatter mode: the kind of record a candidate row became (ScatterMark).
+        enum class ScatterKind : uint32_t
+        {
+            Transform = 1,   // only the transform changed: prevTransform = transform, then the new transform
+            RowNew = 2,      // an entity new to its slot (or a resend): the whole row, prevTransform = transform
+            RowKeep = 3,     // the same entity, its head changed: the whole row, prevTransform = the slot's transform
+        };
+
+        struct ScatterMark
+        {
+            uint32_t slot;
+            ScatterKind kind;
+        };
+
+        // A changed mesh-instance chunk of a scatter-mode update, with its columns and its ranges of the outputs.
+        struct ScatterChunk
+        {
+            const Entity* entities;
+            const GpuInstanceSlot* slots;
+            const MeshRef* refs;
+            const RenderFlags* flags;
+            const WorldTransform* worlds;
+            uint32_t count;
+            bool headCheck;            // MeshRef, RenderFlags, GpuInstanceSlot or rows changed: compare the heads too
+            uint32_t markOffset;       // its candidate rows' range in the marks
+            uint32_t markCount;        // the records it made
+            uint32_t transformCount;
+            uint32_t rowCount;
+            uint32_t keepCount;        // RowKeep records (their slots settle next frame, as the transform records')
+            uint32_t transformOffset;
+            uint32_t rowOffset;
+            uint32_t settleOffset;     // in the next frame's settle candidates
+        };
     }
 
     struct GpuScene::Impl
@@ -118,14 +207,42 @@ namespace donut::engine
         nvrhi::BufferHandle buffers[c_BufferCount];
         GpuSceneStats stats;
 
+        // ------------------------------------------------------------------- scatter mode
+        // instanceFrames holds, per slot, the serial of the update that last gave it a record. slotTransforms holds the
+        // transform each slot was given last, compact (48 bytes, not the image's 112-byte stride): the classification
+        // reads it for every candidate row, and with WorldTransform it is that pass's memory traffic.
+        std::vector<float3x4> slotTransforms;
+        uint64_t scatterSerial = 0;              // of the last scatter-mode update
+        uint64_t ackedSerial = 0;                // the last serial CommitScatter acknowledged
+        bool scatterResend = false;              // the last update's records are a resend
+        std::vector<ScatterChunk> scatterChunks;
+        PodArray<ScatterMark> marks;
+        PodArray<uint32_t> settleRecords;
+        PodArray<GpuSceneTransformRecord> transformRecords;
+        PodArray<GpuSceneRowRecord> rowRecords;
+        // Slots whose prevTransform the last records may have left behind their transform (transform and RowKeep
+        // records): the next frame's settle candidates.
+        PodArray<uint32_t> settlePending;
+        PodArray<uint32_t> settleNext;
+        // CreateBuffers: what it did, the replaced instance buffer kept for the growth copy, and the geometry and
+        // material buffers made since the last UploadAssetsTo (whose writer is told with ResizeBuffer).
+        GpuSceneBufferChanges changes;
+        nvrhi::BufferHandle previousInstanceBuffer;
+        bool assetsResized[c_BufferCount] = {};
+
         void Reset() noexcept;
         void Ensure(GpuSceneBuffer buffer, uint32_t end);
         void Mark(GpuSceneBuffer buffer, uint32_t row);
-        void UpdateMaterials(SceneGraph& graph, bool structureChanged);
+        void UpdateMaterials(SceneGraph& graph, bool structureChanged, bool allConstants = false);
         void FillGeometries(const MeshTable& meshes, uint32_t slot);
         void UpdateGeometries(SceneGraph& graph, bool structureChanged);
         void UpdateInstances(SceneGraphStore& store, SceneGraph& graph, bool all);
+        void UpdateScatter(SceneGraphStore& store, SceneGraph& graph, bool resend, bool layoutChanged);
+        void ClassifyScatterChunk(const MeshTable& meshes, ScatterChunk& chunk, uint64_t serial, bool resend) noexcept;
+        void WriteScatterChunk(const ScatterChunk& chunk) noexcept;
         bool WriteBuffer(IGpuSceneWriter& writer, GpuSceneBuffer buffer, const void* rows, size_t rowSize);
+        void WriteRuns(IGpuSceneWriter& writer, GpuSceneBuffer buffer, const uint8_t* bytes, size_t rowSize);
+        void WriteConstants(IGpuSceneWriter& writer);
         void PushConstants(Material* material, uint32_t slot, const MaterialConstants& value);
     };
 
@@ -141,6 +258,7 @@ namespace donut::engine
         pendingConstants.clear();
         std::fill(pendingBySlot.begin(), pendingBySlot.end(), ~0u);
         settle.clear();
+        settlePending.Clear();   // scatter mode: the next update is a resend (since is 0)
         frame = ~uint64_t(0);
         layoutSerial = 0;
         since = 0;
@@ -159,6 +277,8 @@ namespace donut::engine
         {
         case GpuSceneBuffer::Instances:
             current = std::min(instances.size(), std::min(instanceEntities.size(), instanceFrames.size()));
+            if (desc.uploadMode == GpuSceneUploadMode::Scatter)
+                current = std::min(current, slotTransforms.size());
             break;
         case GpuSceneBuffer::Geometries: current = geometries.size(); break;
         default: current = std::min(materials.size(), pendingBySlot.size()); break;
@@ -173,6 +293,11 @@ namespace donut::engine
             instances.reserve(rows);
             instanceEntities.reserve(rows);
             instanceFrames.reserve(rows);
+            if (desc.uploadMode == GpuSceneUploadMode::Scatter)
+            {
+                slotTransforms.reserve(rows);
+                slotTransforms.resize(rows, float3x4(0.f));
+            }
             instances.resize(rows, InstanceData());
             instanceEntities.resize(rows, Entity::Null);
             instanceFrames.resize(rows, ~uint64_t(0));
@@ -206,10 +331,10 @@ namespace donut::engine
     // Materials: the rows of new materials, of dirty ones, and after structural changes of all of them (as
     // RefreshBuffers refilled them, which also catches textures that arrived without a dirty flag); a row is kept for
     // the upload only when it changed. The material table polls the dirty flag (design 4.8: linear in materials).
-    void GpuScene::Impl::UpdateMaterials(SceneGraph& graph, bool structureChanged)
+    void GpuScene::Impl::UpdateMaterials(SceneGraph& graph, bool structureChanged, bool allConstants)
     {
         const MaterialTable& table = graph.GetMaterials();
-        const bool all = structureChanged;
+        const bool all = structureChanged || allConstants;
         const uint32_t end = table.GetSlotEnd();
         for (uint32_t slot = 0; slot < end; ++slot)
         {
@@ -220,7 +345,7 @@ namespace donut::engine
             // A dirty material, one new to its slot (its constant buffer may hold another slot), and one whose constant
             // buffer a device has not made yet get their constant buffers written.
             const bool added = row.serial > materialSerial;
-            const bool constants = material->dirty || added || (device && !material->materialConstants);
+            const bool constants = allConstants || material->dirty || added || (device && !material->materialConstants);
             if (!all && !constants)
                 continue;
             MaterialConstants value = MaterialConstants();   // value-initialised: zero (the braces would leave its float3s)
@@ -431,6 +556,275 @@ namespace donut::engine
         }
     }
 
+    // ------------------------------------------------------------------------------------- scatter mode
+
+    // One candidate row of a changed chunk becomes at most one record. The image keeps each slot's head and float
+    // transform (not its prevTransform, which the GPU keeps), so that a row whose head and transform are unchanged
+    // costs nothing; the per-slot entity tells a row new to its slot. Chunks write disjoint slots and marks, so the
+    // chunks of one update can be classified in parallel.
+    void GpuScene::Impl::ClassifyScatterChunk(const MeshTable& meshes, ScatterChunk& chunk, uint64_t serial,
+                                              bool resend) noexcept
+    {
+        ScatterMark* out = marks.Data() + chunk.markOffset;
+        uint32_t made = 0, transformCount = 0, rowCount = 0, keepCount = 0;
+        const uint32_t slotEnd = uint32_t(instances.size());
+        for (uint32_t r = 0; r < chunk.count; ++r)
+        {
+            const uint32_t slot = chunk.slots[r].instance;
+            if (slot >= slotEnd)
+                continue;   // cannot happen: Ensure covered the allocator's end
+
+            // Scene::UpdateInstance's row, from the columns: the head, then the transform
+            float3x4 transform;
+            affineToColumnMajor(affine3(chunk.worlds[r].transform), transform);
+            InstanceData& image = instances[slot];
+            auto head = [&](InstanceData& row)
+            {
+                row.flags = chunk.flags[r].instanceFlags;
+                row.firstGeometryInstanceIndex = chunk.slots[r].firstGeometryInstance;
+                const MeshTable::MeshRow* meshRow = chunk.refs[r].mesh != MeshId::Invalid
+                    ? &meshes.GetMeshRow(MeshTable::SlotOf(chunk.refs[r].mesh)) : nullptr;
+                row.numGeometries = meshRow ? meshRow->geometryCount : 0;
+                row.firstGeometryIndex = row.numGeometries > 0 ? meshRow->firstGeometry : ~0u;
+            };
+
+            ScatterKind kind = ScatterKind::Transform;
+            if (resend || instanceEntities[slot] != chunk.entities[r])
+            {
+                // new to the slot: prevTransform = transform, as CPU mode gives an entity new to its slot
+                head(image);
+                image.transform = transform;
+                image.prevTransform = transform;
+                slotTransforms[slot] = transform;
+                instanceEntities[slot] = chunk.entities[r];
+                kind = ScatterKind::RowNew;
+                ++rowCount;
+            }
+            else
+            {
+                bool headChanged = false;
+                if (chunk.headCheck)
+                {
+                    InstanceData row;
+                    head(row);
+                    headChanged = !SameRow(&row, &image, c_HeadBytes);
+                    if (headChanged)
+                        std::memcpy(&image, &row, c_HeadBytes);
+                }
+                const bool moved = !SameTransform(transform, slotTransforms[slot]);
+                if (moved)
+                {
+                    slotTransforms[slot] = transform;
+                    image.transform = transform;
+                }
+                if (headChanged)
+                {
+                    kind = ScatterKind::RowKeep;
+                    ++rowCount;
+                    ++keepCount;
+                }
+                else if (moved)
+                {
+                    kind = ScatterKind::Transform;
+                    ++transformCount;
+                }
+                else
+                    continue;   // CPU mode rebuilds it to the same row; a settle record covers last frame's move
+            }
+            instanceFrames[slot] = serial;
+            out[made++] = ScatterMark{ slot, kind };
+        }
+        chunk.markCount = made;
+        chunk.transformCount = transformCount;
+        chunk.rowCount = rowCount;
+        chunk.keepCount = keepCount;
+    }
+
+    void GpuScene::Impl::WriteScatterChunk(const ScatterChunk& chunk) noexcept
+    {
+        const ScatterMark* in = marks.Data() + chunk.markOffset;
+        GpuSceneTransformRecord* transformsOut = transformRecords.Data() + chunk.transformOffset;
+        GpuSceneRowRecord* rowsOut = rowRecords.Data() + chunk.rowOffset;
+        uint32_t* settleOut = settleNext.Data() + chunk.settleOffset;
+        for (uint32_t i = 0; i < chunk.markCount; ++i)
+        {
+            const ScatterMark mark = in[i];
+            const InstanceData& image = instances[mark.slot];
+            if (mark.kind == ScatterKind::Transform)
+            {
+                GpuSceneTransformRecord& record = *transformsOut++;
+                record.slot = mark.slot;
+                record.padding0 = record.padding1 = record.padding2 = 0;
+                std::memcpy(record.transform, &image.transform, sizeof(record.transform));
+                *settleOut++ = mark.slot;
+            }
+            else
+            {
+                GpuSceneRowRecord& record = *rowsOut++;
+                record.slot = mark.slot;
+                record.flags = mark.kind == ScatterKind::RowKeep ? GPU_SCENE_ROW_FLAG_KEEP_PREVIOUS : 0u;
+                record.padding0 = record.padding1 = 0;
+                // the head and the transform; prevTransform = transform (the kernel ignores it for RowKeep)
+                std::memcpy(record.row, &image, offsetof(InstanceData, prevTransform));
+                std::memcpy(record.row + GPU_SCENE_ROW_PREV_TRANSFORM_WORD, &image.transform, sizeof(float3x4));
+                if (mark.kind == ScatterKind::RowKeep)
+                    *settleOut++ = mark.slot;
+            }
+        }
+    }
+
+    // Scatter mode's instance pass (GpuScene.h): candidate chunks serially, then the rows classified in parallel by
+    // chunk, the settle records, the prefix sums of the per-chunk counts, and the records written in parallel at those
+    // offsets, so the records are in chunk order at any worker count.
+    void GpuScene::Impl::UpdateScatter(SceneGraphStore& store, SceneGraph& graph, bool resend, bool layoutChanged)
+    {
+        const MeshTable& meshes = graph.GetMeshes();
+        const uint64_t currentFrame = store.GetRefreshCalls();
+        const bool newFrame = currentFrame != frame;
+        frame = currentFrame;
+        const uint64_t serial = ++scatterSerial;
+        scatterResend = resend;
+
+        // The candidate chunks.
+        scatterChunks.clear();
+        store.SyncArchetypes();
+        WorldImpl& world = *store.m_Impl;
+        const uint32_t archetypeCount = world.GetArchetypeStorageCount();
+        uint32_t candidateRows = 0;
+        for (uint32_t a = 0; a < archetypeCount; ++a)
+        {
+            const Archetype& archetype = world.GetArchetypeStorage(a);
+            const uint8_t slotColumn = store.ColumnIndex(archetype, a, SceneGraphStore::SlotInstance);
+            const uint8_t refColumn = store.ColumnIndex(archetype, a, SceneGraphStore::SlotMeshRef);
+            const uint8_t flagsColumn = store.ColumnIndex(archetype, a, SceneGraphStore::SlotRenderFlags);
+            const uint8_t worldColumn = store.ColumnIndex(archetype, a, SceneGraphStore::SlotWorld);
+            if (slotColumn == SceneGraphStore::c_Absent || refColumn == SceneGraphStore::c_Absent ||
+                flagsColumn == SceneGraphStore::c_Absent || worldColumn == SceneGraphStore::c_Absent)
+                continue;
+            const uint32_t added = archetype.AddedVersionSlot();
+            for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+            {
+                ++stats.chunksVisited;
+                const uint32_t count = archetype.chunks[c].count;
+                if (count == 0)
+                    continue;
+                const uint64_t* versions = archetype.Versions(c);
+                const bool headCheck = resend || layoutChanged || versions[slotColumn] > since ||
+                                       versions[refColumn] > since || versions[flagsColumn] > since ||
+                                       versions[added] > since;
+                if (!headCheck && versions[worldColumn] <= since)
+                    continue;
+                ++stats.chunksChanged;
+                uint8_t* memory = archetype.chunks[c].memory;
+                ScatterChunk chunk = {};
+                chunk.entities = archetype.Entities(c);
+                chunk.slots = reinterpret_cast<const GpuInstanceSlot*>(memory + archetype.columns[slotColumn].offset);
+                chunk.refs = reinterpret_cast<const MeshRef*>(memory + archetype.columns[refColumn].offset);
+                chunk.flags = reinterpret_cast<const RenderFlags*>(memory + archetype.columns[flagsColumn].offset);
+                chunk.worlds = reinterpret_cast<const WorldTransform*>(memory + archetype.columns[worldColumn].offset);
+                chunk.count = count;
+                chunk.headCheck = headCheck;
+                chunk.markOffset = candidateRows;
+                scatterChunks.push_back(chunk);
+                candidateRows += count;
+            }
+        }
+        stats.rowsBuilt = candidateRows;
+        marks.Resize(candidateRows);
+
+        // Classify, in parallel by chunk.
+        struct Context
+        {
+            Impl* impl;
+            const MeshTable* meshes;
+            uint64_t serial;
+            bool resend;
+            static void Classify(void* context, uint32_t begin, uint32_t end, uint32_t) noexcept
+            {
+                const Context& ctx = *static_cast<const Context*>(context);
+                for (uint32_t i = begin; i < end; ++i)
+                    ctx.impl->ClassifyScatterChunk(*ctx.meshes, ctx.impl->scatterChunks[i], ctx.serial, ctx.resend);
+            }
+            static void Write(void* context, uint32_t begin, uint32_t end, uint32_t) noexcept
+            {
+                const Context& ctx = *static_cast<const Context*>(context);
+                for (uint32_t i = begin; i < end; ++i)
+                    ctx.impl->WriteScatterChunk(ctx.impl->scatterChunks[i]);
+            }
+        };
+        Context ctx{ this, &meshes, serial, resend };
+        const uint32_t chunkCount = uint32_t(scatterChunks.size());
+        IJobSystem* jobs = store.m_Jobs;
+        uint32_t grain = chunkCount;
+        if (jobs && candidateRows >= c_ScatterParallelRows)
+        {
+            static const uint32_t s_Hardware = std::max(1u, std::thread::hardware_concurrency());
+            const uint32_t threads = std::max(1u, std::min(jobs->GetThreadCount(), s_Hardware));
+            grain = std::max(1u, chunkCount / (threads * 4));
+        }
+        auto run = [&](PFN_JobFunction function)
+        {
+            if (chunkCount == 0)
+                return;
+            if (grain >= chunkCount)
+                function(&ctx, 0, chunkCount, 0);
+            else
+                jobs->ParallelFor(chunkCount, grain, function, &ctx);
+        };
+        run(&Context::Classify);
+
+        // Settle records: last frame's candidates without a record now (CPU mode settles them in its first update of
+        // a later frame). After a resend every row has prevTransform = transform.
+        settleRecords.Clear();
+        if (newFrame && !resend)
+        {
+            settleRecords.Resize(settlePending.Size());
+            uint32_t count = 0;
+            const uint32_t slotEnd = uint32_t(instances.size());
+            for (size_t i = 0; i < settlePending.Size(); ++i)
+            {
+                const uint32_t slot = settlePending[i];
+                if (slot >= slotEnd || instanceFrames[slot] == serial)
+                    continue;
+                instanceFrames[slot] = serial;   // a slot settles once
+                settleRecords[count++] = slot;
+            }
+            settleRecords.Resize(count);
+        }
+
+        // Prefix sums, then the records.
+        uint32_t transformTotal = 0, rowTotal = 0, settleTotal = 0;
+        for (ScatterChunk& chunk : scatterChunks)
+        {
+            chunk.transformOffset = transformTotal;
+            chunk.rowOffset = rowTotal;
+            chunk.settleOffset = settleTotal;
+            transformTotal += chunk.transformCount;
+            rowTotal += chunk.rowCount;
+            settleTotal += chunk.transformCount + chunk.keepCount;
+        }
+        // An update in the same frame keeps the frame's earlier candidates for the next frame.
+        const size_t carried = !newFrame && !resend ? settlePending.Size() : 0;
+        transformRecords.Resize(transformTotal);
+        rowRecords.Resize(rowTotal);
+        settleNext.Resize(settleTotal + carried);
+        run(&Context::Write);
+        if (carried)
+            std::memcpy(settleNext.Data() + settleTotal, settlePending.Data(), carried * sizeof(uint32_t));
+        settlePending.Swap(settleNext);
+
+        stats.rowsChanged = transformTotal + rowTotal;
+        stats.rowsSettled = uint32_t(settleRecords.Size());
+        stats.settleRecords = uint32_t(settleRecords.Size());
+        stats.transformRecords = transformTotal;
+        stats.rowRecords = rowTotal;
+        stats.uploadRuns = 0;
+        stats.uploadBytes = uint64_t(settleRecords.Size()) * sizeof(uint32_t) +
+                            uint64_t(transformTotal) * sizeof(GpuSceneTransformRecord) +
+                            uint64_t(rowTotal) * sizeof(GpuSceneRowRecord);
+        stats.buffersResized = 0;
+    }
+
     // False when the buffer could not be made: everything stays to be written, and the next upload tries again.
     bool GpuScene::Impl::WriteBuffer(IGpuSceneWriter& writer, GpuSceneBuffer buffer, const void* rows, size_t rowSize)
     {
@@ -469,10 +863,16 @@ namespace donut::engine
             pending[b].clear();
             return true;
         }
+        WriteRuns(writer, buffer, bytes, rowSize);
+        return true;
+    }
 
-        std::vector<Run>& runs = pending[b];
+    // The kept runs of `buffer`, sorted and merged.
+    void GpuScene::Impl::WriteRuns(IGpuSceneWriter& writer, GpuSceneBuffer buffer, const uint8_t* bytes, size_t rowSize)
+    {
+        std::vector<Run>& runs = pending[uint32_t(buffer)];
         if (runs.empty())
-            return true;
+            return;
         // Runs come in chunk order, mostly ascending: sort them, then merge overlapping and nearby ones.
         std::sort(runs.begin(), runs.end(), [](const Run& x, const Run& y) { return x.first < y.first; });
         Run current = runs.front();
@@ -496,55 +896,79 @@ namespace donut::engine
         }
         flush(current);
         runs.clear();
-        return true;
+    }
+
+    void GpuScene::Impl::WriteConstants(IGpuSceneWriter& writer)
+    {
+        for (const PendingConstants& entry : pendingConstants)
+        {
+            writer.WriteMaterialConstants(entry.material, entry.value);
+            entry.material->dirty = false;
+        }
+        pendingConstants.clear();
+        std::fill(pendingBySlot.begin(), pendingBySlot.end(), ~0u);
     }
 
     // ------------------------------------------------------------------------------------- the device
 
     namespace
     {
+        // Scene::CreateInstanceBuffer, CreateGeometryBuffer and CreateMaterialBuffer. `handle` is replaced (the old
+        // buffer is released through it, so a caller that keeps the old one holds its own reference).
+        bool CreateSceneBuffer(nvrhi::IDevice* device, const GpuSceneDesc& desc, GpuSceneBuffer buffer, uint32_t rows,
+                               nvrhi::BufferHandle& handle) noexcept
+        {
+            nvrhi::BufferDesc bufferDesc;
+            bufferDesc.canHaveRawViews = true;
+            bufferDesc.canHaveUAVs = true;
+            bufferDesc.initialState = nvrhi::ResourceStates::ShaderResource;
+            // Scatter mode: the render graph imports them (ImportBuffer rejects keepInitialState buffers), with
+            // ShaderResource as their state between frames (c_GpuSceneRestingState).
+            bufferDesc.keepInitialState = desc.uploadMode != GpuSceneUploadMode::Scatter;
+            switch (buffer)
+            {
+            case GpuSceneBuffer::Instances:
+                bufferDesc.byteSize = sizeof(InstanceData) * uint64_t(rows);
+                bufferDesc.debugName = "Instances";
+                bufferDesc.structStride = desc.structuredInstanceBuffer ? sizeof(InstanceData) : 0;
+                bufferDesc.isVertexBuffer = true;
+                break;
+            case GpuSceneBuffer::Geometries:
+                bufferDesc.byteSize = sizeof(GeometryData) * uint64_t(rows);
+                bufferDesc.debugName = "BindlessGeometry";
+                bufferDesc.structStride = sizeof(GeometryData);
+                break;
+            default:
+                bufferDesc.byteSize = sizeof(MaterialConstants) * uint64_t(rows);
+                bufferDesc.debugName = "BindlessMaterials";
+                bufferDesc.structStride = sizeof(MaterialConstants);
+                break;
+            }
+            handle.Reset();
+            if (NVRHI_FAILED(device->createBuffer(bufferDesc, &handle)))
+            {
+                log::warning("GpuScene: cannot create the %s buffer (%u rows)", bufferDesc.debugName.c_str(), rows);
+                return false;
+            }
+            return true;
+        }
+
         class DeviceWriter final : public IGpuSceneWriter
         {
         public:
+            // `createBuffers` false (scatter mode's UploadAssets): CreateBuffers made them, ResizeBuffer only reports
+            // whether the buffer exists.
             DeviceWriter(nvrhi::IDevice* device, nvrhi::ICommandList* commandList, const GpuSceneDesc& desc,
-                         nvrhi::BufferHandle* buffers) noexcept
-                : m_Device(device), m_CommandList(commandList), m_Desc(desc), m_Buffers(buffers) { }
+                         nvrhi::BufferHandle* buffers, bool createBuffers = true) noexcept
+                : m_Device(device), m_CommandList(commandList), m_Desc(desc), m_Buffers(buffers),
+                  m_CreateBuffers(createBuffers) { }
 
             // Scene::CreateInstanceBuffer, CreateGeometryBuffer and CreateMaterialBuffer.
             bool ResizeBuffer(GpuSceneBuffer buffer, uint32_t rows) noexcept override
             {
-                nvrhi::BufferDesc bufferDesc;
-                bufferDesc.canHaveRawViews = true;
-                bufferDesc.canHaveUAVs = true;
-                bufferDesc.initialState = nvrhi::ResourceStates::ShaderResource;
-                bufferDesc.keepInitialState = true;
-                switch (buffer)
-                {
-                case GpuSceneBuffer::Instances:
-                    bufferDesc.byteSize = sizeof(InstanceData) * uint64_t(rows);
-                    bufferDesc.debugName = "Instances";
-                    bufferDesc.structStride = m_Desc.structuredInstanceBuffer ? sizeof(InstanceData) : 0;
-                    bufferDesc.isVertexBuffer = true;
-                    break;
-                case GpuSceneBuffer::Geometries:
-                    bufferDesc.byteSize = sizeof(GeometryData) * uint64_t(rows);
-                    bufferDesc.debugName = "BindlessGeometry";
-                    bufferDesc.structStride = sizeof(GeometryData);
-                    break;
-                default:
-                    bufferDesc.byteSize = sizeof(MaterialConstants) * uint64_t(rows);
-                    bufferDesc.debugName = "BindlessMaterials";
-                    bufferDesc.structStride = sizeof(MaterialConstants);
-                    break;
-                }
-                nvrhi::BufferHandle& handle = m_Buffers[uint32_t(buffer)];
-                handle.Reset();
-                if (NVRHI_FAILED(m_Device->createBuffer(bufferDesc, &handle)))
-                {
-                    log::warning("GpuScene: cannot create the %s buffer (%u rows)", bufferDesc.debugName.c_str(), rows);
-                    return false;
-                }
-                return true;
+                if (!m_CreateBuffers)
+                    return m_Buffers[uint32_t(buffer)] != nullptr;
+                return CreateSceneBuffer(m_Device, m_Desc, buffer, rows, m_Buffers[uint32_t(buffer)]);
             }
 
             void WriteRows(GpuSceneBuffer buffer, uint32_t firstRow, uint32_t rowCount, const void* data,
@@ -580,6 +1004,7 @@ namespace donut::engine
             nvrhi::ICommandList* m_CommandList;
             const GpuSceneDesc& m_Desc;
             nvrhi::BufferHandle* m_Buffers;
+            bool m_CreateBuffers;
         };
     }
 
@@ -654,10 +1079,25 @@ namespace donut::engine
             if (impl.desc.geometryAndMaterialBuffers)
                 impl.Ensure(GpuSceneBuffer::Geometries, graph->GetMeshes().GetGeometryEnd());
 
-            impl.UpdateMaterials(*graph, structureChanged);
+            const bool scatter = impl.desc.uploadMode == GpuSceneUploadMode::Scatter;
+            // Scatter mode: records that the upload pass did not acknowledge are lost, and so may be what its Prepare
+            // wrote (UploadAssets cleared the materials' dirty flags and pending constants, and may have made a
+            // constant buffer it never wrote, if the frame then did not execute): every live row is sent again, the
+            // asset buffers are written whole, and every material's constant buffer is written again.
+            const bool unacknowledged = scatter && impl.scatterSerial != impl.ackedSerial;
+            if (unacknowledged)
+            {
+                impl.writeAll[uint32_t(GpuSceneBuffer::Geometries)] = impl.desc.geometryAndMaterialBuffers;
+                impl.writeAll[uint32_t(GpuSceneBuffer::Materials)] = impl.desc.geometryAndMaterialBuffers;
+            }
+
+            impl.UpdateMaterials(*graph, structureChanged, unacknowledged);
             if (impl.desc.geometryAndMaterialBuffers)
                 impl.UpdateGeometries(*graph, structureChanged);
-            impl.UpdateInstances(store, *graph, firstUpdate || layoutChanged || impl.recover);
+            if (scatter)
+                impl.UpdateScatter(store, *graph, firstUpdate || impl.recover || unacknowledged, layoutChanged);
+            else
+                impl.UpdateInstances(store, *graph, firstUpdate || layoutChanged || impl.recover);
 
             // Every stamp after this is newer: phases advance the version, and the graph's structural operations and
             // InvalidateContent advance it before they stamp.
@@ -674,6 +1114,11 @@ namespace donut::engine
             impl.recover = true;
             for (uint32_t b = 0; b < c_BufferCount; ++b)
                 impl.writeAll[b] = true;
+            // Scatter mode: no records (the next update is a resend); the pass acknowledges the empty set.
+            impl.settleRecords.Clear();
+            impl.transformRecords.Clear();
+            impl.rowRecords.Clear();
+            impl.settlePending.Clear();
             log::warning("GpuScene::Update: out of memory");
             return nvrhi::FE_OUT_OF_MEMORY;
         }
@@ -684,6 +1129,8 @@ namespace donut::engine
     {
         if (!writer)
             return nvrhi::FE_INVALID_ARGS;
+        if (m_Desc.uploadMode == GpuSceneUploadMode::Scatter)
+            return nvrhi::FE_UNSUPPORTED;   // the upload pass scatters; UploadAssetsTo writes the asset rows
         if (!m_Impl)
             return nvrhi::FS_OK;   // nothing was updated yet
         Impl& impl = *m_Impl;
@@ -696,13 +1143,7 @@ namespace donut::engine
             ok &= impl.WriteBuffer(*writer, GpuSceneBuffer::Geometries, impl.geometries.data(), sizeof(GeometryData));
             ok &= impl.WriteBuffer(*writer, GpuSceneBuffer::Materials, impl.materials.data(), sizeof(MaterialConstants));
         }
-        for (const Impl::PendingConstants& pending : impl.pendingConstants)
-        {
-            writer->WriteMaterialConstants(pending.material, pending.value);
-            pending.material->dirty = false;
-        }
-        impl.pendingConstants.clear();
-        std::fill(impl.pendingBySlot.begin(), impl.pendingBySlot.end(), ~0u);
+        impl.WriteConstants(*writer);
         return ok ? nvrhi::FS_OK : nvrhi::FE_OUT_OF_MEMORY;
     }
 
@@ -714,6 +1155,203 @@ namespace donut::engine
             return nvrhi::FS_OK;
         DeviceWriter writer(m_Impl->device, commandList, m_Impl->desc, m_Impl->buffers);
         return UploadTo(&writer);
+    }
+
+    // ------------------------------------------------------------------------------------- scatter mode
+
+    nvrhi::FRESULT GpuScene::CreateBuffers() noexcept
+    {
+        if (!m_Impl)
+            return nvrhi::FS_OK;   // nothing was updated yet
+        Impl& impl = *m_Impl;
+        impl.changes = GpuSceneBufferChanges();
+        // The buffer replaced by the last call: its rows were copied by the frame whose records were acknowledged, or
+        // that frame was dropped and the update since then was a resend. The graph and the command lists that used it
+        // hold their own references.
+        impl.previousInstanceBuffer = nullptr;
+        bool ok = true;
+        for (uint32_t b = 0; b < c_BufferCount; ++b)
+        {
+            const GpuSceneBuffer buffer = GpuSceneBuffer(b);
+            if (buffer != GpuSceneBuffer::Instances && !impl.desc.geometryAndMaterialBuffers)
+                continue;
+            uint32_t rows = 0;
+            switch (buffer)
+            {
+            case GpuSceneBuffer::Instances: rows = uint32_t(impl.instances.size()); break;
+            case GpuSceneBuffer::Geometries: rows = uint32_t(impl.geometries.size()); break;
+            default: rows = uint32_t(impl.materials.size()); break;
+            }
+            if (rows == 0 || impl.bufferRows[b] >= rows)
+                continue;   // never shrunk, as Upload does not shrink them
+            nvrhi::BufferHandle old = impl.buffers[b];
+            const uint32_t oldRows = impl.bufferRows[b];
+            if (m_Device && !CreateSceneBuffer(m_Device, impl.desc, buffer, rows, impl.buffers[b]))
+            {
+                impl.buffers[b] = old;   // keep the smaller one; the pass does not scatter into it
+                ok = false;
+                continue;
+            }
+            impl.bufferRows[b] = rows;
+            ++impl.stats.buffersResized;
+            if (buffer == GpuSceneBuffer::Instances)
+            {
+                impl.changes.instancesResized = true;
+                // A resend writes every live row: nothing to copy.
+                if (!impl.scatterResend && oldRows != 0)
+                {
+                    impl.previousInstanceBuffer = old;
+                    impl.changes.previousInstanceBuffer = old;
+                    impl.changes.previousInstanceRows = oldRows;
+                }
+            }
+            else
+            {
+                // written whole by the next UploadAssets, whose writer hears of the new size first
+                impl.rewrite[b] = true;
+                impl.pending[b].clear();
+                impl.assetsResized[b] = true;
+                if (buffer == GpuSceneBuffer::Geometries)
+                    impl.changes.geometriesResized = true;
+                else
+                    impl.changes.materialsResized = true;
+            }
+        }
+        if (!ok)
+            log::warning("GpuScene::CreateBuffers: a buffer could not be made");
+        return ok ? nvrhi::FS_OK : nvrhi::FE_OUT_OF_MEMORY;
+    }
+
+    const GpuSceneBufferChanges& GpuScene::GetBufferChanges() const noexcept
+    {
+        static const GpuSceneBufferChanges s_None;
+        return m_Impl ? m_Impl->changes : s_None;
+    }
+
+    nvrhi::FRESULT GpuScene::UploadAssetsTo(IGpuSceneWriter* writer) noexcept
+    {
+        if (!writer)
+            return nvrhi::FE_INVALID_ARGS;
+        if (m_Desc.uploadMode != GpuSceneUploadMode::Scatter)
+            return nvrhi::FE_UNSUPPORTED;   // Upload writes everything in CPU mode
+        if (!m_Impl)
+            return nvrhi::FS_OK;
+        Impl& impl = *m_Impl;
+        bool ok = true;
+        if (impl.desc.geometryAndMaterialBuffers)
+        {
+            for (GpuSceneBuffer buffer : { GpuSceneBuffer::Geometries, GpuSceneBuffer::Materials })
+            {
+                const uint32_t b = uint32_t(buffer);
+                const bool geometries = buffer == GpuSceneBuffer::Geometries;
+                const uint32_t rowCount = geometries ? uint32_t(impl.geometries.size()) : uint32_t(impl.materials.size());
+                const size_t rowSize = geometries ? sizeof(GeometryData) : sizeof(MaterialConstants);
+                const uint8_t* bytes = geometries ? reinterpret_cast<const uint8_t*>(impl.geometries.data())
+                                                  : reinterpret_cast<const uint8_t*>(impl.materials.data());
+                if (rowCount == 0)
+                    continue;
+                if (impl.bufferRows[b] < rowCount)
+                {
+                    ok = false;   // CreateBuffers has not made it (yet): everything stays to be written
+                    continue;
+                }
+                if (impl.assetsResized[b])
+                {
+                    if (!writer->ResizeBuffer(buffer, impl.bufferRows[b]))
+                    {
+                        ok = false;
+                        continue;
+                    }
+                    impl.assetsResized[b] = false;
+                }
+                if (impl.rewrite[b] || impl.writeAll[b])
+                {
+                    // the buffer may be larger than the image (an image never shrinks, but another graph's was larger)
+                    writer->WriteRows(buffer, 0, rowCount, bytes, rowSize);
+                    ++impl.stats.uploadRuns;
+                    impl.stats.uploadBytes += uint64_t(rowCount) * rowSize;
+                    impl.rewrite[b] = false;
+                    impl.writeAll[b] = false;
+                    impl.pending[b].clear();
+                }
+                else
+                    impl.WriteRuns(*writer, buffer, bytes, rowSize);
+            }
+        }
+        impl.WriteConstants(*writer);
+        return ok ? nvrhi::FS_OK : nvrhi::FE_OUT_OF_MEMORY;
+    }
+
+    nvrhi::FRESULT GpuScene::UploadAssets(nvrhi::ICommandList* commandList) noexcept
+    {
+        if (!commandList || !m_Device)
+            return nvrhi::FE_INVALID_ARGS;
+        if (!m_Impl)
+            return nvrhi::FS_OK;
+        // The buffers are not host-kept in scatter mode: the list tracks them from the state they rest in between
+        // frames (the graph imports them in it) and returns them to it.
+        Impl& impl = *m_Impl;
+        nvrhi::IBuffer* tracked[2] = {};
+        if (impl.desc.geometryAndMaterialBuffers && HasPendingAssets())
+        {
+            tracked[0] = impl.buffers[uint32_t(GpuSceneBuffer::Geometries)];
+            tracked[1] = impl.buffers[uint32_t(GpuSceneBuffer::Materials)];
+        }
+        for (nvrhi::IBuffer* buffer : tracked)
+            if (buffer)
+                commandList->beginTrackingBufferState(buffer, c_GpuSceneRestingState);
+        DeviceWriter writer(impl.device, commandList, impl.desc, impl.buffers, false);
+        const nvrhi::FRESULT result = UploadAssetsTo(&writer);
+        for (nvrhi::IBuffer* buffer : tracked)
+            if (buffer)
+                commandList->setBufferState(buffer, c_GpuSceneRestingState);
+        commandList->commitBarriers();
+        return result;
+    }
+
+    bool GpuScene::HasPendingAssets() const noexcept
+    {
+        if (!m_Impl)
+            return false;
+        const Impl& impl = *m_Impl;
+        if (!impl.pendingConstants.empty())
+            return true;
+        if (!impl.desc.geometryAndMaterialBuffers)
+            return false;
+        for (GpuSceneBuffer buffer : { GpuSceneBuffer::Geometries, GpuSceneBuffer::Materials })
+        {
+            const uint32_t b = uint32_t(buffer);
+            if (!impl.pending[b].empty() || impl.rewrite[b] || impl.writeAll[b] || impl.assetsResized[b])
+                return true;
+        }
+        return false;
+    }
+
+    void GpuScene::GetScatterRecords(GpuSceneScatterRecords& out) const noexcept
+    {
+        out = GpuSceneScatterRecords();
+        if (!m_Impl || m_Desc.uploadMode != GpuSceneUploadMode::Scatter)
+            return;
+        const Impl& impl = *m_Impl;
+        out.settleSlots = impl.settleRecords.Data();
+        out.settleCount = uint32_t(impl.settleRecords.Size());
+        out.transforms = impl.transformRecords.Data();
+        out.transformCount = uint32_t(impl.transformRecords.Size());
+        out.rows = impl.rowRecords.Data();
+        out.rowCount = uint32_t(impl.rowRecords.Size());
+        out.serial = impl.scatterSerial;
+        out.resend = impl.scatterResend;
+    }
+
+    void GpuScene::CommitScatter(uint64_t serial) noexcept
+    {
+        if (m_Impl && serial == m_Impl->scatterSerial)
+            m_Impl->ackedSerial = serial;
+    }
+
+    bool GpuScene::IsScatterPending() const noexcept
+    {
+        return m_Impl && m_Impl->scatterSerial != m_Impl->ackedSerial;
     }
 
     nvrhi::IBuffer* GpuScene::GetInstanceBuffer() const noexcept

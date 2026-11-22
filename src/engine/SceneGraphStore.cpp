@@ -24,6 +24,7 @@
 // Bounds systems, the leaf observer, and the mesh-instance columns and slots. See SceneGraphStore.h for the rules.
 
 #include "SceneGraphStore.h"
+#include "EcsSchedulerImpl.h"
 
 #include <donut/core/log.h>
 #include <donut/core/query_cast.h>
@@ -376,6 +377,7 @@ namespace donut::engine
     void SceneGraphStore::CreateSystems() noexcept
     {
         m_Scheduler.Reset();
+        ++m_SchedulerGeneration;
         if (!m_Jobs || NVRHI_FAILED(CreateScheduler(m_World, m_Jobs, &m_Scheduler)))
         {
             log::warning("SceneGraph: cannot create the scheduler");
@@ -684,6 +686,44 @@ namespace donut::engine
         log::warning("SceneGraph::%s: the graph's world takes no structural change now (inside a phase or a leaf "
                      "callback); nothing changed", operation);
         return false;
+    }
+
+    nvrhi::FRESULT SceneGraphStore::RunReadOnlyPhase(Phase phase) noexcept
+    {
+        if (!m_Scheduler)
+            return nvrhi::FE_INVALID_ARGS;
+        // A system that declares a write (or runs alone) may change anything: the phase is then an ordinary one.
+        const bool writers = ecs::PhaseDeclaresWrites(m_Scheduler, phase);
+#ifndef NDEBUG
+        if (writers)
+            log::warning("SceneGraph::RunReadOnlyPhase: a system of phase %u declares a write or is exclusive; the next "
+                         "Refresh runs its phases", uint32_t(phase));
+#endif
+        const uint64_t version = m_World->GetVersion();
+        const uint64_t structuralVersion = m_World->GetStructuralVersion();
+        ecs::SchedulerCounters before{};
+        const bool counted = ecs::GetSchedulerCounters(m_Scheduler, before);
+        const nvrhi::FRESULT result = m_Scheduler->RunPhase(phase);
+        if (NVRHI_FAILED(result) || writers || !counted)
+            return result;
+        ecs::SchedulerCounters after{};
+        ecs::GetSchedulerCounters(m_Scheduler, after);
+        // Current before the phase (nothing ran on the world since the last Refresh), and the phase changed nothing:
+        // no command played back, no structural change. Its versions are then not a change.
+        if (m_RefreshedVersion == version && m_RefreshedStructuralVersion == structuralVersion &&
+            m_World->GetStructuralVersion() == structuralVersion && after.playbacks == before.playbacks)
+            m_RefreshedVersion = m_World->GetVersion();
+        return result;
+    }
+
+    void SceneGraphStore::WarnRenderRead(const char* operation) const noexcept
+    {
+        // Open point 12 of the E5 sub-plan, beside the phase check of design 5.6: the render service's snapshot points
+        // at this graph's leaves and assets until its EndFrame. A warning, not an error (log::error breaks into the
+        // debugger); the write applies, so Debug and Release behave alike.
+        if (m_RenderReads != 0 && m_RenderReadQuiet == 0)
+            log::warning("SceneGraph::%s while a frame records (between RenderService::Extract and EndFrame): the "
+                         "frame's snapshot may point at what this changes; the write applies", operation);
     }
 
     // The leaf classes and local boxes of the gathered nodes. A separate pass, so that the leaves, which the walk does

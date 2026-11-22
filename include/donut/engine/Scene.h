@@ -81,6 +81,23 @@ namespace donut::engine
         nvrhi::AutoPtr<GpuScene> m_GpuScene;
         // Scatter: the render-graph path (plan step E5; SetGpuSceneUploadMode).
         GpuSceneUploadMode m_GpuSceneUploadMode = GpuSceneUploadMode::CpuRows;
+        // Buffers that CreateMeshBufferObjects made and whose data WriteMeshBufferData has not written yet.
+        struct PendingMeshBufferData
+        {
+            nvrhi::AutoPtr<BufferGroup> buffers;
+            bool indexData = false;
+            bool vertexData = false;
+        };
+        std::vector<PendingMeshBufferData> m_PendingMeshBufferData;
+        // The graph path: buffers WriteMeshBufferData wrote, whose CPU data is kept until ConfirmMeshBufferData says
+        // that the list holding the writes is submitted; CreateMeshBufferObjects makes the writes due again when it
+        // was not.
+        std::vector<PendingMeshBufferData> m_UnconfirmedMeshBufferData;
+        // What CreateMeshBufferObjects scanned last: it scans again only when the graph, its mesh table's serial or the
+        // number of skinned instances changed.
+        const SceneGraph* m_MeshScanGraph = nullptr;
+        uint64_t m_MeshScanSerial = ~uint64_t(0);
+        size_t m_MeshScanSkinnedInstances = ~size_t(0);
 
         nvrhi::DeviceHandle m_Device;
         nvrhi::ShaderHandle m_SkinningShader;
@@ -106,6 +123,9 @@ namespace donut::engine
         void UpdateSkinnedMeshes(nvrhi::ICommandList* commandList, uint32_t frameIndex);
 
         virtual void CreateMeshBuffers(nvrhi::ICommandList* commandList);
+        // The objects of CreateMeshBuffers, of every mesh and skinned instance that has none (may throw std::bad_alloc).
+        // Returns whether it made anything.
+        bool ScanMeshBufferObjects();
 
         virtual bool LoadCustomData(Json::Value& rootNode, const std::filesystem::path& scenePath, ThreadPool* threadPool);
     public:
@@ -162,7 +182,9 @@ namespace donut::engine
         // The GpuScene's upload mode, a creation option: set it before Load / LoadWithThreadPool (before the GpuScene is
         // made), so that nothing is replaced later; FE_INVALID_ARGS once a GpuScene of another mode exists. Scatter puts
         // the scene on the graph path: RefreshBuffers then does nothing (FinishedLoading still makes and writes the
-        // loaded meshes' buffers), and the service calls the functions below each frame. Applications call
+        // loaded meshes' buffers, and uploads the loaded instance, geometry and material rows on its command list, as
+        // RefreshBuffers does on the CPU path, so that the first frame's previous transforms are the loaded ones), and
+        // the service calls the functions below each frame. Applications call
         // RefreshSceneGraph each frame, as before.
         nvrhi::FRESULT SetGpuSceneUploadMode(GpuSceneUploadMode mode) noexcept
         {
@@ -180,13 +202,25 @@ namespace donut::engine
         [[nodiscard]] bool HasStructureChanged() const noexcept { return m_SceneStructureChanged; }
         // At extraction, without a command list: creates the buffer objects and descriptors of meshes that have none,
         // and the skinned instances' BufferGroups, vertex buffers, joint buffers and skinning binding sets, as
-        // CreateMeshBuffers would, without writing any data; then GpuScene::InvalidateAssets when it made anything.
-        // Returns whether it made anything (their data is due: WriteMeshBufferData). The virtual CreateMeshBuffers is
-        // not called on the graph path (no class in the tree overrides it).
-        bool CreateMeshBufferObjects();
+        // CreateMeshBuffers would, without writing any data; then GpuScene::InvalidateAssets when it made anything (their
+        // data is due: WriteMeshBufferData, HasMeshBufferDataPending). It scans only when the graph, its mesh table's
+        // serial or its number of skinned instances changed. First, the writes of a WriteMeshBufferData that no
+        // ConfirmMeshBufferData followed (the frame's Prepare ran, its lists were never submitted) are due again.
+        // FE_OUT_OF_MEMORY when an allocation failed (what was made stays; the next call scans again). The virtual
+        // CreateMeshBuffers is not called on the graph path (no class in the tree overrides it).
+        nvrhi::FRESULT CreateMeshBufferObjects() noexcept;
         // In the upload pass's Prepare, on the graph's upload list: writes the data of the buffers CreateMeshBufferObjects
-        // made and gives them their permanent states, as CreateMeshBuffers does.
+        // made and gives them their permanent states, as CreateMeshBuffers does. On the CPU path the CPU data is freed
+        // at once; on the graph path it is kept until ConfirmMeshBufferData.
         void WriteMeshBufferData(nvrhi::ICommandList* commandList);
+        // The command list of the last WriteMeshBufferData will be submitted (the upload pass's records use calls it
+        // from its Execute: the graph's executor submits the upload list with the lists it records): frees the CPU
+        // data of what it wrote. A write it never confirms is made again by the next CreateMeshBufferObjects; one that
+        // was submitted is never written again (the buffers have their permanent states then).
+        void ConfirmMeshBufferData() noexcept;
+        // CreateMeshBufferObjects made buffers whose data WriteMeshBufferData has not written yet (the upload pass adds
+        // a use for it).
+        [[nodiscard]] bool HasMeshBufferDataPending() const noexcept { return !m_PendingMeshBufferData.empty(); }
         // Points every mesh's BufferGroup::instanceBuffer at the GpuScene's instance buffer (after it was made or
         // replaced, or after structural changes), before any recording reads it. A replaced buffer is reported to the
         // application (SceneFrame::sceneBuffersReplaced): passes that cache binding sets need ResetBindingCache.

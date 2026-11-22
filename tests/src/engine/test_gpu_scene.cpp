@@ -26,9 +26,13 @@
 // callbacks; GpuScene's change tracking against a CPU copy of the buffers over seeded edit scripts (every live row equal
 // to what the graph says, previous transforms as the old PrevTransform flags gave them); uploads proportional to what
 // changed; a second update in a frame; meshes edited in place; switching graphs; no heap allocation in steady state;
-// the review fixes of the step; out of memory in an update and in a buffer creation, retried.
+// the review fixes of the step; out of memory in an update and in a buffer creation, retried. Scatter mode (plan step
+// E5, sub-plan item E5.4): a CPU model of the scatter kernel applied to a mirror equals CPU mode's buffers after every
+// frame of the scripts, growth and settles included; records, settles, the resend after an unacknowledged frame,
+// CommitScatter, the growth bookkeeping, the records at 1, 2 and 8 workers, and no allocation in steady state.
 
 #include <donut/engine/GpuScene.h>
+#include <donut/engine/JobSystem.h>
 #include <donut/engine/SceneGraph.h>
 #include <donut/core/log.h>
 #include <donut/tests/utils.h>
@@ -39,7 +43,9 @@
 using namespace donut::math;
 #include <donut/shaders/material_cb.h>
 #include <donut/shaders/bindless.h>
+#include <donut/shaders/gpu_scene_scatter_cb.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -47,6 +53,7 @@ using namespace donut::math;
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <new>
 #include <string>
 #include <vector>
@@ -543,12 +550,13 @@ namespace
     }
 }
 
-// The change tracking over seeded edit scripts: moves (local and of parents), attaches, detaches and re-attaches,
-// SetLeaf, InvalidateContent, material edits, index-count edits and idle frames; after every frame the buffers equal
-// the graph, and a second update in the same frame writes nothing.
-void test_gpu_scene_tracks_changes()
+namespace
 {
-    for (uint64_t seed : { 11ull, 23ull, 0x5bd1e995ull })
+    // The seeded edit script (also driven in scatter mode, plan step E5): `frames` frames of moves (local and of
+    // parents), attaches, detaches and re-attaches, SetLeaf, InvalidateContent, material edits, index-count edits and
+    // idle frames (every 7th), with skinned instances, lights and curve meshes; after each frame's graph->Refresh,
+    // onFrame(graph, frame).
+    void run_edit_script(uint64_t seed, uint32_t frames, const std::function<void(SceneGraph*, uint32_t)>& onFrame)
     {
         Rng rng{ seed };
         std::vector<nvrhi::AutoPtr<Material>> materials;
@@ -610,11 +618,8 @@ void test_gpu_scene_tracks_changes()
             graph->Attach(nodes[rng.Below(uint32_t(nodes.size()))], newSubgraph());
         }
 
-        GpuScene gpu(nullptr, test_desc());
-        Mirror mirror;
-        PrevModel model;
         std::vector<nvrhi::AutoPtr<SceneGraphNode>> pool;
-        for (uint32_t frame = 1; frame <= 30; ++frame)
+        for (uint32_t frame = 1; frame <= frames; ++frame)
         {
             if (frame % 7 != 0)
             {
@@ -648,6 +653,22 @@ void test_gpu_scene_tracks_changes()
                     meshes[rng.Below(uint32_t(meshes.size()))]->geometries[0]->numIndices += 3;
             }
             graph->Refresh(frame);
+            onFrame(graph, frame);
+        }
+    }
+}
+
+// The change tracking over seeded edit scripts: after every frame the buffers equal the graph, and a second update in
+// the same frame writes nothing.
+void test_gpu_scene_tracks_changes()
+{
+    for (uint64_t seed : { 11ull, 23ull, 0x5bd1e995ull })
+    {
+        GpuScene gpu(nullptr, test_desc());
+        Mirror mirror;
+        PrevModel model;
+        run_edit_script(seed, 30, [&](SceneGraph* graph, uint32_t)
+        {
             CHECK(NVRHI_SUCCEEDED(gpu.Update(graph)));
             CHECK(NVRHI_SUCCEEDED(gpu.UploadTo(&mirror)));
             // a second update in the same frame (VXGISample refreshes the buffers twice) changes nothing
@@ -657,7 +678,7 @@ void test_gpu_scene_tracks_changes()
             CHECK(NVRHI_SUCCEEDED(gpu.UploadTo(&mirror)));
             CHECK(mirror.bytes == 0 && mirror.constantWrites == 0);
             verify_frame(graph, gpu, mirror, model, "script");
-        }
+        });
     }
 }
 
@@ -1244,6 +1265,546 @@ void test_out_of_memory_paths()
     }
 }
 
+// ------------------------------------------------------------------------------------- scatter mode (plan step E5)
+
+namespace
+{
+    GpuSceneDesc scatter_desc(uint32_t granularity = 64)
+    {
+        GpuSceneDesc desc = test_desc(granularity);
+        desc.uploadMode = GpuSceneUploadMode::Scatter;
+        return desc;
+    }
+
+    // The scatter kernel (gpu_scene_scatter_cs.hlsl) on the CPU, over a byte copy of the instance buffer, and the
+    // upload pass's growth copy.
+    struct ScatterModel
+    {
+        std::vector<uint8_t> instances;
+        bool ok = true;   // every record named a slot inside the buffer, and no slot twice in one update
+
+        uint8_t* Row(uint32_t slot) { return instances.data() + size_t(slot) * sizeof(InstanceData); }
+        size_t Rows() const { return instances.size() / sizeof(InstanceData); }
+
+        // A buffer CreateBuffers replaced: the new one is zero (a fresh D3D12 committed buffer; the GPU checks compare
+        // only rows written since), and the growth use copies the old rows in when the frame executes.
+        void Grow(const GpuSceneBufferChanges& changes, uint32_t rows, bool executed)
+        {
+            if (!changes.instancesResized)
+                return;
+            std::vector<uint8_t> next(size_t(rows) * sizeof(InstanceData), 0);
+            if (executed && changes.previousInstanceRows)
+            {
+                const size_t bytes = std::min(instances.size(), size_t(changes.previousInstanceRows) * sizeof(InstanceData));
+                std::memcpy(next.data(), instances.data(), bytes);
+            }
+            instances.swap(next);
+        }
+
+        void Apply(const GpuSceneScatterRecords& records)
+        {
+            const uint32_t transformAt = GPU_SCENE_ROW_TRANSFORM_WORD * 4;
+            const uint32_t prevAt = GPU_SCENE_ROW_PREV_TRANSFORM_WORD * 4;
+            const uint32_t transformBytes = GPU_SCENE_TRANSFORM_WORDS * 4;
+            std::vector<uint8_t> seen(Rows(), 0);
+            auto claim = [&](uint32_t slot)
+            {
+                if (slot >= Rows() || seen[slot])
+                {
+                    ok = false;
+                    return false;
+                }
+                seen[slot] = 1;
+                return true;
+            };
+            for (uint32_t i = 0; i < records.settleCount; ++i)
+            {
+                const uint32_t slot = records.settleSlots[i];
+                if (claim(slot))
+                    std::memcpy(Row(slot) + prevAt, Row(slot) + transformAt, transformBytes);
+            }
+            for (uint32_t i = 0; i < records.transformCount; ++i)
+            {
+                const GpuSceneTransformRecord& record = records.transforms[i];
+                if (!claim(record.slot))
+                    continue;
+                std::memcpy(Row(record.slot) + prevAt, Row(record.slot) + transformAt, transformBytes);
+                std::memcpy(Row(record.slot) + transformAt, record.transform, transformBytes);
+            }
+            for (uint32_t i = 0; i < records.rowCount; ++i)
+            {
+                const GpuSceneRowRecord& record = records.rows[i];
+                if (!claim(record.slot))
+                    continue;
+                uint8_t* row = Row(record.slot);
+                if (record.flags & GPU_SCENE_ROW_FLAG_KEEP_PREVIOUS)
+                    std::memcpy(row + prevAt, row + transformAt, transformBytes);
+                else
+                    std::memcpy(row + prevAt, reinterpret_cast<const uint8_t*>(record.row) + prevAt, transformBytes);
+                std::memcpy(row, record.row, prevAt);   // the head and the transform
+            }
+        }
+    };
+
+    // A scatter-mode GpuScene driven as the render service and the upload pass drive it, without a device.
+    struct ScatterScene
+    {
+        GpuScene gpu;
+        Mirror assets;        // the geometry and material buffers, written by UploadAssetsTo
+        ScatterModel model;   // the instance buffer, written by the kernel model
+
+        explicit ScatterScene(const GpuSceneDesc& desc) : gpu(nullptr, desc) { }
+
+        // Update at extraction; CreateBuffers; then, when the frame executes, the growth copy, Prepare's asset upload,
+        // the scatter and its acknowledgement.
+        void Update(SceneGraph* graph)
+        {
+            CHECK(NVRHI_SUCCEEDED(gpu.Update(graph)));
+            CHECK(NVRHI_SUCCEEDED(gpu.CreateBuffers()));
+        }
+        void Execute(bool executed = true)
+        {
+            model.Grow(gpu.GetBufferChanges(), gpu.GetInstanceRowCount(), executed);
+            if (!executed)
+                return;
+            CHECK(NVRHI_SUCCEEDED(gpu.UploadAssetsTo(&assets)));
+            GpuSceneScatterRecords records;
+            gpu.GetScatterRecords(records);
+            model.Apply(records);
+            gpu.CommitScatter(records.serial);
+            CHECK(!gpu.IsScatterPending());
+        }
+    };
+
+    // The scatter buffers against CPU mode's: the instance rows (all of them, or the live ones after a dropped frame,
+    // with prevTransform = transform in the frame of the resend), the geometry and material buffers, and the material
+    // constant buffers.
+    enum class RowsCompared { All, Live, LiveResent };
+
+    void compare_with_cpu_mode(SceneGraph* graph, const Mirror& cpu, const ScatterScene& scatter, RowsCompared rows,
+                               const char* where)
+    {
+        CHECK(cpu.ok && scatter.assets.ok && scatter.model.ok);
+        CHECK(scatter.model.instances.size() == cpu.buffers[0].size());
+        if (rows == RowsCompared::All)
+        {
+            if (scatter.model.instances != cpu.buffers[0])
+            {
+                for (size_t slot = 0; slot < cpu.InstanceRows(); ++slot)
+                {
+                    if (std::memcmp(scatter.model.instances.data() + slot * sizeof(InstanceData),
+                                    cpu.buffers[0].data() + slot * sizeof(InstanceData), sizeof(InstanceData)) != 0)
+                        std::fprintf(stderr, "%s: instance slot %zu differs\n", where, slot);
+                }
+                CHECK(false);
+            }
+        }
+        else
+        {
+            for (MeshInstance* instance : instances_in_order(graph))
+            {
+                const size_t slot = size_t(instance->GetInstanceIndex());
+                InstanceData expected;
+                std::memcpy(&expected, cpu.buffers[0].data() + slot * sizeof(InstanceData), sizeof(expected));
+                if (rows == RowsCompared::LiveResent)
+                    expected.prevTransform = expected.transform;
+                if (std::memcmp(scatter.model.instances.data() + slot * sizeof(InstanceData), &expected,
+                                sizeof(expected)) != 0)
+                {
+                    std::fprintf(stderr, "%s: live instance slot %zu differs\n", where, slot);
+                    CHECK(false);
+                }
+            }
+        }
+        CHECK(scatter.assets.buffers[1] == cpu.buffers[1]);
+        CHECK(scatter.assets.buffers[2] == cpu.buffers[2]);
+        CHECK(scatter.assets.constantsOf == cpu.constantsOf);
+    }
+}
+
+// Scatter mode against CPU mode over the seeded edit scripts: after every frame the model of the kernel applied to a
+// mirror equals CPU mode's buffers byte for byte, growth across the 64-row granularity and the settle frames included;
+// the records name each slot once. Then the same scripts with two frames dropped (not executed, not acknowledged): the
+// next update is a resend, after which the live rows equal CPU mode's (prevTransform = transform in the resend's frame).
+void test_scatter_matches_cpu_mode()
+{
+    for (uint64_t seed : { 11ull, 23ull, 0x5bd1e995ull })
+    {
+        for (bool drops : { false, true })
+        {
+            GpuScene cpu(nullptr, test_desc());
+            Mirror cpuMirror;
+            ScatterScene scatter(scatter_desc());
+            uint32_t transformRecords = 0, keepRecords = 0, settleRecords = 0, resends = 0, growths = 0;
+            RowsCompared rows = RowsCompared::All;
+            run_edit_script(seed, 30, [&](SceneGraph* graph, uint32_t frame)
+            {
+                // both updates before either upload: they share the materials' dirty flags
+                CHECK(NVRHI_SUCCEEDED(cpu.Update(graph)));
+                scatter.Update(graph);
+                CHECK(NVRHI_SUCCEEDED(cpu.UploadTo(&cpuMirror)));
+                GpuSceneScatterRecords records;
+                scatter.gpu.GetScatterRecords(records);
+                CHECK(records.resend == (frame == 1 || (drops && (frame == 11 || frame == 21))));
+                resends += records.resend ? 1 : 0;
+                growths += scatter.gpu.GetBufferChanges().instancesResized ? 1 : 0;
+                transformRecords += records.transformCount;
+                settleRecords += records.settleCount;
+                for (uint32_t i = 0; i < records.rowCount; ++i)
+                    keepRecords += (records.rows[i].flags & GPU_SCENE_ROW_FLAG_KEEP_PREVIOUS) ? 1 : 0;
+                const bool dropped = drops && (frame == 10 || frame == 20);
+                scatter.Execute(!dropped);
+                if (dropped)
+                {
+                    CHECK(scatter.gpu.IsScatterPending());
+                    rows = RowsCompared::Live;
+                    return;
+                }
+                if (records.resend && frame != 1)
+                    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::LiveResent, "scatter resend");
+                else
+                    compare_with_cpu_mode(graph, cpuMirror, scatter, rows, drops ? "scatter, drops" : "scatter");
+            });
+            std::printf("scatter seed %llx%s: %u transform, %u keep-previous row and %u settle records; %u resends, "
+                        "%u growths\n", (unsigned long long)seed, drops ? " (two frames dropped)" : "", transformRecords,
+                        keepRecords, settleRecords, resends, growths);
+            CHECK(transformRecords > 0 && settleRecords > 0 && growths > 1);
+            CHECK(resends == (drops ? 3u : 1u));
+        }
+    }
+}
+
+// The records follow what changed (4,096 instances, granularity 1,024): a resend first, nothing when idle, one
+// transform record for one move and its settle record in the next frame, only the moved rows of changed chunks, a
+// keep-previous row record for SetLeaf; growth past 4,096 rows with the old rows to copy; CommitScatter, a dropped
+// frame and the resend after it; Upload in scatter mode refused; the asset rows through UploadAssetsTo.
+void test_scatter_records()
+{
+    auto material = make_material("m", MaterialDomain::Opaque);
+    auto mesh = make_mesh("mesh", { material });
+    auto other = make_mesh("other", { material, material });
+    auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+    graph->SetRootNode(make_node("root"));
+    std::vector<nvrhi::AutoPtr<SceneGraphNode>> nodes;
+    auto attach = [&](int count)
+    {
+        for (int i = 0; i < count; ++i)
+        {
+            auto node = make_node("n");
+            node->SetTranslation(dm::double3(double(nodes.size()), 0.0, 0.0));
+            node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, mesh.Get()));
+            nodes.push_back(graph->Attach(graph->GetRootNode(), node));
+        }
+    };
+    attach(4096);
+
+    GpuScene cpu(nullptr, test_desc(1024));
+    Mirror cpuMirror;
+    ScatterScene scatter(scatter_desc(1024));
+    uint32_t frame = 0;
+    GpuSceneScatterRecords records;
+    auto step = [&](bool executed = true)
+    {
+        graph->Refresh(++frame);
+        CHECK(NVRHI_SUCCEEDED(cpu.Update(graph)));
+        scatter.Update(graph);
+        CHECK(NVRHI_SUCCEEDED(cpu.UploadTo(&cpuMirror)));
+        scatter.gpu.GetScatterRecords(records);
+        scatter.Execute(executed);
+        return scatter.gpu.GetStats();
+    };
+
+    GpuSceneStats stats = step();
+    CHECK(records.resend && records.rowCount == 4096 && records.transformCount == 0 && records.settleCount == 0);
+    CHECK(scatter.gpu.GetBufferChanges().instancesResized && !scatter.gpu.GetBufferChanges().previousInstanceRows);
+    CHECK(scatter.gpu.GetBufferChanges().geometriesResized && scatter.gpu.GetBufferChanges().materialsResized);
+    CHECK(stats.rowRecords == 4096 && stats.uploadBytes >= 4096 * sizeof(GpuSceneRowRecord));
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::All, "records 1");
+    CHECK(scatter.gpu.Upload(nullptr) == nvrhi::FE_INVALID_ARGS);
+    CHECK(scatter.gpu.UploadTo(&cpuMirror) == nvrhi::FE_UNSUPPORTED);
+    CHECK(cpu.UploadAssetsTo(&cpuMirror) == nvrhi::FE_UNSUPPORTED);
+
+    stats = step();   // idle
+    CHECK(!records.resend && records.rowCount + records.transformCount + records.settleCount == 0);
+    CHECK(stats.chunksChanged == 0 && !scatter.gpu.GetBufferChanges().instancesResized);
+    const uint32_t chunks = stats.chunksVisited;
+
+    nodes[100]->SetTranslation(dm::double3(1.0, 2.0, 3.0));
+    stats = step();
+    CHECK(stats.chunksChanged == 1 && records.transformCount == 1 && records.rowCount == 0 && records.settleCount == 0);
+    CHECK(records.transforms[0].slot == 100 && stats.uploadBytes == sizeof(GpuSceneTransformRecord));
+    CHECK(stats.rowsBuilt < 4096 / 2);
+    stats = step();   // its previous transform settles
+    CHECK(records.settleCount == 1 && records.settleSlots[0] == 100 && records.transformCount == 0);
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::All, "records settle");
+    stats = step();
+    CHECK(records.settleCount + records.transformCount + records.rowCount == 0);
+
+    // every 16th row: every chunk is a candidate, only the moved rows are records (in slot order: chunk order)
+    for (int i = 0; i < 4096; i += 16)
+        nodes[i]->SetTranslation(dm::double3(double(i), 2.0, 0.0));
+    stats = step();
+    CHECK(stats.chunksChanged == chunks && stats.rowsBuilt == 4096 && records.transformCount == 256);
+    for (uint32_t i = 0; i < records.transformCount; ++i)
+        CHECK(records.transforms[i].slot == i * 16);
+    stats = step();
+    CHECK(records.settleCount == 256 && records.transformCount == 0);
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::All, "records strided");
+
+    // SetLeaf to another mesh: the same entity keeps its slot, its head changes: a keep-previous row record
+    nodes[7]->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, other.Get()));
+    nodes[7]->SetTranslation(dm::double3(7.0, 5.0, 0.0));
+    stats = step();
+    CHECK(records.rowCount == 1 && records.rows[0].slot == 7);
+    std::printf("scatter records: SetLeaf gives a row record with flags %u\n", records.rows[0].flags);
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::All, "records SetLeaf");
+    step();
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::All, "records SetLeaf settle");
+
+    // growth past 4,096 rows: the old rows are copied, the new instances are row records
+    attach(100);
+    stats = step();
+    const GpuSceneBufferChanges& changes = scatter.gpu.GetBufferChanges();
+    CHECK(changes.instancesResized && changes.previousInstanceRows == 4096 && scatter.gpu.GetInstanceRowCount() == 5120);
+    CHECK(changes.previousInstanceBuffer == nullptr);   // no device: the bookkeeping only
+    CHECK(records.rowCount == 100 && !records.resend && stats.buffersResized == 1);
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::All, "records growth");
+    step();
+    CHECK(!scatter.gpu.GetBufferChanges().instancesResized);
+
+    // CommitScatter takes only the last serial
+    nodes[5]->SetTranslation(dm::double3(5.0, 9.0, 0.0));
+    graph->Refresh(++frame);
+    CHECK(NVRHI_SUCCEEDED(cpu.Update(graph)));
+    scatter.Update(graph);
+    CHECK(NVRHI_SUCCEEDED(cpu.UploadTo(&cpuMirror)));
+    scatter.gpu.GetScatterRecords(records);
+    CHECK(scatter.gpu.IsScatterPending());
+    scatter.gpu.CommitScatter(records.serial - 1);
+    CHECK(scatter.gpu.IsScatterPending());
+    scatter.Execute();
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::All, "records commit");
+
+    // a dropped frame that grows the buffer: the next update resends every live row, without settle records, and needs
+    // no growth copy
+    attach(1100);
+    for (int i = 0; i < 4096; i += 3)
+        nodes[i]->SetTranslation(dm::double3(double(i), 3.0, 1.0));
+    step(false);
+    CHECK(scatter.gpu.GetBufferChanges().instancesResized && scatter.gpu.IsScatterPending());
+    for (int i = 0; i < 4096; i += 5)
+        nodes[i]->SetTranslation(dm::double3(double(i), 4.0, 1.0));
+    stats = step();
+    CHECK(records.resend && records.rowCount == uint32_t(nodes.size()) && records.transformCount == 0 &&
+          records.settleCount == 0);
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::LiveResent, "records resend");
+    attach(2000);   // grows again: the copy is back
+    stats = step();
+    CHECK(!records.resend && scatter.gpu.GetBufferChanges().previousInstanceRows == 6144);
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::Live, "records after resend");
+
+    // a material edit: its row and constant buffer through UploadAssetsTo
+    material->roughness = 0.75f;
+    material->dirty = true;
+    graph->Refresh(++frame);
+    CHECK(NVRHI_SUCCEEDED(cpu.Update(graph)));
+    scatter.Update(graph);
+    CHECK(scatter.gpu.HasPendingAssets());
+    CHECK(NVRHI_SUCCEEDED(cpu.UploadTo(&cpuMirror)));
+    scatter.assets.ResetCounters();
+    scatter.Execute();
+    CHECK(!scatter.gpu.HasPendingAssets() && scatter.assets.constantWrites == 1);
+    CHECK(scatter.assets.bytes == sizeof(MaterialConstants));
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::Live, "records material");
+}
+
+// The records are in chunk order whatever the worker count: three equal graphs on job systems of 1, 2 and 8 workers
+// give byte-equal records every frame, with moves spread over every chunk (the parallel path).
+void test_scatter_workers()
+{
+    const uint32_t workerCounts[] = { 1, 2, 8 };
+    auto material = make_material("m", MaterialDomain::Opaque);
+    auto mesh = make_mesh("mesh", { material, material });
+    struct Run
+    {
+        nvrhi::AutoPtr<IJobSystem> jobs;
+        nvrhi::AutoPtr<SceneGraph> graph;
+        std::vector<SceneGraphNode*> nodes;
+        nvrhi::AutoPtr<GpuScene> gpu;
+    };
+    Run runs[3];
+    for (uint32_t r = 0; r < 3; ++r)
+    {
+        JobSystemDesc desc;
+        desc.debugName = "test_scatter_workers";
+        desc.workerThreadCount = workerCounts[r];
+        CHECK(CreateJobSystem(desc, &runs[r].jobs) == nvrhi::FS_OK);
+        runs[r].graph = MAKE_RC_OBJ_PTR(SceneGraph);
+        runs[r].graph->SetJobSystem(runs[r].jobs);
+        runs[r].graph->SetRootNode(make_node("root"));
+        for (int i = 0; i < 20000; ++i)
+        {
+            auto node = make_node("n");
+            node->SetTranslation(dm::double3(double(i % 100), double(i / 100), 0.0));
+            node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, mesh.Get()));
+            runs[r].nodes.push_back(runs[r].graph->Attach(runs[r].graph->GetRootNode(), node));
+        }
+        runs[r].gpu = MAKE_RC_OBJ_PTR(GpuScene, nullptr, scatter_desc(1024));
+    }
+    uint64_t recordsSeen = 0;
+    for (uint32_t frame = 1; frame <= 8; ++frame)
+    {
+        GpuSceneScatterRecords records[3];
+        for (uint32_t r = 0; r < 3; ++r)
+        {
+            Rng rng{ 1000 + frame };
+            for (int k = 0; k < 2000; ++k)
+                runs[r].nodes[rng.Below(20000)]->SetTranslation(dm::double3(rng.Unit(), rng.Unit(), double(frame)));
+            runs[r].graph->Refresh(frame);
+            CHECK(NVRHI_SUCCEEDED(runs[r].gpu->Update(runs[r].graph)));
+            runs[r].gpu->GetScatterRecords(records[r]);
+        }
+        for (uint32_t r = 1; r < 3; ++r)
+        {
+            CHECK(records[r].settleCount == records[0].settleCount);
+            CHECK(records[r].transformCount == records[0].transformCount);
+            CHECK(records[r].rowCount == records[0].rowCount);
+            CHECK(std::memcmp(records[r].settleSlots, records[0].settleSlots, records[0].settleCount * sizeof(uint32_t)) == 0);
+            CHECK(std::memcmp(records[r].transforms, records[0].transforms,
+                              records[0].transformCount * sizeof(GpuSceneTransformRecord)) == 0);
+            CHECK(std::memcmp(records[r].rows, records[0].rows, records[0].rowCount * sizeof(GpuSceneRowRecord)) == 0);
+        }
+        recordsSeen += records[0].settleCount + records[0].transformCount + records[0].rowCount;
+        for (uint32_t r = 0; r < 3; ++r)
+            runs[r].gpu->CommitScatter(records[r].serial);
+    }
+    std::printf("scatter workers: %llu records, equal at 1, 2 and 8 workers\n", (unsigned long long)recordsSeen);
+    for (Run& run : runs)
+    {
+        run.gpu = nullptr;
+        run.nodes.clear();
+        run.graph = nullptr;
+    }
+}
+
+// Scatter mode allocates nothing per frame once its arrays have grown: Update (the parallel gather included),
+// CreateBuffers, the records, CommitScatter and UploadAssetsTo.
+void test_scatter_steady_state_allocations()
+{
+    auto material = make_material("m", MaterialDomain::Opaque);
+    auto mesh = make_mesh("mesh", { material, material });
+    auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+    graph->SetRootNode(make_node("root"));
+    std::vector<SceneGraphNode*> nodes;
+    for (int i = 0; i < 6000; ++i)
+    {
+        auto node = make_node("n");
+        node->SetTranslation(dm::double3(double(i), 0.0, 0.0));
+        node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, mesh.Get()));
+        nodes.push_back(graph->Attach(graph->GetRootNode(), node));
+    }
+    GpuScene gpu(nullptr, scatter_desc());
+    Mirror assets;
+    Rng rng{ 7 };
+    uint32_t frame = 0;
+    uint64_t records = 0;
+    auto run = [&](uint32_t moves)
+    {
+        for (uint32_t k = 0; k < moves; ++k)
+            nodes[rng.Below(6000)]->SetTranslation(dm::double3(rng.Unit(), rng.Unit(), rng.Unit()));
+        graph->Refresh(++frame);
+        gpu.Update(graph);
+        gpu.CreateBuffers();
+        gpu.UploadAssetsTo(&assets);
+        GpuSceneScatterRecords out;
+        gpu.GetScatterRecords(out);
+        records += out.transformCount + out.settleCount + out.rowCount;
+        gpu.CommitScatter(out.serial);
+    };
+    for (int i = 0; i < 6; ++i)
+        run(1500);   // grows the arrays past what 600 moves need
+    const uint64_t newBefore = g_NewCount.load();
+    const uint64_t heapBefore = ecs::GetHeapAllocationCount();
+    const uint64_t recordsBefore = records;
+    for (int i = 0; i < 8; ++i)
+        run(600);
+    run(0);
+    run(0);
+    const uint64_t newCalls = g_NewCount.load() - newBefore;
+    const uint64_t heapBlocks = ecs::GetHeapAllocationCount() - heapBefore;
+    std::printf("scatter steady state: %llu operator new, %llu storage blocks, %llu records\n",
+                (unsigned long long)newCalls, (unsigned long long)heapBlocks,
+                (unsigned long long)(records - recordsBefore));
+    CHECK(newCalls == 0 && heapBlocks == 0 && records > recordsBefore);
+}
+
+// Review fix (E5.4, finding 1): a frame whose Prepare ran (UploadAssetsTo, which clears the materials' dirty flags and
+// pending constants) but that never executed (no CommitScatter; its writes went to a buffer that the GPU never saw):
+// the next update is a resend that writes the geometry and material buffers whole and every material's constant buffer,
+// so the buffers equal CPU mode's again.
+void test_scatter_lost_prepare()
+{
+    auto stone = make_material("stone", MaterialDomain::Opaque);
+    auto glass = make_material("glass", MaterialDomain::AlphaBlended);
+    auto mesh = make_mesh("mesh", { stone, glass });
+    auto other = make_mesh("other", { glass });
+    auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+    graph->SetRootNode(make_node("root"));
+    std::vector<nvrhi::AutoPtr<SceneGraphNode>> nodes;
+    for (int i = 0; i < 100; ++i)
+    {
+        auto node = make_node("n");
+        node->SetTranslation(dm::double3(double(i), 0.0, 0.0));
+        node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, mesh.Get()));
+        nodes.push_back(graph->Attach(graph->GetRootNode(), node));
+    }
+    GpuScene cpu(nullptr, test_desc());
+    Mirror cpuMirror;
+    ScatterScene scatter(scatter_desc());
+    uint32_t frame = 0;
+    auto update = [&]()
+    {
+        graph->Refresh(++frame);
+        CHECK(NVRHI_SUCCEEDED(cpu.Update(graph)));
+        scatter.Update(graph);
+        CHECK(NVRHI_SUCCEEDED(cpu.UploadTo(&cpuMirror)));
+    };
+    update();
+    scatter.Execute();
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::All, "lost prepare 1");
+
+    // the lost frame: a material edit, a new mesh and moves; Prepare writes to a buffer the GPU never sees
+    stone->roughness = 0.125f;
+    stone->dirty = true;
+    graph->AttachLeafNode(graph->GetRootNode(), MAKE_RC_OBJ_PTR(MeshInstance, other.Get()));
+    nodes[3]->SetTranslation(dm::double3(3.0, 1.0, 0.0));
+    update();
+    CHECK(scatter.gpu.HasPendingAssets());
+    Mirror lost = scatter.assets;
+    CHECK(NVRHI_SUCCEEDED(scatter.gpu.UploadAssetsTo(&lost)));
+    CHECK(!stone->dirty && !scatter.gpu.HasPendingAssets() && scatter.gpu.IsScatterPending());
+    scatter.model.Grow(scatter.gpu.GetBufferChanges(), scatter.gpu.GetInstanceRowCount(), false);
+
+    // the next frame resends: every material's constant buffer, the asset buffers whole, every live row
+    scatter.assets.ResetCounters();
+    scatter.assets.constantsOf.clear();
+    update();
+    GpuSceneScatterRecords records;
+    scatter.gpu.GetScatterRecords(records);
+    CHECK(records.resend && scatter.gpu.HasPendingAssets());
+    scatter.Execute();
+    CHECK(scatter.assets.constantWrites == uint32_t(graph->GetMaterials().size()));
+    CHECK(scatter.assets.constantsOf.size() == graph->GetMaterials().size());
+    CHECK(scatter.assets.constantsOf[stone.Get()] == stone->materialID);
+    CHECK(scatter.assets.bytes >= uint64_t(scatter.gpu.GetGeometryRowCount()) * sizeof(GeometryData) +
+                                  uint64_t(scatter.gpu.GetMaterialRowCount()) * sizeof(MaterialConstants));
+    CHECK(scatter.assets.buffers[1] == cpuMirror.buffers[1] && scatter.assets.buffers[2] == cpuMirror.buffers[2]);
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::LiveResent, "lost prepare resend");
+    update();
+    scatter.Execute();
+    compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::Live, "lost prepare after");
+}
+
 int main(int, char**)
 {
 #if defined(_MSC_VER)
@@ -1278,6 +1839,16 @@ int main(int, char**)
         test_review_fixes();
         std::printf("%s\n", "test_out_of_memory_paths");
         test_out_of_memory_paths();
+        std::printf("%s\n", "test_scatter_matches_cpu_mode");
+        test_scatter_matches_cpu_mode();
+        std::printf("%s\n", "test_scatter_records");
+        test_scatter_records();
+        std::printf("%s\n", "test_scatter_workers");
+        test_scatter_workers();
+        std::printf("%s\n", "test_scatter_steady_state_allocations");
+        test_scatter_steady_state_allocations();
+        std::printf("%s\n", "test_scatter_lost_prepare");
+        test_scatter_lost_prepare();
     }
     catch (const std::runtime_error& err)
     {

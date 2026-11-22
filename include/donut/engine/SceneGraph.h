@@ -46,6 +46,7 @@ namespace donut::engine
     struct IWorld;
     struct IJobSystem;
     struct IScheduler;
+    enum class Phase : uint32_t;   // EcsScheduler.h
 
     enum struct SceneContentFlags : uint32_t
     {
@@ -811,6 +812,22 @@ namespace donut::engine
         void BeginRenderRead() noexcept;
         void EndRenderRead() noexcept;
         [[nodiscard]] bool IsInRenderRead() const noexcept;
+        // Runs a phase of GetScheduler() whose systems only read (the render service's RenderExtract, plan step E5.1),
+        // and accounts for it: when nothing else ran on the world since the last Refresh, the version the phase took is
+        // not a change, so the next Refresh still returns at once when nothing changed and the on-demand caches stay. A
+        // phase with an enabled system that declares a write or is exclusive, or that played back commands or changed
+        // structure, counts like any other phase (the next Refresh runs); Debug builds warn about such a system.
+        // FE_INVALID_ARGS without a scheduler; otherwise what IScheduler::RunPhase returns. Only declared accesses,
+        // commands and structural changes are seen: a system that declares reads only but writes through
+        // IWorld::GetComponentForWrite is not (the world's validation mode reports such writes in Debug builds).
+        nvrhi::FRESULT RunReadOnlyPhase(Phase phase) noexcept;
+        // The render service's registration (one service per graph, plan step E5.1): ClaimRenderService returns false
+        // when a service has claimed the graph already; ReleaseRenderService gives the claim back.
+        bool ClaimRenderService() noexcept;
+        void ReleaseRenderService() noexcept;
+        // Counts the schedulers the graph made: SetJobSystem replaces GetScheduler() (and drops the systems on it), so a
+        // caller that registered systems compares this instead of holding the scheduler.
+        [[nodiscard]] uint64_t GetSchedulerGeneration() const noexcept;
 
         // Replaces the current root node of the graph with the new one.
         nvrhi::AutoPtr<SceneGraphNode> SetRootNode(SceneGraphNode *root);

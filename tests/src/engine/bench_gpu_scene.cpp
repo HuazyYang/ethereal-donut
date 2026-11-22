@@ -37,16 +37,26 @@
 //   strided_10pct   every 10th instance moves every frame
 //   all_moved       every instance moves every frame
 // Release: the median of the run medians over alternating rounds (`--rounds N`); `--smoke` divides the sizes by 100.
+//
+// Plan step E5 (sub-plan item E5.4), default build only:
+//   --scatter     the GpuScene in scatter mode: Update, CreateBuffers (bookkeeping, no device), and the records copied
+//                 into the staging array as the upload pass's writeBuffer copies them, then CommitScatter
+//   --workers N   the graph (its refresh, and the scatter gather) on a job system of N worker threads; the thread that
+//                 calls Refresh and Update works too. Without it, the process's shared job system.
 
 #include <donut/engine/SceneGraph.h>
 #include <nvrhi/common/misc.h>
 #if !BENCH_GPU_SCENE_E0
 #include <donut/engine/GpuScene.h>
+#include <donut/engine/JobSystem.h>
 #endif
 
 using namespace donut::math;
 #include <donut/shaders/material_cb.h>
 #include <donut/shaders/bindless.h>
+#if !BENCH_GPU_SCENE_E0
+#include <donut/shaders/gpu_scene_scatter_cb.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -66,6 +76,8 @@ namespace
         uint32_t instances = 100000;
         uint32_t rounds = 5;
         uint32_t frames = 20;
+        bool scatter = false;
+        uint32_t workers = 0;   // 0: the shared job system
     };
 
     struct Scene
@@ -113,7 +125,8 @@ namespace
             s.graph->Attach(s.graph->GetRootNode(), node);
             s.nodes.push_back(node);
         }
-        s.staging.resize(size_t(count + 1024) * sizeof(InstanceData));
+        // the instance rows, or the scatter records (a row, transform or settle record per slot at most)
+        s.staging.resize(size_t(count + 1024) * (sizeof(InstanceData) + 128 + 64 + 4));
     }
 
     enum class Case { Idle, OneMoved, Block10, Strided10, AllMoved, Count };
@@ -198,12 +211,14 @@ namespace
         Scene* scene = nullptr;
         uint64_t bytes = 0;
         uint64_t rows = 0;
+        bool scatter = false;
 
-        Uploader()
+        explicit Uploader(bool scatterMode) : scatter(scatterMode)
         {
             GpuSceneDesc desc;
             desc.geometryAndMaterialBuffers = false;   // as the old instance path: instances only
             desc.rowGranularity = 1024;
+            desc.uploadMode = scatter ? GpuSceneUploadMode::Scatter : GpuSceneUploadMode::CpuRows;
             gpu = MAKE_RC_OBJ_PTR(GpuScene, nullptr, desc);
         }
         void BeforeRefresh(Scene&) { }
@@ -222,6 +237,27 @@ namespace
             scene = &s;
             bytes = 0;
             gpu->Update(s.graph);
+            if (scatter)
+            {
+                // the upload pass: the records into the staging buffer (writeBuffer's copy), then acknowledged
+                gpu->CreateBuffers();
+                GpuSceneScatterRecords records;
+                gpu->GetScatterRecords(records);
+                uint8_t* out = s.staging.data();
+                auto copy = [&](const void* data, size_t size)
+                {
+                    if (size)
+                        std::memcpy(out, data, size);
+                    out += size;
+                    bytes += size;
+                };
+                copy(records.rows, size_t(records.rowCount) * sizeof(GpuSceneRowRecord));
+                copy(records.transforms, size_t(records.transformCount) * sizeof(GpuSceneTransformRecord));
+                copy(records.settleSlots, size_t(records.settleCount) * sizeof(uint32_t));
+                gpu->CommitScatter(records.serial);
+                rows = uint64_t(records.rowCount) + records.transformCount + records.settleCount;
+                return;
+            }
             gpu->UploadTo(this);
             rows = gpu->GetStats().rowsChanged + gpu->GetStats().rowsSettled;
         }
@@ -289,11 +325,40 @@ int main(int argc, char** argv)
             options.frames = uint32_t(std::stoul(argv[++i]));
         else if (arg == "--instances" && i + 1 < argc)
             options.instances = uint32_t(std::stoul(argv[++i]));
+        else if (arg == "--scatter")
+            options.scatter = true;
+        else if (arg == "--workers" && i + 1 < argc)
+            options.workers = std::max(1u, uint32_t(std::stoul(argv[++i])));
     }
 
     Scene scene;
+#if BENCH_GPU_SCENE_E0
+    if (options.scatter || options.workers)
+    {
+        std::fprintf(stderr, "--scatter and --workers need the default build\n");
+        return 2;
+    }
     Build(scene, options.instances);
     Uploader uploader;
+#else
+    // --workers: a job system of the graph's own (its phases and GpuScene's gather)
+    nvrhi::AutoPtr<IJobSystem> jobs;
+    if (options.workers)
+    {
+        JobSystemDesc jobDesc;
+        jobDesc.debugName = "bench_gpu_scene";
+        jobDesc.workerThreadCount = options.workers;
+        if (NVRHI_FAILED(CreateJobSystem(jobDesc, &jobs)))
+        {
+            std::fprintf(stderr, "cannot create a job system with %u workers\n", options.workers);
+            return 1;
+        }
+    }
+    Build(scene, options.instances);
+    if (jobs)
+        scene.graph->SetJobSystem(jobs);
+    Uploader uploader(options.scatter);
+#endif
     uploader.BeforeRefresh(scene);
     scene.graph->Refresh(++scene.frame);
     uploader.Upload(scene);
@@ -310,13 +375,14 @@ int main(int argc, char** argv)
         }
     }
 
-    std::printf("%s, %u instances, %u rounds of %u frames (median of run medians)\n",
+    const std::string threads = options.workers ? std::to_string(options.workers) + " workers" : "shared job system";
+    std::printf("%s, %u instances, %u rounds of %u frames (median of run medians), %s\n",
 #if BENCH_GPU_SCENE_E0
                 "E0 RefreshBuffers instance path",
 #else
-                "GpuScene Update + upload",
+                options.scatter ? "GpuScene scatter: Update + records" : "GpuScene Update + upload",
 #endif
-                options.instances, options.rounds, options.frames);
+                options.instances, options.rounds, options.frames, threads.c_str());
     std::printf("%-14s %12s %12s %12s %12s\n", "case", "upload ms", "refresh ms", "rows", "bytes");
     for (uint32_t c = 0; c < caseCount; ++c)
     {

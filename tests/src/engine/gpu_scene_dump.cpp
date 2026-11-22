@@ -31,6 +31,12 @@
 //     gpu_scene_dump ... --bindless --check-late-attach
 //         attaches a mesh between Scene::RefreshSceneGraph and RefreshBuffers, and checks that the next frame's
 //         geometry row has the mesh's buffer descriptors (review fix 1 of step E4); exit code 0 when it does.
+//     gpu_scene_dump ... --path graph
+//         (plan step E5, sub-plan item E5.4; this tree only, GPU_SCENE_DUMP_GRAPH_PATH) the render-graph path: the
+//         scene in scatter mode (Scene::SetGpuSceneUploadMode before loading), driven as the render service drives it
+//         at extraction, the buffers imported into a render graph, GpuSceneUploadPass, and the readbacks as graph passes
+//         after it. Its dumps must equal --path immediate (the default, Scene::Refresh). With --check-late-attach the
+//         mesh attached after the graph's refresh must have its geometry rows in the same frame.
 //
 // A GPU program: one at a time. Not a ctest test.
 
@@ -41,6 +47,12 @@
 #include <donut/engine/Scene.h>
 #include <donut/engine/ShaderFactory.h>
 #include <donut/engine/TextureCache.h>
+#if GPU_SCENE_DUMP_GRAPH_PATH
+#include <donut/engine/GpuScene.h>
+#include <donut/render/GpuSceneUploadPass.h>
+#include <donut/render/RenderGraph.h>
+#include <donut/render/RenderGraphLambdaPass.h>
+#endif
 
 using namespace donut::math;
 #include <donut/shaders/material_cb.h>
@@ -70,6 +82,7 @@ namespace
         uint32_t frames = 8;
         bool bindless = false;
         bool checkLateAttach = false;
+        bool graphPath = false;   // --path graph
     };
 
     // Copies `bytes` of `source` into a CPU-readable buffer on `commandList`; read it after the list ran.
@@ -105,6 +118,116 @@ namespace
         }
         return rows;
     }
+
+#if GPU_SCENE_DUMP_GRAPH_PATH
+    // The render-graph path of one frame: extraction as RenderService::Extract does it, the GpuScene's buffers imported
+    // (not host-kept in scatter mode: engine::c_GpuSceneRestingState), GpuSceneUploadPass, then graph passes that copy
+    // the instance, geometry and material buffers into readback buffers. Returns them (null where a buffer is absent).
+    struct GraphPath
+    {
+        nvrhi::IDevice* device = nullptr;
+        nvrhi::AutoPtr<render::IResourceRegistry> registry;
+        nvrhi::AutoPtr<render::IRenderGraph> graph;
+        nvrhi::AutoPtr<render::GpuSceneUploadPass> pass;
+        render::BackendProfile profile;
+
+        struct NoData
+        {
+            uint32_t unused;
+        };
+
+        bool Init(nvrhi::IDevice* d, ShaderFactory* shaderFactory)
+        {
+            device = d;
+            if (NVRHI_FAILED(render::CreateResourceRegistry(device, &registry)) ||
+                NVRHI_FAILED(render::CreateRenderGraph(registry, &graph)) ||
+                NVRHI_FAILED(render::ComputeBackendProfile(device, &profile)))
+                return false;
+            pass = MAKE_RC_OBJ_PTR(render::GpuSceneUploadPass, device, shaderFactory);
+            return true;
+        }
+
+        nvrhi::BufferHandle AddReadback(render::ResourceId source)
+        {
+            if (source == render::InvalidResourceId)
+                return nullptr;
+            nvrhi::BufferDesc sourceDesc;
+            graph->GetBufferDesc(source, sourceDesc);
+            nvrhi::BufferDesc desc;
+            desc.byteSize = sourceDesc.byteSize;
+            desc.cpuAccess = nvrhi::CpuAccessMode::Read;
+            desc.initialState = nvrhi::ResourceStates::CopyDest;   // imported in it: not host-kept
+            desc.debugName = "GpuSceneDumpReadback";
+            nvrhi::BufferHandle readback;
+            if (NVRHI_FAILED(device->createBuffer(desc, &readback)))
+                return nullptr;
+            render::ResourceId target = graph->ImportBuffer(readback, nvrhi::ResourceStates::CopyDest,
+                                                            nvrhi::ResourceStates::CopyDest);
+            const uint64_t bytes = desc.byteSize;
+            render::AddLambdaPass<NoData>(graph, render::PassDesc{ "GpuSceneDumpReadback", render::PassType::Copy,
+                                                                   render::PassFlags::None, 0 },
+                [&](render::ISetupContext* setup, NoData&)
+                {
+                    setup->Read(source, render::Access::CopySource, nvrhi::ShaderType::None, {});
+                    target = setup->Write(target, render::Access::CopyDest, nvrhi::ShaderType::None, {},
+                                          render::AccessFlags::FullWrite);
+                },
+                [source, target, bytes](render::IPassContext* context, const NoData&)
+                {
+                    context->GetCommandList()->copyBuffer(context->GetBuffer(target), 0, context->GetBuffer(source), 0,
+                                                          bytes);
+                });
+            return readback;
+        }
+
+        // False when the frame could not be built or run (the diagnostics are printed).
+        bool Frame(Scene* scene, nvrhi::BufferHandle& instances, nvrhi::BufferHandle& geometries,
+                   nvrhi::BufferHandle& materials)
+        {
+            SceneGraph* sceneGraph = scene->GetSceneGraph();
+            scene->CreateMeshBufferObjects();
+            GpuScene* gpu = scene->EnsureGpuScene();
+            if (!gpu || NVRHI_FAILED(gpu->Update(sceneGraph)) || NVRHI_FAILED(gpu->CreateBuffers()))
+                return false;
+            scene->BindMeshInstanceBuffers();
+
+            graph->Reset();
+            render::GpuSceneUploadGraphInputs inputs;
+            inputs.gpuScene = gpu;
+            inputs.scene = scene;
+            inputs.bufferChanges = &gpu->GetBufferChanges();
+            auto import = [&](nvrhi::IBuffer* buffer)
+            {
+                return buffer ? graph->ImportBuffer(buffer, c_GpuSceneRestingState, c_GpuSceneRestingState)
+                              : render::InvalidResourceId;
+            };
+            inputs.instanceBuffer = import(gpu->GetInstanceBuffer());
+            inputs.geometryBuffer = import(gpu->GetGeometryBuffer());
+            inputs.materialBuffer = import(gpu->GetMaterialBuffer());
+            const render::GpuSceneUploadGraphOutputs outputs = pass->AddToGraph(graph, inputs);
+            instances = AddReadback(outputs.instanceBuffer);
+            geometries = AddReadback(outputs.geometryBuffer);
+            materials = AddReadback(outputs.materialBuffer);
+
+            nvrhi::AutoPtr<render::ICompiledRenderGraph> plan;
+            const nvrhi::FRESULT compiled = graph->Compile(profile, render::CompileOptions(), &plan);
+            nvrhi::string diagnostics;
+            graph->GetDiagnostics(diagnostics);
+            if (!diagnostics.empty())
+                std::fprintf(stderr, "render graph: %s\n", diagnostics.c_str());
+            if (NVRHI_FAILED(compiled) || NVRHI_FAILED(graph->Execute(plan, render::ExecuteDesc())))
+                return false;
+            return !gpu->IsScatterPending();
+        }
+
+        void Release()
+        {
+            pass = nullptr;
+            graph = nullptr;
+            registry = nullptr;
+        }
+    };
+#endif
 }
 
 int main(int argc, char** argv)
@@ -128,7 +251,15 @@ int main(int argc, char** argv)
         else if (arg == "--frames") options.frames = uint32_t(std::stoul(next()));
         else if (arg == "--bindless") options.bindless = true;
         else if (arg == "--check-late-attach") options.checkLateAttach = true;
+        else if (arg == "--path") options.graphPath = next() == "graph";
     }
+#if !GPU_SCENE_DUMP_GRAPH_PATH
+    if (options.graphPath)
+    {
+        std::fprintf(stderr, "--path graph needs a build with GPU_SCENE_DUMP_GRAPH_PATH\n");
+        return 2;
+    }
+#endif
     if (options.scene.empty() || options.shaders.empty() || (options.out.empty() && !options.checkLateAttach))
     {
         std::fprintf(stderr, "usage: gpu_scene_dump --scene <file> --shaders <dir> --out <file> [options]\n");
@@ -181,6 +312,19 @@ int main(int argc, char** argv)
     }
     auto textureCache = MAKE_RC_OBJ_PTR(TextureCache, device, nativeFS, descriptorTable);
     auto scene = MAKE_RC_OBJ_PTR(Scene, device, shaderFactory, nativeFS, textureCache, descriptorTable, nullptr);
+#if GPU_SCENE_DUMP_GRAPH_PATH
+    GraphPath graphPath;
+    if (options.graphPath)
+    {
+        // the GpuScene's mode is chosen before anything makes it
+        if (NVRHI_FAILED(scene->SetGpuSceneUploadMode(GpuSceneUploadMode::Scatter)) ||
+            !graphPath.Init(device, shaderFactory))
+        {
+            std::fprintf(stderr, "cannot set up the render-graph path\n");
+            return 1;
+        }
+    }
+#endif
     if (!scene->Load(options.scene))
     {
         std::fprintf(stderr, "cannot load %s\n", options.scene.c_str());
@@ -221,17 +365,34 @@ int main(int argc, char** argv)
 
         int rowIndex = -1, rowVertex = -1;
         uint32_t rowPosition = 0;
+        uint32_t completeFrame = 0;
         for (uint32_t frame = 1; frame <= 2; ++frame)
         {
             scene->RefreshSceneGraph(frame);
             if (frame == 1)
                 graph->AttachLeafNode(graph->GetRootNode(), MAKE_RC_OBJ_PTR(MeshInstance, mesh.Get()));
-            commandList->open();
-            scene->RefreshBuffers(commandList, frame);
-            nvrhi::BufferHandle geometries = Readback(device, commandList, scene->GetGeometryBuffer());
-            commandList->close();
-            device->executeCommandList(commandList);
-            device->waitForIdle();
+            nvrhi::BufferHandle geometries;
+#if GPU_SCENE_DUMP_GRAPH_PATH
+            if (options.graphPath)
+            {
+                nvrhi::BufferHandle instances, materials;
+                if (!graphPath.Frame(scene, instances, geometries, materials))
+                {
+                    std::fprintf(stderr, "frame %u: the render graph did not run\n", frame);
+                    return 1;
+                }
+                device->waitForIdle();
+            }
+            else
+#endif
+            {
+                commandList->open();
+                scene->RefreshBuffers(commandList, frame);
+                geometries = Readback(device, commandList, scene->GetGeometryBuffer());
+                commandList->close();
+                device->executeCommandList(commandList);
+                device->waitForIdle();
+            }
             const std::vector<GeometryData> rows = Read<GeometryData>(device, geometries);
             const int slot = geometry->globalGeometryIndex;
             if (slot >= 0 && size_t(slot) < rows.size())
@@ -242,11 +403,19 @@ int main(int argc, char** argv)
             }
             std::printf("frame %u: geometry slot %d: indexBufferIndex %d vertexBufferIndex %d positionOffset %x\n",
                         frame, slot, rowIndex, rowVertex, rowPosition);
+            const bool complete = rowIndex >= 0 && rowVertex >= 0 && rowPosition != ~0u &&
+                buffers->indexBufferDescriptor && rowIndex == int(buffers->indexBufferDescriptor->Get()) &&
+                buffers->vertexBufferDescriptor && rowVertex == int(buffers->vertexBufferDescriptor->Get());
+            if (complete && !completeFrame)
+                completeFrame = frame;
         }
-        const bool ok = rowIndex >= 0 && rowVertex >= 0 && rowPosition != ~0u &&
-                        buffers->indexBufferDescriptor && rowIndex == int(buffers->indexBufferDescriptor->Get()) &&
-                        buffers->vertexBufferDescriptor && rowVertex == int(buffers->vertexBufferDescriptor->Get());
-        std::printf("late attach: %s\n", ok ? "ok" : "FAILED");
+        // the graph path makes the mesh's buffers at the extraction of the frame it was attached in, before the
+        // GpuScene's update: its rows are complete at once
+        const bool ok = completeFrame != 0 && (!options.graphPath || completeFrame == 1) && rowIndex >= 0;
+        std::printf("late attach: %s (rows complete in frame %u)\n", ok ? "ok" : "FAILED", completeFrame);
+#if GPU_SCENE_DUMP_GRAPH_PATH
+        graphPath.Release();
+#endif
         scene = nullptr;
         textureCache = nullptr;
         descriptorTable = nullptr;
@@ -279,11 +448,27 @@ int main(int argc, char** argv)
             detached = nullptr;
         }
 
-        commandList->open();
-        scene->Refresh(commandList, frame);
-        nvrhi::BufferHandle instances = Readback(device, commandList, scene->GetInstanceBuffer());
-        nvrhi::BufferHandle geometries = Readback(device, commandList, scene->GetGeometryBuffer());
-        nvrhi::BufferHandle materials = Readback(device, commandList, scene->GetMaterialBuffer());
+        nvrhi::BufferHandle instances, geometries, materials;
+#if GPU_SCENE_DUMP_GRAPH_PATH
+        if (options.graphPath)
+        {
+            scene->RefreshSceneGraph(frame);
+            if (!graphPath.Frame(scene, instances, geometries, materials))
+            {
+                std::fprintf(stderr, "frame %u: the render graph did not run\n", frame);
+                return 1;
+            }
+            commandList->open();   // the constant buffers below (host-kept)
+        }
+        else
+#endif
+        {
+            commandList->open();
+            scene->Refresh(commandList, frame);
+            instances = Readback(device, commandList, scene->GetInstanceBuffer());
+            geometries = Readback(device, commandList, scene->GetGeometryBuffer());
+            materials = Readback(device, commandList, scene->GetMaterialBuffer());
+        }
         // Without bindless buffers, each material's own constant buffer, by its slot.
         std::vector<std::pair<int, nvrhi::BufferHandle>> constants;
         if (!materials)
@@ -313,6 +498,9 @@ int main(int argc, char** argv)
     }
     std::fclose(out);
 
+#if GPU_SCENE_DUMP_GRAPH_PATH
+    graphPath.Release();
+#endif
     scene = nullptr;
     textureCache = nullptr;
     descriptorTable = nullptr;

@@ -87,6 +87,23 @@ namespace donut::render
             return *value;
         }
 
+        // Create without asserting, for callers that handle failure: the entry this type already has this frame, or a
+        // new one; nullptr when the arena is exhausted or the blackboard is full.
+        template <typename T>
+        T* TryCreate(IRenderGraph* graph) noexcept
+        {
+            static_assert(std::is_trivially_destructible_v<T>,
+                          "frame data lives in the graph's arena, which runs no destructors");
+            if (T* existing = Find<T>())
+                return existing;
+            if (m_Count >= c_MaxEntries)
+                return nullptr;
+            T* value = NewFrameData<T>(graph);
+            if (value)
+                m_Entries[m_Count++] = Entry{ &detail::FrameDataTag<T>::key, value };
+            return value;
+        }
+
         // nullptr if nothing created it this frame.
         template <typename T>
         T* Find() noexcept

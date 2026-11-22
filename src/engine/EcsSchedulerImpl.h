@@ -82,6 +82,9 @@ namespace donut::engine::ecs
     bool GetSchedulerCounters(IScheduler* scheduler, SchedulerCounters& out) noexcept;
     // A phase's systems in schedule order (Build first): writes up to `capacity` ids, returns how many there are.
     uint32_t GetScheduleOrder(IScheduler* scheduler, Phase phase, SystemId* out, uint32_t capacity) noexcept;
+    // Whether an enabled system of the phase declares a Write access or is Exclusive (SceneGraph::RunReadOnlyPhase);
+    // true for a scheduler of another module.
+    bool PhaseDeclaresWrites(IScheduler* scheduler, Phase phase) noexcept;
     // A system's command buffers (not AddRef'd): one per worker index of the job system, then the home buffer of the
     // thread that runs its Update. Writes up to `capacity`, returns how many there are. A buffer takes its first arena
     // page when it first records, so which of them a system has warmed depends on which workers ran it; tests warm

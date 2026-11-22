@@ -601,8 +601,36 @@ void Scene::FinishedLoading(uint32_t frameIndex)
     CreateMeshBuffers(commandList);
     Refresh(commandList, frameIndex);
 
+    // The graph path (plan step E5): the loaded scene's rows are uploaded here, as RefreshBuffers uploads them on the
+    // CPU path, so that the first rendered frame's previous transforms are the loaded ones there too. The first update
+    // is a resend: its rows are complete in the image (prevTransform = transform), which is written whole, as the
+    // records would write it; the records are then acknowledged.
+    if (IsOnGraphPath())
+    {
+        GpuScene* gpuScene = EnsureGpuScene();
+        GpuSceneScatterRecords records;
+        if (gpuScene && NVRHI_SUCCEEDED(gpuScene->Update(m_SceneGraph)) && NVRHI_SUCCEEDED(gpuScene->CreateBuffers()))
+        {
+            gpuScene->GetScatterRecords(records);
+            nvrhi::IBuffer* instances = gpuScene->GetInstanceBuffer();
+            if (records.resend && instances)
+            {
+                BindMeshInstanceBuffers();
+                commandList->beginTrackingBufferState(instances, c_GpuSceneRestingState);
+                commandList->writeBuffer(instances, gpuScene->GetInstanceRows(),
+                                         size_t(gpuScene->GetInstanceRowCount()) * sizeof(InstanceData));
+                commandList->setBufferState(instances, c_GpuSceneRestingState);
+                commandList->commitBarriers();
+                if (NVRHI_FAILED(gpuScene->UploadAssets(commandList)))
+                    log::warning("Scene::FinishedLoading: the geometry and material rows were not all written");
+                gpuScene->CommitScatter(records.serial);
+            }
+        }
+    }
+
     commandList->close();
     m_Device->executeCommandList(commandList);
+    ConfirmMeshBufferData();   // the graph path keeps the data until its list is submitted
 }
 
 void Scene::RefreshSceneGraph(uint32_t frameIndex)
@@ -629,16 +657,10 @@ void Scene::RefreshBuffers(nvrhi::ICommandList* commandList, uint32_t frameIndex
     }
 
     // The instance, geometry and material rows: GpuScene writes the ones that changed (plan step E4).
-    if (!m_GpuScene)
+    if (!EnsureGpuScene())
     {
-        GpuSceneDesc desc;
-        desc.geometryAndMaterialBuffers = m_EnableBindlessResources;
-        desc.resourceDescriptorHeapBindless = m_UseResourceDescriptorHeapBindless;
-        // On DX11, a buffer cannot be both structured and vertex.
-        // On other APIs, a structured instance buffer can be used for rasterization.
-        desc.structuredInstanceBuffer = m_Device->getGraphicsAPI() != nvrhi::GraphicsAPI::D3D11;
-        desc.rowGranularity = 1024;
-        m_GpuScene = MAKE_RC_OBJ_PTR(GpuScene, m_Device, desc);
+        log::warning("Scene::RefreshBuffers: the GPU scene cannot be made");
+        return;
     }
     nvrhi::IBuffer* previousInstanceBuffer = m_GpuScene->GetInstanceBuffer();
     if (NVRHI_FAILED(m_GpuScene->Update(m_SceneGraph)) || NVRHI_FAILED(m_GpuScene->Upload(commandList)))
@@ -771,12 +793,79 @@ inline void AppendBufferRange(nvrhi::BufferRange& range, size_t size, uint64_t& 
 
 void Scene::CreateMeshBuffers(nvrhi::ICommandList* commandList)
 {
+    // The objects first, then their data (plan step E5: the graph path makes them at extraction and writes the data in
+    // the upload pass's Prepare). The objects and descriptors are made in the same order as before.
+    ScanMeshBufferObjects();
+    WriteMeshBufferData(commandList);
+}
+
+namespace
+{
+    // The CPU copies of a buffer group's data, once written (the vectors' memory too).
+    void FreeMeshCpuData(BufferGroup& buffers, bool indexData, bool vertexData)
+    {
+        if (indexData)
+            std::vector<uint32_t>().swap(buffers.indexData);
+        if (vertexData)
+        {
+            std::vector<float3>().swap(buffers.positionData);
+            std::vector<uint32_t>().swap(buffers.normalData);
+            std::vector<uint32_t>().swap(buffers.tangentData);
+            std::vector<float2>().swap(buffers.texcoord1Data);
+            std::vector<float2>().swap(buffers.texcoord2Data);
+            std::vector<float4>().swap(buffers.weightData);
+            std::vector<vector<uint16_t, 4>>().swap(buffers.jointData);
+            std::vector<float>().swap(buffers.radiusData);
+        }
+    }
+}
+
+nvrhi::FRESULT Scene::CreateMeshBufferObjects() noexcept
+{
+    if (!m_SceneGraph)
+        return nvrhi::FE_INVALID_ARGS;
+    try
+    {
+        // What a Prepare wrote without a confirmation: its lists were never submitted, so the buffers are still
+        // without data and without their permanent states; written again.
+        if (!m_UnconfirmedMeshBufferData.empty())
+        {
+            m_PendingMeshBufferData.reserve(m_PendingMeshBufferData.size() + m_UnconfirmedMeshBufferData.size());
+            for (PendingMeshBufferData& entry : m_UnconfirmedMeshBufferData)
+                m_PendingMeshBufferData.push_back(std::move(entry));
+            m_UnconfirmedMeshBufferData.clear();
+        }
+
+        // New meshes and skinned instances change the mesh table's serial or the skinned-instance count.
+        const uint64_t serial = m_SceneGraph->GetMeshes().GetSerial();
+        const size_t skinned = m_SceneGraph->GetSkinnedMeshInstances().size();
+        if (m_MeshScanGraph == m_SceneGraph.Get() && m_MeshScanSerial == serial && m_MeshScanSkinnedInstances == skinned)
+            return nvrhi::FS_OK;
+        m_MeshScanGraph = nullptr;   // scanned again after a failure
+        ScanMeshBufferObjects();
+        m_MeshScanGraph = m_SceneGraph.Get();
+        m_MeshScanSerial = serial;
+        m_MeshScanSkinnedInstances = skinned;
+    }
+    catch (const std::bad_alloc&)
+    {
+        log::warning("Scene::CreateMeshBufferObjects: out of memory");
+        return nvrhi::FE_OUT_OF_MEMORY;
+    }
+    return nvrhi::FS_OK;
+}
+
+bool Scene::ScanMeshBufferObjects()
+{
+    bool made = false;
     for (const auto& mesh : m_SceneGraph->GetMeshes())
     {
         auto buffers = mesh->buffers;
 
         if (!buffers)
             continue;
+
+        PendingMeshBufferData pending;
 
         if (!buffers->indexData.empty() && !buffers->indexBuffer)
         {
@@ -797,18 +886,7 @@ void Scene::CreateMeshBuffers(nvrhi::ICommandList* commandList)
                     nvrhi::BindingSetItem::RawBuffer_SRV(0, buffers->indexBuffer)));
             }
 
-            commandList->beginTrackingBufferState(buffers->indexBuffer, nvrhi::ResourceStates::Common);
-
-            commandList->writeBuffer(buffers->indexBuffer, buffers->indexData.data(), buffers->indexData.size() * sizeof(uint32_t));
-            std::vector<uint32_t>().swap(buffers->indexData);
-
-            nvrhi::ResourceStates state = nvrhi::ResourceStates::IndexBuffer | nvrhi::ResourceStates::ShaderResource;
-
-            if (bufferDesc.isAccelStructBuildInput)
-                state = state | nvrhi::ResourceStates::AccelStructBuildInput;
-
-            commandList->setPermanentBufferState(buffers->indexBuffer, state);
-            commandList->commitBarriers();
+            pending.indexData = buffers->indexBuffer != nullptr;
         }
 
         if (!buffers->vertexBuffer)
@@ -823,7 +901,7 @@ void Scene::CreateMeshBuffers(nvrhi::ICommandList* commandList)
 
             if (!buffers->positionData.empty())
             {
-                AppendBufferRange(buffers->getVertexBufferRange(VertexAttribute::Position), 
+                AppendBufferRange(buffers->getVertexBufferRange(VertexAttribute::Position),
                     buffers->positionData.size() * sizeof(buffers->positionData[0]), bufferDesc.byteSize);
             }
 
@@ -869,83 +947,24 @@ void Scene::CreateMeshBuffers(nvrhi::ICommandList* commandList)
                     buffers->radiusData.size() * sizeof(buffers->radiusData[0]), bufferDesc.byteSize);
             }
 
-            if (bufferDesc.byteSize == 0)
+            if (bufferDesc.byteSize != 0)
             {
-	            continue;
+                m_Device->createBuffer(bufferDesc, &buffers->vertexBuffer);
+                if (m_DescriptorTable)
+                {
+                    buffers->vertexBufferDescriptor =
+                        MAKE_RC_OBJ_PTR(DescriptorHandle, m_DescriptorTable->CreateDescriptorHandle(nvrhi::BindingSetItem::RawBuffer_SRV(0, buffers->vertexBuffer)));
+                }
+
+                pending.vertexData = buffers->vertexBuffer != nullptr;
             }
+        }
 
-            m_Device->createBuffer(bufferDesc, &buffers->vertexBuffer);
-            if (m_DescriptorTable)
-            {
-                buffers->vertexBufferDescriptor = 
-                    MAKE_RC_OBJ_PTR(DescriptorHandle, m_DescriptorTable->CreateDescriptorHandle(nvrhi::BindingSetItem::RawBuffer_SRV(0, buffers->vertexBuffer)));
-            }
-
-            commandList->beginTrackingBufferState(buffers->vertexBuffer, nvrhi::ResourceStates::Common);
-
-            if (!buffers->positionData.empty())
-            {
-                const auto& range = buffers->getVertexBufferRange(VertexAttribute::Position);
-                commandList->writeBuffer(buffers->vertexBuffer, buffers->positionData.data(), range.byteSize, range.byteOffset);
-                std::vector<float3>().swap(buffers->positionData);
-            }
-
-            if (!buffers->normalData.empty())
-            {
-                const auto& range = buffers->getVertexBufferRange(VertexAttribute::Normal);
-                commandList->writeBuffer(buffers->vertexBuffer, buffers->normalData.data(), range.byteSize, range.byteOffset);
-                std::vector<uint32_t>().swap(buffers->normalData);
-            }
-
-            if (!buffers->tangentData.empty())
-            {
-                const auto& range = buffers->getVertexBufferRange(VertexAttribute::Tangent);
-                commandList->writeBuffer(buffers->vertexBuffer, buffers->tangentData.data(), range.byteSize, range.byteOffset);
-                std::vector<uint32_t>().swap(buffers->tangentData);
-            }
-
-            if (!buffers->texcoord1Data.empty())
-            {
-                const auto& range = buffers->getVertexBufferRange(VertexAttribute::TexCoord1);
-                commandList->writeBuffer(buffers->vertexBuffer, buffers->texcoord1Data.data(), range.byteSize, range.byteOffset);
-                std::vector<float2>().swap(buffers->texcoord1Data);
-            }
-
-            if (!buffers->texcoord2Data.empty())
-            {
-                const auto& range = buffers->getVertexBufferRange(VertexAttribute::TexCoord2);
-                commandList->writeBuffer(buffers->vertexBuffer, buffers->texcoord2Data.data(), range.byteSize, range.byteOffset);
-                std::vector<float2>().swap(buffers->texcoord2Data);
-            }
-
-            if (!buffers->weightData.empty())
-            {
-                const auto& range = buffers->getVertexBufferRange(VertexAttribute::JointWeights);
-                commandList->writeBuffer(buffers->vertexBuffer, buffers->weightData.data(), range.byteSize, range.byteOffset);
-                std::vector<float4>().swap(buffers->weightData);
-            }
-
-            if (!buffers->jointData.empty())
-            {
-                const auto& range = buffers->getVertexBufferRange(VertexAttribute::JointIndices);
-                commandList->writeBuffer(buffers->vertexBuffer, buffers->jointData.data(), range.byteSize, range.byteOffset);
-                std::vector<vector<uint16_t, 4>>().swap(buffers->jointData);
-            }
-
-            if (!buffers->radiusData.empty())
-            {
-                const auto& range = buffers->getVertexBufferRange(VertexAttribute::CurveRadius);
-                commandList->writeBuffer(buffers->vertexBuffer, buffers->radiusData.data(), range.byteSize, range.byteOffset);
-                std::vector<float>().swap(buffers->radiusData);
-            }
-
-            nvrhi::ResourceStates state = nvrhi::ResourceStates::VertexBuffer | nvrhi::ResourceStates::ShaderResource;
-
-            if (bufferDesc.isAccelStructBuildInput)
-                state = state | nvrhi::ResourceStates::AccelStructBuildInput;
-
-            commandList->setPermanentBufferState(buffers->vertexBuffer, state);
-            commandList->commitBarriers();
+        if (pending.indexData || pending.vertexData)
+        {
+            pending.buffers = buffers;
+            m_PendingMeshBufferData.push_back(std::move(pending));
+            made = true;
         }
     }
 
@@ -955,6 +974,7 @@ void Scene::CreateMeshBuffers(nvrhi::ICommandList* commandList)
 
         if (!skinnedMesh->buffers)
         {
+            made = true;
             skinnedMesh->buffers =MAKE_RC_OBJ_PTR(BufferGroup);
 
             uint32_t totalVertices = skinnedMesh->totalVertices;
@@ -970,10 +990,10 @@ void Scene::CreateMeshBuffers(nvrhi::ICommandList* commandList)
 
             AppendBufferRange(skinnedBuffers->getVertexBufferRange(VertexAttribute::Position),
                 totalVertices * sizeof(float3), skinnedVertexBufferSize);
-    
+
             AppendBufferRange(skinnedBuffers->getVertexBufferRange(VertexAttribute::PrevPosition),
                 totalVertices * sizeof(float3), skinnedVertexBufferSize);
-            
+
             if(prototypeBuffers->hasAttribute(VertexAttribute::Normal))
             {
                 AppendBufferRange(skinnedBuffers->getVertexBufferRange(VertexAttribute::Normal),
@@ -1013,13 +1033,14 @@ void Scene::CreateMeshBuffers(nvrhi::ICommandList* commandList)
 
             if (m_DescriptorTable)
             {
-                skinnedBuffers->vertexBufferDescriptor = 
+                skinnedBuffers->vertexBufferDescriptor =
                     MAKE_RC_OBJ_PTR(DescriptorHandle, m_DescriptorTable->CreateDescriptorHandle(nvrhi::BindingSetItem::RawBuffer_SRV(0, skinnedBuffers->vertexBuffer)));
             }
         }
 
         if (!skinnedInstance->jointBuffer)
         {
+            made = true;
             nvrhi::BufferDesc jointBufferDesc;
             jointBufferDesc.debugName = "JointBuffer";
             jointBufferDesc.initialState = nvrhi::ResourceStates::ShaderResource;
@@ -1031,9 +1052,10 @@ void Scene::CreateMeshBuffers(nvrhi::ICommandList* commandList)
 
         if (!skinnedInstance->skinningBindingSet)
         {
+            made = true;
             const auto& prototypeBuffers = skinnedInstance->GetPrototypeMesh()->buffers;
             const auto& skinnedBuffers = skinnedInstance->GetMesh()->buffers;
-            
+
             nvrhi::BindingSetDesc setDesc;
             setDesc.bindings = {
                 nvrhi::BindingSetItem::PushConstants(0, sizeof(SkinningConstants)),
@@ -1044,6 +1066,147 @@ void Scene::CreateMeshBuffers(nvrhi::ICommandList* commandList)
 
             m_Device->createBindingSet(setDesc, m_SkinningBindingLayout, &skinnedInstance->skinningBindingSet);
         }
+    }
+
+    // The geometry rows of these meshes are filled again with the new buffers' descriptors and offsets.
+    if (made && m_GpuScene)
+        m_GpuScene->InvalidateAssets();
+    return made;
+}
+
+void Scene::WriteMeshBufferData(nvrhi::ICommandList* commandList)
+{
+    // The graph path keeps the CPU data until the frame is acknowledged (CreateMeshBufferObjects).
+    const bool keep = IsOnGraphPath();
+    if (keep)
+        m_UnconfirmedMeshBufferData.reserve(m_UnconfirmedMeshBufferData.size() + m_PendingMeshBufferData.size());
+    for (const PendingMeshBufferData& pending : m_PendingMeshBufferData)
+    {
+        BufferGroup* buffers = pending.buffers;
+
+        if (pending.indexData && buffers->indexBuffer)
+        {
+            commandList->beginTrackingBufferState(buffers->indexBuffer, nvrhi::ResourceStates::Common);
+
+            commandList->writeBuffer(buffers->indexBuffer, buffers->indexData.data(), buffers->indexData.size() * sizeof(uint32_t));
+
+            nvrhi::ResourceStates state = nvrhi::ResourceStates::IndexBuffer | nvrhi::ResourceStates::ShaderResource;
+
+            if (buffers->indexBuffer->getDesc().isAccelStructBuildInput)
+                state = state | nvrhi::ResourceStates::AccelStructBuildInput;
+
+            commandList->setPermanentBufferState(buffers->indexBuffer, state);
+            commandList->commitBarriers();
+        }
+
+        if (pending.vertexData && buffers->vertexBuffer)
+        {
+            commandList->beginTrackingBufferState(buffers->vertexBuffer, nvrhi::ResourceStates::Common);
+
+            if (!buffers->positionData.empty())
+            {
+                const auto& range = buffers->getVertexBufferRange(VertexAttribute::Position);
+                commandList->writeBuffer(buffers->vertexBuffer, buffers->positionData.data(), range.byteSize, range.byteOffset);
+            }
+
+            if (!buffers->normalData.empty())
+            {
+                const auto& range = buffers->getVertexBufferRange(VertexAttribute::Normal);
+                commandList->writeBuffer(buffers->vertexBuffer, buffers->normalData.data(), range.byteSize, range.byteOffset);
+            }
+
+            if (!buffers->tangentData.empty())
+            {
+                const auto& range = buffers->getVertexBufferRange(VertexAttribute::Tangent);
+                commandList->writeBuffer(buffers->vertexBuffer, buffers->tangentData.data(), range.byteSize, range.byteOffset);
+            }
+
+            if (!buffers->texcoord1Data.empty())
+            {
+                const auto& range = buffers->getVertexBufferRange(VertexAttribute::TexCoord1);
+                commandList->writeBuffer(buffers->vertexBuffer, buffers->texcoord1Data.data(), range.byteSize, range.byteOffset);
+            }
+
+            if (!buffers->texcoord2Data.empty())
+            {
+                const auto& range = buffers->getVertexBufferRange(VertexAttribute::TexCoord2);
+                commandList->writeBuffer(buffers->vertexBuffer, buffers->texcoord2Data.data(), range.byteSize, range.byteOffset);
+            }
+
+            if (!buffers->weightData.empty())
+            {
+                const auto& range = buffers->getVertexBufferRange(VertexAttribute::JointWeights);
+                commandList->writeBuffer(buffers->vertexBuffer, buffers->weightData.data(), range.byteSize, range.byteOffset);
+            }
+
+            if (!buffers->jointData.empty())
+            {
+                const auto& range = buffers->getVertexBufferRange(VertexAttribute::JointIndices);
+                commandList->writeBuffer(buffers->vertexBuffer, buffers->jointData.data(), range.byteSize, range.byteOffset);
+            }
+
+            if (!buffers->radiusData.empty())
+            {
+                const auto& range = buffers->getVertexBufferRange(VertexAttribute::CurveRadius);
+                commandList->writeBuffer(buffers->vertexBuffer, buffers->radiusData.data(), range.byteSize, range.byteOffset);
+            }
+
+            nvrhi::ResourceStates state = nvrhi::ResourceStates::VertexBuffer | nvrhi::ResourceStates::ShaderResource;
+
+            if (buffers->vertexBuffer->getDesc().isAccelStructBuildInput)
+                state = state | nvrhi::ResourceStates::AccelStructBuildInput;
+
+            commandList->setPermanentBufferState(buffers->vertexBuffer, state);
+            commandList->commitBarriers();
+        }
+    }
+    for (PendingMeshBufferData& pending : m_PendingMeshBufferData)
+    {
+        if (keep)
+            m_UnconfirmedMeshBufferData.push_back(std::move(pending));
+        else
+            FreeMeshCpuData(*pending.buffers, pending.indexData, pending.vertexData);
+    }
+    m_PendingMeshBufferData.clear();
+}
+
+void Scene::ConfirmMeshBufferData() noexcept
+{
+    for (const PendingMeshBufferData& entry : m_UnconfirmedMeshBufferData)
+        FreeMeshCpuData(*entry.buffers, entry.indexData, entry.vertexData);
+    m_UnconfirmedMeshBufferData.clear();
+}
+
+GpuScene* Scene::EnsureGpuScene() noexcept
+{
+    if (m_GpuScene || !m_Device)
+        return m_GpuScene;
+    GpuSceneDesc desc;
+    desc.geometryAndMaterialBuffers = m_EnableBindlessResources;
+    desc.resourceDescriptorHeapBindless = m_UseResourceDescriptorHeapBindless;
+    // On DX11, a buffer cannot be both structured and vertex.
+    // On other APIs, a structured instance buffer can be used for rasterization.
+    desc.structuredInstanceBuffer = m_Device->getGraphicsAPI() != nvrhi::GraphicsAPI::D3D11;
+    desc.rowGranularity = 1024;
+    desc.uploadMode = m_GpuSceneUploadMode;
+    try
+    {
+        m_GpuScene = MAKE_RC_OBJ_PTR(GpuScene, m_Device, desc);
+    }
+    catch (const std::bad_alloc&)
+    {
+        m_GpuScene = nullptr;
+    }
+    return m_GpuScene;
+}
+
+void Scene::BindMeshInstanceBuffers()
+{
+    nvrhi::IBuffer* instanceBuffer = m_GpuScene ? m_GpuScene->GetInstanceBuffer() : nullptr;
+    for (const auto& mesh : m_SceneGraph->GetMeshes())
+    {
+        if (mesh->buffers && mesh->buffers->instanceBuffer.Get() != instanceBuffer)
+            mesh->buffers->instanceBuffer = instanceBuffer;
     }
 }
 

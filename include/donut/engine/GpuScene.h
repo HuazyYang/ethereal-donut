@@ -34,13 +34,18 @@
 //
 // Scatter mode (GpuSceneDesc::uploadMode; plan step E5, sub-plan item E5.4, open points 3 and 9): the render-graph
 // path. Update walks the changed chunks as in CPU mode, but a row whose only change is WorldTransform becomes a
-// transform record (slot and float transform) without building or comparing its row; rows whose MeshRef, RenderFlags
-// or GpuInstanceSlot changed, and rows new to their slot, become row records; the slots scattered last frame become
-// settle records. The upload pass (donut/render/GpuSceneUploadPass.h) scatters them with a compute shader, which
-// keeps prevTransform on the GPU (design 7.2): in this mode the CPU instance image is not kept up to date for
-// transform-only rows. Buffer creation is separate from writing (CreateBuffers; the geometry and material rows with
-// UploadAssets). A GpuScene keeps its mode for its lifetime (Scene chooses it before loading); graph-path scenes update
-// once per frame.
+// transform record (slot and float transform) without building or comparing its row (only its float transform is
+// compared with the one the slot holds, so that an unmoved row of a changed chunk costs no upload); rows whose MeshRef,
+// RenderFlags or GpuInstanceSlot changed, and rows new to their slot, become row records; the slots whose
+// prevTransform the last frame's records left behind their transform become settle records. The gather runs in
+// parallel by chunk on the graph's job system, in chunk order at any worker count. The upload pass
+// (donut/render/GpuSceneUploadPass.h) scatters them with a compute shader, which keeps prevTransform on the GPU
+// (design 7.2): in this mode the CPU instance image holds every row's flags, geometry indices and transform, but its
+// prevTransform only for rows new to their slot. Buffer creation is separate from writing (CreateBuffers; the
+// geometry and material rows with UploadAssets). A GpuScene keeps its mode for its lifetime (Scene chooses it before
+// loading). Graph-path scenes update once per frame (a SceneGraph::Refresh call): a second Update in one frame is
+// treated as a later frame (its transform records move the frame's earlier transform into prevTransform; CPU mode
+// keeps the earlier frame's), and its settle records wait for the next frame.
 //
 // The records of an Update stay pending until the upload pass acknowledges them from its Execute (CommitScatter), that
 // is, once they are recorded into the frame's command lists. An Update that finds the last records unacknowledged (the
@@ -92,6 +97,12 @@ namespace donut::engine
         CpuRows,   // Update builds and compares rows; Upload writes the changed runs (Scene::RefreshBuffers; the reference)
         Scatter    // Update records transforms, rows and settles for the compute scatter (the render-graph path)
     };
+
+    // Scatter mode: the state of the instance, geometry and material buffers between frames. They are not host-kept
+    // (keepInitialState false: the render graph's ImportBuffer rejects host-kept buffers), so the render graph imports
+    // them with this as the entry and exit state, and UploadAssets returns them to it. CPU mode's buffers are host-kept
+    // in it.
+    constexpr nvrhi::ResourceStates c_GpuSceneRestingState = nvrhi::ResourceStates::ShaderResource;
 
     struct GpuSceneDesc
     {
@@ -178,7 +189,9 @@ namespace donut::engine
         uint32_t uploadRuns = 0;
         uint64_t uploadBytes = 0;
         uint32_t buffersResized = 0;
-        // Scatter mode: the records of the last Update.
+        // Scatter mode: the records of the last Update. There rowsBuilt counts the candidate rows of the changed chunks,
+        // rowsChanged the transform and row records, rowsSettled the settle records, and uploadBytes the records' bytes
+        // (Update), then the asset rows' (UploadAssets); buffersResized counts CreateBuffers' new buffers.
         uint32_t settleRecords = 0;
         uint32_t transformRecords = 0;
         uint32_t rowRecords = 0;
@@ -214,7 +227,9 @@ namespace donut::engine
         // Scatter mode (the render-graph path). Upload and UploadTo return FE_UNSUPPORTED in it.
         [[nodiscard]] GpuSceneUploadMode GetUploadMode() const noexcept { return m_Desc.uploadMode; }
         // Creates or grows the buffers to the sizes the last Update needs, without writing any row (RenderService
-        // calls it at extraction, after Update and before the buffers are imported). Needs a device.
+        // calls it at extraction, after Update and before the buffers are imported). Without a device it does the
+        // bookkeeping only (sizes, GetBufferChanges without buffer objects; tests). A buffer is never shrunk. The
+        // replaced instance buffer of the previous call is released here.
         nvrhi::FRESULT CreateBuffers() noexcept;
         // What the last CreateBuffers did; valid until the next one (the upload pass's growth copy reads it).
         [[nodiscard]] const GpuSceneBufferChanges& GetBufferChanges() const noexcept;
@@ -222,8 +237,12 @@ namespace donut::engine
         // on the graph's upload list); clears the materials' dirty flags. The mesh buffers and descriptors the rows name
         // were made at extraction, before Update (Scene::CreateMeshBufferObjects), so the rows are complete.
         nvrhi::FRESULT UploadAssets(nvrhi::ICommandList* commandList) noexcept;
-        // The same writes, to `writer`.
+        // The same writes, to `writer`; ResizeBuffer is called for a geometry or material buffer that CreateBuffers
+        // (re)created since the last asset upload, before its rows are written whole.
         nvrhi::FRESULT UploadAssetsTo(IGpuSceneWriter* writer) noexcept;
+        // UploadAssets has something to write: geometry or material rows, or per-material constant buffers (the
+        // upload pass adds no use when neither this, the records nor mesh data are due).
+        [[nodiscard]] bool HasPendingAssets() const noexcept;
         void GetScatterRecords(GpuSceneScatterRecords& out) const noexcept;
         // The upload pass's Execute: the records with this serial (GpuSceneScatterRecords::serial) are recorded. A
         // serial other than the last Update's is ignored. Unacknowledged records make the next Update a resend.

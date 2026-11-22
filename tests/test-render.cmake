@@ -41,6 +41,15 @@ add_dependencies(donut_all_tests test_render_graph_passes)
 add_test(NAME test_render_graph_passes COMMAND test_render_graph_passes)
 set_property(TARGET test_render_graph_passes PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
+# The render service's extraction into the frame snapshot, device-free (ECS step E5, sub-plan item E5.1). It reaches
+# the ECS allocation counter through the private headers in src/engine, as the engine's GPU scene test does.
+add_executable(test_render_extract src/render/test_render_extract.cpp)
+target_link_libraries(test_render_extract donut_render donut_engine donut_core donut_tests_utils)
+target_include_directories(test_render_extract PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
+add_dependencies(donut_all_tests test_render_extract)
+add_test(NAME test_render_extract COMMAND test_render_extract)
+set_property(TARGET test_render_extract PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
 # The benchmark of design 10.3. The device-free budgets: a smoke run in ctest, measured in Release with
 # `rdg_bench --gate`. The parallel-recording budget needs a device (plan step P1.7): `rdg_bench --parallel d3d12|vulkan
 # --gate`, with GPU smoke runs in ctest.
@@ -134,6 +143,20 @@ foreach(_backend d3d11 d3d12 vulkan)
 endforeach()
 add_dependencies(donut_all_tests test_render_graph_layer)
 set_property(TARGET test_render_graph_layer PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
+# The GpuScene upload pass on a headless device (ECS step E5, sub-plan item E5.4): after every frame of a scripted scene
+# the buffers read back equal a CPU-mode GpuScene's images, under the debug runtime and the nvrhi validation layer.
+add_executable(test_render_extract_gpu src/render/test_render_extract_gpu.cpp)
+target_link_libraries(test_render_extract_gpu donut_app donut_render donut_engine donut_core)
+foreach(_backend d3d11 d3d12 vulkan)
+    if((_backend STREQUAL "d3d11" AND DONUT_WITH_DX11) OR (_backend STREQUAL "d3d12" AND DONUT_WITH_DX12) OR
+       (_backend STREQUAL "vulkan" AND DONUT_WITH_VULKAN))
+        add_test(NAME test_render_extract_gpu_${_backend} COMMAND test_render_extract_gpu ${_backend})
+        set_tests_properties(test_render_extract_gpu_${_backend} PROPERTIES RUN_SERIAL TRUE LABELS gpu)
+    endif()
+endforeach()
+add_dependencies(donut_all_tests test_render_extract_gpu)
+set_property(TARGET test_render_extract_gpu PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
 # Header hygiene (design 3.2): the RenderGraph* files include only nvrhi/, donut/core/, other RenderGraph* headers
 # and the standard library.

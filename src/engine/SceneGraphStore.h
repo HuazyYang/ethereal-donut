@@ -260,6 +260,37 @@ namespace donut::engine
         // Unique per store in the process (an address can be reused).
         uint64_t GetSerial() const noexcept { return m_Serial; }
 
+        // ------------------------------------------------------------------ render read (plan step E5.1)
+        // SceneGraph::BeginRenderRead and EndRenderRead: the scopes the render service keeps open while a frame's
+        // snapshot points at this graph's leaves and assets (open point 12). The count is kept in every build; only
+        // Debug builds check it, in the API's write entry points (SceneGraph.cpp), so Release writes cost nothing.
+        void BeginRenderRead() noexcept { ++m_RenderReads; }
+        void EndRenderRead() noexcept
+        {
+            if (m_RenderReads != 0)
+                --m_RenderReads;
+        }
+        bool IsInRenderRead() const noexcept { return m_RenderReads != 0; }
+        // Logs one warning for a write through the API while a scope is open (and the write is not part of another
+        // one, RenderReadQuiet). The write still applies.
+        void WarnRenderRead(const char* operation) const noexcept;
+        // SceneGraph::RunReadOnlyPhase: runs the phase; when it wrote nothing and nothing else ran on the world since the
+        // last Refresh, moves m_RefreshedVersion past the phase's versions, so that the next Refresh may skip.
+        nvrhi::FRESULT RunReadOnlyPhase(Phase phase) noexcept;
+        // SceneGraph::ClaimRenderService and GetSchedulerGeneration.
+        bool ClaimRenderService() noexcept { return !m_RenderServiceClaimed.exchange(true); }
+        void ReleaseRenderService() noexcept { m_RenderServiceClaimed.store(false); }
+        uint64_t GetSchedulerGeneration() const noexcept { return m_SchedulerGeneration; }
+        // Inside one API call that makes others (SetRootNode: Detach, then Attach), so that it warns once.
+        struct RenderReadQuiet
+        {
+            SceneGraphStore& store;
+            explicit RenderReadQuiet(SceneGraphStore& s) noexcept : store(s) { ++store.m_RenderReadQuiet; }
+            ~RenderReadQuiet() { --store.m_RenderReadQuiet; }
+            RenderReadQuiet(const RenderReadQuiet&) = delete;
+            RenderReadQuiet& operator=(const RenderReadQuiet&) = delete;
+        };
+
         // Test seams: entity ids of the graph's components, and counters.
         ComponentId GetComponentId(Slot slot) const noexcept { return m_Ids[slot]; }
         ComponentId GetDepthId() const noexcept { return m_DepthId; }
@@ -436,6 +467,12 @@ namespace donut::engine
         uint64_t m_RefreshedStructuralVersion = 0;
         uint32_t m_FrameIndex = 0;
         std::atomic<uint64_t> m_Epoch{ 1 };
+
+        // Render-read scopes (BeginRenderRead) and the nesting of API calls that warn once (RenderReadQuiet).
+        uint32_t m_RenderReads = 0;
+        uint32_t m_RenderReadQuiet = 0;
+        std::atomic<bool> m_RenderServiceClaimed{ false };
+        uint64_t m_SchedulerGeneration = 0;   // CreateSystems calls
 
         // System state: the archetypes per depth bucket, the leaf archetypes for bounds and joints, the tasks.
         std::vector<LevelArchetype> m_Levels[c_MaxHierarchyDepth + 1];

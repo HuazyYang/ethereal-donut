@@ -353,6 +353,7 @@ namespace donut::engine::ecs
             return counters;
         }
         uint32_t GetScheduleOrder(Phase phase, SystemId* out, uint32_t capacity) noexcept;
+        bool PhaseDeclaresWrites(Phase phase) noexcept;
         uint32_t GetCommandBuffers(SystemId system, ICommandBuffer** out, uint32_t capacity) const noexcept
         {
             const SystemRecord* record = FindSystem(system);
@@ -1414,6 +1415,28 @@ namespace donut::engine::ecs
         return count;
     }
 
+    bool SchedulerImpl::PhaseDeclaresWrites(Phase phase) noexcept
+    {
+        if (!IsRunning())
+            EnsureBuilt();
+        const PhaseRecord* record = FindPhase(phase);
+        if (!record)
+            return false;
+        for (const SystemRecord* system : record->order)
+        {
+            if (!system || !system->enabled)
+                continue;
+            if (Has(system->flags, SystemFlags::Exclusive))
+                return true;
+            for (const ComponentAccess& access : system->accesses)
+            {
+                if (access.access == Access::Write)
+                    return true;
+            }
+        }
+        return false;
+    }
+
     // -------------------------------------------------------------------------------------------- running
 
     void SchedulerImpl::SetFrameTime(const FrameTime& time) noexcept
@@ -1761,6 +1784,12 @@ namespace donut::engine::ecs
     {
         SchedulerImpl* impl = donut::query_cast<SchedulerImpl>(scheduler);
         return impl ? impl->GetScheduleOrder(phase, out, capacity) : 0;
+    }
+
+    bool PhaseDeclaresWrites(IScheduler* scheduler, Phase phase) noexcept
+    {
+        SchedulerImpl* impl = donut::query_cast<SchedulerImpl>(scheduler);
+        return impl ? impl->PhaseDeclaresWrites(phase) : true;
     }
 
     uint32_t GetSystemCommandBuffers(IScheduler* scheduler, SystemId system, ICommandBuffer** out,

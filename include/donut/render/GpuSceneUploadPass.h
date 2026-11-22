@@ -72,8 +72,9 @@ namespace donut::render
         // What this frame's CreateBuffers did (GpuScene::GetBufferChanges; it stays valid until the next one): the
         // growth copy's source. Null: no growth copy.
         const engine::GpuSceneBufferChanges* bufferChanges = nullptr;
-        // GpuScene's buffers, imported this frame. The geometry and material buffers are optional (no bindless
-        // buffers); the instance buffer is required.
+        // GpuScene's buffers, imported this frame with engine::c_GpuSceneRestingState as entry and exit state (they are
+        // not host-kept in scatter mode). The geometry and material buffers are optional (no bindless buffers); the
+        // instance buffer is required.
         ResourceId instanceBuffer = InvalidResourceId;
         ResourceId geometryBuffer = InvalidResourceId;
         ResourceId materialBuffer = InvalidResourceId;
@@ -102,9 +103,22 @@ namespace donut::render
         GpuSceneUploadPass(const GpuSceneUploadPass&) = delete;
         GpuSceneUploadPass& operator=(const GpuSceneUploadPass&) = delete;
 
-        // Render graph (13.2). When the last Update recorded nothing to write (no record, no asset row, no mesh data),
-        // adds nothing, acknowledges the empty records at once and returns the inputs.
+        // Render graph (13.2). When the last Update recorded nothing to write (no record, no asset row, no mesh data,
+        // no growth copy), adds nothing, acknowledges the empty records at once and returns the inputs. Otherwise the
+        // records are acknowledged only from an Execute (the scatter's, or the records use's when there is no record),
+        // so that a frame whose Prepare ran but which did not execute is sent again in full: the next Update resends the
+        // rows and every asset row and constant buffer, and Scene::CreateMeshBufferObjects makes the mesh data due
+        // again. With records or a growth copy but without the instance buffer (or with one smaller than the
+        // GpuScene's rows) it adds nothing and leaves the records unacknowledged.
+        //
+        // The records' staging buffer is a persistent resource of the graph's registry, named after the GpuScene: a
+        // pass made again for the same GpuScene uses it again; ReleaseStagingBuffer drops it (an application that drops
+        // a GpuScene but keeps the registry).
         GpuSceneUploadGraphOutputs AddToGraph(IRenderGraph* graph, const GpuSceneUploadGraphInputs& inputs);
+        // The staging buffer of the GpuScene this pass last uploaded, from `registry`. FE_NOT_FOUND when there is none.
+        nvrhi::FRESULT ReleaseStagingBuffer(IResourceRegistry* registry) noexcept;
+        // Tests: the widest dispatch in X, in groups (0: GPU_SCENE_SCATTER_MAX_GROUPS_X), to exercise the wrap into Y.
+        void SetMaxDispatchGroupsX(uint32_t groups) noexcept { m_MaxDispatchGroupsX = groups; }
 
         nvrhi::FRESULT Setup(ISetupContext* context, void* data) noexcept override;
         nvrhi::FRESULT Prepare(IPrepareContext* context, void* data) noexcept override;
@@ -115,6 +129,7 @@ namespace donut::render
         struct Impl;
         nvrhi::IDevice* m_Device;                  // not a reference, as in GpuScene: the scene holds the device
         engine::ShaderFactory* m_ShaderFactory;
+        uint32_t m_MaxDispatchGroupsX = 0;
         std::unique_ptr<Impl> m_Impl;
     };
 }

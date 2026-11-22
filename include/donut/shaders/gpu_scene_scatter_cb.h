@@ -32,6 +32,9 @@
 #define GPU_SCENE_SCATTER_CB_H
 
 #define GPU_SCENE_SCATTER_GROUP_SIZE 64
+// The widest dispatch in X; wider ones continue in Y (GpuSceneScatterConstants::groupsX), so more than 65535 groups'
+// worth of records fit one dispatch.
+#define GPU_SCENE_SCATTER_MAX_GROUPS_X 32768
 
 // InstanceData (bindless.h): 112 bytes; transform at word 4, prevTransform at word 16, 12 words each (float3x4).
 #define GPU_SCENE_INSTANCE_ROW_WORDS 28
@@ -56,7 +59,8 @@ struct GpuSceneScatterConstants
     uint rowRecordOffset;
     uint rowRecordCount;
     uint instanceRowStride;   // bytes, sizeof(InstanceData)
-    uint padding;
+    // The dispatch's X size in groups: a thread's record index is (groupId.y * groupsX + groupId.x) * group size + index.
+    uint groupsX;
 };
 
 // 64 bytes.

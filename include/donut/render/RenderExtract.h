@@ -417,7 +417,9 @@ namespace donut::render
         // Refresh: sets the frame context and runs the graph scheduler's RenderExtract phase into a snapshot in
         // `graph`'s arena (open points 1 and 2). `frameData` (may be null) gets the SceneFrame entry; `outFrame` (may
         // be null) receives it. Opens the Debug render-read scope (open point 12) until EndFrame; a scope still open
-        // from the previous frame (EndFrame not called) is closed first.
+        // from the previous frame (EndFrame not called) is closed first. A service serves the graph it was made for:
+        // FE_INVALID_ARGS once the scene's graph was replaced (Scene::CreateSceneGraph, a new load); make a new
+        // service then.
         nvrhi::FRESULT Extract(IRenderGraph* graph, FrameData* frameData, const ExtractDesc& desc,
                                SceneFrame** outFrame) noexcept;
         // The GpuScene upload (GpuSceneUploadPass); fills the buffer ids of `frame`. When it fails, or the frame never

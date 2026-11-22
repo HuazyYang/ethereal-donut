@@ -79,6 +79,8 @@ set_property(TARGET bench_gpu_scene PROPERTY FOLDER "Donut/donut_tests/donut_eng
 # The A/B dump of plan step E4 (a GPU program, not a ctest test): the instance, geometry and material buffers read back
 # after Scene::Refresh, in GpuSceneDump.h's canonical form. The same source builds against the E0 tree from outside it.
 add_executable(gpu_scene_dump src/engine/gpu_scene_dump.cpp src/engine/GpuSceneDump.h)
-target_link_libraries(gpu_scene_dump donut_app donut_engine donut_core)
+target_link_libraries(gpu_scene_dump donut_app donut_render donut_engine donut_core)
+# `--path graph` (ECS step E5, sub-plan item E5.4): the render-graph path, which the E0 tree does not have.
+target_compile_definitions(gpu_scene_dump PRIVATE GPU_SCENE_DUMP_GRAPH_PATH=1)
 add_dependencies(donut_all_tests gpu_scene_dump)
 set_property(TARGET gpu_scene_dump PROPERTY FOLDER "Donut/donut_tests/donut_engine_tests")

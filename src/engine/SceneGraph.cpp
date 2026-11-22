@@ -33,6 +33,16 @@
 
 using namespace donut::engine;
 
+// The render service's isolation guard (SceneGraph::BeginRenderRead; plan step E5, sub-plan item E5.1): Debug builds
+// warn once per write through this API while a frame records; Release builds compile the check out.
+#ifndef NDEBUG
+#define DONUT_SCENE_GRAPH_WARN_RENDER_READ(store, operation) (store)->WarnRenderRead(operation)
+#define DONUT_SCENE_GRAPH_RENDER_READ_QUIET(store) SceneGraphStore::RenderReadQuiet renderReadQuiet(*(store))
+#else
+#define DONUT_SCENE_GRAPH_WARN_RENDER_READ(store, operation) ((void)0)
+#define DONUT_SCENE_GRAPH_RENDER_READ_QUIET(store) ((void)0)
+#endif
+
 const std::string& SceneGraphLeaf::GetName() const
 {
     auto node = GetNode();
@@ -579,13 +589,17 @@ std::filesystem::path SceneGraphNode::GetPath() const
 void SceneGraphNode::InvalidateContent()
 {
     if (m_Store && !m_Record)
+    {
+        DONUT_SCENE_GRAPH_WARN_RENDER_READ(m_Store, "InvalidateContent");
         m_Store->InvalidateContent(this);
+    }
 }
 
 void SceneGraphNode::SetTransform(const dm::double3* translation, const dm::dquat* rotation, const dm::double3* scaling)
 {
     if (m_Store && !m_Record)
     {
+        DONUT_SCENE_GRAPH_WARN_RENDER_READ(m_Store, "SetTransform");
         m_Store->SetTransform(this, translation, rotation, scaling);
         return;
     }
@@ -616,6 +630,7 @@ void SceneGraphNode::SetLeaf(SceneGraphLeaf* leaf)
 {
     if (m_Store && !m_Record)
     {
+        DONUT_SCENE_GRAPH_WARN_RENDER_READ(m_Store, "SetLeaf");
         m_Store->SetLeaf(this, leaf);
         return;
     }
@@ -1022,8 +1037,45 @@ void SceneGraph::CompactLeafVectors()
     m_RemovalMarked.clear();
 }
 
+void SceneGraph::BeginRenderRead() noexcept
+{
+    m_Store->BeginRenderRead();
+}
+
+void SceneGraph::EndRenderRead() noexcept
+{
+    m_Store->EndRenderRead();
+}
+
+bool SceneGraph::IsInRenderRead() const noexcept
+{
+    return m_Store->IsInRenderRead();
+}
+
+nvrhi::FRESULT SceneGraph::RunReadOnlyPhase(Phase phase) noexcept
+{
+    return m_Store->RunReadOnlyPhase(phase);
+}
+
+bool SceneGraph::ClaimRenderService() noexcept
+{
+    return m_Store->ClaimRenderService();
+}
+
+void SceneGraph::ReleaseRenderService() noexcept
+{
+    m_Store->ReleaseRenderService();
+}
+
+uint64_t SceneGraph::GetSchedulerGeneration() const noexcept
+{
+    return m_Store->GetSchedulerGeneration();
+}
+
 nvrhi::AutoPtr<SceneGraphNode> SceneGraph::SetRootNode(SceneGraphNode *root)
 {
+    DONUT_SCENE_GRAPH_WARN_RENDER_READ(m_Store, "SetRootNode");
+    DONUT_SCENE_GRAPH_RENDER_READ_QUIET(m_Store);   // the Detach and Attach below are part of this call
     auto oldRoot = m_Root;
     if (m_Root)
         Detach(m_Root);
@@ -1046,6 +1098,7 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Attach(SceneGraphNode* parent, SceneG
     }
 
     assert(parentGraph == this);
+    DONUT_SCENE_GRAPH_WARN_RENDER_READ(m_Store, "Attach");
     nvrhi::AutoPtr<SceneGraphNode> attachedChild;
 
     if (childGraph)
@@ -1082,6 +1135,7 @@ nvrhi::AutoPtr<SceneGraphNode> SceneGraph::Detach(SceneGraphNode* node, bool /* 
     if (node->m_Store)
     {
         assert(node->m_Store == m_Store);
+        DONUT_SCENE_GRAPH_WARN_RENDER_READ(m_Store, "Detach");
         // the subgraph's rows move into records and its entities go; the leaf observer unregisters the leaves
         detached = m_Store->Detach(node);
     }
