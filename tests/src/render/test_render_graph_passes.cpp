@@ -30,11 +30,14 @@
 
 #include "rdg_donut_frame.h"
 
+#include <donut/render/RenderGraphLambdaPass.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -315,6 +318,144 @@ namespace
         EXPECT(f.Diagnostics().find("PixelReadback") != std::string::npos, "the diagnostic names the pass:\n" + f.Diagnostics());
     }
 
+    // ECS sub-plan item E5.3 (open point 5): GeometryGraphInputs::bufferReads. A geometry pass over two views reads the
+    // scene's buffers after the passes that write them (an upload and a skinning pass, as lambda passes): a buffer made
+    // for vertex input as a vertex-buffer and SRV read, any other as an SRV read, in the vertex and pixel stages; its
+    // uses are Restore; the geometry buffer and an idle skinned vertex buffer, read in their resting states, get no
+    // barrier; the plan verifies on every reference profile. Without buffer reads (the golden frame above) the pass
+    // declares none and stays Tracked.
+    void TestGeometryBufferReads()
+    {
+        struct NoData
+        {
+            uint32_t unused;
+        };
+        Frame f;
+        IRenderGraph* g = f.graph;
+        nvrhi::AutoPtr<engine::CompositeView> stereo = MAKE_RC_OBJ_PTR(engine::CompositeView);
+        nvrhi::AutoPtr<engine::PlanarView> left = MakeView(0.f, 64.f, 64.f, 64.f);
+        nvrhi::AutoPtr<engine::PlanarView> right = MakeView(64.f, 128.f, 64.f, 64.f);
+        stereo->AddView(left);
+        stereo->AddView(right);
+
+        auto buffer = [](const char* name, bool vertexBuffer)
+        {
+            nvrhi::BufferDesc desc;
+            desc.byteSize = 4096;
+            desc.isVertexBuffer = vertexBuffer;
+            desc.canHaveRawViews = true;
+            desc.canHaveUAVs = true;
+            desc.debugName = name;
+            return desc;
+        };
+        // the resting states of the graph path (engine::c_GpuSceneRestingState, c_SkinnedVertexBufferRestingState)
+        const ResourceStates sceneResting = ResourceStates::ShaderResource;
+        const ResourceStates skinnedResting = ResourceStates::VertexBuffer | ResourceStates::ShaderResource;
+        ResourceId instances = g->ImportBufferDesc(buffer("InstanceBuffer", true), sceneResting, sceneResting);
+        const ResourceId geometries = g->ImportBufferDesc(buffer("GeometryBuffer", false), sceneResting, sceneResting);
+        ResourceId skinned = g->ImportBufferDesc(buffer("SkinnedVertices", true), skinnedResting, skinnedResting);
+        const ResourceId idle = g->ImportBufferDesc(buffer("IdleSkinnedVertices", true), skinnedResting, skinnedResting);
+        AddLambdaPass<NoData>(g, PassDesc{ "Upload", PassType::Compute, PassFlags::None, 0 },
+            [&](ISetupContext* setup, NoData&)
+            {
+                instances = setup->Write(instances, Access::UAVWrite, nvrhi::ShaderType::Compute, {}, AccessFlags::None);
+            },
+            [](IPassContext*, const NoData&) { });
+        AddLambdaPass<NoData>(g, PassDesc{ "Skinning", PassType::Compute, PassFlags::None, 0 },
+            [&](ISetupContext* setup, NoData&)
+            {
+                skinned = setup->Write(skinned, Access::UAVWrite, nvrhi::ShaderType::Compute, {}, AccessFlags::None);
+            },
+            [](IPassContext*, const NoData&) { });
+
+        const ResourceId color = g->ImportTextureDesc(Texture(128, 64, Format::RGBA8_UNORM, true, false),
+                                                      ResourceStates::RenderTarget, ResourceStates::RenderTarget);
+        nvrhi::TextureDesc depthDesc = Texture(128, 64, Format::D32, true, false);
+        depthDesc.debugName = "Depth";
+        const ResourceId depth = g->ImportTextureDesc(depthDesc, ResourceStates::DepthWrite, ResourceStates::DepthWrite);
+        nvrhi::AutoPtr<GBufferFillPass> gbuffer = MAKE_RC_OBJ_PTR(GBufferFillPass, nullptr, nullptr);
+        GBufferFillPass::Context context;
+        nvrhi::AutoPtr<PassthroughDrawStrategy> strategy = MAKE_RC_OBJ_PTR(PassthroughDrawStrategy);
+        const ResourceId reads[] = { instances, geometries, skinned, idle, InvalidResourceId };
+        GeometryGraphInputs inputs;
+        inputs.name = "GBufferFill";
+        inputs.view = stereo;
+        inputs.drawStrategy = strategy;
+        inputs.passContext = &context;
+        inputs.colorTargets[0] = color;
+        inputs.colorTargetCount = 1;
+        inputs.depth = depth;
+        inputs.clearTargets = true;
+        inputs.bufferReads = reads;
+        inputs.bufferReadCount = uint32_t(std::size(reads));
+        gbuffer->AddToGraph(g, inputs);
+        EXPECT(g->GetPassCount() == 4, "the writers and one use per view (" + std::to_string(g->GetPassCount()) + ")");
+
+        auto plan = f.Compile();
+        PlanStatistics stats;
+        plan->GetStatistics(stats);
+        EXPECT(stats.culledPasses == 0, "nothing culled");
+        const std::string listing = AccessListing(plan);
+        const std::string expected =
+            "Upload [compute, native, graphics]\n"
+            "    InstanceBuffer UAVWrite stages=0x0020 mips=0+1 slices=0+1\n"
+            "Skinning [compute, native, graphics]\n"
+            "    SkinnedVertices UAVWrite stages=0x0020 mips=0+1 slices=0+1\n";
+        EXPECT(listing.compare(0, expected.size(), expected) == 0, "the writers first:\n" + listing);
+        size_t uses = 0;
+        for (size_t at = listing.find("GBufferFill [raster, restore, graphics]"); at != std::string::npos;
+             at = listing.find("GBufferFill [raster, restore, graphics]", at + 1))
+            ++uses;
+        EXPECT(uses == 2, "two Restore uses after the writers:\n" + listing);
+        auto count = [&listing](const std::string& text)
+        {
+            size_t n = 0;
+            for (size_t at = listing.find(text); at != std::string::npos; at = listing.find(text, at + 1))
+                ++n;
+            return n;
+        };
+        EXPECT(count("InstanceBuffer VertexBuffer|ShaderRead stages=0x0011") == 2 &&
+               count("GeometryBuffer ShaderRead stages=0x0011") == 2 &&
+               count("    SkinnedVertices VertexBuffer|ShaderRead stages=0x0011") == 2 &&
+               count("IdleSkinnedVertices VertexBuffer|ShaderRead stages=0x0011") == 2,
+               "each use reads the four buffers in the vertex and pixel stages:\n" + listing);
+
+        // Barriers: the written buffers move to the read state before the first use and back to rest at the end; the
+        // buffers read in their resting states get none.
+        nvrhi::string dump;
+        EXPECT(plan->WriteDump(DumpFormat::Json, dump) == nvrhi::FS_OK, "dump");
+        std::istringstream lines(dump.c_str());
+        std::string line;
+        uint32_t passLines = 0;
+        size_t instanceBarriers = 0, skinnedBarriers = 0;
+        while (std::getline(lines, line))
+        {
+            // a pass's line: its uses, then its barrier lists (prologue, postClear, epilogue)
+            const size_t barriers = line.find("\"prologue\": [");
+            if (line.find("\"uses\": [") == std::string::npos || barriers == std::string::npos)
+                continue;
+            ++passLines;
+            const std::string lists = line.substr(barriers);
+            EXPECT(lists.find("GeometryBuffer") == std::string::npos, "a barrier for the geometry buffer:\n" + line);
+            EXPECT(lists.find("IdleSkinnedVertices") == std::string::npos, "a barrier for the idle buffer:\n" + line);
+            for (size_t at = lists.find("InstanceBuffer"); at != std::string::npos; at = lists.find("InstanceBuffer", at + 1))
+                ++instanceBarriers;
+            for (size_t at = lists.find("SkinnedVertices"); at != std::string::npos; at = lists.find("SkinnedVertices", at + 1))
+                ++skinnedBarriers;
+        }
+        EXPECT(passLines == 4, "four passes in the dump (" + std::to_string(passLines) + ")");
+        // into the write and from the write to the reads; the instance buffer also back to rest at the end of the frame
+        // (its read state is wider than ShaderResource), the skinned one is read in its resting state
+        EXPECT(instanceBarriers >= 3 && skinnedBarriers >= 2,
+               "the written buffers move between their states (" + std::to_string(instanceBarriers) + ", " +
+                   std::to_string(skinnedBarriers) + ")");
+
+        const ReferenceProfile others[] = { ReferenceProfile::D3D12Enhanced, ReferenceProfile::Vulkan,
+                                            ReferenceProfile::VulkanSeparateComputeFamily, ReferenceProfile::D3D11 };
+        for (ReferenceProfile other : others)
+            f.Compile(other);
+    }
+
     struct Test
     {
         const char* name;
@@ -325,6 +466,7 @@ namespace
         { "golden_pass_accesses", TestGoldenPassAccesses },
         { "per_view_folding", TestPerViewFolding },
         { "unsupported_pass", TestUnsupportedPass },
+        { "geometry_buffer_reads", TestGeometryBufferReads },
     };
 }
 

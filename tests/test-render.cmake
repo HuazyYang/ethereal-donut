@@ -63,6 +63,13 @@ add_dependencies(donut_all_tests test_draw_packets)
 add_test(NAME test_draw_packets COMMAND test_draw_packets)
 set_property(TARGET test_draw_packets PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
+# The draw-strategy adapters over packets against the legacy graph walk, device-free (sub-plan item E5.3).
+add_executable(test_draw_strategy_adapters src/render/test_draw_strategy_adapters.cpp)
+target_link_libraries(test_draw_strategy_adapters donut_render donut_engine donut_core donut_tests_utils)
+add_dependencies(donut_all_tests test_draw_strategy_adapters)
+add_test(NAME test_draw_strategy_adapters COMMAND test_draw_strategy_adapters)
+set_property(TARGET test_draw_strategy_adapters PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
 # The CPU cost of visibility and packets against the legacy strategy walk (sub-plan item E5.2; design 10.1). The same
 # source measures the walk alone when compiled against the E0 tree with BENCH_RENDER_EXTRACT_E0=1. ctest runs the smoke
 # mode; the Release numbers come from `bench_render_extract --workers N`.

@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 
 namespace donut::render::rdg
 {
@@ -82,6 +83,12 @@ namespace donut::render::rdg
 
     void FrameArena::Reset() noexcept
     {
+#ifndef NDEBUG
+        // Debug: what the frame placed here dies now; a pattern instead of its bytes makes a late reader (a draw
+        // strategy still bound to last frame's snapshot) see garbage at once. Memory only: the blocks stay.
+        for (size_t b = 0; b < m_Blocks.size() && b <= m_Current; ++b)
+            std::memset(m_Blocks[b].data, 0xDD, b < m_Current ? m_Blocks[b].size : m_Offset);
+#endif
         m_Current = 0;
         m_Offset = 0;
     }

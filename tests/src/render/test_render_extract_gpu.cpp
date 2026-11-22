@@ -87,6 +87,10 @@ namespace
 {
     std::atomic<uint32_t> g_Errors{ 0 };
     std::atomic<uint32_t> g_Warnings{ 0 };
+    // The Khronos layer's performance warning about GBufferFillPass with the input assembler and without motion vectors
+    // (its input layout has the previous positions, which that vertex shader does not read): older than step E5, and
+    // counted apart (RunGeometry).
+    std::atomic<uint32_t> g_UnconsumedAttributeWarnings{ 0 };
 
     void check(bool condition, const std::string& what)
     {
@@ -1418,6 +1422,386 @@ namespace
         device->runGarbageCollection();
     }
 
+    // ------------------------------------------------------------------------------------------ geometry passes (E5.3)
+    // One draw call of a geometry pass, as RenderView issues it.
+    struct DrawRecord
+    {
+        uint32_t startIndex;
+        uint32_t startVertex;
+        uint32_t startInstance;
+        uint32_t instanceCount;
+    };
+
+    struct RecordingContext : GBufferFillPass::Context
+    {
+        std::vector<std::vector<DrawRecord>> views;   // the draws of each use (child view), in recording order
+    };
+
+    // GBufferFillPass, recording its draw calls into each use's context.
+    class RecordingGBufferPass : public GBufferFillPass
+    {
+        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        using GBufferFillPass::GBufferFillPass;
+
+        void SetupView(GeometryPassContext& context, nvrhi::ICommandList* commandList, const IView* view,
+                       const IView* viewPrev) override
+        {
+            static_cast<RecordingContext&>(context).views.emplace_back();
+            GBufferFillPass::SetupView(context, commandList, view, viewPrev);
+        }
+
+        void SetPushConstants(GeometryPassContext& context, nvrhi::ICommandList* commandList, nvrhi::GraphicsState& state,
+                              nvrhi::DrawArguments& args) override
+        {
+            static_cast<RecordingContext&>(context).views.back().push_back(
+                DrawRecord{ args.startIndexLocation, args.startVertexLocation, args.startInstanceLocation,
+                            args.instanceCount });
+            GBufferFillPass::SetPushConstants(context, commandList, state, args);
+        }
+    };
+
+    // (first index, instance) of every instance a list of draws covers, in draw order.
+    std::vector<std::pair<uint32_t, uint32_t>> Expand(const std::vector<DrawRecord>& draws)
+    {
+        std::vector<std::pair<uint32_t, uint32_t>> drawn;
+        for (const DrawRecord& draw : draws)
+            for (uint32_t i = 0; i < draw.instanceCount; ++i)
+                drawn.emplace_back(draw.startIndex, draw.startInstance + i);
+        return drawn;
+    }
+
+    // Sub-plan item E5.3 on a device: the G-buffer drawn twice in one graph per frame, from the same scene on the graph
+    // path, once through InstancedOpaqueDrawStrategy and TransparentDrawStrategy bound to the snapshot (SetPackets) and
+    // once through the same kinds walking the graph, each pass with the frame's buffer reads (SceneFrame::bufferReads:
+    // the instance buffer, the skinned vertex buffers, with bindless the geometry and material buffers). A
+    // GBufferFillPass (input assembler or vertex pulling) draws the opaque packets into four colour targets and a depth
+    // target, then the transparent ones into the same targets (GBufferFillPass takes every domain), for a composite
+    // view of two children side by side (one use each; the bound strategy finds each child's packets). The scene: 180
+    // quad instances of four meshes of 1-3 geometries, each mesh in a buffer group of its own (one material spans
+    // groups), opaque, alpha-tested, double-sided, blended and double-sided blended materials, in runs of 45 so that one
+    // mesh's instance slots are consecutive, at distinct depths, a third turned away (parallel planes: no depth ties,
+    // so the images do not depend on the draw order; quads turned at random angles intersect, and a few texels on the
+    // intersection lines then follow the draw order); nodes far outside the view with a child inside it (the walk
+    // keeps them through their subgraph box only) and nodes with a child far outside; two skinned copies of one
+    // prototype in front of every quad. Frames: 1 (load), 2 (a fifth of the quads moved: the upload pass writes), 3
+    // (the characters posed: the skinning pass writes), 4 (idle: every buffer read in its resting state). Per frame: VerifyPlan and no diagnostics; after the execution the bound targets equal the walked ones
+    // byte for byte and are not empty (but the emissive one, as no material is emissive; D3D11: the colour targets);
+    // the bound opaque draws are no more than the walk's, and every instance they draw the walk draws too; the
+    // transparent draws cover the walk's instances (less its subgraph-only ones) in the same order, one instance's
+    // geometries in any order. Validation (debug runtime, GPU-based validation on D3D12, the Khronos layer, nvrhi's)
+    // reports nothing but a known Khronos-layer performance warning (g_UnconsumedAttributeWarnings).
+    void RunGeometry(app::DeviceManager* deviceManager, nvrhi::GraphicsAPI api, bool bindless, bool inputAssembler)
+    {
+        nvrhi::IDevice* device = deviceManager->GetDevice();
+        const std::string tag = std::string(app::GetShaderTypeName(api)) + (bindless ? ", bindless" : "") +
+                                (inputAssembler ? ", input assembler" : ", vertex pulling") + ", geometry passes";
+        const uint32_t warningsBefore = g_Warnings.load();
+        const uint32_t unconsumedBefore = g_UnconsumedAttributeWarnings.load();
+        Fixture fixture(device, api, bindless);
+        nvrhi::AutoPtr<Scene> scene = fixture.MakeScene(true);
+        SceneGraph* graph = scene->GetSceneGraph();
+        SceneGraphNode* root = graph->GetRootNode();
+
+        auto material = [](const char* name, MaterialDomain domain, bool doubleSided, float3 color)
+        {
+            auto m = MAKE_RC_OBJ_PTR(Material);
+            m->name = name;
+            m->domain = domain;
+            m->doubleSided = doubleSided;
+            m->baseOrDiffuseColor = color;
+            m->opacity = domain == MaterialDomain::AlphaBlended ? 0.5f : 1.f;
+            return m;
+        };
+        nvrhi::AutoPtr<Material> red = material("red", MaterialDomain::Opaque, false, float3(1.f, 0.f, 0.f));
+        nvrhi::AutoPtr<Material> green = material("green", MaterialDomain::AlphaTested, false, float3(0.f, 1.f, 0.f));
+        nvrhi::AutoPtr<Material> blue = material("blue", MaterialDomain::Opaque, true, float3(0.f, 0.f, 1.f));
+        nvrhi::AutoPtr<Material> yellow = material("yellow", MaterialDomain::AlphaBlended, false, float3(1.f, 1.f, 0.f));
+        nvrhi::AutoPtr<Material> cyan = material("cyan", MaterialDomain::AlphaBlended, true, float3(0.f, 1.f, 1.f));
+        nvrhi::AutoPtr<MeshInfo> meshes[4] = {
+            MakeQuadMesh("quad", { red }, MAKE_RC_OBJ_PTR(BufferGroup)),
+            MakeQuadMesh("pair", { green, blue }, MAKE_RC_OBJ_PTR(BufferGroup)),
+            MakeQuadMesh("triple", { red, yellow, cyan }, MAKE_RC_OBJ_PTR(BufferGroup)),
+            MakeQuadMesh("glass", { cyan }, MAKE_RC_OBJ_PTR(BufferGroup)),
+        };
+
+        std::vector<SceneGraphNode*> nodes;
+        for (uint32_t i = 0; i < 180; ++i)
+        {
+            auto node = MAKE_RC_OBJ_PTR(SceneGraphNode);
+            node->SetName("quad" + std::to_string(i));
+            node->SetTranslation(double3(-6.0 + 0.9 * double(i % 14), -3.8 + 0.85 * double((i / 14) % 9),
+                                         4.0 + 0.31 * double((i * 37) % 61) + 0.001 * double(i)));
+            if (i % 3 == 0)   // facing away: parallel planes at distinct depths, so no two surfaces tie in depth
+                node->SetRotation(rotationQuat(double3(0.0, 1.0, 0.0), dm::PI_d));
+            node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, meshes[(i / 45) % 4].Get()));   // runs of consecutive slots
+            nodes.push_back(graph->Attach(root, node));
+            if (i % 23 == 5)
+            {
+                // a child far to the side: the node's subgraph box reaches it, its own box stays in the view
+                auto child = MAKE_RC_OBJ_PTR(SceneGraphNode);
+                child->SetName("far" + std::to_string(i));
+                child->SetTranslation(double3(60.0, 0.0, 0.0));
+                child->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, meshes[(i + 1) % 4].Get()));
+                graph->Attach(nodes.back(), child);
+            }
+            if (i % 31 == 7)
+            {
+                // a node far outside whose child is in the view: the walk keeps it through its subgraph box
+                auto outside = MAKE_RC_OBJ_PTR(SceneGraphNode);
+                outside->SetName("outside" + std::to_string(i));
+                outside->SetTranslation(double3(-40.0, 0.0, 10.0));
+                outside->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, meshes[(i + 2) % 4].Get()));
+                auto inside = MAKE_RC_OBJ_PTR(SceneGraphNode);
+                inside->SetName("inside" + std::to_string(i));
+                inside->SetTranslation(double3(40.0 + 0.3 * double(i % 5), 1.0, 2.0005 + 0.4 * double(i / 31)));
+                inside->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, meshes[(i + 3) % 4].Get()));
+                graph->Attach(root, outside);
+                graph->Attach(outside, inside);
+            }
+        }
+        auto skinMaterial = material("skin", MaterialDomain::Opaque, true, float3(0.8f, 0.5f, 0.3f));
+        nvrhi::AutoPtr<MeshInfo> prototype = MakeSkinPrototype("p0", 300, 4, true, false, skinMaterial);
+        auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+        // two skinned copies of one prototype: their own skinned buffer groups, the prototype's material
+        Character characters[2] = { MakeCharacter(graph, factory, prototype, 4, "A", 0.0),
+                                    MakeCharacter(graph, factory, prototype, 4, "B", 0.0) };
+        for (uint32_t c = 0; c < 2; ++c)
+        {
+            characters[c].id = c;
+            characters[c].root->SetTranslation(double3(c ? 1.6 : -1.2, -1.5, c ? 3.0 : 2.5));   // in front of every quad
+            graph->Attach(root, characters[c].root);
+        }
+
+        auto view = MAKE_RC_OBJ_PTR(CompositeView);
+        nvrhi::AutoPtr<PlanarView> children[2];
+        for (uint32_t c = 0; c < 2; ++c)
+        {
+            children[c] = MAKE_RC_OBJ_PTR(PlanarView);
+            children[c]->SetViewport(nvrhi::Viewport(96.f * float(c), 96.f * float(c + 1), 0.f, 128.f, 0.f, 1.f));
+            children[c]->SetMatrices(inverse(translation(float3(c ? 0.15f : -0.15f, 0.f, 0.f))),
+                                     perspProjD3DStyleReverse(radians(70.f), 0.75f, 0.1f));
+            children[c]->UpdateCache();
+            view->AddView(children[c]);
+        }
+        const IView* views[] = { children[0].Get(), children[1].Get() };
+
+        nvrhi::AutoPtr<CommonRenderPasses> commonPasses = MAKE_RC_OBJ_PTR(CommonRenderPasses, device, fixture.shaderFactory);
+        auto gbuffer = MAKE_RC_OBJ_PTR(RecordingGBufferPass, device, commonPasses);
+        GBufferFillPass::CreateParameters gbufferParams;
+        gbufferParams.useInputAssembler = inputAssembler;
+        gbuffer->Init(*fixture.shaderFactory, gbufferParams);
+        auto boundOpaque = MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy);
+        auto boundTransparent = MAKE_RC_OBJ_PTR(TransparentDrawStrategy);
+        auto walkOpaque = MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy);
+        auto walkTransparent = MAKE_RC_OBJ_PTR(TransparentDrawStrategy);
+
+        const nvrhi::Format formats[5] = { nvrhi::Format::SRGBA8_UNORM, nvrhi::Format::SRGBA8_UNORM,
+                                           nvrhi::Format::RGBA16_SNORM, nvrhi::Format::RGBA16_FLOAT, nvrhi::Format::D32 };
+        nvrhi::TextureHandle targets[2][5];
+        for (uint32_t side = 0; side < 2; ++side)
+            for (uint32_t t = 0; t < 5; ++t)
+                targets[side][t] = MakeTarget(device, formats[t], side ? "WalkTarget" : "BoundTarget");
+
+        nvrhi::AutoPtr<IResourceRegistry> registry;
+        nvrhi::AutoPtr<IRenderGraph> renderGraph;
+        check(CreateResourceRegistry(device, &registry) == nvrhi::FS_OK, "registry");
+        check(CreateRenderGraph(registry, &renderGraph) == nvrhi::FS_OK, "render graph");
+        BackendProfile profile;
+        check(ComputeBackendProfile(device, &profile) == nvrhi::FS_OK, "profile");
+        RenderServiceDesc serviceDesc;
+        serviceDesc.scene = scene;
+        serviceDesc.shaderFactory = fixture.shaderFactory;
+        auto service = MAKE_RC_OBJ_PTR(RenderService, device, serviceDesc);
+        scene->FinishedLoading(0);
+        device->waitForIdle();
+
+        uint32_t subgraphOnly = 0, mergedDraws = 0;
+        for (uint32_t frame = 1; frame <= 4; ++frame)
+        {
+            const std::string where = tag + ", frame " + std::to_string(frame);
+            if (frame == 2)
+                for (size_t i = 0; i < nodes.size(); i += 5)
+                    nodes[i]->SetTranslation(nodes[i]->GetTranslation() + double3(0.05, 0.02, 0.5003));
+            if (frame == 3)
+                for (Character& character : characters)
+                    Pose(character, frame);
+            scene->RefreshSceneGraph(frame);
+            renderGraph->Reset();
+            SceneFrame* sceneFrame = nullptr;
+            ExtractDesc extractDesc;
+            extractDesc.views = views;
+            extractDesc.viewCount = 2;
+            extractDesc.frameIndex = frame;
+            check(service->Extract(renderGraph, nullptr, extractDesc, &sceneFrame) == nvrhi::FS_OK && sceneFrame,
+                  where + ": Extract");
+            check(service->AddUploadPasses(renderGraph, sceneFrame) == nvrhi::FS_OK, where + ": AddUploadPasses");
+            check(service->AddSkinningPasses(renderGraph, sceneFrame) == nvrhi::FS_OK, where + ": AddSkinningPasses");
+            check(sceneFrame->bufferReadCount >= (bindless ? 4u : 2u), where + ": buffer reads");
+            const uint32_t passesBefore = renderGraph->GetPassCount();
+
+            boundOpaque->SetPackets(sceneFrame->snapshot);
+            boundTransparent->SetPackets(sceneFrame->snapshot);
+            RecordingContext contexts[2][2];   // [bound, walk][opaque, transparent]
+            for (uint32_t side = 0; side < 2; ++side)
+            {
+                GeometryGraphInputs inputs;
+                inputs.name = side ? "GBufferWalk" : "GBufferBound";
+                inputs.view = view;
+                inputs.viewPrev = view;
+                inputs.rootNode = side ? root : nullptr;
+                inputs.colorTargetCount = 4;
+                for (uint32_t t = 0; t < 4; ++t)
+                    inputs.colorTargets[t] = renderGraph->ImportTexture(targets[side][t], TargetState(formats[t]),
+                                                                        TargetState(formats[t]));
+                inputs.depth = renderGraph->ImportTexture(targets[side][4], TargetState(formats[4]),
+                                                          TargetState(formats[4]));
+                inputs.clearTargets = true;
+                inputs.bufferReads = sceneFrame->bufferReads;
+                inputs.bufferReadCount = sceneFrame->bufferReadCount;
+                inputs.drawStrategy = side ? static_cast<IDrawStrategy*>(walkOpaque.Get()) : boundOpaque.Get();
+                inputs.passContext = &contexts[side][0];
+                const GeometryGraphOutputs opaque = gbuffer->AddToGraph(renderGraph, inputs);
+                for (uint32_t t = 0; t < 4; ++t)
+                    inputs.colorTargets[t] = opaque.colorTargets[t];
+                inputs.depth = opaque.depth;
+                inputs.clearTargets = false;
+                inputs.drawStrategy = side ? static_cast<IDrawStrategy*>(walkTransparent.Get()) : boundTransparent.Get();
+                inputs.passContext = &contexts[side][1];
+                gbuffer->AddToGraph(renderGraph, inputs);
+            }
+            check(renderGraph->GetPassCount() == passesBefore + 8, where + ": a use per child view of four geometry passes");
+
+            nvrhi::AutoPtr<ICompiledRenderGraph> plan;
+            const nvrhi::FRESULT compiled = renderGraph->Compile(profile, CompileOptions(), &plan);
+            nvrhi::string diagnostics;
+            renderGraph->GetDiagnostics(diagnostics);
+            check(compiled == nvrhi::FS_OK, where + ": Compile: " + std::string(diagnostics.c_str()));
+            check(diagnostics.empty(), where + ": diagnostics: " + std::string(diagnostics.c_str()));
+            nvrhi::string report;
+            check(VerifyPlan(plan, renderGraph, nullptr, &report) == nvrhi::FS_OK,
+                  where + ": VerifyPlan: " + std::string(report.c_str()));
+            check(renderGraph->Execute(plan, ExecuteDesc()) == nvrhi::FS_OK, where + ": Execute");
+            service->EndFrame(true);
+            device->waitForIdle();
+
+            // the images
+            // D3D11 copies a depth texture only whole (CopyResource), which nvrhi's staging copy does not do: its depth
+            // target is not read back there (the colour targets are)
+            const uint32_t readTargets = api == nvrhi::GraphicsAPI::D3D11 ? 4 : 5;
+            std::vector<uint8_t> images[2][5];
+            for (uint32_t side = 0; side < 2; ++side)
+                for (uint32_t t = 0; t < readTargets; ++t)
+                    images[side][t] = ReadTexture(device, targets[side][t]);
+            for (uint32_t t = 0; t < readTargets; ++t)
+            {
+                const std::vector<uint8_t>& bound = images[0][t];
+                const std::vector<uint8_t>& walked = images[1][t];
+                if (bound != walked)
+                {
+                    // where, and the depths there (a tie: equal depths, different surfaces)
+                    const size_t texel = nvrhi::getFormatInfo(formats[t]).bytesPerBlock;
+                    size_t differing = 0;
+                    for (size_t i = 0; i + texel <= bound.size(); i += texel)
+                    {
+                        if (std::memcmp(bound.data() + i, walked.data() + i, texel) == 0)
+                            continue;
+                        if (++differing <= 4)
+                        {
+                            float depths[2] = {};
+                            if (!images[0][4].empty())
+                            {
+                                std::memcpy(&depths[0], images[0][4].data() + (i / texel) * 4, 4);
+                                std::memcpy(&depths[1], images[1][4].data() + (i / texel) * 4, 4);
+                            }
+                            std::printf("%s: target %u texel (%zu, %zu): depth %.9g bound, %.9g walked; bytes",
+                                        where.c_str(), t, (i / texel) % 192, (i / texel) / 192, depths[0], depths[1]);
+                            for (size_t b = 0; b < texel; ++b)
+                                std::printf(" %02x/%02x", bound[i + b], walked[i + b]);
+                            std::printf("\n");
+                        }
+                    }
+                    std::printf("%s: target %u: %zu of %zu texels differ\n", where.c_str(), t, differing,
+                                bound.size() / texel);
+                }
+                check(bound == walked, where + ": target " + std::to_string(t) + " equal");
+                if (t != 3)   // no material is emissive
+                    check(std::any_of(bound.begin(), bound.end(), [](uint8_t b) { return b != 0; }),
+                          where + ": target " + std::to_string(t) + " has content");
+            }
+
+            // the draws, per child view: opaque no more than the walk's, every instance drawn the walk draws too;
+            // transparent in the walk's order, less its subgraph-only instances, one instance's geometries in any order
+            size_t draws[2][2] = {};   // [bound, walk][opaque, transparent]
+            for (uint32_t side = 0; side < 2; ++side)
+                for (uint32_t pass = 0; pass < 2; ++pass)
+                    check(contexts[side][pass].views.size() == 2, where + ": two uses of each geometry pass");
+            for (uint32_t v = 0; v < 2; ++v)
+            {
+                const std::string inView = where + ", view " + std::to_string(v);
+                const std::vector<DrawRecord>& boundOpaqueDraws = contexts[0][0].views[v];
+                const std::vector<DrawRecord>& walkOpaqueDraws = contexts[1][0].views[v];
+                check(!boundOpaqueDraws.empty() && boundOpaqueDraws.size() <= walkOpaqueDraws.size(),
+                      inView + ": " + std::to_string(boundOpaqueDraws.size()) + " opaque draws bound, " +
+                          std::to_string(walkOpaqueDraws.size()) + " walked");
+                auto boundDrawn = Expand(boundOpaqueDraws);
+                auto walkDrawn = Expand(walkOpaqueDraws);
+                std::sort(boundDrawn.begin(), boundDrawn.end());
+                std::sort(walkDrawn.begin(), walkDrawn.end());
+                check(std::includes(walkDrawn.begin(), walkDrawn.end(), boundDrawn.begin(), boundDrawn.end()),
+                      inView + ": the bound opaque instances are the walk's");
+                subgraphOnly += uint32_t(walkDrawn.size() - boundDrawn.size());
+                mergedDraws += uint32_t(walkOpaqueDraws.size() - boundOpaqueDraws.size());
+
+                const auto boundOrder = Expand(contexts[0][1].views[v]);
+                auto boundSet = boundOrder;
+                std::sort(boundSet.begin(), boundSet.end());
+                std::vector<std::pair<uint32_t, uint32_t>> walkOrder;
+                for (const auto& drawn : Expand(contexts[1][1].views[v]))
+                {
+                    if (std::binary_search(boundSet.begin(), boundSet.end(), drawn))
+                        walkOrder.push_back(drawn);
+                    else
+                        ++subgraphOnly;
+                }
+                check(walkOrder.size() == boundOrder.size() && !boundOrder.empty(), inView + ": the transparent instances");
+                for (size_t i = 0; i < boundOrder.size();)
+                {
+                    size_t j = i;
+                    while (j < boundOrder.size() && boundOrder[j].second == boundOrder[i].second)
+                        ++j;
+                    std::vector<std::pair<uint32_t, uint32_t>> a(boundOrder.begin() + i, boundOrder.begin() + j);
+                    std::vector<std::pair<uint32_t, uint32_t>> b(walkOrder.begin() + i, walkOrder.begin() + j);
+                    std::sort(a.begin(), a.end());
+                    std::sort(b.begin(), b.end());
+                    check(a == b, inView + ": the transparent order");
+                    i = j;
+                }
+                for (uint32_t side = 0; side < 2; ++side)
+                    for (uint32_t pass = 0; pass < 2; ++pass)
+                        draws[side][pass] += contexts[side][pass].views[v].size();
+            }
+            std::printf("ok: %s: images equal; two views: opaque draws %zu bound, %zu walked; transparent draws %zu "
+                        "bound, %zu walked\n", where.c_str(), draws[0][0], draws[1][0], draws[0][1], draws[1][1]);
+            device->runGarbageCollection();
+        }
+        check(subgraphOnly > 0, tag + ": the walk drew instances through subgraph boxes only");
+        check(mergedDraws > 0, tag + ": the packets merged draws the walk did not");
+        check(g_Warnings.load() == warningsBefore, tag + ": no warning");
+        const uint32_t unconsumed = g_UnconsumedAttributeWarnings.load() - unconsumedBefore;
+        check(unconsumed == 0 || (api == nvrhi::GraphicsAPI::VULKAN && inputAssembler),
+              tag + ": the unconsumed-attribute warning only from the input assembler on Vulkan");
+        if (unconsumed)
+            std::printf("ok: %s: %u known Khronos-layer warnings (an input attribute the vertex shader does not read)\n",
+                        tag.c_str(), unconsumed);
+
+        service = nullptr;
+        renderGraph = nullptr;
+        registry = nullptr;
+        device->waitForIdle();
+        device->runGarbageCollection();
+    }
+
     // E5.1's device-only checks: a scene not on the graph path is refused; an empty scene on it adds nothing and warns
     // about nothing.
     void ServiceChecks(app::DeviceManager* deviceManager, nvrhi::GraphicsAPI api)
@@ -1478,6 +1862,8 @@ int main(int argc, char** argv)
     log::SetCallback([](log::Severity severity, const char* text) {
         if (severity >= log::Severity::Error)
             ++g_Errors;
+        else if (severity == log::Severity::Warning && std::strstr(text, "not consumed by vertex shader"))
+            ++g_UnconsumedAttributeWarnings;
         else if (severity == log::Severity::Warning)
             ++g_Warnings;
         if (severity >= log::Severity::Warning)
@@ -1530,6 +1916,8 @@ int main(int argc, char** argv)
         RunSkinning(deviceManager, api, false);
         if (api != nvrhi::GraphicsAPI::D3D11)
             RunSkinning(deviceManager, api, true);
+        for (bool inputAssembler : { false, true })
+            RunGeometry(deviceManager, api, api != nvrhi::GraphicsAPI::D3D11, inputAssembler);
 
         deviceManager->Shutdown();
         deviceManager = nullptr;

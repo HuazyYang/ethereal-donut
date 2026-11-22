@@ -67,6 +67,8 @@ namespace donut::render
         const engine::ICompositeView* view = nullptr;
         const engine::ICompositeView* viewPrev = nullptr;
         engine::SceneGraphNode* rootNode = nullptr;
+        // Prepared for each child view in turn. Strategies are stateful: give each IGeometryPass object its own (the
+        // uses of two pass objects may record on two threads at once; DrawStrategy.h).
         IDrawStrategy* drawStrategy = nullptr;
         GeometryPassContext* passContext = nullptr;
         ResourceId colorTargets[8] = { InvalidResourceId, InvalidResourceId, InvalidResourceId, InvalidResourceId,
@@ -82,10 +84,13 @@ namespace donut::render
         ResourceId shaderReads[4] = { InvalidResourceId, InvalidResourceId, InvalidResourceId, InvalidResourceId };
         uint32_t shaderReadCount = 0;
         bool materialEvents = false;
-        // Buffers the draws read (plan step E5, sub-plan item E5.3, open point 5): the scene's instance, geometry and
-        // material buffers and the skinned vertex buffers (SceneFrame::bufferReads), declared as vertex-buffer and SRV
-        // reads in the vertex and pixel stages, so that the graph orders the pass after the upload and skinning passes
-        // that write them. An array in the graph's arena; none by default.
+        // Buffers the draws read (plan step E5, sub-plan item E5.3, open point 5): the scene's instance, geometry
+        // and material buffers and the skinned vertex buffers (SceneFrame::bufferReads), declared as reads in the
+        // vertex and pixel stages (a buffer made with isVertexBuffer as a vertex-buffer and SRV read, any other as an
+        // SRV read), so that the graph orders the pass after the upload and skinning passes that write them. With
+        // buffer reads the uses are Tracked and Restore: the body's tracker may move a buffer from the combined read
+        // state into the one state a binding asks for, and Restore returns it (an id that names no buffer is skipped,
+        // and without any read declared the uses stay Tracked). Read only while AddToGraph runs; none by default.
         const ResourceId* bufferReads = nullptr;
         uint32_t bufferReadCount = 0;
     };

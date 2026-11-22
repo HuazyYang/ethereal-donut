@@ -22,12 +22,160 @@
 
 #include <donut/render/DrawStrategy.h>
 #include <donut/render/GeometryPasses.h>
+#include <donut/render/RenderExtract.h>
 #include <donut/engine/SceneGraph.h>
 #include <donut/engine/View.h>
+#include <donut/core/log.h>
+
+#include <algorithm>
+#include <functional>
+#include <thread>
 
 using namespace donut::math;
 using namespace donut::engine;
 using namespace donut::render;
+
+// ------------------------------------------------------------------------- packet adapters (plan step E5, item E5.3)
+
+namespace
+{
+    // More views than any frame extracts: a larger count is a snapshot that died with its frame (Debug builds fill the
+    // arena with 0xDD at IRenderGraph::Reset).
+    constexpr uint32_t c_MaxPlausibleSnapshotViews = 1u << 16;
+
+    uint64_t CurrentThreadKey() noexcept
+    {
+        // never 0, the key of "no thread yet"
+        return uint64_t(std::hash<std::thread::id>()(std::this_thread::get_id())) | 1u;
+    }
+}
+
+void DrawStrategyUseCheck::OnPrepare() noexcept
+{
+    const bool overlapping = m_Preparing.fetch_add(1, std::memory_order_acq_rel) != 0;
+    m_Owner.store(CurrentThreadKey(), std::memory_order_release);
+    if (overlapping && !m_Warned.exchange(true))
+        log::warning("A draw strategy was prepared on two threads at once: give each IGeometryPass object its own "
+                     "strategy object (DrawStrategy.h)");
+    m_Preparing.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void DrawStrategyUseCheck::OnNext() noexcept
+{
+    const uint64_t owner = m_Owner.load(std::memory_order_acquire);
+    if (owner != 0 && owner != CurrentThreadKey() && !m_Warned.exchange(true))
+        log::warning("A draw strategy was drained on another thread than the one that prepared it last: give each "
+                     "IGeometryPass object its own strategy object (DrawStrategy.h)");
+}
+
+void PacketDrawItems::Bind(const RenderSnapshot* snapshot, DrawPacketPass pass) noexcept
+{
+    m_Snapshot = snapshot;
+    m_Pass = pass;
+    m_Next = 0;
+    m_End = 0;
+    m_WarnedViews.clear();
+}
+
+void PacketDrawItems::Prepare(const IView& view)
+{
+    m_UseCheck.Prepare();
+    m_Next = 0;
+    m_End = 0;
+    if (!m_Snapshot || uint32_t(m_Pass) >= c_DrawPacketPassCount)
+        return;
+
+    auto warnOnce = [this](const IView* key, const char* message)
+    {
+        if (std::find(m_WarnedViews.begin(), m_WarnedViews.end(), key) != m_WarnedViews.end())
+            return;
+        m_WarnedViews.push_back(key);
+        log::warning("PacketDrawItems: %s (view %p)", message, static_cast<const void*>(key));
+    };
+    if (m_Snapshot->viewCount > c_MaxPlausibleSnapshotViews)
+    {
+        warnOnce(nullptr, "the bound snapshot is not of this frame (it dies at IRenderGraph::Reset); bind the strategy "
+                          "again after each RenderService::Extract; no draw items");
+        return;
+    }
+
+    // The view by address: the child views of a composite view, prepared in turn, each get their own packets.
+    const ExtractedView* extracted = nullptr;
+    for (uint32_t v = 0; v < m_Snapshot->viewCount; ++v)
+    {
+        if (m_Snapshot->views[v].view == &view)
+        {
+            extracted = &m_Snapshot->views[v];
+            break;
+        }
+    }
+    if (!extracted)
+    {
+        warnOnce(&view, "the view was not extracted into the bound snapshot (ExtractDesc::views); it gets no draw items");
+        return;
+    }
+
+    const SnapshotRange range = extracted->packets[uint32_t(m_Pass)];
+    if (range.first > m_Snapshot->packets.count || range.count > m_Snapshot->packets.count - range.first)
+    {
+        warnOnce(&view, "the view's packet range is outside the bound snapshot; no draw items");
+        return;
+    }
+    m_Next = range.first;
+    m_End = range.first + range.count;
+}
+
+const DrawItem* PacketDrawItems::Next() noexcept
+{
+    m_UseCheck.Next();
+    if (m_Next >= m_End || !m_Snapshot)   // m_End is 0 unless Prepare selected packets of the bound snapshot
+        return nullptr;
+    const DrawPackets& packets = m_Snapshot->packets;
+    const VisibleInstances& instances = m_Snapshot->instances;
+    while (m_Next < m_End)
+    {
+        const uint32_t i = m_Next++;
+        const uint32_t visible = packets.visibleInstances[i];
+        if (visible >= instances.count)
+            continue;
+        const MeshInfo* mesh = instances.meshInfos[visible];
+        const uint32_t geometryIndex = packets.geometryIndices[i];
+        // The mesh and its geometries were taken at extraction; a mesh edited in place since then (a structural change
+        // inside the render-read scope) may have fewer geometries: such a packet is dropped, not read out of range.
+        if (!mesh || geometryIndex >= mesh->geometries.size())
+            continue;
+        const MeshGeometry* geometry = mesh->geometries[geometryIndex].Get();
+
+        m_Item.instance = instances.leaves[visible];
+        m_Item.mesh = mesh;
+        m_Item.geometry = geometry;
+        m_Item.material = geometry->material.Get();
+        m_Item.buffers = mesh->buffers.Get();
+        m_Item.distanceToCamera =
+            m_Pass == DrawPacketPass::Transparent ? GetTransparentDrawKeyDistance(packets.keys[i]) : 0.f;
+        m_Item.cullMode = nvrhi::RasterCullMode(packets.cullModes[i]);
+        m_Item.userData = nullptr;
+        return &m_Item;
+    }
+    return nullptr;
+}
+
+void PacketDrawStrategy::SetPackets(const RenderSnapshot* snapshot, DrawPacketPass pass)
+{
+    m_Packets.Bind(snapshot, pass);
+}
+
+void PacketDrawStrategy::PrepareForView(engine::SceneGraphNode*, const engine::IView& view)
+{
+    m_Packets.Prepare(view);
+}
+
+const DrawItem* PacketDrawStrategy::GetNextItem()
+{
+    return m_Packets.Next();
+}
+
+// ------------------------------------------------------------------------------------------ legacy strategies
 
 const DrawItem* PassthroughDrawStrategy::GetNextItem()
 {
@@ -144,14 +292,35 @@ void InstancedOpaqueDrawStrategy::FillChunk()
 
 void donut::render::InstancedOpaqueDrawStrategy::PrepareForView(engine::SceneGraphNode *rootNode, const engine::IView& view)
 {
+    if (m_Packets.IsBound())
+    {
+        m_Packets.Prepare(view);   // checks its own use
+        return;
+    }
+
+    m_UseCheck.Prepare();
     m_Walker = SceneGraphWalker(rootNode);
     m_ViewFrustum = view.GetViewFrustum();
     m_InstanceChunk.clear();
     m_ReadPtr = 0;
 }
 
+void InstancedOpaqueDrawStrategy::SetPackets(const RenderSnapshot* snapshot)
+{
+    m_Packets.Bind(snapshot, DrawPacketPass::Opaque);
+    // Either mode starts from PrepareForView: nothing of the other mode's last view is drained.
+    m_Walker = SceneGraphWalker();
+    m_InstanceChunk.clear();
+    m_InstancePtrChunk.clear();
+    m_ReadPtr = 0;
+}
+
 const DrawItem* InstancedOpaqueDrawStrategy::GetNextItem()
 {
+    if (m_Packets.IsBound())
+        return m_Packets.Next();
+
+    m_UseCheck.Next();
     if (m_ReadPtr >= m_InstancePtrChunk.size())
         FillChunk();
 
@@ -170,8 +339,23 @@ static int CompareDrawItemsTransparent(const DrawItem* a, const DrawItem* b)
     return a->distanceToCamera > b->distanceToCamera;
 }
 
+void TransparentDrawStrategy::SetPackets(const RenderSnapshot* snapshot)
+{
+    m_Packets.Bind(snapshot, DrawPacketPass::Transparent);
+    m_InstancesToDraw.clear();
+    m_InstancePtrsToDraw.clear();
+    m_ReadPtr = 0;
+}
+
 void TransparentDrawStrategy::PrepareForView(engine::SceneGraphNode* rootNode, const IView& view)
 {
+    if (m_Packets.IsBound())
+    {
+        m_Packets.Prepare(view);   // checks its own use
+        return;
+    }
+
+    m_UseCheck.Prepare();
     m_ReadPtr = 0;
 
     m_InstancesToDraw.clear();
@@ -270,6 +454,10 @@ void TransparentDrawStrategy::PrepareForView(engine::SceneGraphNode* rootNode, c
 
 const DrawItem* TransparentDrawStrategy::GetNextItem()
 {
+    if (m_Packets.IsBound())
+        return m_Packets.Next();
+
+    m_UseCheck.Next();
     if (m_ReadPtr >= m_InstancePtrsToDraw.size())
     {
         m_InstancesToDraw.clear();

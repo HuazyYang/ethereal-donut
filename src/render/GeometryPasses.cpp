@@ -214,6 +214,11 @@ namespace
         donut::render::ResourceId depth;
         donut::render::ResourceId shaderReads[4];
         uint32_t shaderReadCount;
+        // GeometryGraphInputs::bufferReads and the access of each (none for an id that names no buffer); read only by
+        // Setup, which AddPass calls at once.
+        const donut::render::ResourceId* bufferReads;
+        const donut::render::Access* bufferAccesses;
+        uint32_t bufferReadCount;
         nvrhi::SubresourceRegion region;
         donut::render::ClearValue colorClear;
         donut::render::ClearValue depthClear;
@@ -232,6 +237,40 @@ donut::render::GeometryGraphOutputs IGeometryPass::AddToGraph(IRenderGraph* grap
     outputs.depth = inputs.depth;
     if (!inputs.view || !inputs.drawStrategy || !inputs.passContext)
         return outputs;
+
+    // Buffer reads (open point 5): a buffer made for vertex input is read as a vertex buffer and as an SRV (the body
+    // binds it either way: input assembler or vertex pulling), any other buffer as an SRV. The declared states are then
+    // the resting states of the graph path's buffers: VertexBuffer | ShaderResource for the skinned vertex buffers
+    // (engine::c_SkinnedVertexBufferRestingState), ShaderResource for the geometry and material buffers
+    // (engine::c_GpuSceneRestingState); the instance buffer, a vertex buffer too, is read in the combined state.
+    Access* bufferAccesses = nullptr;
+    uint32_t bufferReadCount = 0;
+    uint32_t declaredReads = 0;
+    if (inputs.bufferReads && inputs.bufferReadCount)
+    {
+        bufferAccesses = static_cast<Access*>(
+            graph->AllocateFrameData(sizeof(Access) * inputs.bufferReadCount, alignof(Access)));
+        if (!bufferAccesses)
+            return outputs;
+        bufferReadCount = inputs.bufferReadCount;
+        for (uint32_t i = 0; i < bufferReadCount; ++i)
+        {
+            const ResourceId id = inputs.bufferReads[i];
+            nvrhi::BufferDesc desc;
+            bufferAccesses[i] = Access::None;
+            if (id != InvalidResourceId && graph->GetBufferDesc(id, desc) == nvrhi::FS_OK)
+            {
+                bufferAccesses[i] = desc.isVertexBuffer ? Access::VertexBuffer | Access::ShaderRead : Access::ShaderRead;
+                ++declaredReads;
+            }
+        }
+    }
+    // The body binds these buffers through nvrhi's tracker, which asks for one exact state per binding (an SRV, or a
+    // vertex buffer) and so moves a buffer out of the combined state the plan put it in. Restore (Tracked, and the
+    // declared ranges returned to the plan's states after the body) keeps the plan's view of every state true; it also
+    // turns off the Debug check of Tracked bodies for the use. Without a buffer read declared the pass stays Tracked,
+    // as before. (Declaring the exact state the body binds, asked of the pass, would keep it Tracked: a follow-up.)
+    const PassFlags passFlags = declaredReads ? PassFlags::Tracked | PassFlags::Restore : PassFlags::Tracked;
 
     const ViewType::Enum supportedViewTypes = GetSupportedViewTypes();
     const uint32_t viewCount = inputs.view->GetNumChildViews(supportedViewTypes);
@@ -253,6 +292,9 @@ donut::render::GeometryGraphOutputs IGeometryPass::AddToGraph(IRenderGraph* grap
         use->shaderReadCount = std::min<uint32_t>(inputs.shaderReadCount, 4);
         for (uint32_t i = 0; i < 4; ++i)
             use->shaderReads[i] = inputs.shaderReads[i];
+        use->bufferReads = inputs.bufferReads;
+        use->bufferAccesses = bufferAccesses;
+        use->bufferReadCount = bufferReadCount;
         const nvrhi::TextureSubresourceSet subresources = use->view->GetSubresources();
         use->region = nvrhi::SubresourceRegion().setMips(subresources.baseMipLevel, 1)
             .setSlices(subresources.baseArraySlice, subresources.numArraySlices);
@@ -263,7 +305,7 @@ donut::render::GeometryGraphOutputs IGeometryPass::AddToGraph(IRenderGraph* grap
         use->materialEvents = inputs.materialEvents;
 
         // AddPass calls Setup, which writes the new versions into the use; the next view continues from them.
-        graph->AddPass(PassDesc{ inputs.name, PassType::Raster, PassFlags::Tracked, 0 }, this, use, nullptr);
+        graph->AddPass(PassDesc{ inputs.name, PassType::Raster, passFlags, 0 }, this, use, nullptr);
         for (uint32_t i = 0; i < use->colorTargetCount; ++i)
             outputs.colorTargets[i] = use->colorTargets[i];
         outputs.depth = use->depth;
@@ -279,6 +321,14 @@ nvrhi::FRESULT IGeometryPass::Setup(ISetupContext* context, void* data) noexcept
     {
         if (use.shaderReads[i] != InvalidResourceId)
             context->Read(use.shaderReads[i], Access::ShaderRead, nvrhi::ShaderType::Pixel, nvrhi::SubresourceRegion());
+    }
+    for (uint32_t i = 0; i < use.bufferReadCount; ++i)
+    {
+        if (use.bufferAccesses[i] != Access::None)
+        {
+            context->Read(use.bufferReads[i], use.bufferAccesses[i],
+                          nvrhi::ShaderType::Vertex | nvrhi::ShaderType::Pixel, nvrhi::SubresourceRegion());
+        }
     }
     for (uint32_t i = 0; i < use.colorTargetCount; ++i)
     {
