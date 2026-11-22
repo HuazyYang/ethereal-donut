@@ -48,11 +48,18 @@
 #include <donut/app/DeviceManager.h>
 #include <donut/core/log.h>
 #include <donut/core/vfs/VFS.h>
+#include <donut/engine/CommonRenderPasses.h>
 #include <donut/engine/DescriptorTableManager.h>
 #include <donut/engine/GpuScene.h>
 #include <donut/engine/Scene.h>
 #include <donut/engine/ShaderFactory.h>
 #include <donut/engine/TextureCache.h>
+#include <donut/engine/View.h>
+#include <donut/render/DepthPass.h>
+#include <donut/render/DrawStrategy.h>
+#include <donut/render/ForwardShadingPass.h>
+#include <donut/render/GBufferFillPass.h>
+#include <donut/render/GeometryPasses.h>
 #include <donut/render/GpuSceneUploadPass.h>
 #include <donut/render/RenderExtract.h>
 #include <donut/render/RenderGraph.h>
@@ -827,6 +834,308 @@ namespace
         }
     };
 
+    // ------------------------------------------------------------------------------- geometry-pass helpers
+
+    // A mesh of quads side by side along x, one geometry per material, with normals, tangents and texture coordinates,
+    // appended to `buffers` (meshes may share a group, as an importer makes the meshes of one file); the indices are
+    // relative to each geometry's first vertex.
+    nvrhi::AutoPtr<MeshInfo> MakeQuadMesh(const std::string& name, const std::vector<Material*>& materials,
+                                          BufferGroup* buffers)
+    {
+        auto mesh = MAKE_RC_OBJ_PTR(MeshInfo);
+        mesh->name = name;
+        mesh->buffers = buffers;
+        mesh->vertexOffset = uint32_t(buffers->positionData.size());
+        mesh->indexOffset = uint32_t(buffers->indexData.size());
+        box3 bounds = box3::empty();
+        for (uint32_t g = 0; g < uint32_t(materials.size()); ++g)
+        {
+            const uint32_t firstVertex = uint32_t(buffers->positionData.size());
+            const uint32_t firstIndex = uint32_t(buffers->indexData.size());
+            const float x = 1.2f * float(g);
+            const float3 corners[4] = { float3(x, 0.f, 0.f), float3(x + 1.f, 0.f, 0.f), float3(x + 1.f, 1.f, 0.f),
+                                        float3(x, 1.f, 0.f) };
+            for (const float3& corner : corners)
+            {
+                buffers->positionData.push_back(corner);
+                buffers->normalData.push_back(vectorToSnorm8(float3(0.f, 0.f, -1.f)));
+                buffers->tangentData.push_back(vectorToSnorm8(float4(1.f, 0.f, 0.f, 1.f)));
+                buffers->texcoord1Data.push_back(float2(corner.x - x, corner.y));
+            }
+            for (uint32_t index : { 0u, 2u, 1u, 0u, 3u, 2u })
+                buffers->indexData.push_back(index);
+            auto geometry = MAKE_RC_OBJ_PTR(MeshGeometry);
+            geometry->material = materials[g];
+            geometry->indexOffsetInMesh = firstIndex - mesh->indexOffset;
+            geometry->vertexOffsetInMesh = firstVertex - mesh->vertexOffset;
+            geometry->numIndices = 6;
+            geometry->numVertices = 4;
+            geometry->objectSpaceBounds = box3(float3(x, 0.f, -0.01f), float3(x + 1.f, 1.f, 0.01f));
+            bounds |= geometry->objectSpaceBounds;
+            mesh->geometries.push_back(geometry);
+        }
+        mesh->totalIndices = uint32_t(buffers->indexData.size()) - mesh->indexOffset;
+        mesh->totalVertices = uint32_t(buffers->positionData.size()) - mesh->vertexOffset;
+        mesh->objectSpaceBounds = bounds;
+        return mesh;
+    }
+
+    // The state a target rests in between frames (its import's entry and exit).
+    nvrhi::ResourceStates TargetState(nvrhi::Format format)
+    {
+        return nvrhi::getFormatInfo(format).hasDepth ? nvrhi::ResourceStates::DepthWrite
+                                                     : nvrhi::ResourceStates::RenderTarget;
+    }
+
+    // A render target imported into the graph (not host-kept), moved into its resting state once.
+    nvrhi::TextureHandle MakeTarget(nvrhi::IDevice* device, nvrhi::Format format, const char* name)
+    {
+        nvrhi::TextureDesc desc;
+        desc.width = 192;
+        desc.height = 128;
+        desc.format = format;
+        desc.isRenderTarget = true;
+        desc.isTypeless = nvrhi::getFormatInfo(format).hasDepth;   // D3D11: a depth format with a shader view
+        desc.debugName = name;
+        nvrhi::TextureHandle texture;
+        device->createTexture(desc, &texture);
+        check(texture != nullptr, std::string("create ") + name);
+        nvrhi::CommandListHandle commandList;
+        device->createCommandList(nvrhi::CommandListParameters(), &commandList);
+        commandList->open();
+        commandList->setEnableAutomaticBarriers(false);
+        const nvrhi::ResourceBarrier barrier =
+            nvrhi::ResourceBarrier::Transition(texture, nvrhi::ResourceStates::Unknown, TargetState(format));
+        commandList->barriers(&barrier, 1);
+        commandList->setEnableAutomaticBarriers(true);
+        commandList->close();
+        device->executeCommandList(commandList);
+        device->waitForIdle();
+        return texture;
+    }
+
+    // The texels of a target outside the graph, rows packed.
+    std::vector<uint8_t> ReadTexture(nvrhi::IDevice* device, nvrhi::ITexture* texture)
+    {
+        const nvrhi::TextureDesc& desc = texture->getDesc();
+        const nvrhi::ResourceStates state = TargetState(desc.format);
+        nvrhi::TextureDesc stagingDesc = desc;
+        stagingDesc.isRenderTarget = false;
+        stagingDesc.debugName = "ReadTexture";
+        nvrhi::StagingTextureHandle staging;
+        device->createStagingTexture(stagingDesc, nvrhi::CpuAccessMode::Read, &staging);
+        check(staging != nullptr, "a staging texture");
+        nvrhi::CommandListHandle commandList;
+        device->createCommandList(nvrhi::CommandListParameters(), &commandList);
+        commandList->open();
+        commandList->beginTrackingTextureState(texture, nvrhi::AllSubresources, state);
+        commandList->copyTexture2(staging, nvrhi::TextureSlice(), texture, nvrhi::TextureSlice());
+        commandList->setTextureState(texture, nvrhi::AllSubresources, state);
+        commandList->commitBarriers();
+        commandList->close();
+        device->executeCommandList(commandList);
+        device->waitForIdle();
+        size_t pitch = 0;
+        const auto* data = static_cast<const uint8_t*>(
+            device->mapStagingTexture(staging, nvrhi::TextureSlice(), nvrhi::CpuAccessMode::Read, pitch));
+        check(data != nullptr, "map a staging texture");
+        const size_t rowBytes = size_t(desc.width) * nvrhi::getFormatInfo(desc.format).bytesPerBlock;
+        std::vector<uint8_t> texels(rowBytes * desc.height);
+        for (uint32_t y = 0; y < desc.height; ++y)
+            std::memcpy(texels.data() + rowBytes * y, data + pitch * y, rowBytes);
+        device->unmapStagingTexture(staging);
+        return texels;
+    }
+
+    // ------------------------------------------------------------------------------- buffer-group switch (older than E5)
+
+    // The input binding set across a change of buffer group without a change of material, with vertex pulling (the
+    // passes' default): RenderView calls SetupInputBuffers alone then, and DepthPass, GBufferFillPass and
+    // ForwardShadingPass used to keep the previous group's input set (its vertex and instance buffers) in the graphics
+    // state, so a draw read another group's vertex buffer at its own group's offsets. Found by item E5.3's GPU test;
+    // fixed in the three passes' SetupInputBuffers. A Scene on the CPU path (host-kept buffers, drawn outside a graph):
+    // a quad mesh in one buffer group, a second geometry of a mesh in another group (its vertices start past the first
+    // group's), and two skinned instances of one prototype in different poses (each has its own skinned buffer group and
+    // the prototype's material). All four draws share one material. Each pass draws them in one RenderView, and again
+    // one RenderView per draw (each starts from SetupMaterial) into a second set of targets: the targets are equal byte
+    // for byte, and not empty. Without the fix the depth, G-buffer and forward images differ.
+    void RunBufferGroupSwitch(app::DeviceManager* deviceManager, nvrhi::GraphicsAPI api)
+    {
+        nvrhi::IDevice* device = deviceManager->GetDevice();
+        const std::string tag = std::string(app::GetShaderTypeName(api)) + ", buffer-group switch";
+        const uint32_t warningsBefore = g_Warnings.load();
+        Fixture fixture(device, api, false);
+        nvrhi::AutoPtr<Scene> scene = fixture.MakeScene(false);
+        SceneGraph* graph = scene->GetSceneGraph();
+        SceneGraphNode* root = graph->GetRootNode();
+
+        auto material = MAKE_RC_OBJ_PTR(Material);
+        material->name = "shared";
+        material->doubleSided = true;
+        material->baseOrDiffuseColor = float3(0.9f, 0.4f, 0.2f);
+        auto groupA = MAKE_RC_OBJ_PTR(BufferGroup);
+        auto groupB = MAKE_RC_OBJ_PTR(BufferGroup);
+        nvrhi::AutoPtr<MeshInfo> meshA = MakeQuadMesh("a", { material }, groupA);
+        nvrhi::AutoPtr<MeshInfo> meshB = MakeQuadMesh("b", { material, material }, groupB);
+        auto attach = [&](MeshInfo* mesh, double3 position)
+        {
+            auto node = MAKE_RC_OBJ_PTR(SceneGraphNode);
+            node->SetTranslation(position);
+            auto leaf = MAKE_RC_OBJ_PTR(MeshInstance, mesh);
+            node->SetLeaf(leaf);
+            graph->Attach(root, node);
+            return leaf;
+        };
+        nvrhi::AutoPtr<MeshInstance> instanceA = attach(meshA, double3(-2.6, 0.2, 5.0));
+        nvrhi::AutoPtr<MeshInstance> instanceB = attach(meshB, double3(-0.6, 0.2, 5.5));
+        nvrhi::AutoPtr<MeshInfo> prototype = MakeSkinPrototype("p", 300, 4, true, false, material);
+        auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+        Character characters[2] = { MakeCharacter(graph, factory, prototype, 4, "C", 0.0),
+                                    MakeCharacter(graph, factory, prototype, 4, "D", 0.0) };
+        for (uint32_t c = 0; c < 2; ++c)
+        {
+            characters[c].id = 2 * c;
+            characters[c].root->SetTranslation(double3(c ? 2.0 : -1.5, -2.5, 6.0));
+            Pose(characters[c], 5);
+            graph->Attach(root, characters[c].root);
+        }
+        scene->FinishedLoading(0);
+        device->waitForIdle();
+
+        // one material, four buffer groups, in this order
+        std::vector<DrawItem> items;
+        auto add = [&items](const MeshInstance* instance, uint32_t geometry)
+        {
+            const MeshInfo* mesh = instance->GetMesh();
+            DrawItem item{};
+            item.instance = instance;
+            item.mesh = mesh;
+            item.geometry = mesh->geometries[geometry];
+            item.material = item.geometry->material;
+            item.buffers = mesh->buffers;
+            item.cullMode = nvrhi::RasterCullMode::None;
+            items.push_back(item);
+        };
+        add(instanceA, 0);
+        add(instanceB, 1);
+        add(characters[0].skinned, 0);
+        add(characters[1].skinned, 0);
+        check(items[0].buffers != items[1].buffers && items[2].buffers != items[3].buffers &&
+              items[0].material == items[3].material, tag + ": one material, distinct buffer groups");
+
+        auto view = MAKE_RC_OBJ_PTR(PlanarView);
+        view->SetViewport(nvrhi::Viewport(192.f, 128.f));
+        view->SetMatrices(affine3::identity(), perspProjD3DStyleReverse(radians(70.f), 1.5f, 0.1f));
+        view->UpdateCache();
+        nvrhi::AutoPtr<CommonRenderPasses> commonPasses = MAKE_RC_OBJ_PTR(CommonRenderPasses, device, fixture.shaderFactory);
+        auto depthPass = MAKE_RC_OBJ_PTR(DepthPass, device, commonPasses);
+        depthPass->Init(*fixture.shaderFactory, DepthPass::CreateParameters());
+        auto gbufferPass = MAKE_RC_OBJ_PTR(GBufferFillPass, device, commonPasses);
+        gbufferPass->Init(*fixture.shaderFactory, GBufferFillPass::CreateParameters());
+        auto forwardPass = MAKE_RC_OBJ_PTR(ForwardShadingPass, device, commonPasses);
+        forwardPass->Init(*fixture.shaderFactory, ForwardShadingPass::CreateParameters());
+
+        struct Case
+        {
+            const char* name;
+            IGeometryPass* pass;
+            std::vector<nvrhi::Format> formats;   // colour targets, then depth
+        };
+        const Case cases[] = {
+            { "DepthPass", depthPass, { nvrhi::Format::D32 } },
+            { "GBufferFillPass", gbufferPass,
+              { nvrhi::Format::SRGBA8_UNORM, nvrhi::Format::SRGBA8_UNORM, nvrhi::Format::RGBA16_SNORM,
+                nvrhi::Format::RGBA16_FLOAT, nvrhi::Format::D32 } },
+            { "ForwardShadingPass", forwardPass, { nvrhi::Format::RGBA16_FLOAT, nvrhi::Format::D32 } },
+        };
+        nvrhi::CommandListHandle commandList;
+        device->createCommandList(nvrhi::CommandListParameters(), &commandList);
+        for (const Case& c : cases)
+        {
+            const std::string where = tag + ", " + c.name;
+            if (api == nvrhi::GraphicsAPI::D3D11 && c.pass == depthPass.Get())
+                continue;   // depth only, which D3D11 does not read back here
+            std::vector<nvrhi::TextureHandle> targets[2];
+            nvrhi::FramebufferHandle framebuffers[2];
+            for (uint32_t side = 0; side < 2; ++side)
+            {
+                nvrhi::FramebufferDesc framebufferDesc;
+                for (nvrhi::Format format : c.formats)
+                {
+                    targets[side].push_back(MakeTarget(device, format, side ? "SeparateDraws" : "OneRenderView"));
+                    if (nvrhi::getFormatInfo(format).hasDepth)
+                        framebufferDesc.setDepthAttachment(targets[side].back());
+                    else
+                        framebufferDesc.addColorAttachment(targets[side].back());
+                }
+                device->createFramebuffer(framebufferDesc, &framebuffers[side]);
+                check(framebuffers[side] != nullptr, where + ": framebuffer");
+            }
+
+            commandList->open();
+            for (uint32_t side = 0; side < 2; ++side)
+            {
+                for (nvrhi::ITexture* texture : targets[side])
+                {
+                    const nvrhi::Format format = texture->getDesc().format;
+                    commandList->beginTrackingTextureState(texture, nvrhi::AllSubresources, TargetState(format));
+                    if (nvrhi::getFormatInfo(format).hasDepth)
+                        commandList->clearDepthStencilTexture(texture, nvrhi::AllSubresources, true, 0.f, false, 0);
+                    else
+                        commandList->clearTextureFloat(texture, nvrhi::AllSubresources, nvrhi::Color(0.f));
+                }
+            }
+            DepthPass::Context depthContext;
+            GBufferFillPass::Context gbufferContext;
+            ForwardShadingPass::Context forwardContext;
+            GeometryPassContext* context = c.pass == depthPass.Get() ? static_cast<GeometryPassContext*>(&depthContext)
+                : c.pass == gbufferPass.Get() ? static_cast<GeometryPassContext*>(&gbufferContext)
+                : static_cast<GeometryPassContext*>(&forwardContext);
+            if (c.pass == forwardPass.Get())
+                forwardPass->PrepareLights(forwardContext, commandList, {}, float3(0.6f), float3(0.2f), {});
+            auto strategy = MAKE_RC_OBJ_PTR(PassthroughDrawStrategy);
+            strategy->SetData(items.data(), items.size());
+            RenderView(commandList, view, view, framebuffers[0], *strategy, *c.pass, *context);
+            for (const DrawItem& item : items)
+            {
+                strategy->SetData(&item, 1);
+                RenderView(commandList, view, view, framebuffers[1], *strategy, *c.pass, *context);
+            }
+            for (uint32_t side = 0; side < 2; ++side)
+                for (nvrhi::ITexture* texture : targets[side])
+                    commandList->setTextureState(texture, nvrhi::AllSubresources, TargetState(texture->getDesc().format));
+            commandList->commitBarriers();
+            commandList->close();
+            device->executeCommandList(commandList);
+            device->waitForIdle();
+
+            for (size_t t = 0; t < c.formats.size(); ++t)
+            {
+                if (api == nvrhi::GraphicsAPI::D3D11 && nvrhi::getFormatInfo(c.formats[t]).hasDepth)
+                    continue;   // D3D11 reads a depth target back only whole (see RunGeometry); colour is compared
+                const std::vector<uint8_t> one = ReadTexture(device, targets[0][t]);
+                const std::vector<uint8_t> separate = ReadTexture(device, targets[1][t]);
+                size_t differing = 0;
+                const size_t texel = nvrhi::getFormatInfo(c.formats[t]).bytesPerBlock;
+                for (size_t i = 0; i + texel <= one.size(); i += texel)
+                    differing += std::memcmp(one.data() + i, separate.data() + i, texel) != 0 ? 1 : 0;
+                check(differing == 0, where + ": target " + std::to_string(t) + ": " + std::to_string(differing) +
+                                          " texels differ between one RenderView and one per draw");
+                if (c.formats[t] != nvrhi::Format::RGBA16_FLOAT || c.pass == forwardPass.Get())
+                    check(std::any_of(one.begin(), one.end(), [](uint8_t b) { return b != 0; }),
+                          where + ": target " + std::to_string(t) + " has content");
+            }
+            std::printf("ok: %s: four draws of one material over four buffer groups equal the draws made one by one\n",
+                        where.c_str());
+        }
+        check(g_Warnings.load() == warningsBefore, tag + ": no warning");
+
+        commandList = nullptr;
+        scene = nullptr;
+        device->waitForIdle();
+        device->runGarbageCollection();
+    }
+
     // The skinning pass against Scene::UpdateSkinnedMeshes. Two scenes built alike, one on the graph path driven
     // through RenderService::Extract / AddUploadPasses / AddSkinningPasses / EndFrame, one on the CPU path
     // (Scene::Refresh): after every executed frame every skinned vertex buffer (read back through graph passes from
@@ -1208,6 +1517,8 @@ int main(int argc, char** argv)
         }
         check(deviceManager->CreateHeadlessDevice(params), "headless device");
         std::printf("device: %s\n", deviceManager->GetRendererString());
+
+        RunBufferGroupSwitch(deviceManager, api);
 
         for (bool useService : { false, true })
         {

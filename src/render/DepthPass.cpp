@@ -366,6 +366,12 @@ void DepthPass::SetupInputBuffers(GeometryPassContext& abstractContext, const en
     else
     {
         context.inputBindingSet = GetOrCreateInputBindingSet(buffers);
+        // SetupMaterial appends the input set to the bindings, and RenderView calls SetupInputBuffers alone when the
+        // buffers change and the material does not: replace it here, or the next draws read the previous buffer
+        // group's vertex and instance buffers at this group's offsets.
+        if (!state.bindings.empty() && state.bindings.back() &&
+            state.bindings.back()->getLayout() == m_InputBindingLayout.Get())
+            state.bindings.back() = context.inputBindingSet;
         context.positionOffset = uint32_t(buffers->getVertexBufferRange(VertexAttribute::Position).byteOffset);
         context.texCoordOffset = uint32_t(buffers->getVertexBufferRange(VertexAttribute::TexCoord1).byteOffset);
     }
