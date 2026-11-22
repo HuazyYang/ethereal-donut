@@ -25,6 +25,7 @@
 
 #include "SceneGraphStore.h"
 #include "EcsSchedulerImpl.h"
+#include "SharedJobSystem.h"   // the job system that graphs share unless SetJobSystem gives them another
 
 #include <donut/core/log.h>
 #include <donut/core/query_cast.h>
@@ -122,25 +123,6 @@ namespace donut::engine
         using namespace ecs;
 
         constexpr uint32_t c_None = ~0u;
-
-        // The job system that graphs share unless SetJobSystem gives them another. It is never released: its workers
-        // would have to be joined from a static destructor, after the process may have ended them. So a module that
-        // links donut_engine statically and is unloaded (a DLL) leaves its threads running code that is gone: such a
-        // module gives its graphs a job system it owns (SetJobSystem) and releases it before it unloads.
-        IJobSystem* GetSharedJobSystem() noexcept
-        {
-            static IJobSystem* const s_Jobs = []() noexcept
-            {
-                JobSystemDesc desc;
-                desc.debugName = "SceneGraph";
-                desc.maxExternalThreads = 64;   // every thread that may refresh a graph at the same time
-                IJobSystem* jobs = nullptr;
-                if (NVRHI_FAILED(CreateJobSystem(desc, &jobs)))
-                    log::warning("SceneGraph: cannot create the shared job system");
-                return jobs;
-            }();
-            return s_Jobs;
-        }
 
         // The local transform as the old SceneGraphNode::UpdateLocalTransform composed it; the trace goldens pin the
         // order of the operations bit for bit.
@@ -694,6 +676,8 @@ namespace donut::engine
         // Set when the thread's scratch is destroyed (thread exit, or the main thread's before static destruction): a
         // graph torn down after that gets scratch of its own. Trivially destructible, so it stays readable then.
         thread_local bool t_ScratchGone = false;
+        // The same for RunDeepTasks's walk stack.
+        thread_local bool t_DeepStackGone = false;
     }
 
     SceneGraphStore::ScratchScope::ScratchScope(SceneGraphStore& s) noexcept
@@ -2094,7 +2078,27 @@ namespace donut::engine
     {
         DeepContext& ctx = *static_cast<DeepContext*>(context);
         SceneGraphStore& store = *ctx.store;
-        thread_local std::vector<Entity> stack;   // per thread, kept for its capacity
+        // Per thread, kept for its capacity. A range can run on a thread whose thread_locals are destroyed already
+        // (exit destroys the main thread's before the atexit handlers, which may refresh a graph): it then uses a
+        // stack of its own, like ScratchScope.
+        struct StackHolder
+        {
+            std::vector<Entity> entities;
+            ~StackHolder() { t_DeepStackGone = true; }
+        };
+        std::unique_ptr<std::vector<Entity>> ownStack;   // built only then (a Debug vector allocates when built)
+        std::vector<Entity>* stackPointer = nullptr;
+        if (!t_DeepStackGone)
+        {
+            thread_local StackHolder holder;
+            stackPointer = &holder.entities;
+        }
+        else
+        {
+            ownStack = std::make_unique<std::vector<Entity>>();
+            stackPointer = ownStack.get();
+        }
+        std::vector<Entity>& stack = *stackPointer;
         uint64_t rows = 0;
         uint64_t written = 0;
         for (uint32_t e = begin; e < end; ++e)

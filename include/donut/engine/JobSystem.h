@@ -102,9 +102,10 @@ namespace donut::engine
                                  void* context) noexcept = 0;
     };
 
-    // FE_INVALID_ARGS unless maxExternalThreads is 1 to 64 and workerThreadCount at most 256. The last Release runs the
-    // jobs still scheduled, with the releasing thread's help, then stops the workers; it must not come from inside a
-    // call or a job of the same system.
+    // FE_INVALID_ARGS unless maxExternalThreads is 1 to 64 and workerThreadCount at most 256. Returns once every worker
+    // is past thread start-up, so a process that ends right after leaves no worker in C runtime start-up code. The last
+    // Release runs the jobs still scheduled, with the releasing thread's help, then stops the workers; it must not come
+    // from inside a call or a job of the same system.
     nvrhi::FRESULT CreateJobSystem(const JobSystemDesc& desc, IJobSystem** ppJobSystem) noexcept;
 
     // An adapter with the shape of the render graph's ParallelForFunction (rdg design 10.1): set

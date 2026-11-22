@@ -39,6 +39,7 @@
 //   thread waits for, signals.
 
 #include <donut/engine/JobSystem.h>
+#include "SharedJobSystem.h"
 
 #include <donut/core/log.h>
 #include <nvrhi/core/foundation.h>
@@ -77,6 +78,17 @@ namespace donut::engine::jobs
     constexpr uint32_t c_None = ~0u;
     constexpr uint32_t c_PauseRounds = 64;                    // idle rounds that pause; the later ones yield
     constexpr uint32_t c_PausesPerRound = 8;
+    constexpr uint32_t c_StartupTimeoutMs = 2000;             // see Initialize
+
+    // Shared::stop: what an idle worker does. Leave: it leaves its loop (when its state goes from Running to
+    // Leaving). Park: it sleeps until the process ends, and never runs thread-exit code (StopWorkers).
+    constexpr uint32_t c_StopNone = 0;
+    constexpr uint32_t c_StopLeave = 1;
+    constexpr uint32_t c_StopPark = 2;
+    // A worker's state; Running moves to Leaving (the worker) or to Parked (StopWorkers), whichever comes first.
+    constexpr uint32_t c_WorkerRunning = 0;
+    constexpr uint32_t c_WorkerLeaving = 1;
+    constexpr uint32_t c_WorkerParked = 2;
 
     // The low half of JobSlot::status; the high half is the generation, which is never 0 in a handle.
     // Completing: the ranges are done and no dependency can be added, but the dependents and edges are still being
@@ -498,6 +510,12 @@ namespace donut::engine::jobs
         bool IsComplete(JobHandle job) noexcept override;
         void ParallelFor(uint32_t count, uint32_t grainSize, PFN_JobFunction function, void* context) noexcept override;
 
+        // The shared system's exit handler (SharedJobSystem.h): the workers finish the tickets they can find, then
+        // leave, and are joined. The workers still busy after `timeoutMs` are parked instead (they sleep once their
+        // jobs return); so are all of them when the calling thread is inside a call or job of this system. Returns
+        // whether every worker was joined. The system stays usable: Wait and ParallelFor run on the calling thread.
+        bool StopWorkers(uint32_t timeoutMs, uint32_t& parkedCount) noexcept;
+
     private:
         // The state the threads share, allocated on its own so that its alignment holds.
         struct Shared
@@ -511,8 +529,9 @@ namespace donut::engine::jobs
             std::mutex slotMutex;
             std::condition_variable slotCondition;
             alignas(64) std::atomic<uint32_t> liveJobs{ 0 };   // scheduled and not finished
-            std::atomic<bool> quit{ false };
+            std::atomic<uint32_t> stop{ c_StopNone };
             std::atomic<bool> warnedFull{ false };
+            std::atomic<uint32_t> runningWorkers{ 0 };         // workers past start-up (Initialize waits for them)
         };
 
         // The calling thread's slot for the duration of a call: the one it holds, or a free external slot, waited for.
@@ -571,6 +590,7 @@ namespace donut::engine::jobs
         void WaitFor(uint32_t index, uint32_t generation, uint32_t self) noexcept;
         void Drain() noexcept;
         void WorkerMain(uint32_t self) noexcept;
+        [[noreturn]] static void Park() noexcept;
 
         uint32_t m_ExternalCount = 0;
         uint32_t m_WorkerCount = 0;
@@ -582,6 +602,7 @@ namespace donut::engine::jobs
         uint32_t* m_EdgeJobs = nullptr;    // per edge: the job that waits
         WorkDeque* m_Deques = nullptr;     // per slot: external slots, then workers
         std::thread* m_Threads = nullptr;
+        std::atomic<uint32_t>* m_WorkerStates = nullptr;   // per worker: c_WorkerRunning, Leaving or Parked
         uint32_t m_StartedThreads = 0;
     };
 
@@ -604,7 +625,8 @@ namespace donut::engine::jobs
         m_EdgeJobs = new (std::nothrow) uint32_t[c_EdgeCapacity];
         m_Deques = new (std::nothrow) WorkDeque[m_ThreadCount];
         m_Threads = new (std::nothrow) std::thread[m_WorkerCount];
-        if (!m_Shared || !m_Jobs || !m_EdgeJobs || !m_Deques || !m_Threads ||
+        m_WorkerStates = new (std::nothrow) std::atomic<uint32_t>[m_WorkerCount];
+        if (!m_Shared || !m_Jobs || !m_EdgeJobs || !m_Deques || !m_Threads || !m_WorkerStates ||
             !m_Shared->freeJobs.Initialize(c_JobCapacity) || !m_Shared->freeEdges.Initialize(c_EdgeCapacity) ||
             !m_Shared->injection.Initialize(c_JobCapacity))
             return nvrhi::FE_OUT_OF_MEMORY;
@@ -616,6 +638,8 @@ namespace donut::engine::jobs
         }
         m_Shared->freeExternalSlots.store(m_ExternalCount == 64 ? ~0ull : (1ull << m_ExternalCount) - 1,
                                           std::memory_order_relaxed);
+        for (uint32_t i = 0; i < m_WorkerCount; ++i)
+            m_WorkerStates[i].store(c_WorkerRunning, std::memory_order_relaxed);
 
         for (uint32_t i = 0; i < m_WorkerCount; ++i)
         {
@@ -629,6 +653,24 @@ namespace donut::engine::jobs
                 return nvrhi::FE_OUT_OF_MEMORY;
             }
             ++m_StartedThreads;
+        }
+        // Start-up completes before CreateJobSystem returns. A worker still in thread start-up runs C runtime code,
+        // and a process that ends meanwhile can tear that runtime down under it: exit, _Exit and quick_exit
+        // uninitialize a static CRT before ExitProcess ends the threads (SharedJobSystem.h). Once started, an idle
+        // worker touches no C runtime state (it spins, yields, or sleeps on an SRW-based condition variable).
+        // Under the loader lock (DllMain, a DLL's static constructors and destructors) no thread can start: creation
+        // there is not supported, and the wait gives up after c_StartupTimeoutMs.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(c_StartupTimeoutMs);
+        for (uint32_t round = 0; m_Shared->runningWorkers.load(std::memory_order_acquire) < m_StartedThreads; ++round)
+        {
+            Relax(round);
+            if (round >= c_PauseRounds && std::chrono::steady_clock::now() >= deadline)
+            {
+                log::warning("CreateJobSystem('%s'): %u of %u workers have not started after %u ms (created under the "
+                             "loader lock?); it returns without waiting for them", m_Name,
+                             m_StartedThreads - m_Shared->runningWorkers.load(), m_StartedThreads, c_StartupTimeoutMs);
+                break;
+            }
         }
         return nvrhi::FS_OK;
     }
@@ -646,19 +688,95 @@ namespace donut::engine::jobs
             }
             // Clean shutdown: every scheduled job runs, with this thread's help, before the workers stop.
             Drain();
-            m_Shared->quit.store(true, std::memory_order_seq_cst);
+            m_Shared->stop.store(c_StopLeave, std::memory_order_seq_cst);
             m_Shared->events.WakeAll();
             for (uint32_t i = 0; i < m_StartedThreads; ++i)
             {
-                if (m_Threads[i].joinable())
+                // A parked worker (StopWorkers) never leaves; its thread was detached.
+                if (m_Threads[i].joinable() && m_WorkerStates[i].load(std::memory_order_acquire) != c_WorkerParked)
                     m_Threads[i].join();
             }
         }
+        delete[] m_WorkerStates;
         delete[] m_Threads;
         delete[] m_Deques;
         delete[] m_EdgeJobs;
         delete[] m_Jobs;
         delete m_Shared;
+    }
+
+    // Exit runs this while the C runtime holds its exit lock (UCRT runs the atexit and at_quick_exit tables under
+    // it), so a job that registers an exit function meanwhile (a function-local static with a destructor, built for
+    // the first time) blocks until the process ends, and so does a job stuck on state the exit tore down: an
+    // unbounded join would hang the exit. And a worker that left its loop during the C runtime's teardown would run
+    // thread-exit code (the std::thread state, thread_local destructors, _endthreadex) against it. So the workers that
+    // are not joined in time are parked instead: they sleep, once their jobs return, until ExitProcess ends them.
+    bool JobSystemImpl::StopWorkers(uint32_t timeoutMs, uint32_t& parkedCount) noexcept
+    {
+        parkedCount = 0;
+        if (!m_Shared || m_StartedThreads == 0)
+            return true;
+        if (FindThreadIndex() != c_None)
+        {
+            // A worker cannot join itself, and the others may wait for ranges on this thread's stack.
+            m_Shared->stop.store(c_StopPark, std::memory_order_seq_cst);
+            m_Shared->events.WakeAll();
+            parkedCount = m_StartedThreads;
+            return false;
+        }
+        // A worker leaves only when it finds no ticket, so the jobs in flight finish first.
+        m_Shared->stop.store(c_StopLeave, std::memory_order_seq_cst);
+        m_Shared->events.WakeAll();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        for (uint32_t round = 0;; ++round)
+        {
+            uint32_t leaving = 0;
+            for (uint32_t i = 0; i < m_StartedThreads; ++i)
+                leaving += m_WorkerStates[i].load(std::memory_order_acquire) == c_WorkerLeaving ? 1 : 0;
+            if (leaving == m_StartedThreads)
+                break;
+            if (round < c_PauseRounds)
+                Relax(round);
+            else if (std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            else
+            {
+                // The workers that finish their jobs later sleep instead of leaving: whichever of this thread and the
+                // worker moves its state out of Running first decides (WorkerMain).
+                m_Shared->stop.store(c_StopPark, std::memory_order_seq_cst);
+                for (uint32_t i = 0; i < m_StartedThreads; ++i)
+                {
+                    uint32_t expected = c_WorkerRunning;
+                    if (m_WorkerStates[i].compare_exchange_strong(expected, c_WorkerParked, std::memory_order_acq_rel))
+                    {
+                        m_Threads[i].detach();
+                        ++parkedCount;
+                    }
+                }
+                break;
+            }
+        }
+        // The leaving workers are past their loop: each join ends once the thread's exit code has run.
+        for (uint32_t i = 0; i < m_StartedThreads; ++i)
+        {
+            if (!m_Threads[i].joinable())
+                continue;
+            try
+            {
+                m_Threads[i].join();
+            }
+            catch (...)
+            {
+                ++parkedCount;
+            }
+        }
+        return parkedCount == 0;
+    }
+
+    void JobSystemImpl::Park() noexcept
+    {
+        for (;;)
+            std::this_thread::sleep_for(std::chrono::hours(24));
     }
 
     uint32_t JobSystemImpl::FindThreadIndex() const noexcept
@@ -1177,6 +1295,7 @@ namespace donut::engine::jobs
         ThreadFrame frame{ this, self, t_ThreadFrames };
         t_ThreadFrames = &frame;
         Shared& shared = *m_Shared;
+        shared.runningWorkers.fetch_add(1, std::memory_order_release);
         uint32_t idle = 0;
         for (;;)
         {
@@ -1188,15 +1307,23 @@ namespace donut::engine::jobs
                 idle = 0;
                 continue;
             }
-            if (shared.quit.load(std::memory_order_acquire))
-                break;
+            const uint32_t stop = shared.stop.load(std::memory_order_acquire);
+            if (stop != c_StopNone)
+            {
+                uint32_t expected = c_WorkerRunning;
+                if (stop == c_StopLeave &&
+                    m_WorkerStates[self - m_ExternalCount].compare_exchange_strong(expected, c_WorkerLeaving,
+                                                                                   std::memory_order_acq_rel))
+                    break;
+                Park();   // StopWorkers parked this worker, or parks them all
+            }
             if (idle < m_SpinCount)
             {
                 Relax(idle++);
                 continue;
             }
             const uint32_t key = shared.events.PrepareWait();
-            if (MayHaveWork() || shared.quit.load(std::memory_order_relaxed))
+            if (MayHaveWork() || shared.stop.load(std::memory_order_relaxed) != c_StopNone)
             {
                 shared.events.CancelWait();
                 continue;
@@ -1242,5 +1369,82 @@ namespace donut::engine
         }
         *ppJobSystem = system;
         return nvrhi::FS_OK;
+    }
+
+    namespace
+    {
+        // Set once the shared system exists; read by the exit handler. Trivial types: nothing to destroy at exit.
+        std::atomic<jobs::JobSystemImpl*> g_SharedJobSystem{ nullptr };
+        std::atomic<uint32_t> g_SharedExitResult{ uint32_t(SharedJobSystemExit::NotRun) };
+        std::atomic<uint32_t> g_SharedExitTimeoutMs{ 5000 };
+        std::atomic<bool> g_SharedExitStarted{ false };
+
+        void StopSharedWorkersAtExit()
+        {
+            jobs::JobSystemImpl* system = g_SharedJobSystem.load(std::memory_order_acquire);
+            if (!system || g_SharedExitStarted.exchange(true))
+                return;
+            const uint32_t timeoutMs = g_SharedExitTimeoutMs.load(std::memory_order_relaxed);
+            uint32_t parked = 0;
+            SharedJobSystemExit result = SharedJobSystemExit::Joined;
+            if (!system->StopWorkers(timeoutMs, parked))
+            {
+                result = system->GetCurrentWorkerIndex() != ~0u ? SharedJobSystemExit::ParkedFromInside
+                                                                : SharedJobSystemExit::Parked;
+                if (result == SharedJobSystemExit::Parked)
+                    log::warning("SceneGraph: %u workers of the shared job system still ran jobs %u ms into the "
+                                 "process exit; they are left parked", parked, timeoutMs);
+            }
+            g_SharedExitResult.store(uint32_t(result), std::memory_order_release);
+        }
+
+        // The atexit handlers of a DLL run in its DLL_PROCESS_DETACH, where joining threads is not safe.
+        bool IsLinkedIntoExecutable() noexcept
+        {
+#if defined(_WIN32)
+            HMODULE module = nullptr;
+            const DWORD flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+            if (!GetModuleHandleExW(flags, reinterpret_cast<LPCWSTR>(reinterpret_cast<const void*>(
+                                               &StopSharedWorkersAtExit)), &module))
+                return false;
+            return module == GetModuleHandleW(nullptr);
+#else
+            return true;
+#endif
+        }
+    }
+
+    IJobSystem* GetSharedJobSystem() noexcept
+    {
+        static IJobSystem* const s_Jobs = []() noexcept
+        {
+            JobSystemDesc desc;
+            desc.debugName = "SceneGraph";
+            desc.maxExternalThreads = 64;   // every thread that may refresh a graph at the same time
+            IJobSystem* system = nullptr;
+            if (NVRHI_FAILED(CreateJobSystem(desc, &system)))
+            {
+                log::warning("SceneGraph: cannot create the shared job system");
+                return system;
+            }
+            // Registered after the system is complete, so the handlers run before the C runtime's teardown and the
+            // destructors of the statics constructed before this one (SharedJobSystem.h).
+            g_SharedJobSystem.store(static_cast<jobs::JobSystemImpl*>(system), std::memory_order_release);
+            if (IsLinkedIntoExecutable() &&
+                (std::atexit(&StopSharedWorkersAtExit) != 0 || std::at_quick_exit(&StopSharedWorkersAtExit) != 0))
+                log::warning("SceneGraph: cannot register the exit handlers of the shared job system");
+            return system;
+        }();
+        return s_Jobs;
+    }
+
+    SharedJobSystemExit GetSharedJobSystemExitResult() noexcept
+    {
+        return SharedJobSystemExit(g_SharedExitResult.load(std::memory_order_acquire));
+    }
+
+    void SetSharedJobSystemExitTimeout(uint32_t milliseconds) noexcept
+    {
+        g_SharedExitTimeoutMs.store(milliseconds, std::memory_order_relaxed);
     }
 }

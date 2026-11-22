@@ -52,13 +52,16 @@ target_compile_definitions(test_ecs_determinism PRIVATE
 
 # The ECS tests reach the world's internals (allocation counters, chunk layout, entity table) through the private
 # headers in src/engine (EcsWorldImpl.h and the ones beside it); so do the scene-graph storage test (step E3) and the
-# GPU scene test (step E4), for the allocation counter.
+# GPU scene test (step E4), for the allocation counter, and the exit test of the shared job system (SharedJobSystem.h).
 foreach(test_src ${donut_engine_tests})
     get_filename_component(test_name "${test_src}" NAME_WE)
-    if(test_name MATCHES "^test_ecs_" OR test_name STREQUAL "test_scene_graph_store" OR test_name STREQUAL "test_gpu_scene")
+    if(test_name MATCHES "^test_ecs_" OR test_name STREQUAL "test_scene_graph_store" OR test_name STREQUAL "test_gpu_scene"
+       OR test_name STREQUAL "test_job_system_exit")
         target_include_directories("${test_name}" PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
     endif()
 endforeach()
+# The exit test runs ~130 child processes; a child that hangs is killed after 30 s (Windows), this bounds the rest.
+set_tests_properties(test_job_system_exit PROPERTIES TIMEOUT 300)
 
 # Baseline timings of the scene graph (aggregate docs/plans/2026-11-21-donut-ecs.md, step E0.4). The glob above skips
 # it; ctest runs it only in its short smoke mode, the Release numbers come from `bench_scene_graph`.

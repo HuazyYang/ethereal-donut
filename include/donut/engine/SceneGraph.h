@@ -810,9 +810,14 @@ namespace donut::engine
         // The scheduler that runs the TransformPropagation and Bounds phases in Refresh, on the graph's job system.
         [[nodiscard]] IScheduler* GetScheduler() const;
         // The job system the phases run on: by default one that the process shares (hardware threads minus one
-        // workers), which is never released (its workers cannot be joined during static destruction): a DLL that
-        // links donut_engine and is unloaded gives its graphs a job system of its own and releases it first. Set it
-        // between frames; null returns to the shared one.
+        // workers), which is never released. In an executable, an atexit handler stops and joins its workers before
+        // the C runtime tears down (the jobs in flight finish first, for 5 s at most; workers still busy then are
+        // parked until the process ends; afterwards Refresh runs on the calling thread). On Windows a DLL's exit
+        // handlers run under the loader lock, where no thread can be joined, so none is registered there: a DLL that
+        // links donut_engine and is unloaded gives its graphs a job system of its own and releases it first.
+        // Elsewhere a shared object registers the handler too, and it runs at dlclose (glibc runs a shared object's
+        // atexit handlers then); a dlclose from inside a job is not supported. Set it between frames; null returns
+        // to the shared one.
         void SetJobSystem(IJobSystem* jobSystem);
 
         // The render service's isolation guard (plan step E5, sub-plan item E5.1, open point 12), module-private. Between
