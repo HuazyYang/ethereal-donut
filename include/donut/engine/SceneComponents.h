@@ -220,6 +220,9 @@ namespace donut::engine
     DONUT_ECS_TAG(PointLightLeaf, "7d2a8c83-fcab-4177-9c95-9e8fda778a3d")
     struct AnimationLeaf { };
     DONUT_ECS_TAG(AnimationLeaf, "7e13c6c4-00cc-42c3-a5aa-2befa3723396")
+    // On the entities of leaves whose class sets LeafTypeDesc::dynamicBounds: the Bounds system reads their boxes again.
+    struct DynamicBoundsLeaf { };
+    DONUT_ECS_TAG(DynamicBoundsLeaf, "3f0f3c8e-5a0e-4c55-9d2e-6b8f2a6f1c41")
 
     // What a leaf class keeps in columns (D19). One static instance per leaf class, returned by
     // SceneGraphLeaf::GetTypeDesc(); read once per leaf when it is attached, never per entity in a system.
@@ -230,6 +233,13 @@ namespace donut::engine
         uint32_t tagCount;
         const ComponentTypeDesc* const* columns;        // state that lives in columns; empty for object-only leaves
         uint32_t columnCount;
+        // The leaf's GetLocalBoundingBox changes by itself (a simulation's extent): at every Refresh that runs the
+        // phases, the Bounds system reads it again for every such leaf (LocalBounds, then WorldBounds), so that culling
+        // and subgraph bounds follow without SceneGraphNode::InvalidateContent. GetLocalBoundingBox is then called on
+        // job-system threads, for different leaves at once. A box that changes while nothing in the graph changes is
+        // read at the next Refresh that runs (or call InvalidateContent). Off: LocalBounds follows the leaf only at
+        // attach, SetLeaf and InvalidateContent.
+        bool dynamicBounds = false;
     };
 
     // The state of an object that is in no graph (5.3): owned by the object, moved into rows when it is attached and

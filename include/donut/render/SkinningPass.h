@@ -24,11 +24,13 @@
 // docs/plans/2026-11-21-donut-ecs-e5.md, items E5.0 and E5.5).
 //
 // One compute use over the snapshot's skinned instances (RenderSnapshot::skinnedInstances: the instances whose joints
-// moved this frame or the previous one, with their joint matrices computed at extraction). Per instance, as
-// Scene::UpdateSkinnedMeshes does: write the joint matrices into the leaf's joint buffer, then dispatch
-// skinning_cs.hlsl with the constants of engine::FillSkinningConstants (Scene.h), which both paths call. The skinned
-// meshes' vertex buffers are imported by the caller and written here (UAVWrite); no pass body writes a leaf (the
-// first-frame flag was taken at extraction).
+// moved this frame or the previous one, with their joint matrices computed at extraction). Its Prepare writes each
+// instance's joint matrices into the leaf's host-kept joint buffer on the graph's upload list (automatic barriers, as
+// Scene::UpdateSkinnedMeshes writes them); its Execute dispatches skinning_cs.hlsl per instance with the constants of
+// engine::FillSkinningConstants (Scene.h), which both paths call. The skinned meshes' vertex buffers are imported by
+// the caller and written here (UAVWrite); no pass body writes a leaf (the first-frame flag was taken at extraction).
+// The buffers and constants of each dispatch are resolved at AddToGraph, so that no leaf is read after it, and the
+// pass holds the buffers until its next AddToGraph.
 //
 // Module-private C++, like GpuScene.h.
 
@@ -82,8 +84,11 @@ namespace donut::render
         SkinningPass(const SkinningPass&) = delete;
         SkinningPass& operator=(const SkinningPass&) = delete;
 
-        // Render graph (13.2). Adds nothing when the snapshot has no skinned instance.
+        // Render graph (13.2). Adds nothing when the snapshot has no skinned instance. Every call ages the cached
+        // binding sets (one per skinned vertex buffer; dropped after 64 calls unused), with or without skinning.
         SkinningGraphOutputs AddToGraph(IRenderGraph* graph, const SkinningGraphInputs& inputs);
+        // The cached binding sets (tests).
+        [[nodiscard]] uint32_t GetCachedBindingSetCount() const noexcept;
 
         nvrhi::FRESULT Setup(ISetupContext* context, void* data) noexcept override;
         nvrhi::FRESULT Prepare(IPrepareContext* context, void* data) noexcept override;

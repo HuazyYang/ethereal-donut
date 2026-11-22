@@ -27,7 +27,15 @@
 // Rules:
 // - One world per graph (D18). The graph's API runs on one thread at a time, outside phases (5.6); concurrent readers
 //   (views walking the graph in parallel) are allowed between structural changes. Readers never write the store except
-//   the on-demand caches, which are filled under m_CacheMutex and published per node with release order.
+//   the on-demand caches, which are filled under m_CacheMutex and published per node with release order. No reader
+//   may run during Refresh (it writes the columns, the caches and the row hints); readers after Refresh returned see
+//   its writes through the release of m_SubgraphEpoch and the acquire of IsSubgraphCurrent.
+// - Subgraph bounds and content flags (5.7) are computed by Refresh for the nodes with children along the changed
+//   paths, in parallel per depth bucket (PrepareSubgraphs, the Bounds system, UpdateSubgraphs), into the nodes' caches.
+//   A node's own values stay in its row only (design R3: one home per item of state). Until a structural change,
+//   SetLeaf or InvalidateContent advances the epoch again, the getters read the row (a node without children) or the
+//   cache (a node with children), without a lock. In between (a change not yet refreshed) the getters fall back to
+//   the on-demand caches above, as before.
 // - Structural operations create and destroy entities in pre-order, in batches of consecutive nodes with the same
 //   components, so that entity ids, row order and the leaf observer's order are deterministic (5.3, 5.5).
 // - Propagation and Bounds read the archetype storage directly (EcsWorldImpl.h): they test chunk versions per column
@@ -50,6 +58,7 @@
 
 #include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -171,8 +180,11 @@ namespace donut::engine
                     return true;
                 }
             }
-            return Locate(node->m_Entity, out);
+            return LocateNodeSlow(node, out);
         }
+        // The entity-table lookup of LocateNode, out of line: the getters inline LocateNode, and the cold lookup inlined
+        // with it made their code larger and the legacy walk about 3 ms slower per view (bench_render_extract).
+        bool LocateNodeSlow(const SceneGraphNode* node, RowRef& out) const noexcept;
         template <typename T>
         T* GetOf(const SceneGraphNode* node, Slot slot) const noexcept
         {
@@ -194,7 +206,16 @@ namespace donut::engine
             if (column != c_Absent)
                 ecs::StampVersion(row.archetype->Versions(row.chunk) + column, m_Impl->GetStampVersion());
         }
-        SceneGraphNode* NodeOf(Entity entity) const noexcept;
+        // The node of an attached entity: through the store's table by entity index (no entity-table lookup), else the
+        // SceneNode column.
+        SceneGraphNode* NodeOf(Entity entity) const noexcept
+        {
+            const uint32_t index = GetEntityIndex(entity);
+            if (index < m_NodeOfIndex.size() && m_NodeOfIndex[index].entity == entity)
+                return m_NodeOfIndex[index].node;
+            return NodeOfSlow(entity);
+        }
+        SceneGraphNode* NodeOfSlow(Entity entity) const noexcept;
         // The GpuInstanceSlot of an attached mesh instance; null while it is in no graph or holds no slot (before the
         // leaf observer reached it, after it released it): MeshInstance::GetInstanceIndex.
         static const GpuInstanceSlot* InstanceSlotOf(const SceneGraphLeaf* leaf) noexcept;
@@ -232,6 +253,49 @@ namespace donut::engine
         };
         uint64_t GetEpoch() const noexcept { return m_Epoch.load(std::memory_order_relaxed); }
         void ComputeSubgraphCache(const SceneGraphNode* node);
+        // Whether the subgraph values of the last Refresh are current: no structural change, SetLeaf or
+        // InvalidateContent since (UpdateSubgraphs).
+        bool IsSubgraphCurrent() const noexcept
+        {
+            return m_SubgraphEpoch.load(std::memory_order_acquire) == m_Epoch.load(std::memory_order_relaxed);
+        }
+        // A row's own part of its subgraph: its leaf's box in world space (WorldBounds; empty without a leaf) and its
+        // leaf's content flags (RenderFlags for a mesh instance, else the leaf's GetContentFlags). Reports whether the
+        // row has children.
+        bool OwnPart(const RowRef& row, dm::box3& outBounds, SceneContentFlags& outContent) const noexcept;
+        // The lazy path's own box of an attached row: LocalBounds times the float WorldTransform, what the Bounds system
+        // writes into WorldBounds at the next Refresh (WorldBounds of a row attached since is not written yet).
+        dm::box3 OwnBoundsFromLocal(const RowRef& row) const noexcept
+        {
+            const LeafObject* leaf = static_cast<const LeafObject*>(Column(row, SlotLeaf));
+            const LocalBounds* local = static_cast<const LocalBounds*>(Column(row, SlotLocalBounds));
+            const WorldTransform* world = static_cast<const WorldTransform*>(Column(row, SlotWorld));
+            if (!leaf || !leaf->object || !local || local->bounds.isempty())
+                return dm::box3::empty();
+            return local->bounds * dm::affine3(world ? world->transform : dm::daffine3::identity());
+        }
+        // A leaf's content flags and box through its virtual calls, from code that must not throw (job tasks, noexcept
+        // getters): an exception from an override logs a warning and gives None, or `fallback`.
+        static SceneContentFlags SafeContentFlags(const SceneGraphLeaf* leaf) noexcept;
+        static dm::box3 SafeLocalBoundingBox(SceneGraphLeaf* leaf, const dm::box3& fallback) noexcept;
+        bool HasChildren(const RowRef& row) const noexcept
+        {
+            const SceneLinks* links = static_cast<const SceneLinks*>(Column(row, SlotLinks));
+            return links && links->firstChild != Entity::Null;
+        }
+        dm::box3 OwnBounds(const RowRef& row) const noexcept
+        {
+            const LeafObject* leaf = static_cast<const LeafObject*>(Column(row, SlotLeaf));
+            const WorldBounds* world = static_cast<const WorldBounds*>(Column(row, SlotWorldBounds));
+            return leaf && leaf->object && world ? world->bounds : dm::box3::empty();
+        }
+        SceneContentFlags OwnContent(const RowRef& row) const noexcept
+        {
+            if (const RenderFlags* flags = static_cast<const RenderFlags*>(Column(row, SlotRenderFlags)))
+                return SceneContentFlags(flags->contentFlags);
+            const LeafObject* leaf = static_cast<const LeafObject*>(Column(row, SlotLeaf));
+            return leaf && leaf->object ? SafeContentFlags(leaf->object) : SceneContentFlags::None;
+        }
         // The leaf's box and content flags, then each child's in sibling order, as the old Refresh unioned them. With
         // `publish`, every node computed gets its cache stamped with `epoch` (under m_CacheMutex).
         static void ComputeSubgraph(const SceneGraphNode* node, std::vector<CacheFrame>& stack, uint64_t epoch,
@@ -247,6 +311,13 @@ namespace donut::engine
         // The systems' bodies (SceneGraphStore.cpp).
         nvrhi::FRESULT RunPropagation(ISystemContext* context) noexcept;
         nvrhi::FRESULT RunBounds(ISystemContext* context) noexcept;
+        // Before the phases of a Refresh: the pass's marks and summaries ready, so that the Bounds system marks the paths
+        // of the rows whose boxes changed (incremental mode). After them: the subgraph values of the nodes with children
+        // along the marked paths (all of them after a structural change), and the row hints of the archetypes whose rows
+        // moved.
+        void PrepareSubgraphs() noexcept;
+        void UpdateSubgraphs() noexcept;
+        void RefreshRowHints() noexcept;
 
         // ------------------------------------------------------------------------- GPU scene (step E4)
         // Read by GpuScene (a friend), which walks the mesh-instance chunks through the archetype storage.
@@ -303,6 +374,10 @@ namespace donut::engine
             uint64_t boundsChunks = 0;         // chunks the Bounds system wrote
             uint64_t deepRows = 0;             // rows of the last depth bucket visited (c_MaxHierarchyDepth)
             uint64_t createCalls = 0;          // CreateEntities calls of attach and copy (one per batch)
+            uint64_t subgraphPasses = 0;       // UpdateSubgraphs runs (full ones included)
+            uint64_t fullSubgraphPasses = 0;   // after a structural change, SetLeaf or InvalidateContent
+            uint64_t subgraphNodes = 0;        // nodes with children whose values a pass computed
+            uint64_t summarisedChunks = 0;     // chunks a pass took whole from their summary
         };
         const Counters& GetCounters() const noexcept { return m_Counters; }
         // Test seam: the CreateEntities call of attach number `calls` from now (0: the next) is refused by the world
@@ -311,6 +386,14 @@ namespace donut::engine
         // Test seam: the mesh-instance acquisition number `calls` from now throws std::bad_alloc before it allocates
         // anything (as the tables would out of memory); the leaf observer catches it. Negative disarms it.
         static void FailAcquireAfter(int32_t calls) noexcept { s_FailAcquireCountdown.store(calls); }
+        // Test seam: the subgraph pass's storage fails to allocate `calls` passes from now (0: the next); negative
+        // disarms it. The getters then fall back to the on-demand caches until a pass succeeds.
+        static void FailSubgraphAfter(int32_t calls) noexcept { s_FailSubgraphCountdown.store(calls); }
+        // Test seam: the number of rows from which the subgraph pass runs a bucket on the job system (default 4096).
+        static void SetSerialSubgraphRows(uint32_t rows) noexcept { s_SerialSubgraphRows.store(rows); }
+        // Test seam: the subgraph passes (all stores) redone as full passes because a phase of their Refresh changed the
+        // world's structure (commands played back, an exclusive system).
+        static uint64_t GetSubgraphRedoCount() noexcept { return s_SubgraphRedos.load(); }
 
     private:
         // A node of a subgraph that is being attached, in pre-order. Its values are read from its record.
@@ -349,6 +432,7 @@ namespace donut::engine
             uint8_t localBounds;
             uint8_t worldBounds;
             uint8_t chunkBounds;
+            uint8_t leaf;              // LeafObject, for leaves with dynamic bounds (c_Absent otherwise)
         };
 
         struct JointArchetype
@@ -368,6 +452,49 @@ namespace donut::engine
         struct PropagationContext;
         struct BoundsContext;
         struct DeepContext;
+        struct SubgraphContext;
+
+        // A box and content flags as order-independent keys: each float maps to an unsigned key that orders as the
+        // float does, -0 below +0 (UpdateSubgraphs: unions by min and max of keys give the same bits in any order).
+        struct SubgraphKeys
+        {
+            uint32_t keys[6];          // mins x y z, maxs x y z
+            uint32_t content;
+        };
+        // One accumulator per entity index (a node with children marked in this pass), merged into by CAS.
+        struct SubgraphAccumulator
+        {
+            std::atomic<uint32_t> keys[6];
+            std::atomic<uint32_t> content;
+        };
+        // What a chunk gives its parent when every row has the same parent and no row has children: the union of the
+        // rows' own parts, valid while none of the chunk's relevant versions is newer than `version`.
+        struct ChunkSummary
+        {
+            uint64_t version = 0;      // 0: not computed
+            Entity parent = Entity::Null;
+            bool single = false;       // one parent (or none: roots) and no row with children
+            SubgraphKeys keys{};
+        };
+        struct SubgraphFrame
+        {
+            Entity entity;
+            Entity nextChild;
+            SubgraphKeys keys;
+            SceneContentFlags own;
+        };
+
+        void MarkPath(Entity entity, uint32_t pass) noexcept;
+        // The Bounds system's part of an incremental pass, for one chunk it wrote: its summary and the marks.
+        void SubgraphFromBounds(const ecs::Archetype& archetype, uint32_t archetypeIndex, uint32_t chunk,
+                                const dm::box3& chunkBounds) noexcept;
+        struct SubgraphRun;
+        void SubgraphChunk(SubgraphContext& ctx, uint32_t archetypeIndex, uint32_t chunk, SubgraphRun& run) noexcept;
+        void FinalizeSubgraph(SceneGraphNode* node, const SubgraphKeys& keys, uint64_t epoch) const noexcept;
+        static void RunSubgraphMarks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
+        static void RunSubgraphChunks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
+        static void RunSubgraphDeep(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
+        static void RunRowHints(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
 
         friend class GpuScene;
 
@@ -404,6 +531,14 @@ namespace donut::engine
 
         static std::atomic<int32_t> s_FailCreateCountdown;
         static std::atomic<int32_t> s_FailAcquireCountdown;
+        static std::atomic<int32_t> s_FailSubgraphCountdown;
+        static std::atomic<uint32_t> s_SerialSubgraphRows;
+        static std::atomic<uint64_t> s_SubgraphRedos;
+        // The pass's storage (marks, accumulators, summaries, stacks) for the world as it is now; false when it cannot
+        // allocate.
+        bool EnsureSubgraphStorage() noexcept;
+        // Whether a bounds archetype of leaves with dynamic bounds has rows (Refresh does not skip then).
+        bool HasDynamicBoundsRows() const noexcept;
 
         SceneGraph* m_Graph;
         nvrhi::AutoPtr<IWorld> m_World;
@@ -414,6 +549,7 @@ namespace donut::engine
         ComponentId m_Ids[SlotCount] = {};
         ComponentId m_DepthId = ComponentId::Invalid;
         ComponentId m_JointTag = ComponentId::Invalid;   // SkinnedMeshReferenceLeaf, once a joint leaf was attached
+        ComponentId m_DynamicBoundsTag = ComponentId::Invalid;   // DynamicBoundsLeaf, once such a leaf was attached
 
         // Column indices per archetype, for the accessors; synchronised after structural changes.
         std::vector<std::array<uint8_t, SlotCount>> m_ArchetypeColumns;
@@ -490,5 +626,35 @@ namespace donut::engine
         // The on-demand caches.
         std::mutex m_CacheMutex;
         std::vector<CacheFrame> m_CacheStack;
+
+        // UpdateSubgraphs: the epoch its values belong to (IsSubgraphCurrent), the pass
+        // number marks are compared with, marks and accumulators per entity index, summaries per archetype and chunk,
+        // the chunk tasks, the deep bucket's entries and per-thread stacks. Capacity kept.
+        std::atomic<uint64_t> m_SubgraphEpoch{ 0 };
+        uint32_t m_SubgraphPass = 0;
+        bool m_SubgraphPrepared = false;     // between PrepareSubgraphs and UpdateSubgraphs
+        bool m_SubgraphFull = false;         // this pass computes every node with children
+        bool m_SubgraphForceFull = false;    // the Bounds system ran outside a Refresh: the next pass is a full one
+        uint64_t m_SubgraphStructuralVersion = 0;   // the world's structural version at the last pass
+        uint64_t m_PreparedStructuralVersion = 0;   // ... when PrepareSubgraphs ran (a phase may change it)
+        std::atomic<bool> m_SubgraphNeedsFull{ false };   // an index the pass's storage did not cover: redo as a full one
+        std::atomic<uint64_t> m_SubgraphMarked{ 0 };   // marks made in this pass
+        size_t m_SubgraphCapacity = 0;
+        std::unique_ptr<std::atomic<uint32_t>[]> m_SubgraphMarks;
+        std::unique_ptr<SubgraphAccumulator[]> m_SubgraphAccumulators;
+        std::vector<std::vector<ChunkSummary>> m_ChunkSummaries;
+        std::vector<Task> m_SubgraphTasks;
+        std::vector<Entity> m_SubgraphEntries;
+        std::vector<std::vector<SubgraphFrame>> m_SubgraphStacks;
+
+        // NodeOf's table by entity index, written by attach and cleared by detach; the row-move counts the hints of each
+        // archetype were last refreshed at (RefreshRowHints).
+        struct NodeOfEntry
+        {
+            Entity entity = Entity::Null;
+            SceneGraphNode* node = nullptr;
+        };
+        std::vector<NodeOfEntry> m_NodeOfIndex;
+        std::vector<uint64_t> m_HintedMoves;
     };
 }

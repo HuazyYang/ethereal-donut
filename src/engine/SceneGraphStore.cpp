@@ -33,6 +33,7 @@
 #include <cassert>
 #include <exception>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <unordered_map>
 #include <unordered_set>
@@ -302,6 +303,29 @@ namespace donut::engine
             ::operator delete(records[i]);
     }
 
+    namespace
+    {
+        // The subgraph rule for NaN: a box with a NaN anywhere counts as the infinite box (it is never culled, and a
+        // union with it is the same in any order), in the pass, its summaries, the Bounds system's chunk union
+        // (ChunkWorldBounds) and the lazy path.
+        inline bool HasNan(const dm::box3& box) noexcept
+        {
+            return box.m_mins.x != box.m_mins.x || box.m_mins.y != box.m_mins.y || box.m_mins.z != box.m_mins.z ||
+                   box.m_maxs.x != box.m_maxs.x || box.m_maxs.y != box.m_maxs.y || box.m_maxs.z != box.m_maxs.z;
+        }
+
+        inline dm::box3 InfiniteBox() noexcept
+        {
+            const float infinity = std::numeric_limits<float>::infinity();
+            return dm::box3(dm::float3(-infinity), dm::float3(infinity));
+        }
+
+        inline dm::box3 NanToInfinite(const dm::box3& box) noexcept
+        {
+            return HasNan(box) ? InfiniteBox() : box;
+        }
+    }
+
     struct SceneGraphStore::PropagationContext
     {
         SceneGraphStore* store;
@@ -317,6 +341,7 @@ namespace donut::engine
     {
         SceneGraphStore* store;
         uint64_t version;
+        bool subgraph;   // an incremental subgraph pass is prepared: summaries and marks of the chunks written
         std::atomic<uint64_t> chunks{ 0 };
     };
 
@@ -400,7 +425,8 @@ namespace donut::engine
 
         const ComponentAccess boundsAccess[] = {
             { m_Ids[SlotWorld], Access::Read, {} },
-            { m_Ids[SlotLocalBounds], Access::Read, {} },
+            { m_Ids[SlotLocalBounds], Access::Write, {} },   // read again from leaves with dynamic bounds
+            { m_Ids[SlotLeaf], Access::Read, {} },
             { m_Ids[SlotWorldBounds], Access::Write, {} },
             { m_Ids[SlotChunkBounds], Access::Write, {} },
         };
@@ -526,7 +552,15 @@ namespace donut::engine
         }
     }
 
-    SceneGraphNode* SceneGraphStore::NodeOf(Entity entity) const noexcept
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#endif
+    bool SceneGraphStore::LocateNodeSlow(const SceneGraphNode* node, RowRef& out) const noexcept
+    {
+        return Locate(node->m_Entity, out);
+    }
+
+    SceneGraphNode* SceneGraphStore::NodeOfSlow(Entity entity) const noexcept
     {
         const SceneNode* node = Get<SceneNode>(entity, SlotNode);
         return node ? node->object : nullptr;
@@ -566,6 +600,18 @@ namespace donut::engine
                 m_JointTag = id;
             m_LeafTypeTags.push_back(id);
             ++type.tagCount;
+        }
+        if (desc.dynamicBounds)
+        {
+            const ComponentId id = RegisterComponent<DynamicBoundsLeaf>(m_World);
+            if (id != ComponentId::Invalid)
+            {
+                m_DynamicBoundsTag = id;
+                m_LeafTypeTags.push_back(id);
+                ++type.tagCount;
+            }
+            else
+                log::warning("SceneGraph: cannot register the dynamic-bounds tag");
         }
         // The class's columns (D19), zero until something fills them (the mesh-instance columns: OnLeaf).
         for (uint32_t c = 0; c < desc.columnCount; ++c)
@@ -929,6 +975,35 @@ namespace donut::engine
     // components, and links the first under `parentEntity`. Every node hands its reference and its leaf's to the world;
     // its record is read, then given back to the pool.
     std::atomic<int32_t> SceneGraphStore::s_FailCreateCountdown{ -1 };
+    std::atomic<int32_t> SceneGraphStore::s_FailSubgraphCountdown{ -1 };
+    std::atomic<uint64_t> SceneGraphStore::s_SubgraphRedos{ 0 };
+    std::atomic<uint32_t> SceneGraphStore::s_SerialSubgraphRows{ 4096 };
+
+    SceneContentFlags SceneGraphStore::SafeContentFlags(const SceneGraphLeaf* leaf) noexcept
+    {
+        try
+        {
+            return leaf->GetContentFlags();
+        }
+        catch (...)
+        {
+            log::warning("SceneGraph: a leaf's GetContentFlags threw; taken as None");
+            return SceneContentFlags::None;
+        }
+    }
+
+    dm::box3 SceneGraphStore::SafeLocalBoundingBox(SceneGraphLeaf* leaf, const dm::box3& fallback) noexcept
+    {
+        try
+        {
+            return leaf->GetLocalBoundingBox();
+        }
+        catch (...)
+        {
+            log::warning("SceneGraph: a leaf's GetLocalBoundingBox threw; its box stays as it was");
+            return fallback;
+        }
+    }
 
     bool SceneGraphStore::CreateNodes(Entity parentEntity, uint32_t parentDepth)
     {
@@ -941,6 +1016,12 @@ namespace donut::engine
             log::warning("SceneGraph: cannot reserve %u entities", n);
             std::abort();
         }
+        // NodeOf's table covers the new ids before any row exists (a growth that throws leaves nothing half made)
+        uint32_t highest = 0;
+        for (Entity entity : S.entities)
+            highest = std::max(highest, GetEntityIndex(entity));
+        if (highest >= m_NodeOfIndex.size())
+            m_NodeOfIndex.resize(std::max<size_t>(size_t(highest) + 1, m_NodeOfIndex.size() * 2));
 
         // The links between the new nodes, by index, and their depth buckets.
         S.firstChild.assign(n, c_None);
@@ -1130,6 +1211,7 @@ namespace donut::engine
                 RowRef row;
                 if (Locate(S.entities[i], row))
                     RememberRow(nodes[i].node, row);
+                m_NodeOfIndex[GetEntityIndex(S.entities[i])] = NodeOfEntry{ S.entities[i], nodes[i].node };
                 nodes[i].node->Release();
             }
             OrphanRecord::Destroy(S.records.data(), S.records.size());
@@ -1318,6 +1400,9 @@ namespace donut::engine
                     node;
                 parentRecord.lastChild = node;
             }
+            const uint32_t index = GetEntityIndex(m_S->entities[i]);
+            if (index < m_NodeOfIndex.size())
+                m_NodeOfIndex[index] = NodeOfEntry{};
             node->m_Record = record;
             node->m_Store = nullptr;
             node->m_Entity = Entity::Null;
@@ -1412,6 +1497,8 @@ namespace donut::engine
         }
 
         SyncArchetypes();
+        if (Locate(entity, row))
+            RememberRow(node, row);   // its row moved to another archetype
         m_PendingStructure = true;
         BumpEpoch();
     }
@@ -1450,6 +1537,8 @@ namespace donut::engine
             m_World->AddComponent(node->m_Entity, m_Ids[SlotLocal], &value);
             m_World->AddComponent(node->m_Entity, m_Ids[SlotLocalMatrix], nullptr);
             SyncArchetypes();
+            if (Locate(node->m_Entity, row))
+                RememberRow(node, row);   // its row moved to another archetype
         }
         m_PendingTransform = true;
     }
@@ -1474,9 +1563,10 @@ namespace donut::engine
                     Stamp(row, SlotRenderFlags);
                 }
                 m_PendingContent = true;   // the next Refresh runs Bounds for it
+                BumpEpoch();
             }
         }
-        BumpEpoch();
+        // a node without a leaf has no content: nothing changed
     }
 
     // ------------------------------------------------------------------------- mesh instances (step E4)
@@ -1669,9 +1759,13 @@ namespace donut::engine
         const bool moved = m_PendingTransform;
         // Nothing changed through the API (structure, transforms, content), no structural change and no phase ran on
         // the world since: nothing to do. Writes into the world outside phases are not seen here (SceneGraph.h).
-        if (!structure && !moved && !m_PendingContent &&
-            m_World->GetStructuralVersion() == m_RefreshedStructuralVersion &&
-            m_World->GetVersion() == m_RefreshedVersion)
+        const bool unchanged = !structure && !moved && !m_PendingContent &&
+                               m_World->GetStructuralVersion() == m_RefreshedStructuralVersion &&
+                               m_World->GetVersion() == m_RefreshedVersion;
+        // Leaves with dynamic bounds change their boxes by themselves: then only the Bounds phase runs (and the
+        // incremental subgraph pass for what it changed).
+        const bool dynamicOnly = unchanged && HasDynamicBoundsRows();
+        if (unchanged && !dynamicOnly)
         {
             m_LastRefreshMoved = false;
             ++m_Counters.skippedRefreshes;
@@ -1679,10 +1773,14 @@ namespace donut::engine
         }
 
         m_FrameIndex = frameIndex;
-        const nvrhi::FRESULT result = m_Scheduler ? m_Scheduler->RunPhases(Phase::TransformPropagation, Phase::Bounds)
-                                                  : nvrhi::FE_INVALID_ARGS;
+        PrepareSubgraphs();
+        const nvrhi::FRESULT result = !m_Scheduler ? nvrhi::FE_INVALID_ARGS
+            : dynamicOnly ? m_Scheduler->RunPhases(Phase::Bounds, Phase::Bounds)
+                          : m_Scheduler->RunPhases(Phase::TransformPropagation, Phase::Bounds);
         if (NVRHI_FAILED(result))
         {
+            m_SubgraphPrepared = false;
+            m_SubgraphForceFull = true;
             // the changes stay pending for the next Refresh
             log::warning("SceneGraph::Refresh: the phases did not run (no scheduler, or inside a phase); the changes "
                          "stay pending");
@@ -1696,7 +1794,21 @@ namespace donut::engine
         m_LastRefreshMoved = moved;
         m_RefreshedStructuralVersion = m_World->GetStructuralVersion();
         m_RefreshedVersion = m_World->GetVersion();
-        BumpEpoch();
+        // The subgraph values of the nodes with children, computed now, in parallel (5.7): the getters read them
+        // without a lock. The epoch only moves with structural changes, SetLeaf and InvalidateContent; when the pass
+        // cannot run (out of memory), it moves here, and the getters fall back to the on-demand caches.
+        RefreshRowHints();
+        const uint64_t passes = m_Counters.subgraphPasses;
+        UpdateSubgraphs();
+        if (m_Counters.subgraphPasses == passes)
+        {
+            // the pass did not complete: the values it had are stale now (the rows moved), and what it wrote this time
+            // is stamped with the epoch that moves below; the next pass is a full one
+            m_SubgraphForceFull = true;
+            m_SubgraphEpoch.store(~0ull, std::memory_order_release);
+        }
+        if (!IsSubgraphCurrent())
+            BumpEpoch();
         return structure;
     }
 
@@ -1729,8 +1841,11 @@ namespace donut::engine
                 const uint8_t localBounds = column(m_Ids[SlotLocalBounds]);
                 const uint8_t worldBounds = column(m_Ids[SlotWorldBounds]);
                 const uint8_t chunkBounds = column(m_Ids[SlotChunkBounds]);
+                const bool dynamicBounds =
+                    m_DynamicBoundsTag != ComponentId::Invalid && column(m_DynamicBoundsTag) != c_Absent;
                 if (localBounds != c_Absent && worldBounds != c_Absent && chunkBounds != c_Absent)
-                    m_BoundsArchetypes.push_back(BoundsArchetype{ a, world, localBounds, worldBounds, chunkBounds });
+                    m_BoundsArchetypes.push_back(BoundsArchetype{ a, world, localBounds, worldBounds, chunkBounds,
+                                                                  dynamicBounds ? column(m_Ids[SlotLeaf]) : c_Absent });
             }
             m_ArchetypeLevel.push_back(level);
 
@@ -2157,22 +2272,55 @@ namespace donut::engine
             const uint32_t count = archetype.chunks[task.chunk].count;
             const WorldTransform* worlds =
                 reinterpret_cast<const WorldTransform*>(ColumnBase(archetype, task.chunk, bounds.world));
-            const LocalBounds* locals =
-                reinterpret_cast<const LocalBounds*>(ColumnBase(archetype, task.chunk, bounds.localBounds));
+            LocalBounds* locals =
+                reinterpret_cast<LocalBounds*>(ColumnBase(archetype, task.chunk, bounds.localBounds));
+            uint64_t* versions = archetype.Versions(task.chunk);
+
+            // Leaves with dynamic bounds: their boxes again. A chunk queued only for them (task.whole false) is written
+            // only when one of its boxes changed.
+            if (bounds.leaf != c_Absent)
+            {
+                const LeafObject* leaves =
+                    reinterpret_cast<const LeafObject*>(ColumnBase(archetype, task.chunk, bounds.leaf));
+                bool changed = false;
+                for (uint32_t r = 0; r < count; ++r)
+                {
+                    if (!leaves[r].object)
+                        continue;
+                    const dm::box3 box = SafeLocalBoundingBox(leaves[r].object, locals[r].bounds);
+                    if (std::memcmp(&box, &locals[r].bounds, sizeof(box)) != 0)
+                    {
+                        locals[r].bounds = box;
+                        changed = true;
+                    }
+                }
+                if (changed)
+                    StampVersion(versions + bounds.localBounds, ctx.version);
+                else if (!task.whole)
+                    continue;
+            }
+
             WorldBounds* results =
                 reinterpret_cast<WorldBounds*>(ColumnBase(archetype, task.chunk, bounds.worldBounds));
             dm::box3 chunkBounds = dm::box3::empty();
+            bool nan = false;
             for (uint32_t r = 0; r < count; ++r)
             {
                 const dm::box3& local = locals[r].bounds;
-                results[r].bounds = local.isempty() ? dm::box3::empty() : local * dm::affine3(worlds[r].transform);
-                chunkBounds |= results[r].bounds;
+                const dm::box3 world = local.isempty() ? dm::box3::empty() : local * dm::affine3(worlds[r].transform);
+                results[r].bounds = world;
+                chunkBounds |= world;
+                // a NaN would fall out of the union (dm::min keeps the other operand): such a chunk is never culled
+                nan = nan || HasNan(world);
             }
+            if (nan)
+                chunkBounds = InfiniteBox();
             reinterpret_cast<ChunkWorldBounds*>(ColumnBase(archetype, task.chunk, bounds.chunkBounds))->bounds =
                 chunkBounds;
-            uint64_t* versions = archetype.Versions(task.chunk);
             StampVersion(versions + bounds.worldBounds, ctx.version);
             StampVersion(versions + bounds.chunkBounds, ctx.version);
+            if (ctx.subgraph)
+                ctx.store->SubgraphFromBounds(archetype, bounds.archetype, task.chunk, chunkBounds);
         }
         ctx.chunks.fetch_add(end - begin, std::memory_order_relaxed);
     }
@@ -2182,6 +2330,13 @@ namespace donut::engine
         const uint64_t since = context->GetLastRunVersion();
         IJobSystem* jobs = context->GetJobSystem();
         UpdateSystemLists();
+        if (!m_SubgraphPrepared)
+        {
+            // run by someone else than Refresh: no marks for what it changes, so the pass's values are stale until a
+            // full pass, and the getters fall back to the on-demand caches (a new epoch) until then
+            m_SubgraphForceFull = true;
+            BumpEpoch();
+        }
         m_Tasks.clear();
         for (uint32_t i = 0; i < uint32_t(m_BoundsArchetypes.size()); ++i)
         {
@@ -2192,9 +2347,11 @@ namespace donut::engine
                 if (archetype.chunks[c].count == 0)
                     continue;
                 const uint64_t* versions = archetype.Versions(c);
-                if (versions[bounds.world] > since || versions[bounds.localBounds] > since ||
-                    versions[archetype.AddedVersionSlot()] > since)
-                    m_Tasks.push_back(Task{ i, c, true });
+                const bool changed = versions[bounds.world] > since || versions[bounds.localBounds] > since ||
+                                     versions[archetype.AddedVersionSlot()] > since;
+                // a chunk of leaves with dynamic bounds is read at every run
+                if (changed || bounds.leaf != c_Absent)
+                    m_Tasks.push_back(Task{ i, c, changed });
             }
         }
         if (m_Tasks.empty())
@@ -2203,6 +2360,7 @@ namespace donut::engine
         BoundsContext ctx;
         ctx.store = this;
         ctx.version = context->GetVersion();
+        ctx.subgraph = m_SubgraphPrepared && !m_SubgraphFull;
         const uint32_t taskCount = uint32_t(m_Tasks.size());
         const uint32_t grain = std::max(1u, taskCount / (WorkingThreads(jobs) * 4));
         if (!jobs || grain >= taskCount)
@@ -2224,7 +2382,15 @@ namespace donut::engine
         {
             CacheFrame frame{ current, current->GetFirstChild(), dm::box3::empty(), SceneContentFlags::None,
                               SceneContentFlags::None };
-            if (SceneGraphLeaf* leaf = current->GetLeaf())
+            // An attached node: from its row, as Refresh's pass reads it (LocalBounds, not the leaf's box now), so that
+            // the two paths give the same values.
+            RowRef row;
+            if (current->m_Store && !current->m_Record && current->m_Store->LocateNode(current, row))
+            {
+                frame.bounds = NanToInfinite(current->m_Store->OwnBoundsFromLocal(row));
+                frame.leafContent = current->m_Store->OwnContent(row);
+            }
+            else if (SceneGraphLeaf* leaf = current->GetLeaf())
             {
                 const dm::box3 localBoundingBox = leaf->GetLocalBoundingBox();
                 if (!localBoundingBox.isempty())
@@ -2288,5 +2454,881 @@ namespace donut::engine
         SceneContentFlags leafContent;
         SceneContentFlags content;
         ComputeSubgraph(node, m_CacheStack, epoch, true, bounds, leafContent, content);
+    }
+
+    // ------------------------------------------------------------------- subgraph values in Refresh (5.7)
+    //
+    // Refresh computes the subgraph bounds and content flags of the nodes with children whose subtree changed, into the
+    // nodes' caches (derived values, design 4.6), so that the getters (and so the legacy strategies' walks) read them
+    // without a lock. A node's own values (its box, content flags, links, leaf) stay in its row only (design R3).
+    //   Full mode (the epoch moved since the last pass: a structural change, SetLeaf or InvalidateContent; the world's
+    //   structural version moved; or the Bounds system ran outside a Refresh): step 1 runs over every chunk: every
+    //   chunk gets its summary and every node with children a mark.
+    //   Incremental mode: the Bounds system does step 1 for the chunks it wrote (their boxes changed): the chunks'
+    //   summaries, and marks on the paths from the rows with children, and from the other rows' parents, up to the
+    //   roots. Nothing marked: nothing more to do.
+    //   Step 2, bottom-up: the deep bucket's subtrees (a depth-first walk from each entry, whose parent is shallower),
+    //   then the depth buckets from the deepest: each row whose parent is marked adds its subgraph value (its own part,
+    //   plus its accumulator when it is marked, or its node's values when it has children and is not marked) to its
+    //   parent's accumulator; a marked row stores its value in its node. A chunk whose rows share one parent and have
+    //   no children adds its summary (the row-order union of its rows' own parts) instead of its rows.
+    // Marks hold the pass's number per entity index; accumulators are merged into by CAS, after a task merged a run of
+    // one parent locally. Unions across rows and chunks are taken on keys that order as the floats do (-0 below +0),
+    // by min and max, so the result does not depend on the order of the rows or of the threads; it equals the old
+    // sequential union except for the sign of a zero that ties with another zero, and NaN (which the old union kept
+    // or dropped by position; a chunk with a NaN box has an infinite summary).
+
+    namespace
+    {
+        inline uint32_t KeyOfFloat(float value) noexcept
+        {
+            uint32_t bits;
+            std::memcpy(&bits, &value, sizeof(bits));
+            return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+        }
+
+        inline float FloatOfKey(uint32_t key) noexcept
+        {
+            const uint32_t bits = (key & 0x80000000u) ? (key & 0x7fffffffu) : ~key;
+            float value;
+            std::memcpy(&value, &bits, sizeof(value));
+            return value;
+        }
+
+    }
+
+    struct SceneGraphStore::SubgraphContext
+    {
+        SceneGraphStore* store;
+        uint32_t pass;
+        uint64_t epoch;
+        uint64_t version;   // the world's version now: summaries computed in this pass
+        bool full;
+        const Task* tasks;
+        std::atomic<bool> failed{ false };
+        std::atomic<uint64_t> nodes{ 0 };
+        std::atomic<uint64_t> summarised{ 0 };
+    };
+
+    bool SceneGraphStore::OwnPart(const RowRef& row, dm::box3& outBounds, SceneContentFlags& outContent) const noexcept
+    {
+        outBounds = OwnBounds(row);
+        outContent = OwnContent(row);
+        return HasChildren(row);
+    }
+
+    namespace
+    {
+        void KeysOf(const dm::box3& nanBox, SceneContentFlags content, uint32_t* keys, uint32_t& outContent) noexcept
+        {
+            const dm::box3 box = NanToInfinite(nanBox);
+            keys[0] = KeyOfFloat(box.m_mins.x);
+            keys[1] = KeyOfFloat(box.m_mins.y);
+            keys[2] = KeyOfFloat(box.m_mins.z);
+            keys[3] = KeyOfFloat(box.m_maxs.x);
+            keys[4] = KeyOfFloat(box.m_maxs.y);
+            keys[5] = KeyOfFloat(box.m_maxs.z);
+            outContent = uint32_t(content);
+        }
+
+        void EmptyKeys(uint32_t* keys, uint32_t& content) noexcept
+        {
+            KeysOf(dm::box3::empty(), SceneContentFlags::None, keys, content);
+        }
+
+        void UniteKeys(uint32_t* keys, uint32_t& content, const uint32_t* other, uint32_t otherContent) noexcept
+        {
+            for (int i = 0; i < 3; ++i)
+                keys[i] = std::min(keys[i], other[i]);
+            for (int i = 3; i < 6; ++i)
+                keys[i] = std::max(keys[i], other[i]);
+            content |= otherContent;
+        }
+
+        dm::box3 BoxOfKeys(const uint32_t* keys) noexcept
+        {
+            return dm::box3(dm::float3(FloatOfKey(keys[0]), FloatOfKey(keys[1]), FloatOfKey(keys[2])),
+                            dm::float3(FloatOfKey(keys[3]), FloatOfKey(keys[4]), FloatOfKey(keys[5])));
+        }
+    }
+
+    // Marks `entity` and its ancestors up to the first one this pass marked already; each new mark gets an empty
+    // accumulator. Threads may mark at once: the first CAS on a mark wins it.
+    void SceneGraphStore::MarkPath(Entity entity, uint32_t pass) noexcept
+    {
+        while (entity != Entity::Null)
+        {
+            const uint32_t index = GetEntityIndex(entity);
+            if (index >= m_SubgraphCapacity)
+            {
+                m_SubgraphNeedsFull.store(true, std::memory_order_relaxed);   // made during the phases
+                return;
+            }
+            std::atomic<uint32_t>& mark = m_SubgraphMarks[index];
+            uint32_t old = mark.load(std::memory_order_relaxed);
+            for (;;)
+            {
+                if (old == pass)
+                    return;   // marked already, and so are its ancestors (or will be by the thread that marked it)
+                if (mark.compare_exchange_weak(old, pass, std::memory_order_relaxed))
+                    break;
+            }
+            if (!m_SubgraphMarked.load(std::memory_order_relaxed))
+                m_SubgraphMarked.store(1, std::memory_order_relaxed);
+            SubgraphAccumulator& accumulator = m_SubgraphAccumulators[index];
+            uint32_t keys[6];
+            uint32_t content;
+            EmptyKeys(keys, content);
+            for (int i = 0; i < 6; ++i)
+                accumulator.keys[i].store(keys[i], std::memory_order_relaxed);
+            accumulator.content.store(content, std::memory_order_relaxed);
+
+            RowRef row;
+            if (!Locate(entity, row))
+                return;
+            const Parent* parent = static_cast<const Parent*>(Column(row, SlotParent));
+            entity = parent ? parent->entity : Entity::Null;
+        }
+    }
+
+    // The subgraph values of a node with children into its cache (its own values stay in its row).
+    void SceneGraphStore::FinalizeSubgraph(SceneGraphNode* node, const SubgraphKeys& keys, uint64_t epoch) const noexcept
+    {
+        if (!node)
+            return;
+        node->m_CachedBounds = BoxOfKeys(keys.keys);
+        node->m_CachedSubgraphContent = SceneContentFlags(keys.content);
+        node->m_CacheEpoch.store(epoch, std::memory_order_release);
+    }
+
+    namespace
+    {
+        // Merges keys into an accumulator by CAS.
+        template <typename Accumulator>
+        void MergeInto(Accumulator& accumulator, const uint32_t* keys, uint32_t content) noexcept
+        {
+            for (int i = 0; i < 6; ++i)
+            {
+                std::atomic<uint32_t>& target = accumulator.keys[i];
+                uint32_t current = target.load(std::memory_order_relaxed);
+                if (i < 3)
+                {
+                    while (keys[i] < current &&
+                           !target.compare_exchange_weak(current, keys[i], std::memory_order_relaxed)) { }
+                }
+                else
+                {
+                    while (keys[i] > current &&
+                           !target.compare_exchange_weak(current, keys[i], std::memory_order_relaxed)) { }
+                }
+            }
+            if (content)
+                accumulator.content.fetch_or(content, std::memory_order_relaxed);
+        }
+    }
+
+    // A run of merges into one parent's accumulator, kept by a task and flushed when the parent changes and at its end,
+    // so that the chunks and rows of one parent (all of a flat scene's) cost one CAS merge per task.
+    struct SceneGraphStore::SubgraphRun
+    {
+        Entity parent = Entity::Null;
+        uint32_t keys[6];
+        uint32_t content = 0;
+        uint64_t summarised = 0;   // chunks taken whole, counted per task
+
+        SubgraphRun() noexcept { EmptyKeys(keys, content); }
+
+        void Add(SceneGraphStore& store, Entity target, const uint32_t* otherKeys, uint32_t otherContent) noexcept
+        {
+            if (target != parent)
+            {
+                Flush(store);
+                parent = target;
+            }
+            UniteKeys(keys, content, otherKeys, otherContent);
+        }
+
+        void Flush(SceneGraphStore& store) noexcept
+        {
+            if (parent != Entity::Null)
+                MergeInto(store.m_SubgraphAccumulators[GetEntityIndex(parent)], keys, content);
+            parent = Entity::Null;
+            EmptyKeys(keys, content);
+        }
+    };
+
+    // Step 1 of a full pass, over every chunk: the chunk's summary and the marks (every node with children). The node
+    // objects get nothing here: their own values stay in their rows (design R3).
+    void SceneGraphStore::RunSubgraphMarks(void* context, uint32_t begin, uint32_t end, uint32_t) noexcept
+    {
+        SubgraphContext& ctx = *static_cast<SubgraphContext*>(context);
+        SceneGraphStore& store = *ctx.store;
+        for (uint32_t t = begin; t < end; ++t)
+        {
+            const Task& task = ctx.tasks[t];
+            const Archetype& archetype = store.m_Impl->GetArchetypeStorage(task.archetype);
+            const uint32_t count = archetype.chunks[task.chunk].count;
+            const uint8_t linksColumn = store.ColumnIndex(archetype, task.archetype, SlotLinks);
+            if (linksColumn == c_Absent || count == 0)
+                continue;
+            auto columnOf = [&](Slot slot) noexcept -> const void*
+            {
+                const uint8_t column = store.ColumnIndex(archetype, task.archetype, slot);
+                return column != c_Absent ? ColumnBase(archetype, task.chunk, column) : nullptr;
+            };
+            const SceneLinks* links = static_cast<const SceneLinks*>(columnOf(SlotLinks));
+            const Parent* parents = static_cast<const Parent*>(columnOf(SlotParent));
+            const LeafObject* leaves = static_cast<const LeafObject*>(columnOf(SlotLeaf));
+            const WorldBounds* worldBounds = static_cast<const WorldBounds*>(columnOf(SlotWorldBounds));
+            const RenderFlags* renderFlags = static_cast<const RenderFlags*>(columnOf(SlotRenderFlags));
+            const Entity* entities = archetype.Entities(task.chunk);
+
+            if (task.archetype >= store.m_ChunkSummaries.size() ||
+                task.chunk >= store.m_ChunkSummaries[task.archetype].size())
+            {
+                ctx.failed.store(true, std::memory_order_relaxed);   // EnsureSubgraphStorage covers every chunk
+                continue;
+            }
+            ChunkSummary& summary = store.m_ChunkSummaries[task.archetype][task.chunk];
+            summary.single = true;
+            summary.parent = parents ? parents[0].entity : Entity::Null;
+            dm::box3 summaryBounds = dm::box3::empty();
+            uint32_t summaryContent = 0;
+
+            Entity markedParent = Entity::Null;
+            for (uint32_t r = 0; r < count; ++r)
+            {
+                const bool children = links[r].firstChild != Entity::Null;
+                const Entity parent = parents ? parents[r].entity : Entity::Null;
+                SceneGraphLeaf* leaf = leaves ? leaves[r].object : nullptr;
+                const dm::box3 bounds = leaf && worldBounds ? worldBounds[r].bounds : dm::box3::empty();
+                const SceneContentFlags own = renderFlags ? SceneContentFlags(renderFlags[r].contentFlags)
+                                              : leaf ? SafeContentFlags(leaf) : SceneContentFlags::None;
+                if (children || parent != summary.parent)
+                    summary.single = false;
+                summaryBounds |= NanToInfinite(bounds);
+                summaryContent |= uint32_t(own);
+
+                // the paths to mark: a row with children from itself, else from its parent (once per run of rows)
+                if (children)
+                    store.MarkPath(entities[r], ctx.pass);
+                else if (!ctx.full && parent != markedParent)
+                {
+                    store.MarkPath(parent, ctx.pass);
+                    markedParent = parent;
+                }
+            }
+            uint32_t ignored;
+            KeysOf(summaryBounds, SceneContentFlags::None, summary.keys.keys, ignored);
+            summary.keys.content = summaryContent;
+            summary.version = ctx.version;
+        }
+    }
+
+    // Step 2, one chunk of a depth bucket (not the deep one): its rows' values into their parents' accumulators, its
+    // marked rows' values into their nodes.
+    void SceneGraphStore::SubgraphChunk(SubgraphContext& ctx, uint32_t archetypeIndex, uint32_t chunk,
+                                        SubgraphRun& run) noexcept
+    {
+        const uint32_t pass = ctx.pass;
+        auto marked = [&](Entity entity) noexcept
+        {
+            const uint32_t index = GetEntityIndex(entity);
+            return entity != Entity::Null && index < m_SubgraphCapacity &&
+                   m_SubgraphMarks[index].load(std::memory_order_relaxed) == pass;
+        };
+        // A chunk taken whole from its summary touches nothing but the summary.
+        if (archetypeIndex >= m_ChunkSummaries.size() || chunk >= m_ChunkSummaries[archetypeIndex].size())
+        {
+            ctx.failed.store(true, std::memory_order_relaxed);   // EnsureSubgraphStorage covers every chunk
+            return;
+        }
+        ChunkSummary& summary = m_ChunkSummaries[archetypeIndex][chunk];
+        if (summary.version != 0 && summary.single)
+        {
+            if (marked(summary.parent))
+            {
+                run.Add(*this, summary.parent, summary.keys.keys, summary.keys.content);
+                ++run.summarised;
+            }
+            return;
+        }
+
+        const Archetype& archetype = m_Impl->GetArchetypeStorage(archetypeIndex);
+        const uint32_t count = archetype.chunks[chunk].count;
+        if (count == 0)
+            return;
+        const uint8_t parentColumn = ColumnIndex(archetype, archetypeIndex, SlotParent);
+        const uint8_t nodeColumn = ColumnIndex(archetype, archetypeIndex, SlotNode);
+        const Parent* parents = parentColumn != c_Absent
+            ? reinterpret_cast<const Parent*>(ColumnBase(archetype, chunk, parentColumn)) : nullptr;
+        const SceneNode* nodes = nodeColumn != c_Absent
+            ? reinterpret_cast<const SceneNode*>(ColumnBase(archetype, chunk, nodeColumn)) : nullptr;
+        const Entity* entities = archetype.Entities(chunk);
+
+        // The summary: one parent, no row with children. Step 1 of a full pass computes every chunk's; in an incremental
+        // pass the Bounds system computed the summaries of the chunks whose boxes changed, and nothing else changes one
+        // without a full pass (links, parents, leaves and content flags change with the epoch).
+        if (summary.version == 0)
+        {
+            summary.single = true;
+            summary.parent = parents ? parents[0].entity : Entity::Null;
+            dm::box3 summaryBounds = dm::box3::empty();
+            uint32_t summaryContent = 0;
+            for (uint32_t r = 0; r < count; ++r)
+            {
+                const RowRef row{ &archetype, archetypeIndex, chunk, r };
+                dm::box3 bounds;
+                SceneContentFlags own;
+                const bool children = OwnPart(row, bounds, own);
+                if (children || (parents && parents[r].entity != summary.parent))
+                    summary.single = false;
+                summaryBounds |= NanToInfinite(bounds);
+                summaryContent |= uint32_t(own);
+            }
+            uint32_t ignored;
+            KeysOf(summaryBounds, SceneContentFlags::None, summary.keys.keys, ignored);
+            summary.keys.content = summaryContent;
+            summary.version = ctx.version;
+        }
+        if (summary.single)
+        {
+            if (marked(summary.parent))
+            {
+                run.Add(*this, summary.parent, summary.keys.keys, summary.keys.content);
+                ++run.summarised;
+            }
+            return;
+        }
+
+        auto columnOf = [&](Slot slot) noexcept -> const void*
+        {
+            const uint8_t column = ColumnIndex(archetype, archetypeIndex, slot);
+            return column != c_Absent ? ColumnBase(archetype, chunk, column) : nullptr;
+        };
+        const SceneLinks* links = static_cast<const SceneLinks*>(columnOf(SlotLinks));
+        const LeafObject* leaves = static_cast<const LeafObject*>(columnOf(SlotLeaf));
+        const WorldBounds* worldBounds = static_cast<const WorldBounds*>(columnOf(SlotWorldBounds));
+        const RenderFlags* renderFlags = static_cast<const RenderFlags*>(columnOf(SlotRenderFlags));
+        uint64_t computed = 0;
+        for (uint32_t r = 0; r < count; ++r)
+        {
+            const Entity parent = parents ? parents[r].entity : Entity::Null;
+            const bool parentMarked = marked(parent);
+            const bool rowMarked = marked(entities[r]);
+            if (!parentMarked && !rowMarked)
+                continue;
+            const SceneGraphLeaf* leaf = leaves ? leaves[r].object : nullptr;
+            const dm::box3 bounds = leaf && worldBounds ? worldBounds[r].bounds : dm::box3::empty();
+            const SceneContentFlags own = renderFlags ? SceneContentFlags(renderFlags[r].contentFlags)
+                                          : leaf ? SafeContentFlags(leaf) : SceneContentFlags::None;
+            const bool children = links && links[r].firstChild != Entity::Null;
+            SubgraphKeys value;
+            KeysOf(bounds, own, value.keys, value.content);
+            SceneGraphNode* node = nodes ? nodes[r].object : nullptr;
+            if (children)
+            {
+                if (rowMarked)
+                {
+                    const SubgraphAccumulator& accumulator = m_SubgraphAccumulators[GetEntityIndex(entities[r])];
+                    uint32_t keys[6];
+                    for (int i = 0; i < 6; ++i)
+                        keys[i] = accumulator.keys[i].load(std::memory_order_relaxed);
+                    UniteKeys(value.keys, value.content, keys, accumulator.content.load(std::memory_order_relaxed));
+                    FinalizeSubgraph(node, value, ctx.epoch);
+                    ++computed;
+                }
+                else if (node)
+                {
+                    // a subtree that did not change: the values the node keeps from an earlier pass
+                    KeysOf(node->m_CachedBounds, node->m_CachedSubgraphContent, value.keys, value.content);
+                }
+            }
+            if (parentMarked)
+                run.Add(*this, parent, value.keys, value.content);
+        }
+        if (computed)
+            ctx.nodes.fetch_add(computed, std::memory_order_relaxed);
+    }
+
+    void SceneGraphStore::RunSubgraphChunks(void* context, uint32_t begin, uint32_t end, uint32_t) noexcept
+    {
+        SubgraphContext& ctx = *static_cast<SubgraphContext*>(context);
+        SubgraphRun run;
+        for (uint32_t t = begin; t < end; ++t)
+            ctx.store->SubgraphChunk(ctx, ctx.tasks[t].archetype, ctx.tasks[t].chunk, run);
+        run.Flush(*ctx.store);
+        if (run.summarised)
+            ctx.summarised.fetch_add(run.summarised, std::memory_order_relaxed);
+    }
+
+    // The deep bucket: the subtree of each entry (a row whose parent is shallower, or a root) depth first, children in
+    // sibling order; every marked node with children in it gets its values, and the entry's value goes to its parent.
+    void SceneGraphStore::RunSubgraphDeep(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept
+    {
+        SubgraphContext& ctx = *static_cast<SubgraphContext*>(context);
+        SceneGraphStore& store = *ctx.store;
+        std::vector<SubgraphFrame>& stack = store.m_SubgraphStacks[worker];
+        const uint32_t pass = ctx.pass;
+        auto marked = [&](Entity entity) noexcept
+        {
+            const uint32_t index = GetEntityIndex(entity);
+            return entity != Entity::Null && index < store.m_SubgraphCapacity &&
+                   store.m_SubgraphMarks[index].load(std::memory_order_relaxed) == pass;
+        };
+        // The value of `entity` when it needs no walk (no children, or not marked); false when it must be walked.
+        auto leafValue = [&](Entity entity, SubgraphKeys& value, SceneContentFlags& own, Entity& firstChild,
+                             Entity& nextSibling) noexcept
+        {
+            RowRef row;
+            if (!store.Locate(entity, row))
+            {
+                EmptyKeys(value.keys, value.content);
+                own = SceneContentFlags::None;
+                firstChild = nextSibling = Entity::Null;
+                return true;
+            }
+            dm::box3 bounds;
+            const bool children = store.OwnPart(row, bounds, own);
+            KeysOf(bounds, own, value.keys, value.content);
+            const SceneLinks* links = static_cast<const SceneLinks*>(store.Column(row, SlotLinks));
+            firstChild = links ? links->firstChild : Entity::Null;
+            nextSibling = links ? links->nextSibling : Entity::Null;
+            if (!children)
+                return true;
+            if (!marked(entity))
+            {
+                const SceneNode* node = static_cast<const SceneNode*>(store.Column(row, SlotNode));
+                if (node && node->object)
+                    KeysOf(node->object->m_CachedBounds, node->object->m_CachedSubgraphContent, value.keys,
+                           value.content);
+                return true;
+            }
+            return false;
+        };
+
+        uint64_t computed = 0;
+        for (uint32_t e = begin; e < end; ++e)
+        {
+            const Entity entry = store.m_SubgraphEntries[e];
+            SubgraphKeys value;
+            SceneContentFlags own;
+            Entity firstChild, nextSibling;
+            if (!leafValue(entry, value, own, firstChild, nextSibling))
+            {
+                stack.clear();
+                try
+                {
+                    stack.push_back(SubgraphFrame{ entry, firstChild, value, own });
+                    while (!stack.empty())
+                    {
+                        SubgraphFrame& top = stack.back();
+                        if (top.nextChild != Entity::Null)
+                        {
+                            const Entity child = top.nextChild;
+                            SubgraphKeys childValue;
+                            SceneContentFlags childOwn;
+                            Entity childFirst, childNext;
+                            const bool done = leafValue(child, childValue, childOwn, childFirst, childNext);
+                            top.nextChild = childNext;
+                            if (done)
+                                UniteKeys(top.keys.keys, top.keys.content, childValue.keys, childValue.content);
+                            else
+                                stack.push_back(SubgraphFrame{ child, childFirst, childValue, childOwn });
+                            continue;
+                        }
+                        const SubgraphFrame finished = top;
+                        stack.pop_back();
+                        store.FinalizeSubgraph(store.NodeOf(finished.entity), finished.keys, ctx.epoch);
+                        ++computed;
+                        if (stack.empty())
+                            value = finished.keys;
+                        else
+                            UniteKeys(stack.back().keys.keys, stack.back().keys.content, finished.keys.keys,
+                                      finished.keys.content);
+                    }
+                }
+                catch (...)
+                {
+                    ctx.failed.store(true, std::memory_order_relaxed);
+                    break;
+                }
+            }
+            // the entry's parent is shallower: its accumulator
+            RowRef row;
+            if (store.Locate(entry, row))
+            {
+                const Parent* parent = static_cast<const Parent*>(store.Column(row, SlotParent));
+                if (parent && marked(parent->entity))
+                    MergeInto(store.m_SubgraphAccumulators[GetEntityIndex(parent->entity)], value.keys, value.content);
+            }
+        }
+        if (computed)
+            ctx.nodes.fetch_add(computed, std::memory_order_relaxed);
+    }
+
+    bool SceneGraphStore::EnsureSubgraphStorage() noexcept
+    {
+        if (s_FailSubgraphCountdown.load(std::memory_order_relaxed) >= 0 &&
+            s_FailSubgraphCountdown.fetch_sub(1, std::memory_order_relaxed) == 0)
+            return false;   // test seam: as out of memory
+
+        // Marks and accumulators by entity index.
+        const size_t entities = m_Impl->GetEntityTableSize();
+        if (entities > m_SubgraphCapacity)
+        {
+            const size_t capacity = std::max(entities + entities / 4 + 1024, m_SubgraphCapacity * 2);
+            std::unique_ptr<std::atomic<uint32_t>[]> marks(new (std::nothrow) std::atomic<uint32_t>[capacity]);
+            std::unique_ptr<SubgraphAccumulator[]> accumulators(new (std::nothrow) SubgraphAccumulator[capacity]);
+            if (!marks || !accumulators)
+                return false;
+            for (size_t i = 0; i < capacity; ++i)
+                marks[i].store(0, std::memory_order_relaxed);
+            m_SubgraphMarks = std::move(marks);
+            m_SubgraphAccumulators = std::move(accumulators);
+            m_SubgraphCapacity = capacity;
+            m_SubgraphPass = 0;
+        }
+        // A summary per chunk of every archetype; a stack per thread.
+        try
+        {
+            const uint32_t archetypeCount = m_Impl->GetArchetypeStorageCount();
+            if (m_ChunkSummaries.size() < archetypeCount)
+                m_ChunkSummaries.resize(archetypeCount);
+            for (uint32_t a = 0; a < archetypeCount; ++a)
+            {
+                const uint32_t chunks = m_Impl->GetArchetypeStorage(a).GetChunkCount();
+                if (m_ChunkSummaries[a].size() < chunks)
+                    m_ChunkSummaries[a].resize(chunks);
+            }
+            const size_t threads = m_Jobs ? m_Jobs->GetThreadCount() : 1;
+            if (m_SubgraphStacks.size() < threads)
+                m_SubgraphStacks.resize(threads);
+        }
+        catch (...)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    // A new pass number (marks need no clearing), the mode, and the storage for the world before the phases. A phase
+    // that changes the structure (commands played back before it, an exclusive system) is caught by UpdateSubgraphs.
+    void SceneGraphStore::PrepareSubgraphs() noexcept
+    {
+        m_SubgraphPrepared = false;
+        // Full when the epoch moved (a structural change through the API, SetLeaf, InvalidateContent) or the world's
+        // structure did otherwise (the first transform of a node moves its row to another archetype): rows that joined
+        // a chunk make its summary stale.
+        m_PreparedStructuralVersion = m_World->GetStructuralVersion();
+        m_SubgraphFull = m_SubgraphForceFull || m_SubgraphEpoch.load(std::memory_order_relaxed) != GetEpoch() ||
+                         m_PreparedStructuralVersion != m_SubgraphStructuralVersion;
+        m_SubgraphMarked.store(0, std::memory_order_relaxed);
+        m_SubgraphNeedsFull.store(false, std::memory_order_relaxed);
+        if (!EnsureSubgraphStorage())
+            return;   // the getters fall back to the on-demand caches
+        if (++m_SubgraphPass == 0)
+        {
+            for (size_t i = 0; i < m_SubgraphCapacity; ++i)
+                m_SubgraphMarks[i].store(0, std::memory_order_relaxed);
+            m_SubgraphPass = 1;
+        }
+        m_SubgraphPrepared = true;
+    }
+
+    bool SceneGraphStore::HasDynamicBoundsRows() const noexcept
+    {
+        for (const BoundsArchetype& bounds : m_BoundsArchetypes)
+        {
+            if (bounds.leaf == c_Absent)
+                continue;
+            const Archetype& archetype = m_Impl->GetArchetypeStorage(bounds.archetype);
+            for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+            {
+                if (archetype.chunks[c].count != 0)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    // An incremental pass's step 1 for a chunk the Bounds system wrote (its boxes changed): the summary (its bounds the
+    // chunk's union, ChunkWorldBounds, which the Bounds system just made in row order), and the paths to mark, from a
+    // row with children itself, else from its parent (once per run of rows of one parent).
+    void SceneGraphStore::SubgraphFromBounds(const Archetype& archetype, uint32_t archetypeIndex, uint32_t chunk,
+                                             const dm::box3& chunkBounds) noexcept
+    {
+        const uint32_t count = archetype.chunks[chunk].count;
+        const uint8_t linksColumn = ColumnIndex(archetype, archetypeIndex, SlotLinks);
+        if (linksColumn == c_Absent || count == 0)
+            return;
+        const SceneLinks* links = reinterpret_cast<const SceneLinks*>(ColumnBase(archetype, chunk, linksColumn));
+        const uint8_t parentColumn = ColumnIndex(archetype, archetypeIndex, SlotParent);
+        const Parent* parents = parentColumn != c_Absent
+            ? reinterpret_cast<const Parent*>(ColumnBase(archetype, chunk, parentColumn)) : nullptr;
+        const Entity* entities = archetype.Entities(chunk);
+        auto columnOf = [&](Slot slot) noexcept -> const void*
+        {
+            const uint8_t column = ColumnIndex(archetype, archetypeIndex, slot);
+            return column != c_Absent ? ColumnBase(archetype, chunk, column) : nullptr;
+        };
+        const LeafObject* leaves = static_cast<const LeafObject*>(columnOf(SlotLeaf));
+        const RenderFlags* renderFlags = static_cast<const RenderFlags*>(columnOf(SlotRenderFlags));
+        if (archetypeIndex >= m_ChunkSummaries.size() || chunk >= m_ChunkSummaries[archetypeIndex].size())
+        {
+            m_SubgraphNeedsFull.store(true, std::memory_order_relaxed);   // an archetype or chunk made during the phases
+            return;
+        }
+        ChunkSummary& summary = m_ChunkSummaries[archetypeIndex][chunk];
+        summary.single = true;
+        summary.parent = parents ? parents[0].entity : Entity::Null;
+        uint32_t summaryContent = 0;
+        Entity markedParent = Entity::Null;
+        for (uint32_t r = 0; r < count; ++r)
+        {
+            const bool children = links[r].firstChild != Entity::Null;
+            const Entity parent = parents ? parents[r].entity : Entity::Null;
+            if (children || parent != summary.parent)
+                summary.single = false;
+            const SceneGraphLeaf* leaf = leaves ? leaves[r].object : nullptr;
+            summaryContent |= renderFlags ? renderFlags[r].contentFlags
+                              : leaf ? uint32_t(SafeContentFlags(leaf)) : 0u;
+            if (children)
+                MarkPath(entities[r], m_SubgraphPass);
+            else if (parent != markedParent)
+            {
+                MarkPath(parent, m_SubgraphPass);
+                markedParent = parent;
+            }
+        }
+        uint32_t ignored;
+        KeysOf(chunkBounds, SceneContentFlags::None, summary.keys.keys, ignored);
+        summary.keys.content = summaryContent;
+        summary.version = m_World->GetVersion();
+    }
+
+    void SceneGraphStore::UpdateSubgraphs() noexcept
+    {
+        IJobSystem* jobs = m_Jobs;
+        const uint32_t threads = WorkingThreads(jobs);
+        if (!m_SubgraphPrepared)
+            return;   // out of memory before the phases: the getters fall back to the on-demand caches
+        m_SubgraphPrepared = false;
+        bool full = m_SubgraphFull;
+        if (m_World->GetStructuralVersion() != m_PreparedStructuralVersion ||
+            m_SubgraphNeedsFull.load(std::memory_order_relaxed))
+        {
+            // A phase changed the structure (commands played back before it, an exclusive system) or made rows the
+            // storage did not cover: the Bounds system's marks and summaries may be incomplete. Again, in full, over
+            // the world as it is now.
+            SyncArchetypes();
+            UpdateSystemLists();
+            if (!EnsureSubgraphStorage())
+                return;
+            if (++m_SubgraphPass == 0)
+            {
+                for (size_t i = 0; i < m_SubgraphCapacity; ++i)
+                    m_SubgraphMarks[i].store(0, std::memory_order_relaxed);
+                m_SubgraphPass = 1;
+            }
+            full = true;
+            s_SubgraphRedos.fetch_add(1);
+        }
+        // 5: a full pass moves the epoch, so that what the lazy path stamped before (on nodes without children too)
+        // is not taken for current
+        if (full)
+            BumpEpoch();
+        const uint64_t epoch = GetEpoch();
+
+        SubgraphContext ctx;
+        ctx.store = this;
+        ctx.pass = m_SubgraphPass;
+        ctx.epoch = epoch;
+        ctx.version = m_World->GetVersion();
+        ctx.full = full;
+
+        try
+        {
+            // 1. Marks and summaries, in full mode, over every chunk (in incremental mode the Bounds system
+            // did it for the chunks it wrote).
+            if (full)
+            {
+                m_SubgraphTasks.clear();
+                uint32_t rows = 0;
+                for (uint32_t d = 0; d <= c_MaxHierarchyDepth; ++d)
+                {
+                    for (const LevelArchetype& level : m_Levels[d])
+                    {
+                        const Archetype& archetype = m_Impl->GetArchetypeStorage(level.archetype);
+                        for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+                        {
+                            if (archetype.chunks[c].count == 0)
+                                continue;
+                            m_SubgraphTasks.push_back(Task{ level.archetype, c, true });
+                            rows += archetype.chunks[c].count;
+                        }
+                    }
+                }
+                ctx.tasks = m_SubgraphTasks.data();
+                const uint32_t markTasks = uint32_t(m_SubgraphTasks.size());
+                if (jobs && rows >= s_SerialSubgraphRows.load(std::memory_order_relaxed) && markTasks > 1)
+                    jobs->ParallelFor(markTasks, std::max(1u, markTasks / (threads * 4)), &RunSubgraphMarks, &ctx);
+                else if (markTasks)
+                    RunSubgraphMarks(&ctx, 0, markTasks, 0);
+            }
+            if (m_SubgraphMarked.load(std::memory_order_relaxed) == 0)
+            {
+                // nothing marked: every node keeps its values
+                m_SubgraphForceFull = false;
+                m_SubgraphStructuralVersion = m_World->GetStructuralVersion();   // the structure this pass saw
+                m_SubgraphEpoch.store(epoch, std::memory_order_release);
+                ++m_Counters.subgraphPasses;
+                m_Counters.fullSubgraphPasses += full ? 1 : 0;
+                return;
+            }
+
+            // 2a. The deep bucket's entries: rows whose parent is in a shallower bucket (or roots), when they or their
+            // parents are marked.
+            m_SubgraphEntries.clear();
+            for (const LevelArchetype& level : m_Levels[c_MaxHierarchyDepth])
+            {
+                const Archetype& archetype = m_Impl->GetArchetypeStorage(level.archetype);
+                for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+                {
+                    const uint32_t count = archetype.chunks[c].count;
+                    const Entity* rowEntities = archetype.Entities(c);
+                    const Parent* parents = level.parent != c_Absent
+                        ? reinterpret_cast<const Parent*>(ColumnBase(archetype, c, level.parent)) : nullptr;
+                    for (uint32_t r = 0; r < count; ++r)
+                    {
+                        const Entity parent = parents ? parents[r].entity : Entity::Null;
+                        auto isMarked = [&](Entity entity)
+                        {
+                            const uint32_t index = GetEntityIndex(entity);
+                            return entity != Entity::Null && index < m_SubgraphCapacity &&
+                                   m_SubgraphMarks[index].load(std::memory_order_relaxed) == ctx.pass;
+                        };
+                        if (!isMarked(parent) && !isMarked(rowEntities[r]))
+                            continue;
+                        bool entry = parent == Entity::Null;
+                        if (!entry)
+                        {
+                            const EntityRecord* record = m_Impl->FindAlive(parent);
+                            entry = record && record->archetype < m_ArchetypeLevel.size() &&
+                                    m_ArchetypeLevel[record->archetype] != c_MaxHierarchyDepth;
+                        }
+                        if (entry)
+                            m_SubgraphEntries.push_back(rowEntities[r]);
+                    }
+                }
+            }
+        }
+        catch (...)
+        {
+            return;   // out of memory: the getters fall back to the on-demand caches
+        }
+        const uint32_t entryCount = uint32_t(m_SubgraphEntries.size());
+        if (jobs && entryCount > 1)
+            jobs->ParallelFor(entryCount, 1, &RunSubgraphDeep, &ctx);
+        else if (entryCount)
+            RunSubgraphDeep(&ctx, 0, entryCount, 0);
+
+        // 2b. The depth buckets from the deepest shallow one up to the roots.
+        for (int32_t d = int32_t(c_MaxHierarchyDepth) - 1; d >= 0 && !ctx.failed.load(); --d)
+        {
+            m_SubgraphTasks.clear();
+            uint32_t rows = 0;
+            try
+            {
+                for (const LevelArchetype& level : m_Levels[d])
+                {
+                    const Archetype& archetype = m_Impl->GetArchetypeStorage(level.archetype);
+                    for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+                    {
+                        if (archetype.chunks[c].count == 0)
+                            continue;
+                        m_SubgraphTasks.push_back(Task{ level.archetype, c, true });
+                        rows += archetype.chunks[c].count;
+                    }
+                }
+            }
+            catch (...)
+            {
+                return;
+            }
+            const uint32_t taskCount = uint32_t(m_SubgraphTasks.size());
+            ctx.tasks = m_SubgraphTasks.data();
+            if (jobs && rows >= s_SerialSubgraphRows.load(std::memory_order_relaxed) && taskCount > 1)
+                jobs->ParallelFor(taskCount, std::max(1u, taskCount / (threads * 4)), &RunSubgraphChunks, &ctx);
+            else if (taskCount)
+                RunSubgraphChunks(&ctx, 0, taskCount, 0);
+        }
+        if (ctx.failed.load())
+            return;
+
+        m_SubgraphForceFull = false;
+        m_SubgraphStructuralVersion = m_World->GetStructuralVersion();   // the structure this pass saw
+        m_SubgraphEpoch.store(epoch, std::memory_order_release);
+        ++m_Counters.subgraphPasses;
+        m_Counters.fullSubgraphPasses += full ? 1 : 0;
+        m_Counters.subgraphNodes += ctx.nodes.load(std::memory_order_relaxed);
+        m_Counters.summarisedChunks += ctx.summarised.load(std::memory_order_relaxed);
+    }
+
+    // ---------------------------------------------------------------------------- row hints (5.2)
+
+    void SceneGraphStore::RunRowHints(void* context, uint32_t begin, uint32_t end, uint32_t) noexcept
+    {
+        SceneGraphStore& store = *static_cast<SceneGraphStore*>(context);
+        for (uint32_t t = begin; t < end; ++t)
+        {
+            const Task& task = store.m_SubgraphTasks[t];
+            const Archetype& archetype = store.m_Impl->GetArchetypeStorage(task.archetype);
+            const uint8_t nodeColumn = store.ColumnIndex(archetype, task.archetype, SlotNode);
+            const SceneNode* nodes = reinterpret_cast<const SceneNode*>(ColumnBase(archetype, task.chunk, nodeColumn));
+            const uint32_t count = archetype.chunks[task.chunk].count;
+            for (uint32_t r = 0; r < count; ++r)
+            {
+                if (nodes[r].object)
+                    RememberRow(nodes[r].object, RowRef{ &archetype, task.archetype, task.chunk, r });
+            }
+        }
+    }
+
+    // The hints of an archetype go stale for all its rows when one row moves (Archetype::rowMoves): after structural
+    // changes, Refresh writes them again for the archetypes whose rows moved, so that the getters keep their fast path.
+    void SceneGraphStore::RefreshRowHints() noexcept
+    {
+        const uint32_t archetypeCount = m_Impl->GetArchetypeStorageCount();
+        uint32_t rows = 0;
+        try
+        {
+            if (m_HintedMoves.size() < archetypeCount)
+                m_HintedMoves.resize(archetypeCount, ~uint64_t(0));
+            m_SubgraphTasks.clear();
+            for (uint32_t a = 0; a < archetypeCount; ++a)
+            {
+                const Archetype& archetype = m_Impl->GetArchetypeStorage(a);
+                if (m_HintedMoves[a] == archetype.rowMoves || ColumnIndex(archetype, a, SlotNode) == c_Absent)
+                    continue;
+                m_HintedMoves[a] = archetype.rowMoves;
+                for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+                {
+                    if (archetype.chunks[c].count == 0)
+                        continue;
+                    m_SubgraphTasks.push_back(Task{ a, c, true });
+                    rows += archetype.chunks[c].count;
+                }
+            }
+        }
+        catch (...)
+        {
+            return;   // the hints stay stale: the getters take the entity table
+        }
+        const uint32_t taskCount = uint32_t(m_SubgraphTasks.size());
+        if (m_Jobs && rows >= s_SerialSubgraphRows.load(std::memory_order_relaxed) && taskCount > 1)
+            m_Jobs->ParallelFor(taskCount, std::max(1u, taskCount / (WorkingThreads(m_Jobs) * 4)), &RunRowHints, this);
+        else if (taskCount)
+            RunRowHints(this, 0, taskCount, 0);
     }
 }

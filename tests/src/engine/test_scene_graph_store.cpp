@@ -47,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <string>
 #include <thread>
@@ -1006,6 +1007,531 @@ void test_steady_state_allocations()
     CHECK(g_NewCount.load() > newBefore && probe.size() == 1000);
 }
 
+// The subgraph values Refresh computes (incremental and full passes, the deep bucket, rows that change archetype on
+// their first transform, InvalidateContent, attach and detach) against a brute-force walk: each node's leaf box in
+// world space and content flags, united over its subtree; and the links the node objects keep. Equal as floats (the
+// sign of a zero that ties may differ: the union is order-independent).
+namespace
+{
+    struct Expected
+    {
+        dm::box3 bounds;
+        SceneContentFlags leaf;
+        SceneContentFlags subgraph;
+    };
+
+    Expected BruteForce(SceneGraphNode* node, std::unordered_map<const SceneGraphNode*, Expected>& out)
+    {
+        Expected e{ dm::box3::empty(), SceneContentFlags::None, SceneContentFlags::None };
+        if (SceneGraphLeaf* leaf = node->GetLeaf())
+        {
+            const dm::box3 local = leaf->GetLocalBoundingBox();
+            if (!local.isempty())
+                e.bounds = local * node->GetLocalToWorldTransformFloat();
+            e.leaf = leaf->GetContentFlags();
+        }
+        e.subgraph = e.leaf;
+        for (SceneGraphNode* child = node->GetFirstChild(); child; child = child->GetNextSibling())
+        {
+            const Expected c = BruteForce(child, out);
+            e.bounds |= c.bounds;
+            e.subgraph |= c.subgraph;
+        }
+        out[node] = e;
+        return e;
+    }
+
+    bool SameBox(const dm::box3& a, const dm::box3& b)
+    {
+        return all(a.m_mins == b.m_mins) && all(a.m_maxs == b.m_maxs);   // as floats: -0 equals +0
+    }
+
+    // Every attached node's getters against the brute force walk; returns the expected values.
+    std::unordered_map<const SceneGraphNode*, Expected> CheckAgainstBruteForce(SceneGraph* graph)
+    {
+        std::unordered_map<const SceneGraphNode*, Expected> expected;
+        BruteForce(graph->GetRootNode(), expected);
+        size_t visited = 0;
+        for (SceneGraphWalker walker(graph->GetRootNode()); walker; walker.Next(true))
+        {
+            SceneGraphNode* node = walker.Get();
+            const Expected& e = expected[node];
+            CHECK(SameBox(node->GetGlobalBoundingBox(), e.bounds));
+            CHECK(node->GetLeafContentFlags() == e.leaf);
+            CHECK(node->GetSubgraphContentFlags() == e.subgraph);
+            ++visited;
+        }
+        CHECK(visited == expected.size());
+        return expected;
+    }
+}
+
+void test_subgraph_refresh()
+{
+    // every bucket and the marks on the job system (the serial path below 4096 rows is what the other cases run)
+    SceneGraphStore::SetSerialSubgraphRows(1);
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    {
+        // A group without a transform or leaf under the root, and the root's other children, transformed, without leaves
+        // or children (one chunk, taken whole from its summary). The group's first transform moves its row into that
+        // chunk: the world's structure changed without the epoch, and the next pass must not take the chunk whole.
+        auto small = MAKE_RC_OBJ_PTR(SceneGraph);
+        small->SetRootNode(MakeNode("root"));
+        auto plain = MakeNode("plain");
+        small->Attach(small->GetRootNode(), plain);
+        auto mesh = MakeMesh(factory, 1.f);
+        for (int i = 0; i < 20; ++i)
+        {
+            auto child = MakeNode("c");
+            child->SetTranslation(dm::double3(double(i), 0.0, 0.0));
+            child->SetLeaf(factory->CreateMeshInstance(mesh));
+            small->Attach(plain, child);
+            auto other = MakeNode("o");
+            other->SetTranslation(dm::double3(0.0, double(i), 0.0));
+            small->Attach(small->GetRootNode(), other);
+        }
+        small->Refresh(1);
+        plain->GetFirstChild()->SetTranslation(dm::double3(-1.0, 0.0, 0.0));   // an incremental pass
+        small->Refresh(2);
+        plain->SetTranslation(dm::double3(100.0, 0.0, 0.0));
+        small->Refresh(3);
+        std::unordered_map<const SceneGraphNode*, Expected> expected;
+        BruteForce(small->GetRootNode(), expected);
+        CHECK(SameBox(plain->GetGlobalBoundingBox(), expected[plain.Get()].bounds));
+        CHECK(SameBox(small->GetRootNode()->GetGlobalBoundingBox(), expected[small->GetRootNode()].bounds));
+        CHECK(plain->GetGlobalBoundingBox().m_mins.x > 97.f);   // the first child at x = -1, box from -1 to +1
+    }
+
+    auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+    graph->SetRootNode(MakeNode("root"));
+    Rng rng(77);
+    std::vector<nvrhi::AutoPtr<MeshInfo>> meshes;
+    for (int i = 0; i < 4; ++i)
+        meshes.push_back(MakeMesh(factory, 0.25f + 0.5f * float(i)));
+    std::vector<nvrhi::AutoPtr<SceneGraphNode>> all;
+    auto newNode = [&](bool transform)
+    {
+        auto node = MakeNode("n");
+        if (transform)
+            RandomMove(rng, node);
+        const uint32_t pick = rng.Below(5);
+        if (pick < 3)
+            node->SetLeaf(factory->CreateMeshInstance(meshes[rng.Below(4)]));
+        else if (pick == 3)
+            node->SetLeaf(MAKE_RC_OBJ_PTR(PointLight));
+        all.push_back(node);
+        return node;
+    };
+    // a wide part under the root, nested groups, and a chain deeper than the depth buckets (c_MaxHierarchyDepth)
+    for (int i = 0; i < 600; ++i)
+        graph->Attach(graph->GetRootNode(), newNode(true));
+    for (int g = 0; g < 20; ++g)
+    {
+        auto group = newNode(g % 2 == 0);
+        graph->Attach(all[rng.Below(uint32_t(all.size()))], group);
+        for (int i = 0; i < 30; ++i)
+            graph->Attach(i % 3 ? group.Get() : all[rng.Below(uint32_t(all.size()))].Get(), newNode(i % 4 != 0));
+    }
+    SceneGraphNode* tip = graph->GetRootNode();
+    for (int d = 0; d < 90; ++d)
+    {
+        auto node = newNode(d % 5 != 0);
+        graph->Attach(tip, node);
+        if (d % 7 == 0)
+            graph->Attach(tip, newNode(true));   // a sibling in the chain
+        tip = node;
+    }
+    std::vector<nvrhi::AutoPtr<SceneGraphNode>> detached;
+
+    auto attachedNodes = [&]()
+    {
+        std::vector<SceneGraphNode*> nodes;
+        for (SceneGraphWalker walker(graph->GetRootNode()); walker; walker.Next(true))
+            nodes.push_back(walker.Get());
+        return nodes;
+    };
+
+    std::unordered_map<const SceneGraphNode*, Expected> previous = CheckAgainstBruteForce(graph);
+    for (uint32_t frame = 1; frame <= 48; ++frame)
+    {
+        auto nodes = attachedNodes();
+        // moves every frame (incremental passes); a node's first transform moves its row to another archetype
+        for (uint32_t k = 0; k < uint32_t(nodes.size()) / 10; ++k)
+            RandomMove(rng, nodes[1 + rng.Below(uint32_t(nodes.size()) - 1)]);
+        bool structural = false;
+        if (frame % 5 == 1)
+        {
+            // SetLeaf: a mesh, a light, or none
+            SceneGraphNode* node = nodes[1 + rng.Below(uint32_t(nodes.size()) - 1)];
+            const uint32_t pick = rng.Below(3);
+            node->SetLeaf(pick == 0 ? nvrhi::AutoPtr<SceneGraphLeaf>(factory->CreateMeshInstance(meshes[rng.Below(4)]))
+                          : pick == 1 ? nvrhi::AutoPtr<SceneGraphLeaf>(MAKE_RC_OBJ_PTR(PointLight)) : nullptr);
+            structural = true;
+        }
+        if (frame % 3 == 0)
+        {
+            structural = true;
+            // edits that make the next pass a full one
+            switch (frame % 4)
+            {
+            case 0:
+                graph->Attach(nodes[rng.Below(uint32_t(nodes.size()))], newNode(true));
+                break;
+            case 1:
+                if (!detached.empty())
+                {
+                    graph->Attach(nodes[rng.Below(uint32_t(nodes.size()))], detached.back());
+                    detached.pop_back();
+                }
+                else
+                    detached.push_back(graph->Detach(nodes[1 + rng.Below(uint32_t(nodes.size()) - 1)]));
+                break;
+            case 2:
+            {
+                // a mesh's box edited in place, then InvalidateContent on one instance of it (the others keep theirs)
+                meshes[0]->objectSpaceBounds = dm::box3(dm::float3(-3.f), dm::float3(1.f + float(frame)));
+                for (SceneGraphNode* node : nodes)
+                {
+                    if (auto instance = query_cast<MeshInstance>(node->GetLeaf()); instance &&
+                        instance->GetMesh() == meshes[0].Get())
+                        node->InvalidateContent();
+                }
+                break;
+            }
+            default:
+                detached.push_back(graph->Detach(nodes[1 + rng.Below(uint32_t(nodes.size()) - 1)]));
+                break;
+            }
+        }
+
+        // Between the changes and Refresh: after a structural change the getters compute on demand from the rows
+        // (equal to the brute force now: the new rows' transforms are their records'); with moves alone they still
+        // give the last Refresh's values.
+        if (structural)
+            CheckAgainstBruteForce(graph);
+        else
+        {
+            for (SceneGraphWalker walker(graph->GetRootNode()); walker; walker.Next(true))
+            {
+                const Expected& e = previous[walker.Get()];
+                CHECK(SameBox(walker->GetGlobalBoundingBox(), e.bounds));
+                CHECK(walker->GetSubgraphContentFlags() == e.subgraph);
+            }
+        }
+        // the Bounds phase run outside Refresh (the next pass must be a full one), a read-only phase, and a pass whose
+        // storage cannot be allocated (the getters fall back to the on-demand caches)
+        if (frame % 7 == 3)
+            CHECK(graph->GetScheduler()->RunPhase(Phase::Bounds) == nvrhi::FS_OK);
+        if (frame % 7 == 5)
+            CHECK(graph->RunReadOnlyPhase(Phase::RenderExtract) == nvrhi::FS_OK);
+        if (frame % 11 == 6)
+            SceneGraphStore::FailSubgraphAfter(0);
+        graph->Refresh(frame);
+        SceneGraphStore::FailSubgraphAfter(-1);
+
+        // eight readers at once, then the brute force
+        nodes = attachedNodes();
+        std::vector<std::vector<dm::box3>> results(8);
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 8; ++t)
+        {
+            threads.emplace_back([&, t]()
+            {
+                for (SceneGraphWalker walker(graph->GetRootNode()); walker; walker.Next(true))
+                    results[size_t(t)].push_back(walker->GetGlobalBoundingBox());
+            });
+        }
+        for (auto& thread : threads)
+            thread.join();
+        std::unordered_map<const SceneGraphNode*, Expected> expected;
+        BruteForce(graph->GetRootNode(), expected);
+        CHECK(expected.size() == nodes.size());
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
+            SceneGraphNode* node = nodes[i];
+            const Expected& e = expected[node];
+            CHECK(SameBox(node->GetGlobalBoundingBox(), e.bounds));
+            CHECK(node->GetLeafContentFlags() == e.leaf);
+            CHECK(node->GetSubgraphContentFlags() == e.subgraph);
+            for (int t = 0; t < 8; ++t)
+                CHECK(SameBits(&results[size_t(t)][i], &results[0][i], sizeof(dm::box3)));
+            for (SceneGraphNode* child = node->GetFirstChild(); child; child = child->GetNextSibling())
+                CHECK(child->GetParent() == node);
+        }
+        previous = std::move(expected);
+    }
+    SceneGraphStore::SetSerialSubgraphRows(4096);
+    CHECK(g_Warnings.load() == 0);
+}
+
+// Structural changes inside Refresh's phases: commands that a user system in TransformPropagation records (played back
+// before the Bounds phase: rows move to new archetypes and chunks), and an exclusive system in the Bounds phase that
+// moves rows immediately. The pass sees the structure change and redoes itself as a full pass; every node's values
+// equal the brute force.
+namespace
+{
+    struct Tagged { };
+    DONUT_ECS_TAG(Tagged, "5a8e2f41-7c3b-4e5d-9a1f-0b6c2d8e4f73");
+}
+
+void test_phase_structure()
+{
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+    graph->SetRootNode(MakeNode("root"));
+    Rng rng(91);
+    auto mesh = MakeMesh(factory, 0.5f);
+    std::vector<nvrhi::AutoPtr<SceneGraphNode>> nodes;
+    for (int i = 0; i < 6000; ++i)
+    {
+        auto node = MakeNode("n");
+        RandomMove(rng, node);
+        node->SetLeaf(factory->CreateMeshInstance(mesh));
+        graph->Attach(i % 4 || nodes.empty() ? graph->GetRootNode() : nodes[rng.Below(uint32_t(nodes.size()))].Get(), node);
+        nodes.push_back(node);
+    }
+    graph->Refresh(1);
+    CheckAgainstBruteForce(graph);
+
+    IWorld* world = graph->GetWorld();
+    const ComponentId tag = RegisterComponent<Tagged>(world);
+    std::vector<Entity> entities;   // the rows to toggle this frame
+    std::vector<Entity> adds, removes;
+    std::unordered_map<uint64_t, bool> tagged;
+    bool commands = false;
+    bool exclusive = false;
+    uint32_t failures = 0;
+    SystemDesc recorderDesc{};
+    recorderDesc.name = "test.StructureRecorder";
+    recorderDesc.phase = Phase::TransformPropagation;
+    recorderDesc.flags = SystemFlags::MainThread;
+    nvrhi::AutoPtr<ISystem> recorder;
+    CHECK(CreateLambdaSystem(recorderDesc, [&](ISystemContext* context) noexcept
+    {
+        if (commands)
+        {
+            adds.clear();
+            removes.clear();
+            for (Entity entity : entities)
+            {
+                bool& on = tagged[uint64_t(entity)];
+                (on ? removes : adds).push_back(entity);
+                on = !on;
+            }
+            if (!adds.empty())
+                context->GetCommandBuffer()->AddComponents(adds.data(), uint32_t(adds.size()), tag, nullptr, 0);
+            if (!removes.empty())
+                context->GetCommandBuffer()->RemoveComponents(removes.data(), uint32_t(removes.size()), tag, 0);
+        }
+        return nvrhi::FS_OK;
+    }, &recorder) == nvrhi::FS_OK);
+    SystemDesc exclusiveDesc{};
+    exclusiveDesc.name = "test.StructureExclusive";
+    exclusiveDesc.phase = Phase::Bounds;
+    exclusiveDesc.flags = SystemFlags::Exclusive;
+    const char* const afterBounds[] = { "SceneGraph.Bounds" };   // after the marks and summaries of the pass
+    exclusiveDesc.runAfter = afterBounds;
+    exclusiveDesc.runAfterCount = 1;
+    nvrhi::AutoPtr<ISystem> mover;
+    CHECK(CreateLambdaSystem(exclusiveDesc, [&](ISystemContext*) noexcept
+    {
+        if (exclusive)
+        {
+            for (Entity entity : entities)
+            {
+                bool& on = tagged[uint64_t(entity)];
+                failures += (on ? world->RemoveComponent(entity, tag) : world->AddComponent(entity, tag, nullptr)) != nvrhi::FS_OK;
+                on = !on;
+            }
+        }
+        return nvrhi::FS_OK;
+    }, &mover) == nvrhi::FS_OK);
+    SystemId recorderId = SystemId::Invalid, moverId = SystemId::Invalid;
+    CHECK(graph->GetScheduler()->AddSystem(recorder, recorderId) == nvrhi::FS_OK);
+    CHECK(graph->GetScheduler()->AddSystem(mover, moverId) == nvrhi::FS_OK);
+
+    const uint64_t redosBefore = SceneGraphStore::GetSubgraphRedoCount();
+    for (uint32_t frame = 2; frame <= 9; ++frame)
+    {
+        // a third of the nodes move; the systems move a quarter of the rows to the tagged archetypes and back
+        for (size_t i = frame % 3; i < nodes.size(); i += 3)
+            RandomMove(rng, nodes[i]);
+        entities.clear();
+        for (size_t i = frame % 4; i < nodes.size(); i += 4)
+            entities.push_back(graph->GetEntity(nodes[i]));
+        commands = frame % 2 == 0;
+        exclusive = frame % 2 == 1;
+        graph->Refresh(frame);
+        CheckAgainstBruteForce(graph);
+    }
+    commands = exclusive = false;
+    CHECK(failures == 0);
+    CHECK(SceneGraphStore::GetSubgraphRedoCount() > redosBefore);
+    CHECK(graph->GetScheduler()->RemoveSystem(recorderId) == nvrhi::FS_OK);
+    CHECK(graph->GetScheduler()->RemoveSystem(moverId) == nvrhi::FS_OK);
+    CHECK(g_Warnings.load() == 0);
+}
+
+// NaN boxes: the same infinite rule in a full and an incremental pass, in a summary chunk and row by row.
+void test_subgraph_nan()
+{
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+    graph->SetRootNode(MakeNode("root"));
+    auto mesh = MakeMesh(factory, 0.5f);
+    auto nanMesh = MakeMesh(factory, 0.5f);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    nanMesh->objectSpaceBounds = dm::box3(dm::float3(nan), dm::float3(nan));
+    auto group = MakeNode("group");
+    graph->Attach(graph->GetRootNode(), group);
+    std::vector<nvrhi::AutoPtr<SceneGraphNode>> nodes;
+    for (int i = 0; i < 40; ++i)
+    {
+        auto node = MakeNode("n");
+        node->SetTranslation(dm::double3(double(i), 0.0, 0.0));
+        node->SetLeaf(factory->CreateMeshInstance(i == 13 ? nanMesh : mesh));
+        graph->Attach(i < 20 ? group.Get() : graph->GetRootNode(), node);   // the NaN under the group
+        nodes.push_back(node);
+    }
+    graph->Refresh(1);   // full
+    const dm::box3 full = graph->GetRootNode()->GetGlobalBoundingBox();
+    const dm::box3 fullGroup = group->GetGlobalBoundingBox();
+    nodes[3]->SetTranslation(dm::double3(3.0, 1.0, 0.0));
+    nodes[30]->SetTranslation(dm::double3(30.0, 1.0, 0.0));
+    graph->Refresh(2);   // incremental
+    const dm::box3 incremental = graph->GetRootNode()->GetGlobalBoundingBox();
+    const float infinity = std::numeric_limits<float>::infinity();
+    for (const dm::box3* box : { &full, &fullGroup, &incremental })
+    {
+        CHECK(box->m_mins.x == -infinity && box->m_maxs.x == infinity);
+        CHECK(box->m_mins.y == -infinity && box->m_maxs.z == infinity);
+    }
+    CHECK(SameBits(&full, &incremental, sizeof(full)));
+    CHECK(SameBits(&fullGroup, &group->GetGlobalBoundingBox(), sizeof(fullGroup)));
+}
+
+// The walker against an independent pre-order (recursion over the node links), whole and with subtrees skipped, and
+// in lockstep with a walk over the node getters while the graph changes the way the old graph allowed: first
+// transforms (rows move to other archetypes), attaches under the current node, detaches of nodes the walk has left.
+namespace
+{
+    void PreOrder(SceneGraphNode* node, std::vector<SceneGraphNode*>& out)
+    {
+        out.push_back(node);
+        for (SceneGraphNode* child = node->GetFirstChild(); child; child = child->GetNextSibling())
+            PreOrder(child, out);
+    }
+
+    // The walker's algorithm over the node getters (GetFirstChild, GetNextSibling, GetParent), as the old graph ran it.
+    SceneGraphNode* ReferenceNext(SceneGraphNode* current, SceneGraphNode* scope, bool allowChildren)
+    {
+        if (allowChildren)
+        {
+            if (SceneGraphNode* child = current->GetFirstChild())
+                return child;
+        }
+        while (current)
+        {
+            if (current == scope)
+                return nullptr;
+            if (SceneGraphNode* sibling = current->GetNextSibling())
+                return sibling;
+            current = current->GetParent();
+        }
+        return nullptr;
+    }
+}
+
+void test_walker_order()
+{
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+    graph->SetRootNode(MakeNode("root"));
+    Rng rng(123);
+    auto mesh = MakeMesh(factory, 0.5f);
+    std::vector<nvrhi::AutoPtr<SceneGraphNode>> all;
+    for (int i = 0; i < 3000; ++i)
+    {
+        auto node = MakeNode("n");
+        if (rng.Below(2))
+            RandomMove(rng, node);
+        if (rng.Below(3))
+            node->SetLeaf(factory->CreateMeshInstance(mesh));
+        SceneGraphNode* parent = all.empty() || rng.Below(5) == 0 ? graph->GetRootNode()
+                                 : all[rng.Below(uint32_t(all.size()))].Get();
+        graph->Attach(parent, node);
+        all.push_back(node);
+    }
+    graph->Refresh(1);
+
+    // the whole walk and walks of subtrees against the recursion
+    for (int k = 0; k < 20; ++k)
+    {
+        SceneGraphNode* scope = k == 0 ? graph->GetRootNode() : all[rng.Below(uint32_t(all.size()))].Get();
+        std::vector<SceneGraphNode*> expected, actual;
+        PreOrder(scope, expected);
+        for (SceneGraphWalker walker(scope); walker; walker.Next(true))
+            actual.push_back(walker.Get());
+        CHECK(expected == actual);
+    }
+    // subtrees skipped at random, in lockstep with the reference
+    {
+        SceneGraphWalker walker(graph->GetRootNode());
+        SceneGraphNode* reference = graph->GetRootNode();
+        while (walker)
+        {
+            CHECK(walker.Get() == reference);
+            const bool allow = rng.Below(4) != 0;
+            reference = ReferenceNext(reference, graph->GetRootNode(), allow);
+            walker.Next(allow);
+        }
+        CHECK(reference == nullptr);
+    }
+    // the graph changes during the walk; both walks see the same structure at each step
+    {
+        SceneGraphWalker walker(graph->GetRootNode());
+        SceneGraphNode* reference = graph->GetRootNode();
+        std::vector<SceneGraphNode*> left;   // visited nodes that are not ancestors of the current one
+        std::vector<nvrhi::AutoPtr<SceneGraphNode>> kept;   // the detached subtrees
+        uint32_t steps = 0, attached = 0, detachedCount = 0;
+        while (walker)
+        {
+            CHECK(walker.Get() == reference);
+            SceneGraphNode* current = walker.Get();
+            const uint32_t pick = rng.Below(10);
+            if (pick == 0)
+                current->SetTranslation(dm::double3(rng.Range(-1, 1), 0.0, 0.0));   // maybe a first transform
+            else if (pick == 1)
+            {
+                graph->Attach(current, MakeNode("new"));   // seen at the next step, as before
+                ++attached;
+            }
+            else if (pick == 2 && !left.empty())
+            {
+                // a visited leaf node (childless when visited): still attached unless a detached subtree took it
+                const size_t index = rng.Below(uint32_t(left.size()));
+                SceneGraphNode* victim = left[index];
+                bool ancestor = false;
+                for (SceneGraphNode* up = current; up; up = up->GetParent())
+                    ancestor = ancestor || up == victim;
+                if (!ancestor && victim->GetGraph() == graph.Get() && victim != graph->GetRootNode())
+                {
+                    kept.push_back(graph->Detach(victim));
+                    ++detachedCount;
+                }
+            }
+            if (current->GetFirstChild() == nullptr)
+                left.push_back(current);
+            reference = ReferenceNext(reference, graph->GetRootNode(), true);
+            walker.Next(true);
+            ++steps;
+        }
+        CHECK(reference == nullptr);
+        CHECK(attached > 0 && detachedCount > 0);
+    }
+    graph->Refresh(2);
+}
+
 int main(int argc, char** argv)
 {
     struct Case { const char* name; void (*run)(); };
@@ -1017,6 +1543,10 @@ int main(int argc, char** argv)
         { "deep", test_deep_hierarchy_and_determinism },
         { "bounds", test_bounds_and_chunk_bounds },
         { "caches", test_subgraph_caches },
+        { "subgraph_refresh", test_subgraph_refresh },
+        { "phase_structure", test_phase_structure },
+        { "subgraph_nan", test_subgraph_nan },
+        { "walker_order", test_walker_order },
         { "pending", test_pending_changes_and_joints },
         { "row_hints", test_row_hints },
         { "review_fixes", test_review_fixes },

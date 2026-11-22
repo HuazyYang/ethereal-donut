@@ -403,6 +403,7 @@ namespace donut::engine
     private:
         friend class SceneGraph;
         friend class SceneGraphStore;
+        friend class SceneGraphWalker;   // its Next reads an attached node's links in one step
 
         // A node is a handle (design 5.2): while it is attached, its state lives in the columns of its entity in the
         // graph's world (SceneComponents.h) and the world holds it through SceneNode; while it is in no graph, its
@@ -419,9 +420,11 @@ namespace donut::engine
         uint32_t m_HintRow = 0;
         std::string m_Name;
 
-        // Derived state computed on demand (5.7): the subgraph's bounds and content flags and the leaf's content
-        // flags, valid while m_CacheEpoch equals the graph's epoch. Published with release order, so that threads that
-        // walk the graph at the same time (views rendered in parallel) may fill and read it.
+        // Derived state (5.7): the subgraph's bounds and content flags and the leaf's content flags, valid while
+        // m_CacheEpoch equals the graph's epoch. SceneGraph::Refresh fills the subgraph values of the nodes with
+        // children (their own values stay in their rows); between a structural change and the next Refresh they are
+        // computed on demand, under the store's lock, and published with release order, so that threads that walk the
+        // graph at the same time (views rendered in parallel) may fill and read them.
         mutable std::atomic<uint64_t> m_CacheEpoch{ 0 };
         mutable dm::box3 m_CachedBounds = dm::box3::empty();
         mutable SceneContentFlags m_CachedLeafContent = SceneContentFlags::None;
@@ -538,11 +541,19 @@ namespace donut::engine
     // A walker created with SceneGraphWalker(current, scope) continues the pre-order traversal of 'scope' from
     // 'current': after the sub-tree of 'current' it moves on to the following siblings of 'current' and of its
     // ancestors, up to 'scope' (or the root when scope is null).
+    // In an attached subtree the walker steps through the graph's rows and keeps a pointer to the graph's storage: the
+    // graph must outlive the walk (destroying it while a walker is in it is not supported). Changes the old graph
+    // allowed during a walk (transforms, attaching under the current node, detaching nodes the walk has left) are seen
+    // at the next step, as before; the loop body must not detach the node it is visiting.
     class SceneGraphWalker final
     {
     private:
         SceneGraphNode* m_Current;
         SceneGraphNode* m_Scope;
+        // While the walk is in a graph: its store and m_Current's entity, so that Next steps through rows (SceneLinks,
+        // Parent) and the store's NodeOf index without reading the node objects. Transient walk state, not scene state.
+        SceneGraphStore* m_Store = nullptr;
+        Entity m_Entity = Entity::Null;
     public:
         SceneGraphWalker() = default;
 
@@ -858,7 +869,10 @@ namespace donut::engine
         // world, or a phase that ran on the world (its version moved). Writes into the graph's columns through
         // GetWorld() outside phases (GetComponentForWrite with c_WorldVersion) do not move the version and are not
         // seen: make them in a system of GetScheduler()'s phases, or through the node API. When the phases cannot
-        // run (inside a phase), the changes stay pending for the next call.
+        // run (inside a phase), the changes stay pending for the next call. It also computes the subgraph bounds and
+        // content flags (GetGlobalBoundingBox, GetSubgraphContentFlags) of the nodes with children whose subtree
+        // changed. No other thread may read the graph while it runs; readers after it returned see its results.
+        // Leaves with dynamic bounds (LeafTypeDesc::dynamicBounds) make every call run the Bounds phase.
         void Refresh(uint32_t frameIndex);
     };
 

@@ -21,6 +21,9 @@
 */
 
 #include <donut/engine/SceneGraph.h>
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+#include <xmmintrin.h>
+#endif
 #include <donut/core/log.h>
 #include <donut/core/json.h>
 #include <sstream>
@@ -438,10 +441,25 @@ dm::affine3 SceneGraphNode::GetLocalToWorldTransformFloat() const
     return dm::affine3(GetLocalToWorldTransform());
 }
 
+// While the values of the last Refresh are current (SceneGraphStore::IsSubgraphCurrent), a node without children answers
+// from its row (WorldBounds, RenderFlags or its leaf) and a node with children from the subgraph values Refresh stored
+// in it, without a lock; otherwise (a structural change, SetLeaf or InvalidateContent not yet refreshed) the on-demand
+// caches answer, as before.
 dm::box3 SceneGraphNode::GetGlobalBoundingBox() const
 {
     if (m_Store && !m_Record)
     {
+        if (m_Store->IsSubgraphCurrent())
+        {
+            SceneGraphStore::RowRef row;
+            if (m_Store->LocateNode(this, row))
+            {
+                if (!m_Store->HasChildren(row))
+                    return m_Store->OwnBounds(row);
+                if (m_CacheEpoch.load(std::memory_order_acquire) == m_Store->GetEpoch())
+                    return m_CachedBounds;
+            }
+        }
         if (m_CacheEpoch.load(std::memory_order_acquire) != m_Store->GetEpoch())
             m_Store->ComputeSubgraphCache(this);
         return m_CachedBounds;
@@ -456,6 +474,12 @@ dm::box3 SceneGraphNode::GetGlobalBoundingBox() const
 
 SceneContentFlags SceneGraphNode::GetLeafContentFlags() const
 {
+    if (m_Store && !m_Record && m_Store->IsSubgraphCurrent())
+    {
+        SceneGraphStore::RowRef row;
+        if (m_Store->LocateNode(this, row))
+            return m_Store->OwnContent(row);
+    }
     if (m_Store && !m_Record && m_CacheEpoch.load(std::memory_order_acquire) == m_Store->GetEpoch())
         return m_CachedLeafContent;
     SceneGraphLeaf* leaf = GetLeaf();
@@ -466,6 +490,17 @@ SceneContentFlags SceneGraphNode::GetSubgraphContentFlags() const
 {
     if (m_Store && !m_Record)
     {
+        if (m_Store->IsSubgraphCurrent())
+        {
+            SceneGraphStore::RowRef row;
+            if (m_Store->LocateNode(this, row))
+            {
+                if (!m_Store->HasChildren(row))
+                    return m_Store->OwnContent(row);
+                if (m_CacheEpoch.load(std::memory_order_acquire) == m_Store->GetEpoch())
+                    return m_CachedSubgraphContent;
+            }
+        }
         if (m_CacheEpoch.load(std::memory_order_acquire) != m_Store->GetEpoch())
             m_Store->ComputeSubgraphCache(this);
         return m_CachedSubgraphContent;
@@ -673,10 +708,95 @@ SceneGraphNode::~SceneGraphNode()
     m_Record = nullptr;
 }
 
+namespace
+{
+    inline void PrefetchObject(const void* object) noexcept
+    {
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+        _mm_prefetch(static_cast<const char*>(object), _MM_HINT_T0);
+#elif defined(__GNUC__) || defined(__clang__)
+        __builtin_prefetch(object);
+#else
+        (void)object;
+#endif
+    }
+}
+
 int SceneGraphWalker::Next(bool allowChildren)
 {
     if (!m_Current)
         return 0;
+
+    // An attached node: one read of its row's SceneLinks per step, through the entity (the entity table, then the
+    // store's NodeOf index for the next node); Parent only when the walk climbs. The node objects are not read.
+    if (!m_Store && m_Current->m_Store && !m_Current->m_Record)
+    {
+        m_Store = m_Current->m_Store;
+        m_Entity = m_Current->m_Entity;
+    }
+    if (m_Store)
+    {
+        // The node the walk will most likely visit after the one it moves to (that one's first child, else its next
+        // sibling): its object is fetched into the cache while the caller reads the current one, as a walk over node
+        // objects linked by pointers had the hardware do.
+        auto prefetchAfter = [this](Entity entity) noexcept
+        {
+            SceneGraphStore::RowRef next;
+            if (!m_Store->Locate(entity, next))
+                return;
+            const SceneLinks* links =
+                static_cast<const SceneLinks*>(m_Store->Column(next, SceneGraphStore::SlotLinks));
+            const Entity after = !links ? Entity::Null
+                                 : links->firstChild != Entity::Null ? links->firstChild : links->nextSibling;
+            if (after != Entity::Null)
+            {
+                if (const SceneGraphNode* node = m_Store->NodeOf(after))
+                    PrefetchObject(node);
+            }
+        };
+        SceneGraphStore::RowRef row;
+        if (m_Store->Locate(m_Entity, row))
+        {
+            const SceneLinks* links =
+                static_cast<const SceneLinks*>(m_Store->Column(row, SceneGraphStore::SlotLinks));
+            if (allowChildren && links && links->firstChild != Entity::Null)
+            {
+                m_Entity = links->firstChild;
+                m_Current = m_Store->NodeOf(m_Entity);
+                prefetchAfter(m_Entity);
+                return 1;
+            }
+            int depth = 0;
+            for (;;)
+            {
+                if (m_Current == m_Scope)
+                {
+                    m_Current = nullptr;
+                    return depth;
+                }
+                if (links && links->nextSibling != Entity::Null)
+                {
+                    m_Entity = links->nextSibling;
+                    m_Current = m_Store->NodeOf(m_Entity);
+                    prefetchAfter(m_Entity);
+                    return depth;
+                }
+                const Parent* parent = static_cast<const Parent*>(m_Store->Column(row, SceneGraphStore::SlotParent));
+                --depth;
+                if (!parent || !m_Store->Locate(parent->entity, row))
+                {
+                    m_Current = nullptr;
+                    return depth;
+                }
+                m_Entity = parent->entity;
+                m_Current = m_Store->NodeOf(m_Entity);
+                links = static_cast<const SceneLinks*>(m_Store->Column(row, SceneGraphStore::SlotLinks));
+            }
+        }
+        // not a row of the graph (cannot happen while the graph does not change): the general path
+        m_Store = nullptr;
+        m_Entity = Entity::Null;
+    }
 
     // Try to move down to the first child of the current node
     if (allowChildren)
@@ -716,6 +836,8 @@ int SceneGraphWalker::Next(bool allowChildren)
 
 int SceneGraphWalker::Up()
 {
+    m_Store = nullptr;   // Next takes the entity from the node again
+    m_Entity = Entity::Null;
     if (!m_Current)
         return 0;
 

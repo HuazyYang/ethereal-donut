@@ -58,6 +58,14 @@ namespace donut::engine
     void FillSkinningConstants(const MeshInfo& prototype, const MeshInfo& skinned, bool firstFrame,
                                SkinningConstants& constants);
 
+    // The graph path (sub-plan item E5.5): the skinned meshes' vertex buffers are not host-kept (the render graph's
+    // ImportBuffer rejects keepInitialState buffers); between frames they rest in this state, which the render service
+    // imports them in and returns them to: vertex fetch and bindless or SRV reads need no transition. The CPU path
+    // keeps them host-kept in VertexBuffer, as before. The joint buffers stay host-kept (ShaderResource) on both paths:
+    // the skinning pass writes them on the graph's upload list, with automatic barriers, as UpdateSkinnedMeshes does.
+    constexpr nvrhi::ResourceStates c_SkinnedVertexBufferRestingState = nvrhi::ResourceStates(
+        uint32_t(nvrhi::ResourceStates::VertexBuffer) | uint32_t(nvrhi::ResourceStates::ShaderResource));
+
     class Scene: public nvrhi::ObjectImpl<nvrhi::IObject>
     {
     public:

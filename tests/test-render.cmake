@@ -50,6 +50,28 @@ add_dependencies(donut_all_tests test_render_extract)
 add_test(NAME test_render_extract COMMAND test_render_extract)
 set_property(TARGET test_render_extract PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
+# Visibility and draw packets against the legacy strategies, device-free (sub-plan item E5.2). The ECS allocation
+# counter through src/engine, the radix sort through src/render (RenderVisibility.h); the per-frame packet hashes are
+# compared with tests/src/render/golden/render_extract_packets.txt (ECS_UPDATE_GOLDEN=1 rewrites it).
+add_executable(test_draw_packets src/render/test_draw_packets.cpp)
+target_link_libraries(test_draw_packets donut_render donut_engine donut_core donut_tests_utils)
+target_include_directories(test_draw_packets PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/engine"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/render")
+target_compile_definitions(test_draw_packets PRIVATE
+    DONUT_TEST_GOLDEN_DIR="${CMAKE_CURRENT_LIST_DIR}/src/render/golden")
+add_dependencies(donut_all_tests test_draw_packets)
+add_test(NAME test_draw_packets COMMAND test_draw_packets)
+set_property(TARGET test_draw_packets PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
+# The CPU cost of visibility and packets against the legacy strategy walk (sub-plan item E5.2; design 10.1). The same
+# source measures the walk alone when compiled against the E0 tree with BENCH_RENDER_EXTRACT_E0=1. ctest runs the smoke
+# mode; the Release numbers come from `bench_render_extract --workers N`.
+add_executable(bench_render_extract src/render/bench_render_extract.cpp)
+target_link_libraries(bench_render_extract donut_render donut_engine donut_core)
+add_dependencies(donut_all_tests bench_render_extract)
+add_test(NAME bench_render_extract_smoke COMMAND bench_render_extract --smoke)
+set_property(TARGET bench_render_extract PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
 # The benchmark of design 10.3. The device-free budgets: a smoke run in ctest, measured in Release with
 # `rdg_bench --gate`. The parallel-recording budget needs a device (plan step P1.7): `rdg_bench --parallel d3d12|vulkan
 # --gate`, with GPU smoke runs in ctest.

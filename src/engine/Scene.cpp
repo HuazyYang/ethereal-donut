@@ -626,6 +626,19 @@ void Scene::FinishedLoading(uint32_t frameIndex)
                 gpuScene->CommitScatter(records.serial);
             }
         }
+
+        // The loaded skinned instances are skinned on this list too, as Refresh skins them on the CPU path (sub-plan
+        // item E5.5), so that the first rendered frame is not their first skinning there either. Their vertex buffers
+        // are not host-kept on the graph path: tracked from their resting state and returned to it.
+        const auto& skinnedInstances = m_SceneGraph->GetSkinnedMeshInstances();
+        for (const auto& skinnedInstance : skinnedInstances)
+            commandList->beginTrackingBufferState(skinnedInstance->GetMesh()->buffers->vertexBuffer,
+                                                  c_SkinnedVertexBufferRestingState);
+        UpdateSkinnedMeshes(commandList, frameIndex);
+        for (const auto& skinnedInstance : skinnedInstances)
+            commandList->setBufferState(skinnedInstance->GetMesh()->buffers->vertexBuffer,
+                                        c_SkinnedVertexBufferRestingState);
+        commandList->commitBarriers();
     }
 
     commandList->close();
@@ -678,6 +691,38 @@ void Scene::RefreshBuffers(nvrhi::ICommandList* commandList, uint32_t frameIndex
     UpdateSkinnedMeshes(commandList, frameIndex);
 }
 
+void donut::engine::FillSkinningConstants(const MeshInfo& prototype, const MeshInfo& skinned, bool firstFrame,
+                                          SkinningConstants& constants)
+{
+    const uint32_t vertexOffset = prototype.vertexOffset;
+    const BufferGroup* prototypeBuffers = prototype.buffers;
+    const BufferGroup* skinnedBuffers = skinned.buffers;
+
+    constants = SkinningConstants{};
+    constants.numVertices = prototype.totalVertices;
+
+    constants.flags = 0;
+    if (prototypeBuffers->hasAttribute(VertexAttribute::Normal)) constants.flags |= SkinningFlag_Normals;
+    if (prototypeBuffers->hasAttribute(VertexAttribute::Tangent)) constants.flags |= SkinningFlag_Tangents;
+    if (prototypeBuffers->hasAttribute(VertexAttribute::TexCoord1)) constants.flags |= SkinningFlag_TexCoord1;
+    if (prototypeBuffers->hasAttribute(VertexAttribute::TexCoord2)) constants.flags |= SkinningFlag_TexCoord2;
+    if (firstFrame) constants.flags |= SkinningFlag_FirstFrame;
+
+    constants.inputPositionOffset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::Position).byteOffset + vertexOffset * sizeof(float3));
+    constants.inputNormalOffset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::Normal).byteOffset + vertexOffset * sizeof(uint32_t));
+    constants.inputTangentOffset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::Tangent).byteOffset + vertexOffset * sizeof(uint32_t));
+    constants.inputTexCoord1Offset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::TexCoord1).byteOffset + vertexOffset * sizeof(float2));
+    constants.inputTexCoord2Offset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::TexCoord2).byteOffset + vertexOffset * sizeof(float2));
+    constants.inputJointIndexOffset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::JointIndices).byteOffset + vertexOffset * sizeof(uint2));
+    constants.inputJointWeightOffset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::JointWeights).byteOffset + vertexOffset * sizeof(float4));
+    constants.outputPositionOffset = uint32_t(skinnedBuffers->getVertexBufferRange(VertexAttribute::Position).byteOffset);
+    constants.outputPrevPositionOffset = uint32_t(skinnedBuffers->getVertexBufferRange(VertexAttribute::PrevPosition).byteOffset);
+    constants.outputNormalOffset = uint32_t(skinnedBuffers->getVertexBufferRange(VertexAttribute::Normal).byteOffset);
+    constants.outputTangentOffset = uint32_t(skinnedBuffers->getVertexBufferRange(VertexAttribute::Tangent).byteOffset);
+    constants.outputTexCoord1Offset = uint32_t(skinnedBuffers->getVertexBufferRange(VertexAttribute::TexCoord1).byteOffset);
+    constants.outputTexCoord2Offset = uint32_t(skinnedBuffers->getVertexBufferRange(VertexAttribute::TexCoord2).byteOffset);
+}
+
 void Scene::UpdateSkinnedMeshes(nvrhi::ICommandList* commandList, uint32_t frameIndex)
 {
     bool skinningMarkerPlaced = false;
@@ -719,34 +764,10 @@ void Scene::UpdateSkinnedMeshes(nvrhi::ICommandList* commandList, uint32_t frame
         state.bindings = { skinnedInstance->skinningBindingSet };
         commandList->setComputeState(state);
 
-        uint32_t vertexOffset = skinnedInstance->GetPrototypeMesh()->vertexOffset;
-        const auto& prototypeBuffers = skinnedInstance->GetPrototypeMesh()->buffers;
-        const auto& skinnedBuffers = skinnedInstance->GetMesh()->buffers;
-
         SkinningConstants constants{};
-        constants.numVertices = skinnedInstance->GetPrototypeMesh()->totalVertices;
-
-        constants.flags = 0;
-        if (prototypeBuffers->hasAttribute(VertexAttribute::Normal)) constants.flags |= SkinningFlag_Normals;
-        if (prototypeBuffers->hasAttribute(VertexAttribute::Tangent)) constants.flags |= SkinningFlag_Tangents;
-        if (prototypeBuffers->hasAttribute(VertexAttribute::TexCoord1)) constants.flags |= SkinningFlag_TexCoord1;
-        if (prototypeBuffers->hasAttribute(VertexAttribute::TexCoord2)) constants.flags |= SkinningFlag_TexCoord2;
-        if (!skinnedInstance->skinningInitialized) constants.flags |= SkinningFlag_FirstFrame;
+        FillSkinningConstants(*skinnedInstance->GetPrototypeMesh(), *skinnedInstance->GetMesh(),
+                              !skinnedInstance->skinningInitialized, constants);
         skinnedInstance->skinningInitialized = true;
-
-        constants.inputPositionOffset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::Position).byteOffset + vertexOffset * sizeof(float3));
-        constants.inputNormalOffset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::Normal).byteOffset + vertexOffset * sizeof(uint32_t));
-        constants.inputTangentOffset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::Tangent).byteOffset + vertexOffset * sizeof(uint32_t));
-        constants.inputTexCoord1Offset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::TexCoord1).byteOffset + vertexOffset * sizeof(float2));
-        constants.inputTexCoord2Offset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::TexCoord2).byteOffset + vertexOffset * sizeof(float2));
-        constants.inputJointIndexOffset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::JointIndices).byteOffset + vertexOffset * sizeof(uint2));
-        constants.inputJointWeightOffset = uint32_t(prototypeBuffers->getVertexBufferRange(VertexAttribute::JointWeights).byteOffset + vertexOffset * sizeof(float4));
-        constants.outputPositionOffset = uint32_t(skinnedBuffers->getVertexBufferRange(VertexAttribute::Position).byteOffset);
-        constants.outputPrevPositionOffset = uint32_t(skinnedBuffers->getVertexBufferRange(VertexAttribute::PrevPosition).byteOffset);
-        constants.outputNormalOffset = uint32_t(skinnedBuffers->getVertexBufferRange(VertexAttribute::Normal).byteOffset);
-        constants.outputTangentOffset = uint32_t(skinnedBuffers->getVertexBufferRange(VertexAttribute::Tangent).byteOffset);
-        constants.outputTexCoord1Offset = uint32_t(skinnedBuffers->getVertexBufferRange(VertexAttribute::TexCoord1).byteOffset);
-        constants.outputTexCoord2Offset = uint32_t(skinnedBuffers->getVertexBufferRange(VertexAttribute::TexCoord2).byteOffset);
         commandList->setPushConstants(&constants, sizeof(constants));
 
         commandList->dispatch(dm::div_ceil(constants.numVertices, 256u));
@@ -1026,8 +1047,17 @@ bool Scene::ScanMeshBufferObjects()
             bufferDesc.canHaveRawViews = true;
             bufferDesc.canHaveUAVs = true;
             bufferDesc.isAccelStructBuildInput = m_RayTracingSupported;
-            bufferDesc.keepInitialState = true;
-            bufferDesc.initialState = nvrhi::ResourceStates::VertexBuffer;
+            if (IsOnGraphPath())
+            {
+                // The render service imports it each frame (ImportBuffer rejects host-kept buffers): sub-plan E5.5.
+                bufferDesc.keepInitialState = false;
+                bufferDesc.initialState = c_SkinnedVertexBufferRestingState;
+            }
+            else
+            {
+                bufferDesc.keepInitialState = true;
+                bufferDesc.initialState = nvrhi::ResourceStates::VertexBuffer;
+            }
 
             m_Device->createBuffer(bufferDesc, &skinnedBuffers->vertexBuffer);
 

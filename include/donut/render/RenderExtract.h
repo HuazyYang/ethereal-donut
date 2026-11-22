@@ -268,8 +268,10 @@ namespace donut::render
         dm::affine3 viewToWorld = dm::affine3::identity();   // relative to the render origin
     };
 
-    // A skinned instance whose joints moved this frame or the previous one (the legacy rule,
-    // GetLastUpdateFrameIndex() + 1 >= frameIndex): one skinning dispatch.
+    // A skinned instance to skin this frame: one skinning dispatch. Selected when its joints moved this frame or the
+    // previous one (the legacy rule, GetLastUpdateFrameIndex() + 1 >= frameIndex), when it was never skinned
+    // (skinningInitialized unset), or when a frame that did not execute selected it, until two executed frames have
+    // (its dispatch and the settle of its previous positions): dropped frames and frame-index gaps lose no pose.
     struct ExtractedSkinnedInstance
     {
         engine::Entity entity = engine::Entity::Null;
@@ -324,8 +326,11 @@ namespace donut::render
         ResourceId instanceBuffer = InvalidResourceId;
         ResourceId geometryBuffer = InvalidResourceId;
         ResourceId materialBuffer = InvalidResourceId;
-        // The skinned meshes' vertex buffers, one per RenderSnapshot::skinnedInstances entry, imported and written at
-        // AddSkinningPasses (an arena array).
+        // The skinned meshes' vertex buffers, imported at AddSkinningPasses (an arena array): first one per
+        // RenderSnapshot::skinnedInstances entry, in its order, in the version the skinning pass wrote
+        // (InvalidResourceId for an instance without a vertex buffer yet); then those of the graph's other skinned
+        // instances, in SceneGraph::GetSkinnedMeshInstances() order, imported only, so that the geometry passes declare
+        // reads of every skinned buffer they may draw (they are not host-kept on the graph path).
         const ResourceId* skinnedVertexBuffers = nullptr;
         uint32_t skinnedVertexBufferCount = 0;
         // Every buffer above that is valid, in their latest versions: GeometryGraphInputs::bufferReads of the geometry
@@ -386,14 +391,15 @@ namespace donut::render
     {
         uint32_t views = 0;
         uint32_t cascadeViews = 0;
-        uint32_t visibleInstances = 0;
-        uint32_t packets[c_DrawPacketPassCount] = {};
+        uint32_t visibleInstances = 0;   // summed over the views: an instance visible in two views counts twice
+        uint32_t packets[c_DrawPacketPassCount] = {};   // per pass, summed over the views
         uint32_t lights = 0;
         uint32_t cameras = 0;
         uint32_t skinnedInstances = 0;
         uint32_t jointMatrices = 0;
         uint32_t serviceShadowMaps = 0;
         uint64_t snapshotBytes = 0;   // frame-arena bytes of the snapshot
+        uint32_t skinningBindingSets = 0;   // the skinning pass's cached binding sets, aged by AddSkinningPasses
     };
 
     class RenderService : public nvrhi::ObjectImpl<nvrhi::IObject>
@@ -425,7 +431,9 @@ namespace donut::render
         // The GpuScene upload (GpuSceneUploadPass); fills the buffer ids of `frame`. When it fails, or the frame never
         // executes, the records stay unacknowledged and the next frame sends every row again (GpuScene::CommitScatter).
         nvrhi::FRESULT AddUploadPasses(IRenderGraph* graph, SceneFrame* frame) noexcept;
-        // Skinning (SkinningPass); fills the skinned vertex buffer ids of `frame`.
+        // Skinning (SkinningPass); fills the skinned vertex buffer ids of `frame`. Call it after AddUploadPasses, which
+        // writes the skinned meshes' prototype data in its Prepare: without it, FE_INVALID_ARGS with a warning (for a
+        // service with a scene, device and shader factory; one without adds nothing either way).
         nvrhi::FRESULT AddSkinningPasses(IRenderGraph* graph, SceneFrame* frame) noexcept;
         // A DepthPass use per cascade of each service shadow, drawing the cascade view's opaque packets through a bound
         // adapter; one DepthPass object per cascade, so that a parallel recorder records cascades on separate threads.

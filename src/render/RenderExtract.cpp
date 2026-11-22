@@ -30,13 +30,15 @@
 // from a prefix sum over the chunks' counts, so that the rows are in chunk order at any worker count. The systems
 // write no world component (only arena data) and declare only reads.
 //
-// E5.1 lists every mesh instance with a slot as visible in every view: the views share one range of the instance
-// arrays. Culling and draw packets are E5.2's, the service shadows (cascade views, LightShadowTable requests) E5.6's,
-// the skinning pass E5.5's; AddUploadPasses is a thin call into E5.4's GpuSceneUploadPass.
+// Instances runs the per-view visibility and the draw packets of E5.2 (RenderVisibility.h): a chunk test, a row test
+// and the legacy strategies' per-geometry rules, each view's packets of each pass radix-sorted by key. The service
+// shadows (cascade views, LightShadowTable requests) are E5.6's, the skinning pass E5.5's; AddUploadPasses is a thin
+// call into E5.4's GpuSceneUploadPass.
 
 #include <donut/render/RenderExtract.h>
 #include <donut/render/GpuSceneUploadPass.h>
 #include <donut/render/RenderGraphFrameData.h>
+#include <donut/render/SkinningPass.h>
 #include <donut/engine/EcsQuery.h>
 #include <donut/engine/EcsScheduler.h>
 #include <donut/engine/Scene.h>
@@ -45,6 +47,8 @@
 #include <donut/engine/ShadowMap.h>
 #include <donut/engine/View.h>
 #include <donut/core/log.h>
+
+#include "RenderVisibility.h"
 
 using namespace donut::math;
 #include <donut/shaders/light_cb.h>
@@ -95,8 +99,7 @@ namespace donut::render
 
     struct RenderService::Impl
     {
-        using InstanceQuery =
-            Query<With<MeshInstanceLeaf>, Read<GpuInstanceSlot>, Read<MeshRef>, Read<WorldBounds>, Read<LeafObject>>;
+        using InstanceQuery = visibility::InstanceQuery;
         using SkinnedQuery = Query<With<SkinnedMeshInstanceLeaf>, Read<LeafObject>>;
 
         nvrhi::AutoPtr<SceneGraph> graph;   // claimed (SceneGraph::ClaimRenderService) while set
@@ -133,8 +136,28 @@ namespace donut::render
         std::vector<nvrhi::AutoPtr<SkinnedMeshInstance>> consumedFirstFrames;
         // AddUploadPasses ran for the open frame (a second call adds nothing).
         bool uploadAdded = false;
-        // Per matched chunk of the instance query: its rows with a slot, then their first index (prefix sum).
-        std::vector<uint32_t> chunkRows;
+        // AddSkinningPasses ran for the open frame (a second call adds nothing).
+        bool skinningAdded = false;
+        // AddSkinningPasses: the snapshot's skinned leaves, sorted, to find the graph's other skinned instances.
+        // Capacity kept.
+        std::vector<const SkinnedMeshInstance*> selectedSkinned;
+        // The skinning pass (E5.5), made at the first AddSkinningPasses.
+        nvrhi::AutoPtr<SkinningPass> skinningPass;
+        // The skinned leaves this frame's snapshot selected, held until EndFrame (E5.5 review fix 1): when the frame
+        // does not execute they become pending. Capacity kept.
+        std::vector<nvrhi::AutoPtr<SkinnedMeshInstance>> frameSkinned;
+        // Leaves a frame that did not execute selected: selected again until two executed frames have selected them
+        // (the dispatch, then the settle of the previous positions that the legacy rule's second frame gives), so that
+        // dropped frames and frame-index gaps lose no pose. Ordered by address (the SkinnedInstances system looks them
+        // up). Capacity kept.
+        struct PendingSkin
+        {
+            nvrhi::AutoPtr<SkinnedMeshInstance> leaf;
+            uint32_t remaining = 0;
+        };
+        std::vector<PendingSkin> pendingSkins;
+        // Visibility and draw packets (E5.2): the scratch of the Instances system, capacity kept.
+        visibility::InstanceVisibility instanceVisibility;
 
         LightShadowTable shadows;
         RenderServiceStats stats;
@@ -291,13 +314,22 @@ namespace donut::render
             const ComponentId instanceSlot = RegisterComponent<GpuInstanceSlot>(world);
             const ComponentId meshRef = RegisterComponent<MeshRef>(world);
             const ComponentId worldBounds = RegisterComponent<WorldBounds>(world);
+            const ComponentId renderFlags = RegisterComponent<RenderFlags>(world);
+            const ComponentId chunkBounds = RegisterComponent<ChunkWorldBounds>(world);
+            const ComponentId sceneLinks = RegisterComponent<SceneLinks>(world);
+            const ComponentId sceneNode = RegisterComponent<SceneNode>(world);
+            const ComponentId localBounds = RegisterComponent<LocalBounds>(world);
             if (leafObject == ComponentId::Invalid || worldTransform == ComponentId::Invalid ||
                 instanceSlot == ComponentId::Invalid || meshRef == ComponentId::Invalid ||
-                worldBounds == ComponentId::Invalid)
+                worldBounds == ComponentId::Invalid || renderFlags == ComponentId::Invalid ||
+                chunkBounds == ComponentId::Invalid || sceneLinks == ComponentId::Invalid ||
+                sceneNode == ComponentId::Invalid || localBounds == ComponentId::Invalid)
                 return nvrhi::FE_INVALID_ARGS;
 
             // Lights, cameras and skinned instances read their leaves and, through the node getters, the world
-            // transforms; Instances reads its query's columns. Nothing writes: no ambiguity with any other system.
+            // transforms; Instances reads its query's columns, and through SceneGraphNode::GetGlobalBoundingBox (the
+            // legacy transparent distance of a node with children) the subgraph's links, leaves and transforms.
+            // Nothing writes: no ambiguity with any other system.
             const ComponentAccess leafReads[] = {
                 { leafObject, engine::Access::Read, {} },
                 { worldTransform, engine::Access::Read, {} },
@@ -305,8 +337,14 @@ namespace donut::render
             const ComponentAccess instanceReads[] = {
                 { instanceSlot, engine::Access::Read, {} },
                 { meshRef, engine::Access::Read, {} },
+                { renderFlags, engine::Access::Read, {} },
                 { worldBounds, engine::Access::Read, {} },
+                { worldTransform, engine::Access::Read, {} },
+                { sceneLinks, engine::Access::Read, {} },
+                { sceneNode, engine::Access::Read, {} },
                 { leafObject, engine::Access::Read, {} },
+                { localBounds, engine::Access::Read, {} },   // the Debug leaf check
+                { chunkBounds, engine::Access::Read, {} },
             };
 
             registered = true;   // so that a failure below removes what was added
@@ -462,7 +500,8 @@ namespace donut::render
         }
 
         // Skinned instances whose joints moved this frame or the previous one (the legacy rule of
-        // Scene::UpdateSkinnedMeshes), in chunk order, with their joint matrices by the legacy formula:
+        // Scene::UpdateSkinnedMeshes), never skinned yet, or pending from a frame that did not execute (E5.5 review fix
+        // 1), in chunk order, with their joint matrices by the legacy formula:
         // inverseBindMatrix * affineToHomogeneous(affine3(jointWorld * inverse(instanceWorld))), doubles until the
         // conversion. The first-frame flag is the leaf's skinningInitialized at extraction; EndFrame(true) sets it for
         // the instances a skinning dispatch consumed (ConsumeFirstFrame).
@@ -471,9 +510,10 @@ namespace donut::render
             if (!snapshot || NVRHI_FAILED(failure))
                 return nvrhi::FS_OK;
             const uint32_t frameIndex = desc->frameIndex;
-            auto selected = [frameIndex](const SkinnedMeshInstance* instance) noexcept
+            auto selected = [this, frameIndex](const SkinnedMeshInstance* instance) noexcept
             {
-                return instance && !(instance->GetLastUpdateFrameIndex() + 1 < frameIndex);
+                return instance && (!(instance->GetLastUpdateFrameIndex() + 1 < frameIndex) ||
+                                    !instance->skinningInitialized || IsPendingSkin(instance));
             };
 
             uint32_t count = 0;
@@ -544,98 +584,21 @@ namespace donut::render
             return nvrhi::FS_OK;
         }
 
-        // Every mesh instance with a slot, in chunk order (E5.1: no culling; E5.2 replaces this with visibility per
-        // view).
+        // Visibility per view and the draw packets (E5.2, RenderVisibility.h): each view's visible instances in chunk
+        // order, its packets of each pass sorted by key; the arrays in the arena, allocated serially.
         nvrhi::FRESULT RunInstances(ISystemContext* context) noexcept
         {
             if (!snapshot || NVRHI_FAILED(failure))
                 return nvrhi::FS_OK;
-            snapshot->instances = VisibleInstances{};
-            if (snapshot->viewCount == 0)
-                return nvrhi::FS_OK;
-
-            IQuery* query = instanceQuery.Get();
-            const uint32_t chunkCount = query->GetChunkCount();
-            try
-            {
-                if (chunkRows.size() < size_t(chunkCount) + 1)
-                    chunkRows.resize(size_t(chunkCount) + 1);
-            }
-            catch (...)
-            {
+            visibility::VisibilityFrame frame;
+            frame.context = context;
+            frame.graph = graph;
+            frame.renderGraph = renderGraph;
+            frame.views = views;
+            frame.viewCount = snapshot->viewCount;
+            frame.drawDoubleSidedMaterialsSeparately = desc->drawDoubleSidedMaterialsSeparately;
+            if (NVRHI_FAILED(instanceVisibility.Run(instanceQuery, frame, *snapshot, bytes)))
                 return Fail();
-            }
-            uint32_t* rows = chunkRows.data();
-            std::fill(rows, rows + chunkCount + 1, 0u);
-            const uint32_t chunksPerTask = ChunksPerTask(context->GetJobSystem(), chunkCount);
-
-            // Pass 1, in parallel: the rows with a slot per chunk (an instance whose acquisition failed has none).
-            instanceQuery.ParallelForChunks(context, chunksPerTask,
-                [rows](const ChunkView& chunk, const GpuInstanceSlot* slots, const MeshRef*, const WorldBounds*,
-                       const LeafObject*)
-                {
-                    uint32_t n = 0;
-                    for (uint32_t row = 0; row < chunk.count; ++row)
-                        n += slots[row].instance != c_NoInstanceSlot ? 1u : 0u;
-                    rows[chunk.chunkIndex] = n;
-                });
-
-            // The prefix sum, serially; then the arrays, serially (the arena is not thread-safe).
-            uint32_t total = 0;
-            for (uint32_t c = 0; c < chunkCount; ++c)
-            {
-                const uint32_t n = rows[c];
-                rows[c] = total;
-                total += n;
-            }
-
-            Entity* entities = Allocate<Entity>(total);
-            uint32_t* instanceSlots = Allocate<uint32_t>(total);
-            MeshId* meshes = Allocate<MeshId>(total);
-            uint32_t* firstGeometryInstanceSlots = Allocate<uint32_t>(total);
-            uint32_t* geometryCounts = Allocate<uint32_t>(total);
-            const MeshInstance** leaves = Allocate<const MeshInstance*>(total);
-            const MeshInfo** meshInfos = Allocate<const MeshInfo*>(total);
-            dm::box3* worldBounds = Allocate<dm::box3>(total);
-            if (total != 0 && NVRHI_FAILED(failure))
-                return nvrhi::FS_OK;
-
-            // Pass 2, in parallel: each chunk's rows at its offset.
-            instanceQuery.ParallelForChunks(context, chunksPerTask,
-                [=](const ChunkView& chunk, const GpuInstanceSlot* slots, const MeshRef* meshRefs,
-                    const WorldBounds* bounds, const LeafObject* leafObjects)
-                {
-                    uint32_t at = rows[chunk.chunkIndex];
-                    for (uint32_t row = 0; row < chunk.count; ++row)
-                    {
-                        const GpuInstanceSlot& slot = slots[row];
-                        if (slot.instance == c_NoInstanceSlot)
-                            continue;
-                        const auto* leaf = static_cast<const MeshInstance*>(leafObjects[row].object);
-                        entities[at] = chunk.entities[row];
-                        instanceSlots[at] = slot.instance;
-                        meshes[at] = meshRefs[row].mesh;
-                        firstGeometryInstanceSlots[at] = slot.firstGeometryInstance;
-                        geometryCounts[at] = slot.geometryCount;
-                        leaves[at] = leaf;
-                        meshInfos[at] = leaf ? leaf->GetMesh() : nullptr;
-                        worldBounds[at] = bounds[row].bounds;
-                        ++at;
-                    }
-                });
-
-            VisibleInstances& instances = snapshot->instances;
-            instances.entities = entities;
-            instances.instanceSlots = instanceSlots;
-            instances.meshes = meshes;
-            instances.firstGeometryInstanceSlots = firstGeometryInstanceSlots;
-            instances.geometryCounts = geometryCounts;
-            instances.leaves = leaves;
-            instances.meshInfos = meshInfos;
-            instances.worldBounds = worldBounds;
-            instances.count = total;
-            for (uint32_t v = 0; v < snapshot->viewCount; ++v)
-                views[v].instances = SnapshotRange{ 0, total };
             return nvrhi::FS_OK;
         }
 
@@ -667,11 +630,57 @@ namespace donut::render
             return true;
         }
 
-        // The frame's references (the leaves' shadow maps, the consumed first frames), capacity kept.
+        // The frame's references (the leaves' shadow maps, the consumed first frames, the selected skinned leaves),
+        // capacity kept.
         void ReleaseFrameReferences() noexcept
         {
             frameShadowMaps.clear();
             consumedFirstFrames.clear();
+            frameSkinned.clear();
+        }
+
+        static bool PendingLess(const PendingSkin& entry, const SkinnedMeshInstance* leaf) noexcept
+        {
+            return entry.leaf.Get() < leaf;
+        }
+
+        bool IsPendingSkin(const SkinnedMeshInstance* leaf) const noexcept
+        {
+            const auto it = std::lower_bound(pendingSkins.begin(), pendingSkins.end(), leaf, PendingLess);
+            return it != pendingSkins.end() && it->leaf.Get() == leaf;
+        }
+
+        // An executed frame counts one of the two selections of every pending leaf; one that did not execute makes
+        // its selected leaves pending for two more.
+        void UpdatePendingSkins(bool executed) noexcept
+        {
+            if (executed)
+            {
+                for (PendingSkin& entry : pendingSkins)
+                    entry.remaining = entry.remaining ? entry.remaining - 1 : 0;
+                pendingSkins.erase(std::remove_if(pendingSkins.begin(), pendingSkins.end(),
+                                                  [](const PendingSkin& entry) { return entry.remaining == 0; }),
+                                   pendingSkins.end());
+                return;
+            }
+            for (const auto& leaf : frameSkinned)
+            {
+                const auto it = std::lower_bound(pendingSkins.begin(), pendingSkins.end(), leaf.Get(), PendingLess);
+                if (it != pendingSkins.end() && it->leaf.Get() == leaf.Get())
+                {
+                    it->remaining = 2;
+                    continue;
+                }
+                try
+                {
+                    pendingSkins.insert(it, PendingSkin{ leaf, 2 });
+                }
+                catch (...)
+                {
+                    log::warning("RenderService: out of memory; a skinned instance of a dropped frame may keep its "
+                                 "pose");
+                }
+            }
         }
 
         // Idempotent: the scope closes once, and the first-frame flags are set at most once, for an executed frame.
@@ -683,8 +692,11 @@ namespace donut::render
                 for (const auto& leaf : consumedFirstFrames)
                     leaf->skinningInitialized = true;
             }
+            if (frameOpen)
+                UpdatePendingSkins(executed);
             frameOpen = false;
             uploadAdded = false;
+            skinningAdded = false;
             ReleaseFrameReferences();
         }
     };
@@ -774,6 +786,18 @@ namespace donut::render
             s.ReleaseFrameReferences();
             return result;
         }
+        // The selected skinned leaves, held for the frame: EndFrame(false) makes them pending (E5.5 review fix 1).
+        try
+        {
+            for (uint32_t i = 0; i < snapshot->skinnedInstanceCount; ++i)
+                s.frameSkinned.push_back(const_cast<SkinnedMeshInstance*>(snapshot->skinnedInstances[i].leaf));
+        }
+        catch (...)
+        {
+            s.CloseScope();
+            s.ReleaseFrameReferences();
+            return nvrhi::FE_OUT_OF_MEMORY;
+        }
 
         // The blackboard's entry: this frame's (a second Extract in one frame overwrites it) or a new one.
         SceneFrame* frame = frameData ? frameData->TryCreate<SceneFrame>(graph) : NewFrameData<SceneFrame>(graph);
@@ -793,6 +817,11 @@ namespace donut::render
         stats.views = snapshot->descViewCount;
         stats.cascadeViews = snapshot->viewCount - snapshot->descViewCount;
         stats.visibleInstances = snapshot->instances.count;
+        for (uint32_t v = 0; v < snapshot->viewCount; ++v)
+        {
+            for (uint32_t p = 0; p < c_DrawPacketPassCount; ++p)
+                stats.packets[p] += snapshot->views[v].packets[p].count;
+        }
         stats.lights = snapshot->lightCount;
         stats.cameras = snapshot->cameraCount;
         stats.skinnedInstances = snapshot->skinnedInstanceCount;
@@ -912,15 +941,139 @@ namespace donut::render
         return RebuildBufferReads(graph, frame);
     }
 
+    // Skinning (E5.5). Every skinned instance's vertex buffer is imported in its resting state
+    // (engine::c_SkinnedVertexBufferRestingState): first the snapshot's skinned instances, in snapshot order, which the
+    // SkinningPass writes; then the graph's other skinned instances, in SceneGraph::GetSkinnedMeshInstances() order,
+    // only imported, so that SceneFrame::bufferReads names every skinned buffer a geometry pass may draw (they are not
+    // host-kept on the graph path). Each first-frame instance the pass dispatches is marked (ConsumeFirstFrame), so
+    // that EndFrame(true) sets its skinningInitialized; one it does not dispatch keeps its first frame. FE_INVALID_ARGS
+    // when no frame is open. Nothing for a service without a scene, device or shader factory (extraction only), nor for
+    // a second call in the same frame.
     nvrhi::FRESULT RenderService::AddSkinningPasses(IRenderGraph* graph, SceneFrame* frame) noexcept
     {
         if (!graph || !frame || !m_Impl || !m_Impl->frameOpen)
             return nvrhi::FE_INVALID_ARGS;
-        // TODO(E5.5): SkinningPass over frame->snapshot's skinned instances. For each first-frame instance it
-        // dispatches with SkinningFlag_FirstFrame, call m_Impl->ConsumeFirstFrame(leaf): only those get
-        // skinningInitialized at EndFrame(true). Until then no instance is marked, and every selected instance stays a
-        // first frame.
-        return nvrhi::FS_OK;
+        Impl& s = *m_Impl;
+        if (!s.scene || !m_Device || !m_Desc.shaderFactory || s.skinningAdded)
+            return nvrhi::FS_OK;
+        const RenderSnapshot* snapshot = frame->snapshot;
+        if (!snapshot)
+            return nvrhi::FE_INVALID_ARGS;
+        // The prototypes' vertex data is written by the upload pass's Prepare (E5.5 review fix 3).
+        if (!s.uploadAdded)
+        {
+            log::warning("RenderService::AddSkinningPasses: call AddUploadPasses first (it writes the prototypes' "
+                         "data)");
+            return nvrhi::FE_INVALID_ARGS;
+        }
+        s.skinningAdded = true;
+
+        // The snapshot's leaves, sorted, to tell the other skinned instances of the graph apart.
+        const uint32_t selected = snapshot->skinnedInstanceCount;
+        const auto& skinnedLeaves = s.graph->GetSkinnedMeshInstances();
+        try
+        {
+            s.selectedSkinned.clear();
+            for (uint32_t i = 0; i < selected; ++i)
+                s.selectedSkinned.push_back(snapshot->skinnedInstances[i].leaf);
+        }
+        catch (...)
+        {
+            return nvrhi::FE_OUT_OF_MEMORY;
+        }
+        std::sort(s.selectedSkinned.begin(), s.selectedSkinned.end());
+        auto isSelected = [&s](const SkinnedMeshInstance* leaf) noexcept
+        {
+            return std::binary_search(s.selectedSkinned.begin(), s.selectedSkinned.end(), leaf);
+        };
+        uint32_t others = 0;
+        for (const auto& leaf : skinnedLeaves)
+            others += isSelected(leaf.Get()) ? 0u : 1u;
+        const uint32_t total = selected + others;
+        if (total == 0)
+        {
+            // Nothing to skin; the pass still ages its binding-set cache (E5.5 review fix 4).
+            if (s.skinningPass)
+            {
+                try
+                {
+                    (void)s.skinningPass->AddToGraph(graph, SkinningGraphInputs{ snapshot, nullptr, 0 });
+                }
+                catch (...)
+                {
+                    return nvrhi::FE_OUT_OF_MEMORY;
+                }
+                s.stats.skinningBindingSets = s.skinningPass->GetCachedBindingSetCount();
+            }
+            return nvrhi::FS_OK;
+        }
+
+        auto* ids = static_cast<ResourceId*>(graph->AllocateFrameData(sizeof(ResourceId) * total, alignof(ResourceId)));
+        if (!ids)
+            return nvrhi::FE_OUT_OF_MEMORY;
+        // A skinned instance's vertex buffer, imported; invalid when it has none yet, or a host-kept one (CPU path).
+        bool importFailed = false;
+        auto import = [&](const SkinnedMeshInstance* leaf) noexcept
+        {
+            const MeshInfo* mesh = leaf ? leaf->GetMesh() : nullptr;
+            nvrhi::IBuffer* buffer = mesh && mesh->buffers ? mesh->buffers->vertexBuffer.Get() : nullptr;
+            if (!buffer || buffer->getDesc().keepInitialState)
+                return InvalidResourceId;
+            const ResourceId id = graph->ImportBuffer(buffer, c_SkinnedVertexBufferRestingState,
+                                                      c_SkinnedVertexBufferRestingState);
+            importFailed = importFailed || id == InvalidResourceId;
+            return id;
+        };
+        for (uint32_t i = 0; i < selected; ++i)
+            ids[i] = import(snapshot->skinnedInstances[i].leaf);
+        uint32_t at = selected;
+        for (const auto& leaf : skinnedLeaves)
+        {
+            if (!isSelected(leaf.Get()))
+                ids[at++] = import(leaf.Get());
+        }
+        if (importFailed)
+            return nvrhi::FE_OUT_OF_MEMORY;
+
+        nvrhi::FRESULT result = nvrhi::FS_OK;
+        if (selected != 0 || s.skinningPass)   // the pass ages its cache at every call (review fix 4)
+        {
+            if (!s.skinningPass)
+            {
+                try
+                {
+                    s.skinningPass = MAKE_RC_OBJ_PTR(SkinningPass, m_Device, m_Desc.shaderFactory);
+                }
+                catch (...)
+                {
+                }
+                if (!s.skinningPass)
+                    return nvrhi::FE_OUT_OF_MEMORY;
+            }
+            SkinningGraphOutputs outputs;
+            try
+            {
+                outputs = s.skinningPass->AddToGraph(graph, SkinningGraphInputs{ snapshot, ids, selected });
+            }
+            catch (...)
+            {
+                return nvrhi::FE_OUT_OF_MEMORY;
+            }
+            // A dispatched instance's buffer has a new version; its first frame is consumed if the frame executes.
+            for (uint32_t i = 0; i < selected && outputs.vertexBuffers && i < outputs.vertexBufferCount; ++i)
+            {
+                const ExtractedSkinnedInstance& instance = snapshot->skinnedInstances[i];
+                const bool dispatched = outputs.vertexBuffers[i] != ids[i];
+                ids[i] = outputs.vertexBuffers[i];
+                if (dispatched && instance.firstFrame && !s.ConsumeFirstFrame(instance.leaf))
+                    result = nvrhi::FE_OUT_OF_MEMORY;   // the flag stays unset: the next dispatch is a first one again
+            }
+            s.stats.skinningBindingSets = s.skinningPass->GetCachedBindingSetCount();
+        }
+        frame->skinnedVertexBuffers = ids;
+        frame->skinnedVertexBufferCount = total;
+        const nvrhi::FRESULT reads = RebuildBufferReads(graph, frame);
+        return NVRHI_FAILED(reads) ? reads : result;
     }
 
     nvrhi::FRESULT RenderService::AddShadowPasses(IRenderGraph* graph, SceneFrame* frame) noexcept

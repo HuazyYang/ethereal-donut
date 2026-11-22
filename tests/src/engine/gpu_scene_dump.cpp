@@ -32,11 +32,16 @@
 //         attaches a mesh between Scene::RefreshSceneGraph and RefreshBuffers, and checks that the next frame's
 //         geometry row has the mesh's buffer descriptors (review fix 1 of step E4); exit code 0 when it does.
 //     gpu_scene_dump ... --path graph
-//         (plan step E5, sub-plan item E5.4; this tree only, GPU_SCENE_DUMP_GRAPH_PATH) the render-graph path: the
-//         scene in scatter mode (Scene::SetGpuSceneUploadMode before loading), driven as the render service drives it
-//         at extraction, the buffers imported into a render graph, GpuSceneUploadPass, and the readbacks as graph passes
-//         after it. Its dumps must equal --path immediate (the default, Scene::Refresh). With --check-late-attach the
-//         mesh attached after the graph's refresh must have its geometry rows in the same frame.
+//         (plan step E5, sub-plan items E5.4 and E5.5; this tree only, GPU_SCENE_DUMP_GRAPH_PATH) the render-graph
+//         path: the scene in scatter mode (Scene::SetGpuSceneUploadMode before loading), driven by a render service
+//         (RenderService::Extract, AddUploadPasses, AddSkinningPasses, EndFrame), and the readbacks of the instance,
+//         geometry and material buffers as graph passes after them. Its dumps must equal --path immediate (the default,
+//         Scene::Refresh). With --check-late-attach the mesh attached after the graph's refresh must have its geometry
+//         rows in the same frame.
+//     gpu_scene_dump ... --skinned-out <file>
+//         (sub-plan item E5.5) also writes, after every frame, each skinned instance's vertex buffer ranges
+//         (positions, previous positions, normals, tangents, texture coordinates) and joint buffer, by node path, as
+//         byte counts and FNV-1a hashes, read back outside the graph after the frame. Both paths, and the E0 build.
 //
 // A GPU program: one at a time. Not a ctest test.
 
@@ -49,7 +54,7 @@
 #include <donut/engine/TextureCache.h>
 #if GPU_SCENE_DUMP_GRAPH_PATH
 #include <donut/engine/GpuScene.h>
-#include <donut/render/GpuSceneUploadPass.h>
+#include <donut/render/RenderExtract.h>
 #include <donut/render/RenderGraph.h>
 #include <donut/render/RenderGraphLambdaPass.h>
 #endif
@@ -59,6 +64,7 @@ using namespace donut::math;
 #include <donut/shaders/bindless.h>
 #include "GpuSceneDump.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -77,6 +83,7 @@ namespace
         std::string scene;
         std::string shaders;
         std::string out;
+        std::string skinnedOut;   // --skinned-out
         std::string move;
         std::string detach;
         uint32_t frames = 8;
@@ -119,16 +126,92 @@ namespace
         return rows;
     }
 
+    uint64_t Fnv1a(const uint8_t* bytes, size_t count)
+    {
+        uint64_t hash = 0xcbf29ce484222325ull;
+        for (size_t i = 0; i < count; ++i)
+            hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+        return hash;
+    }
+
+    // Every skinned instance's vertex buffer ranges and joint buffer after the frame ran (sub-plan item E5.5), by node
+    // path: byte counts and FNV-1a hashes. Read outside the graph: the immediate path's buffers are host-kept; the
+    // graph path's skinned vertex buffers rest in engine::c_SkinnedVertexBufferRestingState between frames.
+    void DumpSkinned(FILE* out, uint32_t frame, nvrhi::IDevice* device, SceneGraph* graph)
+    {
+        std::vector<std::pair<std::string, SkinnedMeshInstance*>> instances;
+        for (const auto& instance : graph->GetSkinnedMeshInstances())
+        {
+            const SceneGraphNode* node = instance->GetNode();
+            instances.emplace_back(node ? node->GetPath().generic_string() : std::string(), instance.Get());
+        }
+        std::stable_sort(instances.begin(), instances.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        nvrhi::CommandListHandle commandList;
+        device->createCommandList(nvrhi::CommandListParameters(), &commandList);
+        commandList->open();
+        std::vector<nvrhi::BufferHandle> vertices, joints;
+        for (const auto& entry : instances)
+        {
+            const BufferGroup* buffers = entry.second->GetMesh()->buffers;
+            nvrhi::IBuffer* buffer = buffers ? buffers->vertexBuffer.Get() : nullptr;
+            if (buffer && !buffer->getDesc().keepInitialState)
+            {
 #if GPU_SCENE_DUMP_GRAPH_PATH
-    // The render-graph path of one frame: extraction as RenderService::Extract does it, the GpuScene's buffers imported
-    // (not host-kept in scatter mode: engine::c_GpuSceneRestingState), GpuSceneUploadPass, then graph passes that copy
-    // the instance, geometry and material buffers into readback buffers. Returns them (null where a buffer is absent).
+                commandList->beginTrackingBufferState(buffer, c_SkinnedVertexBufferRestingState);
+                vertices.push_back(Readback(device, commandList, buffer));
+                commandList->setBufferState(buffer, c_SkinnedVertexBufferRestingState);
+#else
+                vertices.push_back(nullptr);
+#endif
+            }
+            else
+                vertices.push_back(Readback(device, commandList, buffer));
+            joints.push_back(Readback(device, commandList, entry.second->jointBuffer));
+        }
+        commandList->close();
+        device->executeCommandList(commandList);
+        device->waitForIdle();
+
+        const std::pair<VertexAttribute, const char*> attributes[] = {
+            { VertexAttribute::Position, "positions" }, { VertexAttribute::PrevPosition, "previous" },
+            { VertexAttribute::Normal, "normals" }, { VertexAttribute::Tangent, "tangents" },
+            { VertexAttribute::TexCoord1, "texcoord1" }, { VertexAttribute::TexCoord2, "texcoord2" } };
+        for (size_t i = 0; i < instances.size(); ++i)
+        {
+            const char* path = instances[i].first.c_str();
+            const BufferGroup* buffers = instances[i].second->GetMesh()->buffers;
+            const std::vector<uint8_t> bytes = Read<uint8_t>(device, vertices[i]);
+            for (const auto& attribute : attributes)
+            {
+                const nvrhi::BufferRange range = buffers ? buffers->getVertexBufferRange(attribute.first)
+                                                         : nvrhi::BufferRange();
+                if (range.byteSize == 0)
+                    continue;
+                const bool inside = range.byteOffset + range.byteSize <= bytes.size();
+                const uint64_t hash = inside ? Fnv1a(bytes.data() + range.byteOffset, size_t(range.byteSize)) : 0;
+                std::fprintf(out, "frame %u skinned %s %s bytes %llu fnv %016llx\n", frame, path, attribute.second,
+                             static_cast<unsigned long long>(range.byteSize), static_cast<unsigned long long>(hash));
+            }
+            const std::vector<uint8_t> jointBytes = Read<uint8_t>(device, joints[i]);
+            std::fprintf(out, "frame %u skinned %s joints bytes %llu fnv %016llx\n", frame, path,
+                         static_cast<unsigned long long>(jointBytes.size()),
+                         static_cast<unsigned long long>(Fnv1a(jointBytes.data(), jointBytes.size())));
+        }
+    }
+
+#if GPU_SCENE_DUMP_GRAPH_PATH
+    // The render-graph path of one frame through a render service: RenderService::Extract (the GpuScene's update and
+    // its buffers made at extraction), AddUploadPasses (the buffers imported, GpuSceneUploadPass), AddSkinningPasses
+    // (SkinningPass), then graph passes that copy the instance, geometry and material buffers into readback buffers;
+    // EndFrame after the graph executed. Returns the readbacks (null where a buffer is absent).
     struct GraphPath
     {
         nvrhi::IDevice* device = nullptr;
         nvrhi::AutoPtr<render::IResourceRegistry> registry;
         nvrhi::AutoPtr<render::IRenderGraph> graph;
-        nvrhi::AutoPtr<render::GpuSceneUploadPass> pass;
+        nvrhi::AutoPtr<render::RenderService> service;
         render::BackendProfile profile;
 
         struct NoData
@@ -136,14 +219,17 @@ namespace
             uint32_t unused;
         };
 
-        bool Init(nvrhi::IDevice* d, ShaderFactory* shaderFactory)
+        bool Init(nvrhi::IDevice* d, ShaderFactory* shaderFactory, Scene* scene)
         {
             device = d;
             if (NVRHI_FAILED(render::CreateResourceRegistry(device, &registry)) ||
                 NVRHI_FAILED(render::CreateRenderGraph(registry, &graph)) ||
                 NVRHI_FAILED(render::ComputeBackendProfile(device, &profile)))
                 return false;
-            pass = MAKE_RC_OBJ_PTR(render::GpuSceneUploadPass, device, shaderFactory);
+            render::RenderServiceDesc desc;
+            desc.scene = scene;
+            desc.shaderFactory = shaderFactory;
+            service = MAKE_RC_OBJ_PTR(render::RenderService, device, desc);
             return true;
         }
 
@@ -181,33 +267,24 @@ namespace
         }
 
         // False when the frame could not be built or run (the diagnostics are printed).
-        bool Frame(Scene* scene, nvrhi::BufferHandle& instances, nvrhi::BufferHandle& geometries,
+        bool Frame(Scene* scene, uint32_t frameIndex, nvrhi::BufferHandle& instances, nvrhi::BufferHandle& geometries,
                    nvrhi::BufferHandle& materials)
         {
-            SceneGraph* sceneGraph = scene->GetSceneGraph();
-            scene->CreateMeshBufferObjects();
-            GpuScene* gpu = scene->EnsureGpuScene();
-            if (!gpu || NVRHI_FAILED(gpu->Update(sceneGraph)) || NVRHI_FAILED(gpu->CreateBuffers()))
-                return false;
-            scene->BindMeshInstanceBuffers();
-
             graph->Reset();
-            render::GpuSceneUploadGraphInputs inputs;
-            inputs.gpuScene = gpu;
-            inputs.scene = scene;
-            inputs.bufferChanges = &gpu->GetBufferChanges();
-            auto import = [&](nvrhi::IBuffer* buffer)
+            render::ExtractDesc desc;
+            desc.frameIndex = frameIndex;
+            render::SceneFrame* frame = nullptr;
+            if (NVRHI_FAILED(service->Extract(graph, nullptr, desc, &frame)) || !frame)
+                return false;
+            if (NVRHI_FAILED(service->AddUploadPasses(graph, frame)) ||
+                NVRHI_FAILED(service->AddSkinningPasses(graph, frame)))
             {
-                return buffer ? graph->ImportBuffer(buffer, c_GpuSceneRestingState, c_GpuSceneRestingState)
-                              : render::InvalidResourceId;
-            };
-            inputs.instanceBuffer = import(gpu->GetInstanceBuffer());
-            inputs.geometryBuffer = import(gpu->GetGeometryBuffer());
-            inputs.materialBuffer = import(gpu->GetMaterialBuffer());
-            const render::GpuSceneUploadGraphOutputs outputs = pass->AddToGraph(graph, inputs);
-            instances = AddReadback(outputs.instanceBuffer);
-            geometries = AddReadback(outputs.geometryBuffer);
-            materials = AddReadback(outputs.materialBuffer);
+                service->EndFrame(false);
+                return false;
+            }
+            instances = AddReadback(frame->instanceBuffer);
+            geometries = AddReadback(frame->geometryBuffer);
+            materials = AddReadback(frame->materialBuffer);
 
             nvrhi::AutoPtr<render::ICompiledRenderGraph> plan;
             const nvrhi::FRESULT compiled = graph->Compile(profile, render::CompileOptions(), &plan);
@@ -215,14 +292,15 @@ namespace
             graph->GetDiagnostics(diagnostics);
             if (!diagnostics.empty())
                 std::fprintf(stderr, "render graph: %s\n", diagnostics.c_str());
-            if (NVRHI_FAILED(compiled) || NVRHI_FAILED(graph->Execute(plan, render::ExecuteDesc())))
-                return false;
-            return !gpu->IsScatterPending();
+            const bool executed =
+                NVRHI_SUCCEEDED(compiled) && NVRHI_SUCCEEDED(graph->Execute(plan, render::ExecuteDesc()));
+            service->EndFrame(executed);
+            return executed && scene->GetGpuScene() && !scene->GetGpuScene()->IsScatterPending();
         }
 
         void Release()
         {
-            pass = nullptr;
+            service = nullptr;
             graph = nullptr;
             registry = nullptr;
         }
@@ -246,6 +324,7 @@ int main(int argc, char** argv)
         else if (arg == "--scene") options.scene = next();
         else if (arg == "--shaders") options.shaders = next();
         else if (arg == "--out") options.out = next();
+        else if (arg == "--skinned-out") options.skinnedOut = next();
         else if (arg == "--move") options.move = next();
         else if (arg == "--detach") options.detach = next();
         else if (arg == "--frames") options.frames = uint32_t(std::stoul(next()));
@@ -318,7 +397,7 @@ int main(int argc, char** argv)
     {
         // the GpuScene's mode is chosen before anything makes it
         if (NVRHI_FAILED(scene->SetGpuSceneUploadMode(GpuSceneUploadMode::Scatter)) ||
-            !graphPath.Init(device, shaderFactory))
+            !graphPath.Init(device, shaderFactory, scene))
         {
             std::fprintf(stderr, "cannot set up the render-graph path\n");
             return 1;
@@ -376,7 +455,7 @@ int main(int argc, char** argv)
             if (options.graphPath)
             {
                 nvrhi::BufferHandle instances, materials;
-                if (!graphPath.Frame(scene, instances, geometries, materials))
+                if (!graphPath.Frame(scene, frame, instances, geometries, materials))
                 {
                     std::fprintf(stderr, "frame %u: the render graph did not run\n", frame);
                     return 1;
@@ -428,6 +507,9 @@ int main(int argc, char** argv)
     FILE* out = std::fopen(options.out.c_str(), "wb");
     if (!out)
         return 1;
+    FILE* skinnedOut = options.skinnedOut.empty() ? nullptr : std::fopen(options.skinnedOut.c_str(), "wb");
+    if (!options.skinnedOut.empty() && !skinnedOut)
+        return 1;
 
     for (uint32_t frame = 1; frame <= options.frames; ++frame)
     {
@@ -453,7 +535,7 @@ int main(int argc, char** argv)
         if (options.graphPath)
         {
             scene->RefreshSceneGraph(frame);
-            if (!graphPath.Frame(scene, instances, geometries, materials))
+            if (!graphPath.Frame(scene, frame, instances, geometries, materials))
             {
                 std::fprintf(stderr, "frame %u: the render graph did not run\n", frame);
                 return 1;
@@ -494,9 +576,13 @@ int main(int argc, char** argv)
         }
         gpu_scene_dump::Dump(out, frame, graph, instanceRows.data(), instanceRows.size(), geometryRows.data(),
                              geometryRows.size(), materialRows.data(), materialRows.size());
+        if (skinnedOut)
+            DumpSkinned(skinnedOut, frame, device, graph);
         device->runGarbageCollection();
     }
     std::fclose(out);
+    if (skinnedOut)
+        std::fclose(skinnedOut);
 
 #if GPU_SCENE_DUMP_GRAPH_PATH
     graphPath.Release();

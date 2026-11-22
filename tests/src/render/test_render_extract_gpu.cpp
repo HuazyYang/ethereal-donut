@@ -39,8 +39,10 @@
 // vertex buffers of the meshes made in the late frames, and of the loaded ones, hold their data. Every plan passes
 // VerifyPlan. Bindless buffers off, then on (not D3D11); each driven by hand (the dispatch narrowed to 2 groups in X, so
 // that it wraps into Y), then through RenderService::Extract / AddUploadPasses / EndFrame after Scene::FinishedLoading
-// (its load-time upload: the first frame is no resend), with item E5.1's device-only checks. A GPU program: one at a
-// time.
+// (its load-time upload: the first frame is no resend), with item E5.1's device-only checks. Then the skinning pass of
+// item E5.5 against Scene::UpdateSkinnedMeshes (RunSkinning): skinned vertex buffers and joint buffers byte-identical
+// to the CPU path's after every executed frame, the first frame, a skinned instance attached at runtime, a detach and
+// re-attach, and a dropped frame that keeps a first frame for the next one. A GPU program: one at a time.
 
 #include <donut/app/ApplicationBase.h>
 #include <donut/app/DeviceManager.h>
@@ -61,7 +63,9 @@ using namespace donut::math;
 #include <donut/shaders/gpu_scene_scatter_cb.h>
 #include <donut/shaders/material_cb.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -673,6 +677,438 @@ namespace
         device->runGarbageCollection();
     }
 
+    // ------------------------------------------------------------------------------------------ skinning (E5.5)
+
+    // A skin prototype of `vertices` vertices (one triangle per three): positions, normals, first texture coordinates,
+    // joint indices into `joints` joints and weights (some zero), tangents and second texture coordinates when asked.
+    nvrhi::AutoPtr<MeshInfo> MakeSkinPrototype(const std::string& name, uint32_t vertices, uint32_t joints,
+                                               bool tangents, bool texcoord2, Material* material)
+    {
+        auto buffers = MAKE_RC_OBJ_PTR(BufferGroup);
+        for (uint32_t v = 0; v < vertices; ++v)
+        {
+            const float t = float(v) * 0.37f;
+            buffers->positionData.push_back(float3(std::sin(t), float(v) * 0.01f, std::cos(t)));
+            buffers->normalData.push_back(vectorToSnorm8(normalize(float3(std::cos(t), 0.5f, std::sin(t)))));
+            if (tangents)
+                buffers->tangentData.push_back(vectorToSnorm8(float4(-std::sin(t), 0.f, std::cos(t), 1.f)));
+            buffers->texcoord1Data.push_back(float2(float(v) / float(vertices), 0.25f));
+            if (texcoord2)
+                buffers->texcoord2Data.push_back(float2(0.5f, float(v) / float(vertices)));
+            buffers->jointData.push_back(dm::vector<uint16_t, 4>(uint16_t(v % joints), uint16_t((v + 1) % joints),
+                                                                 uint16_t((v + 2) % joints),
+                                                                 uint16_t((v + 3) % joints)));
+            float4 weights(1.f + float(v % 3), float(v % 2), (v % 5) ? 0.5f : 0.f, (v % 7) ? 0.f : 0.25f);
+            weights /= weights.x + weights.y + weights.z + weights.w;
+            buffers->weightData.push_back(weights);
+            buffers->indexData.push_back(v);
+        }
+        auto geometry = MAKE_RC_OBJ_PTR(MeshGeometry);
+        geometry->material = material;
+        geometry->numIndices = vertices;
+        geometry->numVertices = vertices;
+        geometry->objectSpaceBounds = box3(float3(-1.f), float3(1.f, float(vertices) * 0.01f, 1.f));
+        auto mesh = MAKE_RC_OBJ_PTR(MeshInfo);
+        mesh->name = name;
+        mesh->buffers = buffers;
+        mesh->geometries.push_back(geometry);
+        mesh->totalIndices = vertices;
+        mesh->totalVertices = vertices;
+        mesh->objectSpaceBounds = geometry->objectSpaceBounds;
+        mesh->isSkinPrototype = true;
+        return mesh;
+    }
+
+    // A character as an importer builds it, off the graph: a root, a chain of joints (SkinnedMeshReference leaves) and
+    // the skin (a SkinnedMeshInstance with the joints and their inverse bind matrices).
+    struct Character
+    {
+        std::string name;
+        uint32_t id = 0;   // the same in both scenes: the pose's phase
+        nvrhi::AutoPtr<SceneGraphNode> root;
+        std::vector<SceneGraphNode*> joints;
+        nvrhi::AutoPtr<SkinnedMeshInstance> skinned;
+    };
+
+    Character MakeCharacter(SceneGraph* graph, SceneTypeFactory* factory, MeshInfo* prototype, uint32_t jointCount,
+                            const std::string& name, double x)
+    {
+        Character character;
+        character.name = name;
+        character.root = MAKE_RC_OBJ_PTR(SceneGraphNode);
+        character.root->SetName(name);
+        character.root->SetTranslation(double3(x, 0.0, 0.0));
+        character.skinned = factory->CreateSkinnedMeshInstance(factory, prototype);
+        SceneGraphNode* parent = character.root;
+        for (uint32_t j = 0; j < jointCount; ++j)
+        {
+            auto joint = MAKE_RC_OBJ_PTR(SceneGraphNode);
+            joint->SetName(name + "_joint" + std::to_string(j));
+            joint->SetTranslation(double3(0.0, j ? 0.5 : 0.0, 0.0));
+            joint->SetLeaf(MAKE_RC_OBJ_PTR(SkinnedMeshReference, character.skinned.Get()));
+            graph->Attach(parent, joint);
+            const float4x4 inverseBind = affineToHomogeneous(translation(float3(0.1f, -0.5f * float(j), 0.f)));
+            character.skinned->joints.push_back(
+                SkinnedMeshJoint{ nvrhi::WeakPtr<SceneGraphNode>(joint.Get()), inverseBind });
+            character.joints.push_back(joint);
+            parent = joint;
+        }
+        auto skin = MAKE_RC_OBJ_PTR(SceneGraphNode);
+        skin->SetName(name + "_skin");
+        skin->SetLeaf(character.skinned);
+        graph->Attach(character.root, skin);
+        return character;
+    }
+
+    // The pose of a character's joints in a frame: the same values in both scenes.
+    void Pose(Character& character, uint32_t frame)
+    {
+        for (size_t j = 0; j < character.joints.size(); ++j)
+        {
+            const double angle = 0.3 * std::sin(0.7 * double(frame) + double(j) + 1.3 * double(character.id));
+            character.joints[j]->SetRotation(rotationQuat(double3(0.0, 0.0, 1.0), angle));
+        }
+    }
+
+    // One scene of the skinning comparison: the render-graph path (the service) or the CPU path (the reference).
+    struct SkinningScene
+    {
+        nvrhi::AutoPtr<Scene> scene;
+        nvrhi::AutoPtr<SceneTypeFactory> factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+        nvrhi::AutoPtr<Material> material = MAKE_RC_OBJ_PTR(Material);
+        nvrhi::AutoPtr<MeshInfo> prototypes[3];
+        std::vector<Character> characters;   // in creation order: A, B, C (frame 4), D (frame 7), E (13), F (16)
+
+        SkinningScene(Fixture& fixture, bool graphPath)
+        {
+            scene = fixture.MakeScene(graphPath);
+            material->name = "skin";
+            prototypes[0] = MakeSkinPrototype("p0", 700, 6, true, false, material);   // three dispatch groups
+            prototypes[1] = MakeSkinPrototype("p1", 300, 4, false, true, material);
+            prototypes[2] = MakeSkinPrototype("p2", 512, 5, true, true, material);
+        }
+
+        void Add(uint32_t prototype, uint32_t joints, const std::string& name, double x)
+        {
+            SceneGraph* graph = scene->GetSceneGraph();
+            characters.push_back(MakeCharacter(graph, factory, prototypes[prototype], joints, name, x));
+            characters.back().id = uint32_t(name[0] - 'A');
+            graph->Attach(graph->GetRootNode(), characters.back().root);
+        }
+
+        Character* Find(const SkinnedMeshInstance* leaf)
+        {
+            for (Character& character : characters)
+                if (character.skinned.Get() == leaf)
+                    return &character;
+            return nullptr;
+        }
+
+        Character* Find(const std::string& name)
+        {
+            for (Character& character : characters)
+                if (character.name == name)
+                    return &character;
+            return nullptr;
+        }
+
+        // Detaches a character and drops every reference the test holds to it.
+        void Remove(const std::string& name)
+        {
+            for (auto it = characters.begin(); it != characters.end(); ++it)
+            {
+                if (it->name == name)
+                {
+                    nvrhi::AutoPtr<SceneGraphNode> detached = scene->GetSceneGraph()->Detach(it->root);
+                    characters.erase(it);
+                    return;
+                }
+            }
+        }
+    };
+
+    // The skinning pass against Scene::UpdateSkinnedMeshes. Two scenes built alike, one on the graph path driven
+    // through RenderService::Extract / AddUploadPasses / AddSkinningPasses / EndFrame, one on the CPU path
+    // (Scene::Refresh): after every executed frame every skinned vertex buffer (read back through graph passes from
+    // SceneFrame's ids) and every joint buffer equal the CPU path's byte for byte. Both load through FinishedLoading,
+    // which skins the loaded characters A and B. The script (a frame the graph path drops is skipped by the CPU path):
+    //   frames 1-12   A animated in 1-9, B in 1-3, 5 (while detached) and 8-9, the others in their frames up to 9;
+    //                 B detached in 5 and attached again in 6; C attached in 4 with a prototype new to the scene; D
+    //                 attached in 7 with A's prototype; frame 7 dropped: D's first frame is not consumed and frame 8
+    //                 skins it as a first frame; in frame 9, C is detached and released on the graph path between
+    //                 AddSkinningPasses and the execution (it was dispatched; review fix 2); 10-12 idle
+    //   frames 13-15  A moves in 13; E attached in 13; 13 and 14 dropped (review fix 1: E is never skinned and A's pose
+    //                 is pending): 15 skins both
+    //   frames 16-20  A moves in 16; F attached in 16; 16 dropped; then a frame-index gap (17 and 18 do not exist);
+    //                 19 skins A and F, 20 settles
+    //   frames 21-90  idle: every call of AddSkinningPasses ages the binding-set cache, which ends empty (review fix 4)
+    // AddSkinningPasses before AddUploadPasses is refused (review fix 3).
+    void RunSkinning(app::DeviceManager* deviceManager, nvrhi::GraphicsAPI api, bool bindless)
+    {
+        nvrhi::IDevice* device = deviceManager->GetDevice();
+        const std::string tag =
+            std::string(app::GetShaderTypeName(api)) + (bindless ? ", bindless" : "") + ", skinning";
+        const uint32_t warningsBefore = g_Warnings.load();
+        uint32_t expectedWarnings = 0;
+        Fixture fixture(device, api, bindless);
+        SkinningScene graphScene(fixture, true);
+        SkinningScene cpuScene(fixture, false);
+        for (SkinningScene* side : { &graphScene, &cpuScene })
+        {
+            side->Add(0, 6, "A", 0.0);
+            side->Add(1, 4, "B", 3.0);
+        }
+
+        nvrhi::AutoPtr<IResourceRegistry> registry;
+        nvrhi::AutoPtr<IRenderGraph> renderGraph;
+        check(CreateResourceRegistry(device, &registry) == nvrhi::FS_OK, "registry");
+        check(CreateRenderGraph(registry, &renderGraph) == nvrhi::FS_OK, "render graph");
+        BackendProfile profile;
+        check(ComputeBackendProfile(device, &profile) == nvrhi::FS_OK, "profile");
+        RenderServiceDesc serviceDesc;
+        serviceDesc.scene = graphScene.scene;
+        serviceDesc.shaderFactory = fixture.shaderFactory;
+        auto service = MAKE_RC_OBJ_PTR(RenderService, device, serviceDesc);
+        graphScene.scene->FinishedLoading(0);
+        cpuScene.scene->FinishedLoading(0);
+        device->waitForIdle();
+        for (SkinningScene* side : { &graphScene, &cpuScene })
+            for (const Character& character : side->characters)
+                check(character.skinned->skinningInitialized, tag + ": " + character.name + " skinned at the load");
+
+        auto animated = [](const std::string& name, uint32_t frame)
+        {
+            if (name == "A")
+                return frame <= 9 || frame == 13 || frame == 16;
+            if (name == "B")
+                return frame <= 3 || frame == 5 || frame == 8 || frame == 9;
+            return frame <= 9;
+        };
+        std::vector<uint32_t> frames;
+        for (uint32_t frame = 1; frame <= 16; ++frame)
+            frames.push_back(frame);
+        for (uint32_t frame = 19; frame <= 90; ++frame)   // 17 and 18: a frame-index gap
+            frames.push_back(frame);
+        auto dropped = [](uint32_t frame) { return frame == 7 || frame == 13 || frame == 14 || frame == 16; };
+
+        nvrhi::CommandListHandle commandList;
+        device->createCommandList(nvrhi::CommandListParameters(), &commandList);
+        nvrhi::AutoPtr<SceneGraphNode> detachedB[2];
+        uint32_t dispatchedFrames = 0, firstFrameDispatches = 0, othersImported = 0, setsAtFrame20 = 0;
+        std::vector<uint8_t> lastA;
+        for (const uint32_t frame : frames)
+        {
+            const std::string where = tag + ", frame " + std::to_string(frame);
+            const bool executed = !dropped(frame);
+            const bool compared = frame <= 20 || frame == frames.back();
+            for (SkinningScene* side : { &graphScene, &cpuScene })
+            {
+                const size_t s = side == &graphScene ? 0 : 1;
+                SceneGraph* graph = side->scene->GetSceneGraph();
+                if (frame == 4)
+                    side->Add(2, 5, "C", 6.0);
+                if (frame == 7)
+                    side->Add(0, 6, "D", 9.0);
+                if (frame == 13)
+                    side->Add(1, 4, "E", 12.0);
+                if (frame == 16)
+                    side->Add(2, 5, "F", 15.0);
+                if (frame == 5)
+                    detachedB[s] = graph->Detach(side->Find("B")->root);
+                if (frame == 6)
+                {
+                    graph->Attach(graph->GetRootNode(), detachedB[s]);
+                    detachedB[s] = nullptr;
+                }
+                if (frame == 9 && side == &cpuScene)   // the graph path removes C mid-frame, below
+                    side->Remove("C");
+                for (Character& character : side->characters)
+                {
+                    if (animated(character.name, frame))
+                        Pose(character, frame);
+                }
+            }
+
+            // the CPU path: Scene::Refresh; the dropped frames do not exist there
+            if (executed)
+            {
+                cpuScene.scene->RefreshSceneGraph(frame);
+                commandList->open();
+                cpuScene.scene->RefreshBuffers(commandList, frame);
+                commandList->close();
+                device->executeCommandList(commandList);
+            }
+
+            // the graph path
+            SceneGraph* graph = graphScene.scene->GetSceneGraph();
+            graphScene.scene->RefreshSceneGraph(frame);
+            renderGraph->Reset();
+            SceneFrame* sceneFrame = nullptr;
+            ExtractDesc extractDesc;
+            extractDesc.frameIndex = frame;
+            check(service->Extract(renderGraph, nullptr, extractDesc, &sceneFrame) == nvrhi::FS_OK && sceneFrame,
+                  where + ": Extract");
+            const RenderSnapshot& snapshot = *sceneFrame->snapshot;
+            // the legacy rule's instances and those never skinned are all selected (and those pending from a dropped
+            // frame, which the CPU path cannot tell)
+            for (const auto& leaf : graph->GetSkinnedMeshInstances())
+            {
+                if (leaf->GetLastUpdateFrameIndex() + 1 >= frame || !leaf->skinningInitialized)
+                {
+                    bool found = false;
+                    for (uint32_t i = 0; i < snapshot.skinnedInstanceCount; ++i)
+                        found = found || snapshot.skinnedInstances[i].leaf == leaf.Get();
+                    check(found, where + ": the selection");
+                }
+            }
+            if (frame == 1)
+            {
+                // review fix 3: skinning before the upload pass is refused, with a warning
+                check(service->AddSkinningPasses(renderGraph, sceneFrame) == nvrhi::FE_INVALID_ARGS &&
+                      renderGraph->GetPassCount() == 0, where + ": AddSkinningPasses before AddUploadPasses");
+                ++expectedWarnings;
+            }
+            check(service->AddUploadPasses(renderGraph, sceneFrame) == nvrhi::FS_OK, where + ": AddUploadPasses");
+            const uint32_t passesBefore = renderGraph->GetPassCount();
+            check(service->AddSkinningPasses(renderGraph, sceneFrame) == nvrhi::FS_OK, where + ": AddSkinningPasses");
+            const uint32_t skinningPasses = renderGraph->GetPassCount() - passesBefore;
+            check(skinningPasses == (snapshot.skinnedInstanceCount ? 1u : 0u), where + ": one compute use");
+            check(service->AddSkinningPasses(renderGraph, sceneFrame) == nvrhi::FS_OK &&
+                  renderGraph->GetPassCount() == passesBefore + skinningPasses, where + ": a second call adds nothing");
+            if (frame == 20)
+                setsAtFrame20 = service->GetStats().skinningBindingSets;
+
+            // SceneFrame's ids: the snapshot's instances (written), then the others in the graph's order (imported)
+            const auto& skinnedLeaves = graph->GetSkinnedMeshInstances();
+            check(sceneFrame->skinnedVertexBufferCount == skinnedLeaves.size(),
+                  where + ": one id per skinned instance");
+            std::vector<const SkinnedMeshInstance*> order;
+            for (uint32_t i = 0; i < snapshot.skinnedInstanceCount; ++i)
+                order.push_back(snapshot.skinnedInstances[i].leaf);
+            for (const auto& leaf : skinnedLeaves)
+                if (std::find(order.begin(), order.end(), leaf.Get()) == order.end())
+                    order.push_back(leaf.Get());
+            for (uint32_t i = 0; i < sceneFrame->skinnedVertexBufferCount; ++i)
+            {
+                const ResourceId id = sceneFrame->skinnedVertexBuffers[i];
+                check(id != InvalidResourceId, where + ": a skinned buffer imported");
+                othersImported += i < snapshot.skinnedInstanceCount ? 0u : 1u;
+            }
+            uint32_t reads = 0;
+            for (uint32_t i = 0; i < sceneFrame->bufferReadCount; ++i)
+                for (uint32_t k = 0; k < sceneFrame->skinnedVertexBufferCount; ++k)
+                    reads += sceneFrame->bufferReads[i] == sceneFrame->skinnedVertexBuffers[k] ? 1u : 0u;
+            check(reads == sceneFrame->skinnedVertexBufferCount,
+                  where + ": SceneFrame::bufferReads has the skinned buffers");
+            for (uint32_t i = 0; executed && i < snapshot.skinnedInstanceCount; ++i)
+                firstFrameDispatches += snapshot.skinnedInstances[i].firstFrame ? 1u : 0u;
+            dispatchedFrames += executed && snapshot.skinnedInstanceCount ? 1u : 0u;
+
+            std::vector<nvrhi::BufferHandle> readbacks;
+            for (uint32_t i = 0; i < sceneFrame->skinnedVertexBufferCount; ++i)
+            {
+                const uint64_t bytes = order[i]->GetMesh()->buffers->vertexBuffer->getDesc().byteSize;
+                readbacks.push_back(MakeReadback(device, bytes));
+                AddReadback(renderGraph, sceneFrame->skinnedVertexBuffers[i], readbacks.back(), bytes, "ReadSkinned");
+            }
+
+            // review fix 2: C, dispatched this frame, is detached and released before the graph compiles and executes
+            const SkinnedMeshInstance* removed = nullptr;
+            if (frame == 9)
+            {
+                const Character* c = graphScene.Find("C");
+                check(c != nullptr && c->skinned->skinningInitialized, where + ": C is no first frame");
+                removed = c->skinned.Get();
+                bool dispatched = false;
+                for (uint32_t i = 0; i < snapshot.skinnedInstanceCount; ++i)
+                    dispatched = dispatched || snapshot.skinnedInstances[i].leaf == removed;
+                check(dispatched, where + ": C is dispatched");
+                graphScene.Remove("C");
+#ifndef NDEBUG
+                ++expectedWarnings;   // a scene-graph write inside the render-read scope
+#endif
+            }
+
+            nvrhi::AutoPtr<ICompiledRenderGraph> plan;
+            const nvrhi::FRESULT compiled = renderGraph->Compile(profile, CompileOptions(), &plan);
+            nvrhi::string diagnostics;
+            renderGraph->GetDiagnostics(diagnostics);
+            check(compiled == nvrhi::FS_OK, where + ": Compile: " + std::string(diagnostics.c_str()));
+            check(diagnostics.empty(), where + ": diagnostics: " + std::string(diagnostics.c_str()));
+            nvrhi::string report;
+            check(VerifyPlan(plan, renderGraph, nullptr, &report) == nvrhi::FS_OK,
+                  where + ": VerifyPlan: " + std::string(report.c_str()));
+            if (!executed)
+            {
+                service->EndFrame(false);
+                const char* first = frame == 7 ? "D" : frame == 16 ? "F" : "E";
+                const Character* character = graphScene.Find(first);
+                check(character && !character->skinned->skinningInitialized,
+                      where + ": a dropped first frame is not consumed (" + first + ")");
+                std::printf("ok: %s: compiled, not executed; %u skinned instances selected\n", where.c_str(),
+                            snapshot.skinnedInstanceCount);
+                continue;
+            }
+            check(renderGraph->Execute(plan, ExecuteDesc()) == nvrhi::FS_OK, where + ": Execute");
+            service->EndFrame(true);
+            device->waitForIdle();
+            for (const auto& leaf : skinnedLeaves)
+                check(leaf->skinningInitialized, where + ": skinningInitialized after an executed frame");
+
+            // every skinned buffer and every joint buffer against the CPU path's
+            check(cpuScene.scene->GetSceneGraph()->GetSkinnedMeshInstances().size() == skinnedLeaves.size(),
+                  where + ": the same skinned instances");
+            for (uint32_t i = 0; compared && i < sceneFrame->skinnedVertexBufferCount; ++i)
+            {
+                if (order[i] == removed)
+                    continue;   // released; the CPU path did not have it this frame
+                const Character* character = graphScene.Find(order[i]);
+                check(character != nullptr, where + ": a known skinned instance");
+                const Character* reference = cpuScene.Find(character->name);
+                check(reference != nullptr, where + ": " + character->name + " on the CPU path");
+                const std::vector<uint8_t> graphBytes = Read<uint8_t>(device, readbacks[i]);
+                const std::vector<uint8_t> cpuBytes =
+                    ReadBuffer(device, reference->skinned->GetMesh()->buffers->vertexBuffer);
+                check(graphBytes.size() == cpuBytes.size() &&
+                      std::memcmp(graphBytes.data(), cpuBytes.data(), cpuBytes.size()) == 0,
+                      where + ": " + character->name + "'s skinned vertex buffer");
+                check(std::any_of(graphBytes.begin(), graphBytes.end(), [](uint8_t b) { return b != 0; }),
+                      where + ": " + character->name + "'s skinned vertex buffer has data");
+                // A's positions move in every animated frame, and its previous positions follow one frame behind
+                if (character->name == "A")
+                {
+                    if (!lastA.empty() && frame <= 9)
+                        check(graphBytes != lastA, where + ": A's skinned vertices moved");
+                    lastA = graphBytes;
+                }
+                const std::vector<uint8_t> graphJoints = ReadBuffer(device, character->skinned->jointBuffer);
+                const std::vector<uint8_t> cpuJoints = ReadBuffer(device, reference->skinned->jointBuffer);
+                check(graphJoints == cpuJoints, where + ": " + character->name + "'s joint buffer");
+            }
+            if (compared)
+                std::printf("ok: %s: %u of %zu skinned instances dispatched, every skinned and joint buffer equal\n",
+                            where.c_str(), snapshot.skinnedInstanceCount, skinnedLeaves.size());
+            device->runGarbageCollection();
+        }
+        // first-frame dispatches in executed frames: C (4), D (8), E (15), F (19)
+        check(dispatchedFrames >= 12 && firstFrameDispatches == 4 && othersImported > 0,
+              tag + ": frames with dispatches " + std::to_string(dispatchedFrames) + ", first-frame dispatches " +
+                  std::to_string(firstFrameDispatches));
+        const uint32_t setsAtEnd = service->GetStats().skinningBindingSets;
+        check(setsAtFrame20 >= 5 && setsAtEnd == 0, tag + ": binding-set cache " + std::to_string(setsAtFrame20) +
+                                                        " at frame 20, " + std::to_string(setsAtEnd) + " at the end");
+        std::printf("ok: %s: binding-set cache %u at frame 20, %u after 70 idle frames\n", tag.c_str(), setsAtFrame20,
+                    setsAtEnd);
+        check(g_Warnings.load() == warningsBefore + expectedWarnings, tag + ": the expected warnings only");
+
+        service = nullptr;
+        renderGraph = nullptr;
+        registry = nullptr;
+        commandList = nullptr;
+        device->waitForIdle();
+        device->runGarbageCollection();
+    }
+
     // E5.1's device-only checks: a scene not on the graph path is refused; an empty scene on it adds nothing and warns
     // about nothing.
     void ServiceChecks(app::DeviceManager* deviceManager, nvrhi::GraphicsAPI api)
@@ -780,6 +1216,9 @@ int main(int argc, char** argv)
                 Run(deviceManager, api, true, useService);
         }
         ServiceChecks(deviceManager, api);
+        RunSkinning(deviceManager, api, false);
+        if (api != nvrhi::GraphicsAPI::D3D11)
+            RunSkinning(deviceManager, api, true);
 
         deviceManager->Shutdown();
         deviceManager = nullptr;

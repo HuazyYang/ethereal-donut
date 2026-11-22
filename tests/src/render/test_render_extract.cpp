@@ -954,7 +954,14 @@ namespace
         h.Array(in.leaves, in.count);
         h.Array(in.meshInfos, in.count);
         h.Array(in.worldBounds, in.count);
-        h.Value(s.packets.count);
+        const DrawPackets& packets = s.packets;
+        h.Array(packets.keys, packets.count);
+        h.Array(packets.visibleInstances, packets.count);
+        h.Array(packets.geometryIndices, packets.count);
+        h.Array(packets.geometrySlots, packets.count);
+        h.Array(packets.materialSlots, packets.count);
+        h.Array(packets.cullModes, packets.count);
+        h.Array(packets.flags, packets.count);
         h.Value(s.lightCount);
         for (uint32_t i = 0; i < s.lightCount; ++i)
         {
@@ -1005,10 +1012,16 @@ namespace
         return std::memcmp(a, b, size) == 0;
     }
 
-    // The legacy skinning rule and formula (Scene::UpdateSkinnedMeshes), through the node getters.
+    // The leaves a test expects pending from a frame that did not execute (E5.5 review fix 1); empty elsewhere.
+    std::vector<const SkinnedMeshInstance*> g_ExpectedPendingSkins;
+
+    // The legacy skinning rule and formula (Scene::UpdateSkinnedMeshes), through the node getters, with the service's
+    // additions (E5.5 review fix 1): an instance never skinned, and one pending from a frame that did not execute.
     bool LegacySelected(const SkinnedMeshInstance* instance, uint32_t frameIndex)
     {
-        return !(instance->GetLastUpdateFrameIndex() + 1 < frameIndex);
+        return !(instance->GetLastUpdateFrameIndex() + 1 < frameIndex) || !instance->skinningInitialized ||
+               std::find(g_ExpectedPendingSkins.begin(), g_ExpectedPendingSkins.end(), instance) !=
+                   g_ExpectedPendingSkins.end();
     }
 
     dm::float4x4 LegacyJointMatrix(const SkinnedMeshInstance* instance, size_t joint)
@@ -1039,12 +1052,24 @@ namespace
             CHECK(view.view == desc.views[v]);
             CHECK(SameBits(&view.frustum, &frustum, sizeof(frustum)));
             CHECK(SameBits(&view.viewOrigin, &origin, sizeof(origin)));
-            CHECK(view.instances.first == 0 && view.instances.count == s.instances.count);   // E5.1: no culling
-            for (const SnapshotRange& range : view.packets)
-                CHECK(range.count == 0);
+            // E5.2: each view its own range of visible instances, then per pass its range of packets, in order
+            const SnapshotRange previousInstances = v != 0 ? s.views[v - 1].instances : SnapshotRange{};
+            CHECK(view.instances.first == previousInstances.first + previousInstances.count);
+            for (uint32_t p = 0; p < c_DrawPacketPassCount; ++p)
+            {
+                const SnapshotRange& previous = p != 0 ? view.packets[p - 1] : v != 0
+                    ? s.views[v - 1].packets[c_DrawPacketPassCount - 1] : SnapshotRange{};
+                CHECK(view.packets[p].first == previous.first + previous.count);
+            }
             CHECK(view.light == c_NoExtractedLight);
         }
-        CHECK(s.packets.count == 0);
+        if (s.viewCount != 0)
+        {
+            const ExtractedView& last = s.views[s.viewCount - 1];
+            CHECK(last.instances.first + last.instances.count == s.instances.count);
+            const SnapshotRange& lastPackets = last.packets[c_DrawPacketPassCount - 1];
+            CHECK(lastPackets.first + lastPackets.count == s.packets.count);
+        }
 
         // lights in GetLights() order, their constants byte-equal to FillLightConstants called directly
         const auto& lights = graph->GetLights();
@@ -1075,8 +1100,9 @@ namespace
             CHECK(SameBits(&s.cameras[i].viewToWorld, &expected, sizeof(expected)));
         }
 
-        // every mesh instance with a slot: a pre-order walk against the snapshot, as sets keyed by entity
-        std::vector<InstanceRow> expected;
+        // per view, every mesh instance with a slot whose own box passes the view's frustum test (the legacy test): a
+        // pre-order walk against the view's range, as sets keyed by entity (test_draw_packets checks the packets)
+        std::vector<InstanceRow> all;
         for (SceneGraphWalker walker(graph->GetRootNode()); walker; walker.Next(true))
         {
             SceneGraphNode* node = walker.Get();
@@ -1094,29 +1120,40 @@ namespace
             row.leaf = instance;
             row.meshInfo = mesh;
             row.bounds = local.isempty() ? dm::box3::empty() : local * node->GetLocalToWorldTransformFloat();
-            expected.push_back(row);
-        }
-        std::vector<InstanceRow> actual;
-        const VisibleInstances& in = s.instances;
-        for (uint32_t i = 0; i < in.count; ++i)
-        {
-            actual.push_back(InstanceRow{ in.entities[i], in.instanceSlots[i], in.meshes[i],
-                                          in.firstGeometryInstanceSlots[i], in.geometryCounts[i], in.leaves[i],
-                                          in.meshInfos[i], in.worldBounds[i] });
+            all.push_back(row);
         }
         auto byEntity = [](const InstanceRow& a, const InstanceRow& b) { return a.entity < b.entity; };
-        std::sort(expected.begin(), expected.end(), byEntity);
-        std::sort(actual.begin(), actual.end(), byEntity);
-        CHECK(expected.size() == actual.size());
-        for (size_t i = 0; i < expected.size(); ++i)
+        const VisibleInstances& in = s.instances;
+        for (uint32_t v = 0; v < s.viewCount; ++v)
         {
-            const InstanceRow& e = expected[i];
-            const InstanceRow& a = actual[i];
-            CHECK(e.entity == a.entity && e.entity != Entity::Null);
-            CHECK(e.slot == a.slot && e.mesh == a.mesh && e.mesh != MeshId::Invalid);
-            CHECK(e.firstGeometryInstance == a.firstGeometryInstance && e.geometryCount == a.geometryCount);
-            CHECK(e.leaf == a.leaf && e.meshInfo == a.meshInfo);
-            CHECK(SameBits(&e.bounds, &a.bounds, sizeof(e.bounds)));
+            const dm::frustum frustum = desc.views[v]->GetViewFrustum();
+            std::vector<InstanceRow> expected;
+            for (const InstanceRow& row : all)
+            {
+                if (frustum.intersectsWith(row.bounds))
+                    expected.push_back(row);
+            }
+            std::vector<InstanceRow> actual;
+            const SnapshotRange range = s.views[v].instances;
+            for (uint32_t i = range.first; i < range.first + range.count; ++i)
+            {
+                actual.push_back(InstanceRow{ in.entities[i], in.instanceSlots[i], in.meshes[i],
+                                              in.firstGeometryInstanceSlots[i], in.geometryCounts[i], in.leaves[i],
+                                              in.meshInfos[i], in.worldBounds[i] });
+            }
+            std::sort(expected.begin(), expected.end(), byEntity);
+            std::sort(actual.begin(), actual.end(), byEntity);
+            CHECK(expected.size() == actual.size());
+            for (size_t i = 0; i < expected.size() && i < actual.size(); ++i)
+            {
+                const InstanceRow& e = expected[i];
+                const InstanceRow& a = actual[i];
+                CHECK(e.entity == a.entity && e.entity != Entity::Null);
+                CHECK(e.slot == a.slot && e.mesh == a.mesh && e.mesh != MeshId::Invalid);
+                CHECK(e.firstGeometryInstance == a.firstGeometryInstance && e.geometryCount == a.geometryCount);
+                CHECK(e.leaf == a.leaf && e.meshInfo == a.meshInfo);
+                CHECK(SameBits(&e.bounds, &a.bounds, sizeof(e.bounds)));
+            }
         }
 
         // skinned instances: the legacy selection over the graph's vector, the legacy joint matrices bit for bit
@@ -1282,8 +1319,9 @@ namespace
         CHECK(!runFrame());
 
         // a RenderExtract system that declares a write: Debug warns at each extraction, and the next Refresh runs
-        const ComponentId localBounds = RegisterComponent<LocalBounds>(world);
-        const ComponentAccess write[] = { { localBounds, engine::Access::Write, {} } };
+        // (LocalTransform: no RenderService system reads it, so the writer adds no ambiguity of its own)
+        const ComponentId localTransform = RegisterComponent<LocalTransform>(world);
+        const ComponentAccess write[] = { { localTransform, engine::Access::Write, {} } };
         SystemDesc systemDesc{};
         systemDesc.name = "test.RenderExtractWriter";
         systemDesc.accesses = write;
@@ -1507,7 +1545,8 @@ namespace
                     stats.cameras, stats.skinnedInstances, stats.jointMatrices,
                     (unsigned long long)stats.snapshotBytes, (unsigned long long)newCalls,
                     (unsigned long long)heapBlocks);
-        CHECK(warm.visibleInstances == 4096 && stats.skinnedInstances > 0 && stats.lights > 0);
+        CHECK(warm.visibleInstances > 0 && stats.skinnedInstances > 0 && stats.lights > 0);
+        CHECK(warm.packets[uint32_t(DrawPacketPass::Opaque)] > 0);
         CHECK(newCalls == 0 && heapBlocks == 0);
         CHECK(g_Warnings.load() == 0);
     }
@@ -1565,8 +1604,9 @@ namespace
 
     // EndFrame: idempotent; a frame without EndFrame is closed by the next Extract; the graph counts scopes, the
     // service keeps one flag. The first-frame skinning flag: EndFrame(true) sets skinningInitialized only for instances
-    // a skinning dispatch consumed (AddSkinningPasses, E5.5); before E5.5 nothing consumes them, so every selected
-    // instance stays a first frame through executed frames.
+    // a skinning dispatch consumed (AddSkinningPasses, E5.5); a service without a device adds no skinning pass, so
+    // every selected instance stays a first frame through executed frames (the dispatching side is checked on the
+    // device by test_render_extract_gpu).
     void test_end_frame()
     {
         TestViews views;
@@ -1615,7 +1655,9 @@ namespace
         CHECK(g_Warnings.load() == warningsBefore + 12);
 #endif
         g_Warnings.store(warningsBefore);
-        CHECK(service->AddSkinningPasses(frame.graph, frame.data.Find<SceneFrame>()) == nvrhi::FS_OK);   // a stub
+        // no device: no skinning pass
+        CHECK(service->AddSkinningPasses(frame.graph, frame.data.Find<SceneFrame>()) == nvrhi::FS_OK);
+        CHECK(frame.graph->GetPassCount() == 0);
         service->EndFrame(true);    // executed, but no dispatch consumed a first frame
         noneInitialized();
         CHECK(!s.graph->IsInRenderRead());
@@ -1957,6 +1999,136 @@ namespace
         service = nullptr;
     }
 
+    // The E0.2 regression on the graph path (sub-plan item E5.5): a detached skinned instance is never selected, though
+    // its joints keep moving; attached again, it is selected again. Every frame also equals the legacy selection and
+    // joint matrices (CheckSnapshot).
+    void test_skinned_detach()
+    {
+        TestViews views;
+        TraceScene s(0x1006, c_SmallProfile);
+        BuildCrowd(s, 3);
+        RenderFrame frame;
+        auto service = MakeService(s.graph);
+        CHECK(s.graph->GetSkinnedMeshInstances().size() == 3);
+        for (const auto& instance : s.graph->GetSkinnedMeshInstances())
+            instance->skinningInitialized = true;   // skinned at the load: the legacy rule alone selects
+        const SkinnedMeshInstance* leaf = s.graph->GetSkinnedMeshInstances()[1];
+        nvrhi::AutoPtr<SceneGraphNode> character = leaf->GetNode()->GetParent();
+        nvrhi::AutoPtr<SceneGraphNode> detached;
+        for (uint32_t f = 1; f <= 8; ++f)
+        {
+            for (const SkinnedMeshJoint& joint : leaf->joints)   // its joints move in every frame, attached or not
+                if (nvrhi::AutoPtr<SceneGraphNode> node = joint.node.Lock())
+                    node->SetTranslation(dm::double3(0.0, 0.01 * double(f), 0.0));
+            if (f == 3)
+                detached = s.graph->Detach(character);
+            if (f == 6)
+            {
+                s.graph->Attach(s.graph->GetRootNode(), detached);
+                detached = nullptr;
+            }
+            s.graph->Refresh(f);
+            const ExtractDesc desc = views.Desc(f);
+            const RenderSnapshot& snapshot = ExtractFrame(service, frame, desc);
+            CheckSnapshot(s.graph, snapshot, desc);
+            bool selected = false;
+            for (uint32_t i = 0; i < snapshot.skinnedInstanceCount; ++i)
+                selected = selected || snapshot.skinnedInstances[i].leaf == leaf;
+            CHECK(selected == (f < 3 || f >= 6));
+            service->EndFrame(true);
+        }
+        service = nullptr;
+    }
+
+    // E5.5 review fix 1: a skinned instance selected by a frame that did not execute is selected again, across
+    // frame-index gaps, until two executed frames have selected it (its dispatch, then the settle); two dropped frames
+    // in a row keep it pending; an instance never skinned is selected in every frame.
+    void test_skinned_pending()
+    {
+        TestViews views;
+        TraceScene s(0x1007, c_SmallProfile);
+        BuildCrowd(s, 3);
+        RenderFrame frame;
+        auto service = MakeService(s.graph);
+        const auto& leaves = s.graph->GetSkinnedMeshInstances();
+        CHECK(leaves.size() == 3);
+        leaves[0]->skinningInitialized = true;
+        leaves[1]->skinningInitialized = true;   // leaves[2] is never skinned: selected in every frame
+        const SkinnedMeshInstance* moving = leaves[0];
+        const SkinnedMeshInstance* never = leaves[2];
+        s.graph->Refresh(0);
+        struct Step
+        {
+            uint32_t frame;
+            bool move;        // the joints of `moving` move before the refresh
+            bool executed;    // EndFrame(executed)
+            bool pending;     // `moving` is expected pending at the extraction
+            bool selected;    // `moving` is expected in the snapshot
+        };
+        // The pending leaves as the rule says (joint versions are per chunk, so a character sharing a chunk with
+        // `moving` is selected with it and pending too): a dropped frame makes its selected leaves pending for two
+        // executed frames.
+        std::vector<std::pair<const SkinnedMeshInstance*, uint32_t>> pending;
+        const Step steps[] = {
+            { 3, true, false, false, true },    // moved, dropped (frame 3: the load's frame 0 no longer selects)
+            { 4, false, false, true, true },    // pending (and the legacy rule), dropped again
+            { 7, false, true, true, true },     // a frame-index gap: pending only; executed
+            { 8, false, true, true, true },     // the settle; executed
+            { 9, false, true, false, false },   // nothing left
+            { 11, true, true, false, true },    // moved, executed: the legacy rule alone
+            { 15, false, true, false, false },  // a gap after executed frames: nothing pending
+        };
+        for (const Step& step : steps)
+        {
+            if (step.move)
+            {
+                for (const SkinnedMeshJoint& joint : moving->joints)
+                    if (nvrhi::AutoPtr<SceneGraphNode> node = joint.node.Lock())
+                        node->SetTranslation(dm::double3(0.0, 0.01 * double(step.frame), 0.0));
+            }
+            s.graph->Refresh(step.frame);
+            g_ExpectedPendingSkins.clear();
+            for (const auto& entry : pending)
+                g_ExpectedPendingSkins.push_back(entry.first);
+            CHECK((std::find(g_ExpectedPendingSkins.begin(), g_ExpectedPendingSkins.end(), moving) !=
+                   g_ExpectedPendingSkins.end()) == step.pending);
+            const ExtractDesc desc = views.Desc(step.frame);
+            const RenderSnapshot& snapshot = ExtractFrame(service, frame, desc);
+            CheckSnapshot(s.graph, snapshot, desc);
+            bool selected = false, neverSelected = false;
+            for (uint32_t i = 0; i < snapshot.skinnedInstanceCount; ++i)
+            {
+                selected = selected || snapshot.skinnedInstances[i].leaf == moving;
+                neverSelected = neverSelected || snapshot.skinnedInstances[i].leaf == never;
+            }
+            CHECK(selected == step.selected && neverSelected);
+            service->EndFrame(step.executed);
+            if (step.executed)
+            {
+                for (auto& entry : pending)
+                    --entry.second;
+                pending.erase(std::remove_if(pending.begin(), pending.end(),
+                                             [](const auto& entry) { return entry.second == 0; }),
+                              pending.end());
+            }
+            else
+            {
+                for (uint32_t i = 0; i < snapshot.skinnedInstanceCount; ++i)
+                {
+                    const SkinnedMeshInstance* leaf = snapshot.skinnedInstances[i].leaf;
+                    auto it = std::find_if(pending.begin(), pending.end(),
+                                           [leaf](const auto& entry) { return entry.first == leaf; });
+                    if (it != pending.end())
+                        it->second = 2;
+                    else
+                        pending.emplace_back(leaf, 2u);
+                }
+            }
+        }
+        g_ExpectedPendingSkins.clear();
+        service = nullptr;
+    }
+
     // A skinned instance whose joint nodes were destroyed: their matrices are the identity.
     void test_destroyed_joint()
     {
@@ -2164,6 +2336,8 @@ int main(int argc, char** argv)
         { "read_only_phase", test_read_only_phase },
         { "failure_injection", test_failure_injection },
         { "destroyed_joint", test_destroyed_joint },
+        { "skinned_detach", test_skinned_detach },
+        { "skinned_pending", test_skinned_pending },
         { "shadow_map_reassigned", test_shadow_map_reassigned },
         { "scheduler_release", test_scheduler_release },
         { "repeated_calls", test_repeated_calls },
