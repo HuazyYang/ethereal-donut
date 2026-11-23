@@ -29,17 +29,13 @@ using namespace donut::math;
 using namespace donut::engine;
 using namespace donut::render;
 
-CascadedShadowMap::CascadedShadowMap(
-    nvrhi::IDevice* device, 
-    int resolution, 
+nvrhi::TextureDesc CascadedShadowMap::GetTextureDesc(
+    int resolution,
     int numCascades,
     int numPerObjectShadows,
     nvrhi::Format format,
     bool isUAV)
 {
-    assert(numCascades > 0);
-    assert(numCascades <= 4);
-
     nvrhi::TextureDesc desc;
     desc.width = resolution;
     desc.height = resolution;
@@ -54,8 +50,43 @@ CascadedShadowMap::CascadedShadowMap(
     desc.keepInitialState = true;
     desc.dimension = nvrhi::TextureDimension::Texture2DArray;
     desc.arraySize = numCascades + numPerObjectShadows;
-	desc.isUAV = isUAV;
-    device->createTexture(desc, &m_ShadowMapTexture);
+    desc.isUAV = isUAV;
+    return desc;
+}
+
+CascadedShadowMap::CascadedShadowMap(
+    nvrhi::IDevice* device,
+    int resolution,
+    int numCascades,
+    int numPerObjectShadows,
+    nvrhi::Format format,
+    bool isUAV)
+{
+    assert(numCascades > 0);
+    assert(numCascades <= 4);
+
+    nvrhi::TextureHandle texture;
+    device->createTexture(GetTextureDesc(resolution, numCascades, numPerObjectShadows, format, isUAV), &texture);
+    Init(device, texture, numCascades, numPerObjectShadows);
+}
+
+CascadedShadowMap::CascadedShadowMap(
+    nvrhi::IDevice* device,
+    nvrhi::ITexture* texture,
+    int numCascades,
+    int numPerObjectShadows)
+{
+    assert(numCascades > 0);
+    assert(numCascades <= 4);
+    assert(texture && int(texture->getDesc().arraySize) >= numCascades + numPerObjectShadows);
+
+    Init(device, texture, numCascades, numPerObjectShadows);
+}
+
+void CascadedShadowMap::Init(nvrhi::IDevice* device, nvrhi::ITexture* texture, int numCascades, int numPerObjectShadows)
+{
+    m_ShadowMapTexture = texture;
+    const int resolution = int(texture->getDesc().width);
 
     nvrhi::Viewport cascadeViewport = nvrhi::Viewport(float(resolution), float(resolution));
 
@@ -396,6 +427,16 @@ donut::engine::PlanarView* donut::render::CascadedShadowMap::GetPerObjectView(ui
         return m_PerObjectShadows[object]->GetPlanarView();
 
     return nullptr;
+}
+
+float CascadedShadowMap::GetFalloffDistance() const
+{
+    return m_Cascades.empty() ? 1.f : m_Cascades[0]->GetFalloffDistance();
+}
+
+uint32_t CascadedShadowMap::GetCascadeCapacity() const
+{
+    return static_cast<uint32_t>(m_Cascades.size());
 }
 
 void donut::render::CascadedShadowMap::SetNumberOfCascadesUnsafe(int cascades)

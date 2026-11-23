@@ -21,14 +21,19 @@
 */
 
 // The render service's shadow table (LightShadows.h; plan step E5, sub-plan items E5.1 and E5.6): primitive operations
-// on entries ordered by light entity. The service decides what to request (E5.6); a table held by value needs these
-// definitions from E5.1 on.
+// on entries ordered by light entity, and the service's reading of a light's hint and set-up of its cascades. The
+// service decides what to request (RenderExtract.cpp).
 
 #include <donut/render/LightShadows.h>
+#include <donut/render/CascadedShadowMap.h>
+#include <donut/engine/SceneGraph.h>
 #include <donut/engine/ShadowMap.h>
+#include <donut/engine/View.h>
 #include <donut/core/log.h>
+#include <donut/core/query_cast.h>
 
 #include <algorithm>
+#include <cmath>
 
 namespace donut::render
 {
@@ -98,14 +103,14 @@ namespace donut::render
         if (it != m_Entries.end() && it->light == light)
         {
             LightShadowEntry& entry = m_Entries[index];
-            if (entry.shadow != shadow || entry.kind != kind)
+            if (!entry.shadow.HasSameTexture(shadow) || entry.kind != kind)
             {
-                // another configuration: a new map, made by the service
+                // another texture: a new map, made by the service
                 Retire(m_Retired, entry.map);
                 entry.map = nullptr;
-                entry.shadow = shadow;
                 entry.kind = kind;
             }
+            entry.shadow = shadow;   // the channel, in place
             m_Requested[index] = 1;
             return &entry;
         }
@@ -155,6 +160,11 @@ namespace donut::render
         return removed;
     }
 
+    void LightShadowTable::CancelRequests() noexcept
+    {
+        std::fill(m_Requested.begin(), m_Requested.end(), uint8_t(0));
+    }
+
     void LightShadowTable::ReleaseRetired() noexcept
     {
         for (engine::IShadowMap* map : m_Retired)
@@ -163,5 +173,65 @@ namespace donut::render
                 map->Release();
         }
         m_Retired.clear();
+    }
+
+    bool GetLightShadowRequest(const engine::Light* light, LightShadow& outShadow, LightShadowKind& outKind) noexcept
+    {
+        if (!light || !light->shadowMap || light->GetLightType() != LightType_Directional)
+            return false;
+        const CascadedShadowMap* hint = query_cast<CascadedShadowMap>(light->shadowMap.Get());
+        const nvrhi::ITexture* texture = hint ? hint->GetTexture() : nullptr;
+        if (!texture)
+            return false;
+        const uint32_t cascades = hint->GetCascadeCapacity();
+        if (cascades == 0 || cascades > 4)
+            return false;
+        const nvrhi::TextureDesc& desc = texture->getDesc();
+        outShadow.channel = light->shadowChannel;
+        outShadow.cascadeCount = cascades;
+        outShadow.resolution = desc.width;
+        outShadow.format = desc.format;
+        outKind = LightShadowKind::Cascaded;
+        return true;
+    }
+
+    bool SetupLightShadowCascades(CascadedShadowMap* map, const engine::DirectionalLight* light,
+                                  const engine::IView* view, const ShadowSettings& settings,
+                                  dm::float3 preViewTranslation) noexcept
+    {
+        if (!map || !light || !view || !light->GetNode() || !AreShadowSettingsValid(view, settings))
+            return false;
+        try
+        {
+            if (settings.stable)
+            {
+                map->SetupForPlanarViewStable(*light, view->GetProjectionFrustum(), view->GetInverseViewMatrix(),
+                                              settings.maxShadowDistance, settings.lightSpaceZUp,
+                                              settings.lightSpaceZDown, settings.exponent, preViewTranslation);
+            }
+            else
+            {
+                map->SetupForPlanarView(*light, view->GetViewFrustum(), settings.maxShadowDistance,
+                                        settings.lightSpaceZUp, settings.lightSpaceZDown, settings.exponent,
+                                        preViewTranslation);
+            }
+        }
+        catch (...)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    bool AreShadowSettingsValid(const engine::IView* view, const ShadowSettings& settings) noexcept
+    {
+        if (!view || !(settings.exponent > 1.f) || !std::isfinite(settings.exponent))
+            return false;
+        const dm::frustum frustum = settings.stable ? view->GetProjectionFrustum() : view->GetViewFrustum();
+        if (!(dm::length(frustum.planes[dm::frustum::NEAR_PLANE].normal) > 0.f))
+            return false;
+        if (settings.maxShadowDistance > 0.f)
+            return std::isfinite(settings.maxShadowDistance);
+        return dm::length(frustum.planes[dm::frustum::FAR_PLANE].normal) > 0.f;
     }
 }

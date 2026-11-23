@@ -70,6 +70,16 @@ add_dependencies(donut_all_tests test_draw_strategy_adapters)
 add_test(NAME test_draw_strategy_adapters COMMAND test_draw_strategy_adapters)
 set_property(TARGET test_draw_strategy_adapters PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
+# Shadow maps owned by the render service, keyed by light entity, device-free (sub-plan item E5.6): the shadow table's
+# lifecycle, the lighting constants of both input forms (src/render/LightingConstants.h), the cascades against the
+# application's set-up, and the depth passes' uses in a compiled graph, over stand-in textures.
+add_executable(test_light_shadows src/render/test_light_shadows.cpp)
+target_link_libraries(test_light_shadows donut_render donut_engine donut_core donut_tests_utils)
+target_include_directories(test_light_shadows PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/render")
+add_dependencies(donut_all_tests test_light_shadows)
+add_test(NAME test_light_shadows COMMAND test_light_shadows)
+set_property(TARGET test_light_shadows PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
 # The CPU cost of visibility and packets against the legacy strategy walk (sub-plan item E5.2; design 10.1). The same
 # source measures the walk alone when compiled against the E0 tree with BENCH_RENDER_EXTRACT_E0=1. ctest runs the smoke
 # mode; the Release numbers come from `bench_render_extract --workers N`.

@@ -47,6 +47,8 @@
 using namespace donut::math;
 #include <donut/shaders/deferred_lighting_cb.h>
 
+#include "LightingConstants.h"
+
 using namespace donut::engine;
 using namespace donut::render;
 
@@ -154,63 +156,28 @@ void DeferredLightingPass::Render(
 
     nvrhi::ITexture* shadowMapTexture = nullptr;
 
-    int numShadows = 0;
-
-    if (inputs.lights)
+    // The leaf vector, or the snapshot's lights (plan step E5, sub-plan item E5.6): one loop for both
+    // (LightingConstants.h), so that the two forms give the same constants.
+    if (inputs.extractedLights)
     {
-        for (const auto& light : *inputs.lights)
+        const lighting::SnapshotLights lights{ inputs.extractedLights, inputs.extractedLightCount };
+        if (!lighting::FillDeferredLights(lights, deferredConstants, DEFERRED_MAX_LIGHTS, DEFERRED_MAX_SHADOWS,
+                                          shadowMapTexture))
         {
-            if (light->shadowMap)
-            {
-                if (!shadowMapTexture)
-                {
-                    shadowMapTexture = light->shadowMap->GetTexture();
-                    deferredConstants.shadowMapTextureSize = float2(light->shadowMap->GetTextureSize());
-                }
-                else
-                {
-                    if (shadowMapTexture != light->shadowMap->GetTexture())
-                    {
-                        log::error("All lights submitted to DeferredLightingPass::Render(...) must use the same shadow map textures");
-                        return;
-                    }
-                }
-            }
-
-            if (deferredConstants.numLights >= DEFERRED_MAX_LIGHTS)
-            {
-                log::warning("Maximum number of active lights (%d) exceeded in DeferredLightingPass",
-                    DEFERRED_MAX_LIGHTS);
-                break;
-            }
-
-            LightConstants& lightConstants = deferredConstants.lights[deferredConstants.numLights];
-            light->FillLightConstants(lightConstants);
-
-            if (light->shadowMap)
-            {
-                for (uint32_t cascade = 0; cascade < light->shadowMap->GetNumberOfCascades(); cascade++)
-                {
-                    if (numShadows < DEFERRED_MAX_SHADOWS)
-                    {
-                        light->shadowMap->GetCascade(cascade)->FillShadowConstants(deferredConstants.shadows[numShadows]);
-                        lightConstants.shadowCascades[cascade] = numShadows;
-                        ++numShadows;
-                    }
-                }
-
-                for (uint32_t perObjectShadow = 0; perObjectShadow < light->shadowMap->GetNumberOfPerObjectShadows(); perObjectShadow++)
-                {
-                    if (numShadows < DEFERRED_MAX_SHADOWS)
-                    {
-                        light->shadowMap->GetPerObjectShadow(perObjectShadow)->FillShadowConstants(deferredConstants.shadows[numShadows]);
-                        lightConstants.perObjectShadows[perObjectShadow] = numShadows;
-                        ++numShadows;
-                    }
-                }
-            }
-
-            ++deferredConstants.numLights;
+            log::warning("DeferredLightingPass: the extracted lights' shadow maps use more than one texture (one is "
+                         "bound): nothing is drawn");
+            commandList->endMarker();
+            return;
+        }
+    }
+    else if (inputs.lights)
+    {
+        const lighting::LeafLights lights{ inputs.lights };
+        if (!lighting::FillDeferredLights(lights, deferredConstants, DEFERRED_MAX_LIGHTS, DEFERRED_MAX_SHADOWS,
+                                          shadowMapTexture))
+        {
+            log::error("All lights submitted to DeferredLightingPass::Render(...) must use the same shadow map textures");
+            return;
         }
     }
 
@@ -339,6 +306,18 @@ nvrhi::FRESULT DeferredLightingPass::Setup(ISetupContext* context, void* data) n
         if (id != InvalidResourceId)
             context->Read(id, Access::ShaderRead, nvrhi::ShaderType::Compute, nvrhi::SubresourceRegion());
     }
+    // The extracted lights' service shadow textures (written by RenderService::AddShadowPasses), each once.
+    for (uint32_t i = 0; inputs.extractedLights && i < inputs.extractedLightCount; ++i)
+    {
+        const ResourceId id = inputs.extractedLights[i].shadowTexture;
+        if (id == InvalidResourceId || id == inputs.shadowMap)
+            continue;
+        bool seen = false;
+        for (uint32_t j = 0; j < i && !seen; ++j)
+            seen = inputs.extractedLights[j].shadowTexture == id;
+        if (!seen)
+            context->Read(id, Access::ShaderRead, nvrhi::ShaderType::Compute, nvrhi::SubresourceRegion());
+    }
     inputs.output = context->Write(inputs.output, Access::UAVWrite, nvrhi::ShaderType::Compute, nvrhi::SubresourceRegion(),
                                    AccessFlags::FullWrite);
     return nvrhi::FS_OK;
@@ -364,6 +343,8 @@ nvrhi::FRESULT DeferredLightingPass::Execute(IPassContext* context, const void* 
     inputs.ambientOcclusion = context->GetTexture(use.ambientOcclusion);
     inputs.output = context->GetTexture(use.output);
     inputs.lights = use.lights;
+    inputs.extractedLights = use.extractedLights;
+    inputs.extractedLightCount = use.extractedLightCount;
     inputs.lightProbes = use.lightProbes;
     inputs.ambientColorTop = use.ambientColorTop;
     inputs.ambientColorBottom = use.ambientColorBottom;

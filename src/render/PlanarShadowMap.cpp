@@ -173,6 +173,11 @@ void PlanarShadowMap::SetFalloffDistance(float distance)
     m_FalloffDistance = distance;
 }
 
+float PlanarShadowMap::GetFalloffDistance() const
+{
+    return m_FalloffDistance;
+}
+
 PlanarView* PlanarShadowMap::GetPlanarView()
 {
     return m_View;

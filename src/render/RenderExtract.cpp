@@ -31,11 +31,22 @@
 // write no world component (only arena data) and declare only reads.
 //
 // Instances runs the per-view visibility and the draw packets of E5.2 (RenderVisibility.h): a chunk test, a row test
-// and the legacy strategies' per-geometry rules, each view's packets of each pass radix-sorted by key. The service
-// shadows (cascade views, LightShadowTable requests) are E5.6's, the skinning pass E5.5's; AddUploadPasses is a thin
-// call into E5.4's GpuSceneUploadPass.
+// and the legacy strategies' per-geometry rules, each view's packets of each pass radix-sorted by key. The skinning pass
+// is E5.5's; AddUploadPasses is a thin call into E5.4's GpuSceneUploadPass.
+//
+// Service shadows (E5.6, LightShadows.h; RenderServiceDesc::serviceShadows): the Lights system reads each light's hint;
+// the first light with a cascaded hint (one shadow texture in the lighting passes) requests its LightShadow from the
+// table keyed by entity, makes a CascadedShadowMap for a new or reconfigured entry,
+// copies the hint's lit-out-of-bounds and falloff onto it, sets its cascades up for the shadow view, and appends one
+// ExtractedView per cascade after the desc's views, so that Instances extracts their packets too. A sweep in entity
+// order then retires the maps of entries no light requested; EndFrame releases them. AddShadowPasses adds one DepthPass
+// use per cascade view (a DepthPass and a PacketDrawStrategy per cascade, pooled) into the map's imported texture.
 
 #include <donut/render/RenderExtract.h>
+#include <donut/render/CascadedShadowMap.h>
+#include <donut/render/DepthPass.h>
+#include <donut/render/DrawStrategy.h>
+#include <donut/render/GeometryPasses.h>
 #include <donut/render/GpuSceneUploadPass.h>
 #include <donut/render/RenderGraphFrameData.h>
 #include <donut/render/SkinningPass.h>
@@ -47,6 +58,7 @@
 #include <donut/engine/ShadowMap.h>
 #include <donut/engine/View.h>
 #include <donut/core/log.h>
+#include <donut/core/query_cast.h>
 
 #include "RenderVisibility.h"
 
@@ -159,7 +171,47 @@ namespace donut::render
         // Visibility and draw packets (E5.2): the scratch of the Instances system, capacity kept.
         visibility::InstanceVisibility instanceVisibility;
 
+        // Service shadows (E5.6). The service's desc and device, for the Lights system (set by Extract).
+        const RenderServiceDesc* serviceDesc = nullptr;
+        nvrhi::IDevice* device = nullptr;
         LightShadowTable shadows;
+        // The Lights system's served lights of the frame: (light index, its map), capacity kept.
+        struct ServedShadow
+        {
+            uint32_t light = 0;
+            CascadedShadowMap* map = nullptr;
+        };
+        std::vector<ServedShadow> servedShadows;
+        // The frame's hints the service does not serve: another kind than a cascaded directional one, and cascaded
+        // ones after the first (one service shadow: the lighting passes bind one shadow texture).
+        uint32_t unsupportedHints = 0;
+        uint32_t withheldHints = 0;
+        // One warning per service each.
+        bool shadowViewWarned = false;
+        bool shadowSettingsWarned = false;
+        bool unsupportedWarned = false;
+        bool withheldWarned = false;
+        bool shadowConfigWarned = false;
+        // AddShadowPasses ran for the open frame (a second call adds nothing).
+        bool shadowsAdded = false;
+        // AddUploadPasses and AddSkinningPasses were called for the open frame (even when they added nothing): the
+        // order AddShadowPasses checks.
+        bool uploadCalled = false;
+        bool skinningCalled = false;
+        // A frame replaced the scene's buffers (SceneFrame::sceneBuffersReplaced) since the shadow depth passes' binding
+        // caches were last reset: set by Extract (and by AddShadowPasses from its frame), cleared only by the
+        // AddShadowPasses call that resets every pooled DepthPass, so that a frame whose AddShadowPasses did not run or
+        // was refused does not lose the reset.
+        bool shadowBindingResetPending = false;
+        // One per cascade view of a frame, pooled: a DepthPass object per cascade (a graph records one pass object's
+        // uses on one thread), its bound strategy (strategies are stateful) and context.
+        struct ShadowSlot
+        {
+            nvrhi::AutoPtr<DepthPass> pass;
+            nvrhi::AutoPtr<PacketDrawStrategy> strategy;
+            DepthPass::Context context;
+        };
+        std::vector<std::unique_ptr<ShadowSlot>> shadowSlots;
         RenderServiceStats stats;
         // The GpuScene upload (E5.4), made at the first AddUploadPasses.
         nvrhi::AutoPtr<GpuSceneUploadPass> uploadPass;
@@ -445,6 +497,19 @@ namespace donut::render
             LightConstants* constants = Allocate<LightConstants>(count);
             if (count != 0 && (!out || !constants))
                 return Fail();
+            const bool service = serviceDesc && serviceDesc->serviceShadows;
+            servedShadows.clear();
+            unsupportedHints = 0;
+            withheldHints = 0;
+            // A failure before the Sweep forgets this extraction's requests, so that the next Sweep sees only its own
+            // (a light removed meanwhile does not keep its map an extra frame).
+            auto fail = [&]() noexcept
+            {
+                if (service)
+                    shadows.CancelRequests();
+                return Fail();
+            };
+            bool claimed = false;   // a light took the frame's one service shadow
             for (uint32_t i = 0; i < count; ++i)
             {
                 const Light* light = lights[i].Get();
@@ -454,8 +519,34 @@ namespace donut::render
                 extracted.constants = &constants[i];
                 extracted.entity = graph->GetEntity(light->GetNode());
                 extracted.leaf = light;
-                // Without service shadows (E5.6) the light keeps its leaf's own map, which the application renders;
-                // held until EndFrame, so that the application may replace Light::shadowMap meanwhile.
+                extracted.shadowTexture = InvalidResourceId;
+                extracted.serviceShadow = false;
+                if (service)
+                {
+                    CascadedShadowMap* map = nullptr;
+                    bool withheld = false;
+                    const nvrhi::FRESULT result = ServeShadow(i, light, extracted.entity, claimed, map, withheld);
+                    if (NVRHI_FAILED(result))
+                        return fail();
+                    if (map)
+                    {
+                        // the service's map, held by the table until a later extraction retires it
+                        extracted.shadowMap = map;
+                        extracted.serviceShadow = true;
+                        continue;
+                    }
+                    if (withheld)
+                    {
+                        // a cascaded hint after the first: no shadow (one shadow texture in the lighting passes), and
+                        // the constants of a light without a map (FillLightConstants: lit outside any cascade), or
+                        // the shaders would take the hint's out-of-bounds value for the whole light
+                        extracted.shadowMap = nullptr;
+                        constants[i].outOfBoundsShadow = 1.f;
+                        continue;
+                    }
+                }
+                // Without a service shadow the light keeps its leaf's own map, which the application renders; held
+                // until EndFrame, so that the application may replace Light::shadowMap meanwhile.
                 extracted.shadowMap = light->shadowMap.Get();
                 if (light->shadowMap)
                 {
@@ -465,15 +556,181 @@ namespace donut::render
                     }
                     catch (...)
                     {
-                        return Fail();
+                        return fail();
                     }
                 }
-                extracted.shadowTexture = InvalidResourceId;
-                extracted.serviceShadow = false;
             }
             snapshot->lights = out;
             snapshot->lightConstants = constants;
             snapshot->lightCount = count;
+            if (service)
+            {
+                // the entries no light requested this extraction, in entity order: their maps retire
+                shadows.Sweep();
+                if (unsupportedHints != 0 && !unsupportedWarned)
+                {
+                    unsupportedWarned = true;
+                    log::warning("RenderService: %u light(s) have a shadow-map hint the service does not serve (only "
+                                 "a DirectionalLight with a CascadedShadowMap); they keep their own map",
+                                 unsupportedHints);
+                }
+                if (withheldHints != 0 && !withheldWarned)
+                {
+                    withheldWarned = true;
+                    log::warning("RenderService: %u more light(s) have a CascadedShadowMap hint; the service serves the "
+                                 "first light's only (the lighting passes bind one shadow texture), the others get no "
+                                 "shadow", withheldHints);
+                }
+                return AppendCascadeViews();
+            }
+            return nvrhi::FS_OK;
+        }
+
+        // ------------------------------------------------------------------------------- service shadows (E5.6)
+
+        // A new map for `shadow`: its texture from the desc's seam, else the device. Null when neither can make it.
+        CascadedShadowMap* CreateShadowMap(const LightShadow& shadow) noexcept
+        {
+            nvrhi::TextureDesc textureDesc = CascadedShadowMap::GetTextureDesc(
+                int(shadow.resolution), int(shadow.cascadeCount), 0, shadow.format);
+            textureDesc.debugName = "ServiceShadowMap";
+            nvrhi::TextureHandle texture;
+            if (serviceDesc->createShadowTexture)
+                texture = nvrhi::TakeOver(serviceDesc->createShadowTexture(serviceDesc->createShadowTextureContext,
+                                                                           textureDesc));
+            else if (device)
+                device->createTexture(textureDesc, &texture);
+            if (!texture)
+                return nullptr;
+            try
+            {
+                nvrhi::AutoPtr<CascadedShadowMap> map =
+                    MAKE_RC_OBJ_PTR(CascadedShadowMap, device, texture.Get(), int(shadow.cascadeCount), 0);
+                return map.Detach();
+            }
+            catch (...)
+            {
+                return nullptr;
+            }
+        }
+
+        // The view the frame's service shadow is set up for, or null when the desc names none or its ShadowSettings
+        // are not valid for it (AreShadowSettingsValid: what SetupForPlanarView asserts); one warning per service each.
+        const IView* GetShadowView() noexcept
+        {
+            const IView* view = desc->shadowViewIndex < desc->viewCount ? desc->views[desc->shadowViewIndex] : nullptr;
+            if (!view)
+            {
+                if (!shadowViewWarned)
+                {
+                    shadowViewWarned = true;
+                    log::warning("RenderService: ExtractDesc::shadowViewIndex %u names no view; the service shadows "
+                                 "are not set up", desc->shadowViewIndex);
+                }
+                return nullptr;
+            }
+            if (!AreShadowSettingsValid(view, desc->shadows))
+            {
+                if (!shadowSettingsWarned)
+                {
+                    shadowSettingsWarned = true;
+                    log::warning("RenderService: ExtractDesc::shadows is not valid for the shadow view (an exponent "
+                                 "above 1, and a maxShadowDistance above 0 or a view with a far plane); the service "
+                                 "shadows are not set up");
+                }
+                return nullptr;
+            }
+            return view;
+        }
+
+        // One light's service shadow. The first light whose hint the service serves (`claimed` still false) takes the
+        // frame's one service shadow: its entry is requested, made a map when it has none, the hint's values copied
+        // onto the map and the cascades set up for the shadow view; `outMap` is then the map, or null when it cannot
+        // be served this frame (no map, no valid shadow view: the light keeps its leaf's map). A later light with such
+        // a hint is withheld (`outWithheld`: no shadow). Another hint is unsupported (the light keeps its leaf's map).
+        // Fails only when the table cannot grow.
+        nvrhi::FRESULT ServeShadow(uint32_t index, const Light* light, Entity entity, bool& claimed,
+                                   CascadedShadowMap*& outMap, bool& outWithheld) noexcept
+        {
+            outMap = nullptr;
+            outWithheld = false;
+            LightShadow shadow;
+            LightShadowKind kind = LightShadowKind::Cascaded;
+            if (!GetLightShadowRequest(light, shadow, kind) || entity == Entity::Null)
+            {
+                unsupportedHints += light->shadowMap ? 1u : 0u;
+                return nvrhi::FS_OK;
+            }
+            if (claimed)
+            {
+                ++withheldHints;
+                outWithheld = true;
+                return nvrhi::FS_OK;
+            }
+            claimed = true;
+            LightShadowEntry* entry = shadows.Request(entity, shadow, kind);
+            if (!entry)
+                return nvrhi::FE_OUT_OF_MEMORY;
+            if (!entry->map)
+                entry->map = CreateShadowMap(shadow);   // the table's reference
+            if (!entry->map)
+                return nvrhi::FS_OK;   // no device and no seam, or out of memory: the next extraction tries again
+
+            const IView* shadowView = GetShadowView();
+            if (!shadowView)
+                return nvrhi::FS_OK;
+
+            auto* map = static_cast<CascadedShadowMap*>(entry->map);
+            const CascadedShadowMap* hint = query_cast<CascadedShadowMap>(light->shadowMap.Get());
+            map->SetLitOutOfBounds(hint->IsLitOutOfBounds());
+            map->SetFalloffDistance(hint->GetFalloffDistance());
+            if (!SetupLightShadowCascades(map, static_cast<const DirectionalLight*>(light), shadowView, desc->shadows,
+                                          dm::float3(snapshot->renderOrigin)))
+                return nvrhi::FS_OK;
+            try
+            {
+                servedShadows.push_back(ServedShadow{ index, map });
+            }
+            catch (...)
+            {
+                return nvrhi::FE_OUT_OF_MEMORY;
+            }
+            outMap = map;
+            return nvrhi::FS_OK;
+        }
+
+        // The served maps' cascades as views after the desc's (ExtractedView::light, cascade), in light order, then
+        // cascade order. The views array grows into a new arena array (the old one stays unused until Reset).
+        nvrhi::FRESULT AppendCascadeViews() noexcept
+        {
+            uint32_t cascades = 0;
+            for (const ServedShadow& served : servedShadows)
+                cascades += served.map->GetNumberOfCascades();
+            if (cascades == 0)
+                return nvrhi::FS_OK;
+            const uint32_t descCount = snapshot->viewCount;
+            ExtractedView* out = AllocateConstructed<ExtractedView>(descCount + cascades);
+            if (!out)
+                return Fail();
+            for (uint32_t v = 0; v < descCount; ++v)
+                out[v] = views[v];
+            uint32_t at = descCount;
+            for (const ServedShadow& served : servedShadows)
+            {
+                for (uint32_t c = 0; c < served.map->GetNumberOfCascades(); ++c)
+                {
+                    const IView* view = served.map->GetCascadeView(c);
+                    ExtractedView& extracted = out[at++];
+                    extracted.view = view;
+                    extracted.frustum = view->GetViewFrustum();
+                    extracted.viewOrigin = view->GetViewOrigin();
+                    extracted.light = served.light;
+                    extracted.cascade = c;
+                }
+            }
+            views = out;
+            snapshot->views = out;
+            snapshot->viewCount = descCount + cascades;
             return nvrhi::FS_OK;
         }
 
@@ -697,6 +954,11 @@ namespace donut::render
             frameOpen = false;
             uploadAdded = false;
             skinningAdded = false;
+            shadowsAdded = false;
+            uploadCalled = false;
+            skinningCalled = false;
+            // Retired at this frame's extraction: no pass of this frame draws into or reads them.
+            shadows.ReleaseRetired();
             ReleaseFrameReferences();
         }
     };
@@ -751,6 +1013,10 @@ namespace donut::render
         if (s.scene)
         {
             result = s.UpdateGpuScene(m_Device, sceneBuffersReplaced);
+            // The meshes point at the new buffers from here on, even when this Extract fails below: the shadow depth
+            // passes reset their binding caches at the next AddShadowPasses that runs.
+            if (sceneBuffersReplaced)
+                s.shadowBindingResetPending = true;
             if (NVRHI_FAILED(result))
                 return result;
         }
@@ -764,6 +1030,8 @@ namespace donut::render
         snapshot->renderOrigin = dm::double3(0.0);   // open point 10
 
         // The phase: the systems fill the snapshot (they find the frame through these members).
+        s.serviceDesc = &m_Desc;
+        s.device = m_Device;
         s.renderGraph = graph;
         s.desc = &desc;
         s.snapshot = snapshot;
@@ -826,7 +1094,10 @@ namespace donut::render
         stats.cameras = snapshot->cameraCount;
         stats.skinnedInstances = snapshot->skinnedInstanceCount;
         stats.jointMatrices = snapshot->jointMatrixCount;
-        stats.serviceShadowMaps = s.shadows.GetCount();
+        for (uint32_t e = 0; e < s.shadows.GetCount(); ++e)
+            stats.serviceShadowMaps += s.shadows.GetEntries()[e].map ? 1u : 0u;
+        stats.unservedShadowHints = s.unsupportedHints + s.withheldHints;
+        stats.retiredShadowMaps = s.shadows.GetRetiredCount();
         stats.snapshotBytes = s.bytes;
 
         if (outFrame)
@@ -883,6 +1154,7 @@ namespace donut::render
         if (!m_Impl || !m_Impl->frameOpen)
             return nvrhi::FE_INVALID_ARGS;
         Impl& s = *m_Impl;
+        s.uploadCalled = true;   // the order AddShadowPasses checks
         if (!s.scene || !m_Device || !m_Desc.shaderFactory || s.uploadAdded)
             return nvrhi::FS_OK;
         GpuScene* gpuScene = s.scene->GetGpuScene();
@@ -954,6 +1226,7 @@ namespace donut::render
         if (!graph || !frame || !m_Impl || !m_Impl->frameOpen)
             return nvrhi::FE_INVALID_ARGS;
         Impl& s = *m_Impl;
+        s.skinningCalled = true;   // the order AddShadowPasses checks
         if (!s.scene || !m_Device || !m_Desc.shaderFactory || s.skinningAdded)
             return nvrhi::FS_OK;
         const RenderSnapshot* snapshot = frame->snapshot;
@@ -1076,11 +1349,122 @@ namespace donut::render
         return NVRHI_FAILED(reads) ? reads : result;
     }
 
+    // Service shadows (E5.6): for each served light (ExtractedLight::serviceShadow), its map's texture imported
+    // host-kept (CascadedShadowMap makes it keepInitialState, ShaderResource) and one DepthPass use per cascade view of
+    // the snapshot (ExtractedView::light), in cascade order, each clearing its slice and drawing the view's opaque
+    // packets through its own bound PacketDrawStrategy with the frame's buffer reads. The last version goes into the
+    // extracted light's shadowTexture. The DepthPass objects are pooled per cascade slot and made with the desc's bias;
+    // their binding caches are reset by the first call that runs after a frame replaced the scene's buffers (the
+    // pending reset survives frames whose call did not run or was refused). With a device the passes are initialised,
+    // which needs the shader factory and the common passes; without one (device-free tests, the seam) they are not.
     nvrhi::FRESULT RenderService::AddShadowPasses(IRenderGraph* graph, SceneFrame* frame) noexcept
     {
         if (!graph || !frame || !m_Impl || !m_Impl->frameOpen)
             return nvrhi::FE_INVALID_ARGS;
-        // TODO(E5.6): a DepthPass use per cascade of each service shadow (RenderServiceDesc::serviceShadows).
+        Impl& s = *m_Impl;
+        if (!m_Desc.serviceShadows)
+            return nvrhi::FS_OK;
+        if (frame->sceneBuffersReplaced)
+            s.shadowBindingResetPending = true;
+        if (s.shadowsAdded)
+            return nvrhi::FS_OK;
+        const RenderSnapshot* snapshot = frame->snapshot;
+        if (!snapshot)
+            return nvrhi::FE_INVALID_ARGS;
+        if (m_Device && (!m_Desc.shaderFactory || !m_Desc.commonPasses))
+        {
+            if (!s.shadowConfigWarned)
+            {
+                s.shadowConfigWarned = true;
+                log::warning("RenderService::AddShadowPasses: with a device the depth passes need "
+                             "RenderServiceDesc::shaderFactory and commonPasses; no shadow pass is added");
+            }
+            return nvrhi::FE_INVALID_ARGS;
+        }
+        // The depth passes read SceneFrame::bufferReads, which the upload and skinning passes fill: the calls must come
+        // first (checked for every service; without a scene or device they add nothing but still record the call), and
+        // on the GPU path they must have added their passes.
+        const bool gpu = s.scene && m_Device;
+        if (!s.uploadCalled || !s.skinningCalled || (gpu && (!s.uploadAdded || !s.skinningAdded)))
+        {
+            log::warning("RenderService::AddShadowPasses: call AddUploadPasses and AddSkinningPasses first (the depth "
+                         "passes read their buffers)");
+            return nvrhi::FE_INVALID_ARGS;
+        }
+        s.shadowsAdded = true;
+
+        if (s.shadowBindingResetPending)
+        {
+            for (const auto& slot : s.shadowSlots)
+                slot->pass->ResetBindingCache();
+            s.stats.shadowBindingCacheResets = uint32_t(s.shadowSlots.size());
+            s.shadowBindingResetPending = false;
+        }
+
+        uint32_t slotIndex = 0;
+        for (uint32_t i = 0; i < snapshot->lightCount; ++i)
+        {
+            ExtractedLight& light = const_cast<ExtractedLight&>(snapshot->lights[i]);
+            if (!light.serviceShadow || !light.shadowMap)
+                continue;
+            ResourceId texture = graph->ImportHostKeptTexture(light.shadowMap->GetTexture());
+            if (texture == InvalidResourceId)
+                return nvrhi::FE_OUT_OF_MEMORY;
+            for (uint32_t v = snapshot->descViewCount; v < snapshot->viewCount; ++v)
+            {
+                const ExtractedView& view = snapshot->views[v];
+                if (view.light != i)
+                    continue;
+                if (slotIndex == s.shadowSlots.size())
+                {
+                    try
+                    {
+                        auto slot = std::make_unique<Impl::ShadowSlot>();
+                        slot->pass = MAKE_RC_OBJ_PTR(DepthPass, m_Device, m_Desc.commonPasses);
+                        slot->strategy = MAKE_RC_OBJ_PTR(PacketDrawStrategy);
+                        if (m_Device && m_Desc.shaderFactory && m_Desc.commonPasses)
+                        {
+                            DepthPass::CreateParameters params;
+                            params.depthBias = m_Desc.shadowDepthBias;
+                            params.depthBiasClamp = m_Desc.shadowDepthBiasClamp;
+                            params.slopeScaledDepthBias = m_Desc.shadowSlopeScaledDepthBias;
+                            slot->pass->Init(*m_Desc.shaderFactory, params);
+                        }
+                        s.shadowSlots.push_back(std::move(slot));
+                    }
+                    catch (...)
+                    {
+                        return nvrhi::FE_OUT_OF_MEMORY;
+                    }
+                }
+                Impl::ShadowSlot& slot = *s.shadowSlots[slotIndex++];
+                slot.strategy->SetPackets(snapshot, DrawPacketPass::Opaque);
+
+                GeometryGraphInputs inputs;
+                inputs.name = "ShadowDepth";
+                inputs.view = view.view;
+                inputs.drawStrategy = slot.strategy;
+                inputs.passContext = &slot.context;
+                inputs.depth = texture;
+                inputs.clearTargets = true;   // the cascade's slice, as CascadedShadowMap::Clear
+                inputs.depthClear.depth = 1.f;
+                inputs.bufferReads = frame->bufferReads;
+                inputs.bufferReadCount = frame->bufferReadCount;
+                GeometryGraphOutputs outputs;
+                try
+                {
+                    outputs = slot.pass->AddToGraph(graph, inputs);
+                }
+                catch (...)
+                {
+                    return nvrhi::FE_OUT_OF_MEMORY;
+                }
+                if (outputs.depth == texture)
+                    return nvrhi::FE_OUT_OF_MEMORY;   // the use was not added
+                texture = outputs.depth;
+            }
+            light.shadowTexture = texture;
+        }
         return nvrhi::FS_OK;
     }
 

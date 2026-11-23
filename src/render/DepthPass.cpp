@@ -92,7 +92,9 @@ void DepthPass::Init(ShaderFactory& shaderFactory, const CreateParameters& param
 
 void DepthPass::ResetBindingCache()
 {
-    m_MaterialBindings->Clear();
+    // A pass that was never initialised (Init makes the material bindings) has nothing cached.
+    if (m_MaterialBindings)
+        m_MaterialBindings->Clear();
     m_InputBindingSets.clear();
 }
 

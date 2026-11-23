@@ -56,6 +56,8 @@
 using namespace donut::math;
 #include <donut/shaders/forward_cb.h>
 
+#include "LightingConstants.h"
+
 
 using namespace donut::engine;
 using namespace donut::render;
@@ -357,6 +359,81 @@ void ForwardShadingPass::SetupView(
     context.keyTemplate.shadingRateState = view->GetVariableRateShadingState();
 }
 
+namespace
+{
+    // The body of PrepareLights and PrepareExtractedLights, for both input forms (LightingConstants.h): the light
+    // probes' textures checked, the light constants (FillForwardLights), the shading binding set for the first shadow
+    // map's texture and the probes (the pass's cache, `bindingSets` under `mutex`, made by `createBindingSet` when
+    // missing) into `outBindingSet`, then the probe constants, all written to `lightBuffer` on `commandList`. False,
+    // with nothing bound or written, when the enabled probes use different textures (the caller reports it).
+    template <typename Lights, typename BindingSets, typename CreateBindingSet>
+    bool PrepareForwardLights(const Lights& lights, const std::vector<nvrhi::AutoPtr<LightProbe>>& lightProbes,
+                              dm::float3 ambientColorTop, dm::float3 ambientColorBottom, std::mutex& mutex,
+                              BindingSets& bindingSets, CreateBindingSet&& createBindingSet,
+                              nvrhi::BindingSetHandle& outBindingSet, nvrhi::ICommandList* commandList,
+                              nvrhi::IBuffer* lightBuffer)
+    {
+        nvrhi::ITexture* lightProbeDiffuse = nullptr;
+        nvrhi::ITexture* lightProbeSpecular = nullptr;
+        nvrhi::ITexture* lightProbeEnvironmentBrdf = nullptr;
+
+        for (const auto& probe : lightProbes)
+        {
+            if (!probe->enabled)
+                continue;
+
+            if (lightProbeDiffuse == nullptr || lightProbeSpecular == nullptr || lightProbeEnvironmentBrdf == nullptr)
+            {
+                lightProbeDiffuse = probe->diffuseMap;
+                lightProbeSpecular = probe->specularMap;
+                lightProbeEnvironmentBrdf = probe->environmentBrdf;
+            }
+            else
+            {
+                if (lightProbeDiffuse != probe->diffuseMap || lightProbeSpecular != probe->specularMap || lightProbeEnvironmentBrdf != probe->environmentBrdf)
+                    return false;
+            }
+        }
+
+        ForwardShadingLightConstants constants = {};
+        nvrhi::ITexture* shadowMapTexture = nullptr;
+        lighting::FillForwardLights(lights, constants, FORWARD_MAX_LIGHTS, FORWARD_MAX_SHADOWS, shadowMapTexture);
+
+        {
+            std::lock_guard<std::mutex> lockGuard(mutex);
+
+            nvrhi::BindingSetHandle& shadingBindings = bindingSets[std::make_pair(shadowMapTexture, lightProbeDiffuse)];
+
+            if (!shadingBindings)
+            {
+                shadingBindings = createBindingSet(shadowMapTexture, lightProbeDiffuse, lightProbeSpecular, lightProbeEnvironmentBrdf);
+            }
+
+            outBindingSet = shadingBindings;
+        }
+
+        constants.ambientColorTop = float4(ambientColorTop, 0.f);
+        constants.ambientColorBottom = float4(ambientColorBottom, 0.f);
+
+        for (const auto& probe : lightProbes)
+        {
+            if (!probe->IsActive())
+                continue;
+
+            LightProbeConstants& lightProbeConstants = constants.lightProbes[constants.numLightProbes];
+            probe->FillLightProbeConstants(lightProbeConstants);
+
+            ++constants.numLightProbes;
+
+            if (constants.numLightProbes >= FORWARD_MAX_LIGHT_PROBES)
+                break;
+        }
+
+        commandList->writeBuffer(lightBuffer, &constants, sizeof(constants));
+        return true;
+    }
+}
+
 void ForwardShadingPass::PrepareLights(
     Context& context,
     nvrhi::ICommandList* commandList,
@@ -365,129 +442,43 @@ void ForwardShadingPass::PrepareLights(
     dm::float3 ambientColorBottom,
     const std::vector<nvrhi::AutoPtr<LightProbe>>& lightProbes)
 {
-    nvrhi::ITexture* shadowMapTexture = nullptr;
-    int2 shadowMapTextureSize = 0;
-    for (const auto& light : lights)
+    auto createBindingSet = [this](nvrhi::ITexture* shadowMapTexture, nvrhi::ITexture* diffuse, nvrhi::ITexture* specular,
+                                   nvrhi::ITexture* environmentBrdf)
     {
-        if (light->shadowMap)
-        {
-            shadowMapTexture = light->shadowMap->GetTexture();
-            shadowMapTextureSize = light->shadowMap->GetTextureSize();
-            break;
-        }
-    }
-
-    nvrhi::ITexture* lightProbeDiffuse = nullptr;
-    nvrhi::ITexture* lightProbeSpecular = nullptr;
-    nvrhi::ITexture* lightProbeEnvironmentBrdf = nullptr;
-
-    for (const auto& probe : lightProbes)
+        return CreateShadingBindingSet(shadowMapTexture, diffuse, specular, environmentBrdf);
+    };
+    if (!PrepareForwardLights(lighting::LeafLights{ &lights }, lightProbes, ambientColorTop, ambientColorBottom, m_Mutex,
+                              m_ShadingBindingSets, createBindingSet, context.shadingBindingSet, commandList,
+                              m_ForwardLightCB))
     {
-        if (!probe->enabled)
-            continue;
-
-        if (lightProbeDiffuse == nullptr || lightProbeSpecular == nullptr || lightProbeEnvironmentBrdf == nullptr)
-        {
-            lightProbeDiffuse = probe->diffuseMap;
-            lightProbeSpecular = probe->specularMap;
-            lightProbeEnvironmentBrdf = probe->environmentBrdf;
-        }
-        else
-        {
-            if (lightProbeDiffuse != probe->diffuseMap || lightProbeSpecular != probe->specularMap || lightProbeEnvironmentBrdf != probe->environmentBrdf)
-            {
-                log::error("All lights probe submitted to ForwardShadingPass::PrepareLights(...) must use the same set of textures");
-                return;
-            }
-        }
+        log::error("All lights probe submitted to ForwardShadingPass::PrepareLights(...) must use the same set of textures");
     }
-
-    {
-        std::lock_guard<std::mutex> lockGuard(m_Mutex);
-
-        nvrhi::BindingSetHandle& shadingBindings = m_ShadingBindingSets[std::make_pair(shadowMapTexture, lightProbeDiffuse)];
-
-        if (!shadingBindings)
-        {
-            shadingBindings = CreateShadingBindingSet(shadowMapTexture, lightProbeDiffuse, lightProbeSpecular, lightProbeEnvironmentBrdf);
-        }
-
-        context.shadingBindingSet = shadingBindings;
-    }
-
-
-    ForwardShadingLightConstants constants = {};
-
-    constants.shadowMapTextureSize = float2(shadowMapTextureSize);
-    constants.shadowMapTextureSizeInv = 1.f / constants.shadowMapTextureSize;
-
-    int numShadows = 0;
-
-    for (int nLight = 0; nLight < std::min(static_cast<int>(lights.size()), FORWARD_MAX_LIGHTS); nLight++)
-    {
-        const auto& light = lights[nLight];
-
-        LightConstants& lightConstants = constants.lights[constants.numLights];
-        light->FillLightConstants(lightConstants);
-
-        if (light->shadowMap)
-        {
-            for (uint32_t cascade = 0; cascade < light->shadowMap->GetNumberOfCascades(); cascade++)
-            {
-                if (numShadows < FORWARD_MAX_SHADOWS)
-                {
-                    light->shadowMap->GetCascade(cascade)->FillShadowConstants(constants.shadows[numShadows]);
-                    lightConstants.shadowCascades[cascade] = numShadows;
-                    ++numShadows;
-                }
-            }
-
-            for (uint32_t perObjectShadow = 0; perObjectShadow < light->shadowMap->GetNumberOfPerObjectShadows(); perObjectShadow++)
-            {
-                if (numShadows < FORWARD_MAX_SHADOWS)
-                {
-                    light->shadowMap->GetPerObjectShadow(perObjectShadow)->FillShadowConstants(constants.shadows[numShadows]);
-                    lightConstants.perObjectShadows[perObjectShadow] = numShadows;
-                    ++numShadows;
-                }
-            }
-        }
-
-        ++constants.numLights;
-    }
-
-    constants.ambientColorTop = float4(ambientColorTop, 0.f);
-    constants.ambientColorBottom = float4(ambientColorBottom, 0.f);
-
-    for (const auto& probe : lightProbes)
-    {
-        if (!probe->IsActive())
-            continue;
-
-        LightProbeConstants& lightProbeConstants = constants.lightProbes[constants.numLightProbes];
-        probe->FillLightProbeConstants(lightProbeConstants);
-
-        ++constants.numLightProbes;
-
-        if (constants.numLightProbes >= FORWARD_MAX_LIGHT_PROBES)
-            break;
-    }
-
-    commandList->writeBuffer(m_ForwardLightCB, &constants, sizeof(constants));
 }
 
-// Declared by plan step E5.0 so that the vtable links; implemented by step E5.6 (sub-plan
-// docs/plans/2026-11-21-donut-ecs-e5.md). Nothing calls it before then.
+// The snapshot's lights (plan step E5, sub-plan item E5.6): PrepareLights' body (one helper above, so that both bind
+// and write alike), each light's shadow map from the extracted light (the render service's, or the leaf's own without
+// service shadows). The shadow texture is bound as PrepareLights binds it: an application in a render graph declares
+// the read of ExtractedLight::shadowTexture (GeometryGraphInputs::shaderReads, or its own pass's reads).
 void ForwardShadingPass::PrepareExtractedLights(
-    Context&,
-    nvrhi::ICommandList*,
-    const ExtractedLight*,
-    uint32_t,
-    float3,
-    float3,
-    const std::vector<nvrhi::AutoPtr<LightProbe>>&)
+    Context& context,
+    nvrhi::ICommandList* commandList,
+    const ExtractedLight* lights,
+    uint32_t lightCount,
+    float3 ambientColorTop,
+    float3 ambientColorBottom,
+    const std::vector<nvrhi::AutoPtr<LightProbe>>& lightProbes)
 {
-    log::warning("ForwardShadingPass::PrepareExtractedLights is not implemented yet (plan step E5.6)");
+    auto createBindingSet = [this](nvrhi::ITexture* shadowMapTexture, nvrhi::ITexture* diffuse, nvrhi::ITexture* specular,
+                                   nvrhi::ITexture* environmentBrdf)
+    {
+        return CreateShadingBindingSet(shadowMapTexture, diffuse, specular, environmentBrdf);
+    };
+    if (!PrepareForwardLights(lighting::SnapshotLights{ lights, lightCount }, lightProbes, ambientColorTop,
+                              ambientColorBottom, m_Mutex, m_ShadingBindingSets, createBindingSet,
+                              context.shadingBindingSet, commandList, m_ForwardLightCB))
+    {
+        log::warning("ForwardShadingPass::PrepareExtractedLights: the light probes must use the same set of textures");
+    }
 }
 
 ViewType::Enum ForwardShadingPass::GetSupportedViewTypes() const

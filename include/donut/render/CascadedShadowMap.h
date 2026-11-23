@@ -31,9 +31,18 @@ namespace donut::render
 {
     class PlanarShadowMap;
 
+    // A class ID, so that a light's shadow map can be recognised without dynamic_cast (nvrhi ADR 0006; query_cast):
+    // the render service serves a directional light whose Light::shadowMap hint is a CascadedShadowMap (LightShadows.h).
+    NVRHI_CLASS_CLSID(CascadedShadowMap, "ddc2b9ba-16a4-4777-a316-67540a428138")
     class CascadedShadowMap : public engine::IShadowMap
     {
-        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(CascadedShadowMap)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(CascadedShadowMap)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IObject)
+        NVRHI_IMPLEMENTS_CLASS(CascadedShadowMap)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(engine::IShadowMap)
+        NVRHI_END_INTERFACE_TABLE()
     private:
         nvrhi::TextureHandle m_ShadowMapTexture;
         std::vector<nvrhi::AutoPtr<PlanarShadowMap>> m_Cascades;
@@ -41,9 +50,27 @@ namespace donut::render
         engine::CompositeView m_CompositeView;
         int m_NumberOfCascades;
 
+        void Init(nvrhi::IDevice* device, nvrhi::ITexture* texture, int numCascades, int numPerObjectShadows);
+
     public:
         CascadedShadowMap(
             nvrhi::IDevice* device,
+            int resolution,
+            int numCascades,
+            int numPerObjectShadows,
+            nvrhi::Format format,
+            bool isUAV = false);
+
+        // Over an existing texture array of numCascades + numPerObjectShadows slices (GetTextureDesc), cascades first.
+        // `device` may be null: it is not used (the render service's device-free tests make maps over stand-in textures).
+        CascadedShadowMap(
+            nvrhi::IDevice* device,
+            nvrhi::ITexture* texture,
+            int numCascades,
+            int numPerObjectShadows);
+
+        // The description of the texture the first constructor makes.
+        [[nodiscard]] static nvrhi::TextureDesc GetTextureDesc(
             int resolution,
             int numCascades,
             int numPerObjectShadows,
@@ -94,6 +121,10 @@ namespace donut::render
         void SetLitOutOfBounds(bool litOutOfBounds);
         void SetFalloffDistance(float distance);
 		void SetNumberOfCascadesUnsafe(int cascades);
+        // The first cascade's falloff distance (SetFalloffDistance sets every cascade's).
+        [[nodiscard]] float GetFalloffDistance() const;
+        // The cascades the texture holds (the constructor's numCascades); GetNumberOfCascades is the number set up.
+        [[nodiscard]] uint32_t GetCascadeCapacity() const;
 
         engine::PlanarView* GetCascadeView(uint32_t cascade);
         engine::PlanarView* GetPerObjectView(uint32_t object);

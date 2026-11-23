@@ -71,6 +71,7 @@ namespace donut::render
 
         void SetLitOutOfBounds(bool litOutOfBounds);
         void SetFalloffDistance(float distance);
+        [[nodiscard]] float GetFalloffDistance() const;
 
         engine::PlanarView* GetPlanarView();
 

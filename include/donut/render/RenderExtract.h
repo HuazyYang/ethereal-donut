@@ -252,7 +252,9 @@ namespace donut::render
         engine::Entity entity = engine::Entity::Null;
         const engine::Light* leaf = nullptr;         // its parameters stay in the leaf (D16)
         // The light's shadow: the service's map when it has a service shadow (serviceShadow), else the leaf's own
-        // Light::shadowMap (rendered by the application, as before), or null.
+        // Light::shadowMap (rendered by the application, as before), or null. With service shadows, null too for a
+        // light whose cascaded hint the service withholds (one after the first: LightShadows.h); its constants are
+        // then those of a light without a map (outOfBoundsShadow 1).
         const engine::IShadowMap* shadowMap = nullptr;
         // The service shadow's texture in this frame's graph: InvalidResourceId until AddShadowPasses sets it (the
         // version its cascades wrote last); always invalid for a leaf's own map.
@@ -357,7 +359,9 @@ namespace donut::render
         // TransparentDrawStrategy::DrawDoubleSidedMaterialsSeparately: a double-sided transparent material gives two
         // packets (front faces, then back faces) instead of one without culling.
         bool drawDoubleSidedMaterialsSeparately = true;
-        // Service shadows (RenderServiceDesc::serviceShadows): the view their cascades are set up for, and how.
+        // Service shadows (RenderServiceDesc::serviceShadows): the view their cascades are set up for (an index into
+        // `views`; out of range: no light is served this frame, with a warning), and how (LightShadows.h; settings
+        // that fail AreShadowSettingsValid for that view: no light is served this frame, with a warning).
         uint32_t shadowViewIndex = 0;
         ShadowSettings shadows;
     };
@@ -377,13 +381,18 @@ namespace donut::render
         // The depth passes of the service shadows.
         engine::CommonRenderPasses* commonPasses = nullptr;
         // Shadow maps owned by the service (D13; opt-in, open point 8). Off: every light keeps its leaf's map, and
-        // applications that render it themselves (VXGI, nv_asteroids) are unaffected. The maps take their format,
-        // cascade count, resolution and channel from the leaf's hint (LightShadows.h).
+        // applications that render it themselves (VXGI, nv_asteroids) are unaffected. One light is served, the first
+        // with a cascaded hint; its map takes its format, cascade count, resolution and channel from the hint
+        // (LightShadows.h).
         bool serviceShadows = false;
         // The rasterizer state of the service's shadow depth passes (DepthPass::CreateParameters; its defaults).
         int shadowDepthBias = 0;
         float shadowDepthBiasClamp = 0.f;
         float shadowSlopeScaledDepthBias = 0.f;
+        // A seam for device-free tests: makes the service shadows' textures when set (else the device does; without
+        // either, served lights get a table entry but no map and keep their leaf's map).
+        CreateShadowTextureFunction createShadowTexture = nullptr;
+        void* createShadowTextureContext = nullptr;
     };
 
     // The last frame's counts.
@@ -397,7 +406,18 @@ namespace donut::render
         uint32_t cameras = 0;
         uint32_t skinnedInstances = 0;
         uint32_t jointMatrices = 0;
-        uint32_t serviceShadowMaps = 0;
+        uint32_t serviceShadowMaps = 0;     // the table's entries that hold a map
+        // With service shadows: lights whose hint the service does not serve (another kind, or a cascaded hint after
+        // the first light's: LightShadows.h).
+        uint32_t unservedShadowHints = 0;
+        // Maps the extraction retired (reconfigured, or their light gone), released at EndFrame. A retired map's
+        // texture can stay alive in the binding caches of DeferredLightingPass and ForwardShadingPass (their cached
+        // sets name it) until the application calls their ResetBindingCache: a non-zero count is the signal to do so.
+        uint32_t retiredShadowMaps = 0;
+        // The shadow depth passes whose binding caches the last AddShadowPasses reset (after a frame replaced the
+        // scene's buffers: SceneFrame::sceneBuffersReplaced, of this frame or of one whose AddShadowPasses did not
+        // run or was refused).
+        uint32_t shadowBindingCacheResets = 0;
         uint64_t snapshotBytes = 0;   // frame-arena bytes of the snapshot
         uint32_t skinningBindingSets = 0;   // the skinning pass's cached binding sets, aged by AddSkinningPasses
     };
@@ -435,14 +455,28 @@ namespace donut::render
         // writes the skinned meshes' prototype data in its Prepare: without it, FE_INVALID_ARGS with a warning (for a
         // service with a scene, device and shader factory; one without adds nothing either way).
         nvrhi::FRESULT AddSkinningPasses(IRenderGraph* graph, SceneFrame* frame) noexcept;
-        // A DepthPass use per cascade of each service shadow, drawing the cascade view's opaque packets through a bound
-        // adapter; one DepthPass object per cascade, so that a parallel recorder records cascades on separate threads.
-        // Imports the shadow textures and stores their written versions in the extracted lights. Nothing without
-        // RenderServiceDesc::serviceShadows.
+        // A DepthPass use per cascade of the service shadow (one light: LightShadows.h), drawing the cascade view's
+        // opaque packets through a bound adapter (PacketDrawStrategy) with `frame`'s bufferReads (the uses are then
+        // Restore, GeometryPasses.h); one DepthPass object per cascade, so that a parallel recorder records cascades on
+        // separate threads. Imports the shadow texture (host-kept, as CascadedShadowMap makes it), clears each
+        // cascade's slice, and stores the version the last cascade wrote in the extracted light's shadowTexture, which
+        // the lighting passes then read. Call it after AddUploadPasses and AddSkinningPasses (bufferReads) and before
+        // the lighting passes: otherwise FE_INVALID_ARGS with a warning (checked for every service: those calls record
+        // that they ran even when they add nothing; on the GPU path they must also have added their passes). With a
+        // device, FE_INVALID_ARGS with a warning (once per service) unless RenderServiceDesc::shaderFactory and
+        // commonPasses are both set; without a device the uses are added over uninitialised passes (device-free tests).
+        // The pooled passes' binding caches are reset by the first call that runs after a frame replaced the scene's
+        // buffers (RenderServiceStats::shadowBindingCacheResets). Nothing without RenderServiceDesc::serviceShadows, nor
+        // for a second call in the frame. FE_INVALID_ARGS when no frame is open.
         nvrhi::FRESULT AddShadowPasses(IRenderGraph* graph, SceneFrame* frame) noexcept;
         // After the graph has executed (`executed`), or failed to compile or execute: closes the render-read scope (a
         // flag per service, not a count). Only an executed frame sets the leaves' skinningInitialized for its first-frame
-        // skinned instances; otherwise the next frame dispatches them as first frames again. Idempotent per frame.
+        // skinned instances; otherwise the next frame dispatches them as first frames again. Releases the shadow maps
+        // this frame's extraction retired (the frames that drew into them were submitted before it; nvrhi keeps a
+        // texture alive for the command lists that reference it). The service's references go; a retired texture can
+        // still be held by the binding caches of DeferredLightingPass and ForwardShadingPass, whose cached sets name the
+        // shadow texture, until the application calls their ResetBindingCache (RenderServiceStats::retiredShadowMaps
+        // non-zero is the signal; the service adds no mechanism for it). Idempotent per frame.
         // app::RenderGraphLayer::OnGraphExecuted is the place to call it; without the layer, call it after
         // IRenderGraph::Execute. A frame whose EndFrame never came counts as not executed. The snapshot dies at the
         // next Reset.
