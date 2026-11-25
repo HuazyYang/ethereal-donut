@@ -231,7 +231,9 @@ namespace donut::engine
     //
     // While an entity is driven its pose has one home, the two SimPose columns: LocalTransform is neither read nor
     // written, and WorldTransform is written by the interpolation after PostSimulation, not by transform propagation. The
-    // ones with data are Relocatable, so that a domain gets views of them (D14).
+    // ones with data are Relocatable, so that a domain gets views of them (D14). A row that had a LocalTransform keeps
+    // it, out of date: code that reads the column itself (a query, GetComponent) excludes such rows with
+    // Without<SimulationDriven>.
 
     // The entity's WorldTransform comes from a simulation domain (TransformDriver::Simulation of 4.7).
     struct SimulationDriven { };
@@ -261,7 +263,10 @@ namespace donut::engine
     };
     DONUT_ECS_COMPONENT(SimScale, "8597b8ec-dde0-4612-a644-10453fd55287", DONUT_ECS_FIELDS(scaling))
 
-    // The entity's object in its domain's engine (8.1), written by the domain when the entity is added to it.
+    // The entity's object in its domain's engine (8.1), written by the domain when the entity is added to it, and reset
+    // by it to the default value when the entity is removed from it (ISimulationDomain::OnEntitiesRemoved): the row may
+    // stay. A row of no domain is shown at its SimPose. One that still names a domain which has not got it is
+    // interpolated with the time of whatever domain has that id, between its two old poses.
     constexpr uint32_t c_NoSimulationDomain = ~0u;   // uint32_t(SimulationDomainId::Invalid)
     struct SimBodyRef
     {

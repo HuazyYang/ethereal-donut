@@ -882,7 +882,9 @@ namespace donut::engine
         // Attach, Detach, SetRootNode or SetLeaf since the last Refresh.
         [[nodiscard]] bool HasPendingStructureChanges() const;
         // A transform set (or nodes with transforms attached) since the last Refresh, or the last Refresh moved
-        // something: then the next one is still pending for the previous-frame transforms.
+        // something: then the next one is still pending for the previous-frame transforms. Only edits through this API
+        // count: what a simulation moves (the driven nodes and what hangs below them) sets it neither before nor after
+        // the Refresh that propagates it.
         [[nodiscard]] bool HasPendingTransformChanges() const;
         // A transform or structural edit through this API (the node's setters and SetLeaf; Attach, AttachLeafNode,
         // Detach, SetRootNode) that no run of transform propagation has processed: the world transforms are older than
@@ -981,14 +983,20 @@ namespace donut::engine
         // has them.
         nvrhi::FRESULT Simulate(const FrameTime& time) noexcept;
         // Binds a node of this graph to the simulation, or unbinds it (SceneComponents.h, simulation-driven entities).
-        // Structural: outside phases and leaf callbacks. Binding takes the poses and the scale from the node's current
-        // world transform (shear and mirroring are refused with a warning); the domain whose lifetime query then
+        // Structural: outside phases and leaf callbacks. Binding takes both poses and the scale from the node's current
+        // world transform: composed from its local transform and its ancestors' as they are now, propagated or not, and
+        // below a driven ancestor over that one's simulated pose (SimPose), so that the engine's bodies are of one time
+        // and binding and unbinding on a moving parent gives the local transform back. The node is shown there at once:
+        // below a driven ancestor that the interpolation shows behind its pose, that is a jump of at most one fixed step
+        // of the ancestor's motion. Shear and mirroring are refused with a warning; the domain whose lifetime query then
         // matches the entity adds it. While bound, the transform setters are teleport requests (a part that a setter
         // does not give stays as a pending request has it, else as the simulation has it), and the local getters
-        // compute from the simulated world transform. Unbinding makes the simulated pose the local transform, and so
-        // does Detach: a node that is attached again or copied is authored. Binding a bound node, or unbinding another,
-        // does nothing. FE_INVALID_ARGS for a node that is not attached to this graph, a refused transform, or a wrong
-        // time.
+        // compute from the simulated world transform. Unbinding makes the simulated pose the local transform, relative
+        // to the simulated world of the parent, and so does Detach: a node that is attached again or copied is authored.
+        // Binding a bound node, or unbinding another, does nothing. FE_INVALID_ARGS for a node that is not attached to
+        // this graph, a refused transform (also a scale of 0, or numbers that are not finite), or a wrong time; also, or
+        // FE_OUT_OF_MEMORY, when the world cannot make the node's new row (it fits no chunk; no memory): a warning, and
+        // nothing changed. A failing observer or domain callback is a warning only: the call stands.
         nvrhi::FRESULT SetSimulationDriven(SceneGraphNode* node, bool driven) noexcept;
     };
 

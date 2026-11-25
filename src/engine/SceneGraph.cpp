@@ -416,6 +416,9 @@ dm::dquat SceneGraphNode::GetRotation() const
     {
         if (const LocalTransform* local = m_Store->GetOf<LocalTransform>(this, SceneGraphStore::SlotLocal))
             return local->rotation;
+        LocalTransform driven;
+        if (m_Store->GetDrivenLocal(this, driven))
+            return driven.rotation;
     }
     return dm::dquat::identity();
 }
@@ -428,6 +431,9 @@ dm::double3 SceneGraphNode::GetScaling() const
     {
         if (const LocalTransform* local = m_Store->GetOf<LocalTransform>(this, SceneGraphStore::SlotLocal))
             return local->scaling;
+        LocalTransform driven;
+        if (m_Store->GetDrivenLocal(this, driven))
+            return driven.scaling;
     }
     return dm::double3(1.0);
 }
@@ -440,6 +446,9 @@ dm::double3 SceneGraphNode::GetTranslation() const
     {
         if (const LocalTransform* local = m_Store->GetOf<LocalTransform>(this, SceneGraphStore::SlotLocal))
             return local->translation;
+        LocalTransform driven;
+        if (m_Store->GetDrivenLocal(this, driven))
+            return driven.translation;
     }
     return dm::double3(0.0);
 }
@@ -452,7 +461,10 @@ dm::daffine3 SceneGraphNode::GetLocalToParentTransform() const
     else if (m_Store)
         local = m_Store->GetOf<LocalTransform>(this, SceneGraphStore::SlotLocal);
     if (!local)
-        return dm::daffine3::identity();
+    {
+        dm::daffine3 driven;
+        return !m_Record && m_Store && m_Store->GetDrivenLocal(this, driven) ? driven : dm::daffine3::identity();
+    }
     dm::daffine3 transform = dm::scaling(local->scaling);
     transform *= local->rotation.toAffine();
     transform *= dm::translation(local->translation);
@@ -1387,10 +1399,19 @@ nvrhi::FRESULT SceneGraph::Simulate(const FrameTime&) noexcept
     return nvrhi::FE_UNSUPPORTED;
 }
 
-// Stub: item E6.2a of the E6 sub-plan implements it.
-nvrhi::FRESULT SceneGraph::SetSimulationDriven(SceneGraphNode*, bool) noexcept
+nvrhi::FRESULT SceneGraph::SetSimulationDriven(SceneGraphNode* node, bool driven) noexcept
 {
-    return nvrhi::FE_UNSUPPORTED;
+    if (GetEntity(node) == Entity::Null)
+        return nvrhi::FE_INVALID_ARGS;   // null, in no graph, or in another one
+    DONUT_SCENE_GRAPH_WARN_RENDER_READ(m_Store, "SetSimulationDriven");
+    try
+    {
+        return m_Store->SetSimulationDriven(node, driven);
+    }
+    catch (...)
+    {
+        return nvrhi::FE_OUT_OF_MEMORY;   // the walk up to the root, before anything changed
+    }
 }
 
 const size_t SceneGraph::GetGeometryInstancesCount() const

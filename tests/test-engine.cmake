@@ -54,11 +54,13 @@ target_compile_definitions(test_ecs_determinism PRIVATE
 # The ECS tests reach the world's internals (allocation counters, chunk layout, entity table) through the private
 # headers in src/engine (EcsWorldImpl.h and the ones beside it); so do the scene-graph storage test (step E3) and the
 # GPU scene test (step E4), for the allocation counter, the leaf columns test (E6.3), for the records' counter and the
-# failure seams, and the exit test of the shared job system (SharedJobSystem.h).
+# failure seams, the simulation test (E6.2a), for the store's counters, and the exit test of the shared job system
+# (SharedJobSystem.h).
 foreach(test_src ${donut_engine_tests})
     get_filename_component(test_name "${test_src}" NAME_WE)
     if(test_name MATCHES "^test_ecs_" OR test_name STREQUAL "test_scene_graph_store" OR test_name STREQUAL "test_gpu_scene"
-       OR test_name STREQUAL "test_scene_graph_leaf_columns" OR test_name STREQUAL "test_job_system_exit")
+       OR test_name STREQUAL "test_scene_graph_leaf_columns" OR test_name STREQUAL "test_scene_graph_simulation"
+       OR test_name STREQUAL "test_job_system_exit")
         target_include_directories("${test_name}" PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
     endif()
 endforeach()
@@ -80,6 +82,13 @@ target_link_libraries(bench_gpu_scene donut_app donut_engine donut_core)
 add_dependencies(donut_all_tests bench_gpu_scene)
 add_test(NAME bench_gpu_scene_smoke COMMAND bench_gpu_scene --smoke)
 set_property(TARGET bench_gpu_scene PROPERTY FOLDER "Donut/donut_tests/donut_engine_tests")
+
+# What simulation-driven nodes cost (plan step E6, sub-plan item E6.2a). ctest runs the smoke mode.
+add_executable(bench_simulation src/engine/bench_simulation.cpp)
+target_link_libraries(bench_simulation donut_app donut_engine donut_core)
+add_dependencies(donut_all_tests bench_simulation)
+add_test(NAME bench_simulation_smoke COMMAND bench_simulation --smoke)
+set_property(TARGET bench_simulation PROPERTY FOLDER "Donut/donut_tests/donut_engine_tests")
 
 # The A/B dump of plan step E4 (a GPU program, not a ctest test): the instance, geometry and material buffers read back
 # after Scene::Refresh, in GpuSceneDump.h's canonical form. The same source builds against the E0 tree from outside it.

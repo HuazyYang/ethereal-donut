@@ -175,7 +175,10 @@ namespace donut::engine
         // engine objects and store their engine indices in the batch's write columns. Engine indices are assigned in
         // batch order, which is deterministic (rule 3.3.6). Observer re-entrancy rules apply (EcsWorld.h). Entities
         // that match when the domain is added are delivered then, and the ones that still match when it is removed
-        // then (AddSimulationDomain, RemoveSimulationDomain); the scheduler's destruction delivers nothing.
+        // then (AddSimulationDomain, RemoveSimulationDomain); the scheduler's destruction delivers nothing. A removed
+        // entity may live on (the domain is removed; a component that the query needs went), and domain ids are reused:
+        // so OnEntitiesRemoved resets what OnEntitiesAdded stored in the row (SimBodyRef: its default value), in the
+        // batch's write columns. The row is still in its old place then, and what is written there goes with it.
         virtual nvrhi::FRESULT OnEntitiesAdded(const EntityBatch& batch, ISimulationContext* context) noexcept = 0;
         virtual nvrhi::FRESULT OnEntitiesRemoved(const EntityBatch& batch, ISimulationContext* context) noexcept = 0;
         virtual nvrhi::FRESULT GatherInputs(ISimulationContext* context) noexcept = 0;      // PreSimulation

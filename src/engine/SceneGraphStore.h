@@ -47,6 +47,11 @@
 //   out after the last observer of the row's removal and before the row goes (WorldImpl::RowHooks). While a removal
 //   runs, the leaf's record names the row (LeafRecord::IsInRow), so that the observers' Get and Edit still find it.
 //   Graphs that never saw such a class (m_AnyLeafRecord) do none of this.
+// - Simulation-driven nodes (E6.2a): the rows with SimulationDriven have archetypes of their own. Their pose has one
+//   home, the SimPose columns; propagation does not write their WorldTransform, which the interpolation system writes
+//   (a phase of its own after PostSimulation), and their children follow them. A LocalTransform that such a row has is
+//   neither read nor written: the column table hides it (SlotLocal is absent there), so that the paths of authored nodes
+//   stay as they were; the few that find none ask whether the row is driven.
 // - Asset tables and slots (step E4): the leaf observer fills a mesh instance's MeshRef, RenderFlags and
 //   GpuInstanceSlot columns (table references, stable slots) before it calls RegisterLeaf, and releases them before it
 //   calls UnregisterLeaf. Every structural operation and InvalidateContent first advances the world's version, so that
@@ -56,6 +61,7 @@
 
 #include <donut/engine/SceneGraph.h>
 #include <donut/engine/EcsScheduler.h>
+#include <donut/engine/EcsSimulation.h>
 #include <donut/engine/EcsWorld.h>
 #include <donut/engine/JobSystem.h>
 
@@ -152,7 +158,8 @@ namespace donut::engine
         enum Slot : uint32_t
         {
             SlotNode, SlotLinks, SlotParent, SlotLocal, SlotLocalMatrix, SlotWorld, SlotLeaf, SlotLocalBounds,
-            SlotWorldBounds, SlotChunkBounds, SlotMeshRef, SlotRenderFlags, SlotInstance, SlotCount
+            SlotWorldBounds, SlotChunkBounds, SlotMeshRef, SlotRenderFlags, SlotInstance, SlotDriven, SlotSimPose,
+            SlotSimScale, SlotCount
         };
         static constexpr uint8_t c_Absent = 0xff;
 
@@ -183,9 +190,10 @@ namespace donut::engine
             if (archetypeIndex < m_ArchetypeColumns.size())
                 return m_ArchetypeColumns[archetypeIndex][slot];
             // an archetype made since the last synchronisation (by code outside the graph): look it up, write nothing
-            const uint32_t column = archetype.FindColumn(m_Ids[slot]);
-            return column == ecs::c_NoColumn ? c_Absent : uint8_t(column);
+            return LookUpColumn(archetype, slot);
         }
+        // The column of a slot by the component id; the local transform of a driven archetype is hidden (c_Absent).
+        uint8_t LookUpColumn(const ecs::Archetype& archetype, Slot slot) const noexcept;
         bool Locate(Entity entity, RowRef& out) const noexcept
         {
             // WorldImpl::FindAlive, inline
@@ -307,6 +315,21 @@ namespace donut::engine
                           const dm::double3* scaling);
         void InvalidateContent(SceneGraphNode* node);
 
+        // ------------------------------------------------------------ simulation-driven nodes (4.7, 8.4; E6.2a)
+        bool IsDriven(const RowRef& row) const noexcept
+        {
+            return ColumnIndex(*row.archetype, row.archetypeIndex, SlotDriven) != c_Absent;
+        }
+        // SceneGraph::SetSimulationDriven of a node that is attached here.
+        nvrhi::FRESULT SetSimulationDriven(SceneGraphNode* node, bool driven);
+        // The local getters of a driven node, from its WorldTransform and its parent's (nothing is stored): the matrix,
+        // and its parts as far as a translation, a rotation and a scaling can express it. False for another node.
+        bool GetDrivenLocal(const SceneGraphNode* node, dm::daffine3& outMatrix) const noexcept;
+        bool GetDrivenLocal(const SceneGraphNode* node, LocalTransform& out) const noexcept;
+        // The phase of the interpolation system, right after PostSimulation; c_NoPhase when there is none.
+        static constexpr Phase c_NoPhase = Phase(~0u);   // Phase::Count is the first named phase
+        Phase GetInterpolationPhase() const noexcept { return m_InterpolationPhase; }
+
         // ------------------------------------------------------------------------------ refresh (5.4, 5.7)
         // Runs the phases when anything changed; returns whether structure changed since the last refresh.
         bool Refresh(uint32_t frameIndex);
@@ -388,6 +411,7 @@ namespace donut::engine
         // The systems' bodies (SceneGraphStore.cpp).
         nvrhi::FRESULT RunPropagation(ISystemContext* context) noexcept;
         nvrhi::FRESULT RunBounds(ISystemContext* context) noexcept;
+        nvrhi::FRESULT RunInterpolation(ISystemContext* context) noexcept;
         // Before the phases of a Refresh: the pass's marks and summaries ready, so that the Bounds system marks the paths
         // of the rows whose boxes changed (incremental mode). After them: the subgraph values of the nodes with children
         // along the marked paths (all of them after a structural change), and the row hints of the archetypes whose rows
@@ -449,6 +473,7 @@ namespace donut::engine
             uint64_t propagatedChunks = 0;     // chunks propagation wrote
             uint64_t propagatedRows = 0;
             uint64_t boundsChunks = 0;         // chunks the Bounds system wrote
+            uint64_t interpolatedChunks = 0;   // chunks of driven rows the interpolation wrote
             uint64_t deepRows = 0;             // rows of the last depth bucket visited (c_MaxHierarchyDepth)
             uint64_t createCalls = 0;          // CreateEntities calls of attach and copy (one per batch)
             uint64_t subgraphPasses = 0;       // UpdateSubgraphs runs (full ones included)
@@ -510,6 +535,27 @@ namespace donut::engine
             uint8_t matrix;
             uint8_t parent;
             uint8_t world;
+            bool driven;               // the interpolation writes its rows' worlds, not propagation
+        };
+
+        // Rows that the interpolation writes: driven, with the columns that SetSimulationDriven adds.
+        struct DrivenArchetype
+        {
+            uint32_t archetype;
+            uint8_t pose;
+            uint8_t previous;
+            uint8_t scale;
+            uint8_t body;
+            uint8_t world;
+        };
+
+        // The simulated world of a row's parent, kept for the next row with the same parent (SimulatedLocal); `chain` is
+        // the calling store's scratch (m_ComposeChain).
+        struct ParentWorld
+        {
+            std::vector<Entity>& chain;
+            Entity parent = Entity::Null;
+            dm::daffine3 world = dm::daffine3::identity();
         };
 
         struct BoundsArchetype
@@ -525,7 +571,7 @@ namespace donut::engine
         struct JointArchetype
         {
             uint32_t archetype;
-            uint8_t local;
+            uint8_t moved;             // what changes when a joint moves: LocalTransform, WorldTransform of a driven one
             uint8_t leaf;
         };
 
@@ -538,6 +584,7 @@ namespace donut::engine
 
         struct PropagationContext;
         struct BoundsContext;
+        struct InterpolationContext;
         struct DeepContext;
         struct SubgraphContext;
 
@@ -624,10 +671,11 @@ namespace donut::engine
         void UpdateSystemLists() noexcept;
         void PropagateRow(const LevelArchetype& level, const ecs::Archetype& archetype, uint32_t chunk, uint32_t row,
                           const dm::daffine3* parentWorld, bool compose) const noexcept;
-        bool ParentWritten(Entity parent, uint64_t version, const dm::daffine3** outWorld,
+        bool ParentWritten(Entity parent, uint64_t since, const dm::daffine3** outWorld,
                            bool readVersion) const noexcept;
         void PropagateDeepBucket(IJobSystem* jobs, uint64_t since, uint64_t version, bool parentLevelWrote);
         const LevelArchetype* DeepLevel(uint32_t archetypeIndex) const noexcept;
+        static bool DrivenWritten(const LevelArchetype& level, const ecs::Archetype& archetype, uint64_t since) noexcept;
         static bool DeepChunkDirty(const LevelArchetype& level, const ecs::Archetype& archetype, uint32_t chunk,
                                    uint64_t since) noexcept;
         bool PropagateDeepRow(Entity entity, bool parentInBucket, uint64_t since, uint64_t version) noexcept;
@@ -635,6 +683,23 @@ namespace donut::engine
         void MarkSkinnedJoints(uint64_t since);
         static void RunPropagationTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
         static void RunBoundsTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
+        static void RunInterpolationTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
+
+        nvrhi::FRESULT BindToSimulation(SceneGraphNode* node);
+        nvrhi::FRESULT UnbindFromSimulation(SceneGraphNode* node, const RowRef& boundRow);
+        // The move of the row of `node`; what both share around it.
+        nvrhi::FRESULT ChangeDriven(SceneGraphNode* node, ecs::WorldImpl::ComponentChange& change,
+                                    const ecs::WorldImpl::RowHooks* hooks);
+        // A driven row's simulated world: its SimPose and SimScale (its WorldTransform when it lacks them).
+        dm::daffine3 SimulatedPose(const RowRef& row) const noexcept;
+        // The simulated world transform of an entity: composed from the local transforms as they are now, propagated or
+        // not, from the simulated pose of the nearest driven ancestor (or of the entity itself) down, else from the root.
+        // Where nothing is driven it is what propagation gives, bit for bit. `chain` is scratch.
+        dm::daffine3 ComposeWorld(Entity entity, std::vector<Entity>& chain) const;
+        // The local transform that a driven row gets when it is not driven any more: its simulated pose relative to the
+        // simulated world of its parent, so that both are of the same time. Warns when no local transform can express it
+        // (a parent whose scale shears it or has no inverse); `operation` names the call.
+        LocalTransform SimulatedLocal(const RowRef& row, ParentWorld& cache, const char* operation) const;
 
         static std::atomic<int32_t> s_FailCreateCountdown;
         static std::atomic<int32_t> s_FailAcquireCountdown;
@@ -654,6 +719,10 @@ namespace donut::engine
         nvrhi::AutoPtr<IScheduler> m_Scheduler;
         nvrhi::AutoPtr<IObserver> m_LeafObserver;
         ComponentId m_Ids[SlotCount] = {};
+        ComponentId m_SimPreviousId = ComponentId::Invalid;
+        ComponentId m_SimBodyId = ComponentId::Invalid;
+        ComponentId m_SimTeleportId = ComponentId::Invalid;
+        ComponentId m_FixedStepId = ComponentId::Invalid;   // the resource; the scheduler registers it
         ComponentId m_DepthId = ComponentId::Invalid;
         ComponentId m_JointTag = ComponentId::Invalid;   // SkinnedMeshReferenceLeaf, once a joint leaf was attached
         ComponentId m_DynamicBoundsTag = ComponentId::Invalid;   // DynamicBoundsLeaf, once such a leaf was attached
@@ -720,6 +789,10 @@ namespace donut::engine
         uint32_t m_RenderReadQuiet = 0;
         std::atomic<bool> m_RenderServiceClaimed{ false };
         uint64_t m_SchedulerGeneration = 0;   // CreateSystems calls
+        Phase m_InterpolationPhase = c_NoPhase;
+        // The interpolation's alpha per domain at its last run: a chunk is computed again when its poses changed or the
+        // alpha of a domain of its rows did.
+        double m_LastAlphas[c_MaxSimulationDomains] = {};
 
         // System state: the archetypes per depth bucket, the leaf archetypes for bounds and joints, the tasks.
         std::vector<LevelArchetype> m_Levels[c_MaxHierarchyDepth + 1];
@@ -727,6 +800,8 @@ namespace donut::engine
         std::vector<uint32_t> m_ArchetypeLevelSlot;   // per archetype: its index in its bucket's list
         std::vector<BoundsArchetype> m_BoundsArchetypes;
         std::vector<JointArchetype> m_JointArchetypes;
+        std::vector<DrivenArchetype> m_DrivenArchetypes;
+        std::vector<Entity> m_ComposeChain;      // ComposeWorld's, of the structural call that runs; capacity kept
         uint32_t m_SystemArchetypesSeen = 0;
         std::vector<Task> m_Tasks;
         std::vector<uint8_t> m_DeepMarks;        // per entity index, the rows of the last bucket visited and written
