@@ -38,7 +38,9 @@
 //                          non-increasing in distance) where the legacy order is defined (its comparator is no strict
 //                          weak ordering in a view with a skinned multi-geometry instance: such views are counted,
 //                          multisets only);
-//                        - every frame extracted again at 2 and 8 workers gives the same bytes; the per-frame hashes
+//                        - every frame extracted on the calling thread and again at 1, 2 and 8 workers, with the
+//                          ranges, the copy and sort, or both in parallel whatever the frame's size, gives the same
+//                          bytes (the calls into the job system tell that each combination ran); the per-frame hashes
 //                          match the golden file tests/src/render/golden/render_extract_packets.txt
 //                          (ECS_UPDATE_GOLDEN=1 rewrites it), which Release and Debug share
 //   combined_double_sided ExtractDesc::drawDoubleSidedMaterialsSeparately off: one None packet per double-sided
@@ -50,6 +52,8 @@
 //   review_cases         a leaf with dynamic bounds; meshes and materials shared with another graph; a domain edited
 //                        without InvalidateContent; a transparent instance with a large subtree; NaN boxes; the view
 //                        count changing between frames
+//   small_extraction     a scene below the limits of the serial extraction hands nothing to the job system (so no worker
+//                        wakes) and allocates nothing; the same frames in parallel give the same bytes
 //   parallel_sort_workers  a segment sorted in parallel inside the segments' parallel loop: equal at 1, 2, 8 workers
 //
 //     test_draw_packets [case]
@@ -66,8 +70,9 @@
 #include <donut/core/query_cast.h>
 #include <donut/tests/utils.h>
 
+#include "CountingJobSystem.h"
 #include "EcsWorldImpl.h"       // ecs::GetHeapAllocationCount
-#include "RenderVisibility.h"   // the radix sort's own cases
+#include "RenderVisibility.h"   // the radix sort's own cases, the limits of the serial extraction
 
 #include <algorithm>
 #include <atomic>
@@ -180,6 +185,8 @@ void operator delete[](void* memory, std::align_val_t, const std::nothrow_t&) no
 using namespace donut;
 using namespace donut::engine;
 using namespace donut::render;
+using donut::tests::CountingJobSystem;
+using donut::tests::ExtractionMode;
 
 namespace
 {
@@ -769,15 +776,25 @@ namespace
 
     void test_legacy_equivalence()
     {
-        nvrhi::AutoPtr<IJobSystem> jobs[3];
+        // Run 0 is serial, whatever the frame's size; the others combine the steps at 1, 2 and 8 workers.
+        constexpr uint32_t c_Runs = 6;
         const uint32_t workerCounts[3] = { 1, 2, 8 };
+        nvrhi::AutoPtr<CountingJobSystem> jobs[3];
         for (uint32_t k = 0; k < 3; ++k)
         {
             JobSystemDesc desc;
             desc.debugName = "test_draw_packets";
             desc.workerThreadCount = workerCounts[k];
-            CHECK(CreateJobSystem(desc, &jobs[k]) == nvrhi::FS_OK);
+            nvrhi::AutoPtr<IJobSystem> inner;
+            CHECK(CreateJobSystem(desc, &inner) == nvrhi::FS_OK);
+            jobs[k] = MAKE_RC_OBJ_PTR(CountingJobSystem, inner.Get());
         }
+        const struct
+        {
+            uint32_t jobs;
+            ExtractionMode mode;
+        } runs[c_Runs] = { { 0, { false, false } }, { 0, { true, true } }, { 1, { true, true } }, { 2, { true, true } },
+                           { 2, { false, true } }, { 2, { true, false } } };
 
         TestViews views;
         Tally tally;
@@ -794,11 +811,15 @@ namespace
                 scene.Edit(f);
                 scene.graph->Refresh(f);
                 const ExtractDesc desc = views.Desc(f);
-                uint64_t hashes[3] = {};
-                for (uint32_t k = 0; k < 3; ++k)
+                uint64_t hashes[c_Runs] = {};
+                for (uint32_t k = 0; k < c_Runs; ++k)
                 {
-                    scene.graph->SetJobSystem(jobs[k]);
+                    CountingJobSystem* runJobs = jobs[runs[k].jobs];
+                    scene.graph->SetJobSystem(runJobs);
+                    runs[k].mode.Set();
+                    const uint32_t calls = runJobs->calls.load();
                     const RenderSnapshot& snapshot = ExtractFrame(service, frame, desc);
+                    CHECK(runJobs->calls.load() - calls == runs[k].mode.Calls(snapshot.packets.count));
                     hashes[k] = HashPackets(snapshot);
                     if (k == 0)
                     {
@@ -815,8 +836,10 @@ namespace
                     }
                     service->EndFrame(true);
                 }
-                CHECK(hashes[0] == hashes[1] && hashes[1] == hashes[2]);
+                for (uint32_t k = 1; k < c_Runs; ++k)
+                    CHECK(hashes[k] == hashes[0]);
             }
+            ExtractionMode::Reset();
             scene.graph->SetJobSystem(nullptr);
         }
         std::printf("  %llu view-frames: %llu visible instances, %llu opaque and %llu transparent packets, %llu "
@@ -1264,6 +1287,67 @@ namespace
         }
     }
 
+    // A frame of a small scene hands nothing to the job system (E5.8: one sort of 352 packets per frame woke ten
+    // workers); in parallel the same frame does, and gives the same bytes.
+    void test_small_extraction()
+    {
+        JobSystemDesc jobDesc;
+        jobDesc.debugName = "test_draw_packets.small";
+        jobDesc.workerThreadCount = 4;
+        nvrhi::AutoPtr<IJobSystem> inner;
+        CHECK(CreateJobSystem(jobDesc, &inner) == nvrhi::FS_OK);
+        auto jobs = MAKE_RC_OBJ_PTR(CountingJobSystem, inner.Get());
+
+        TestViews views;
+        PacketScene scene(0x58);
+        scene.Build(25);
+        scene.graph->SetJobSystem(jobs);
+        RenderFrame frame;
+        auto service = MakeService(scene.graph);
+        uint32_t packets = 0, parallelCalls = 0;
+        for (uint32_t f = 1; f <= 10; ++f)
+        {
+            scene.Edit(f);
+            scene.graph->Refresh(f);
+            uint32_t calls = jobs->calls.load();
+            const RenderSnapshot& serial = ExtractFrame(service, frame, views.Desc(f));
+            CHECK(jobs->calls.load() == calls);
+            CHECK(serial.packets.count > 100);
+            packets = std::max(packets, serial.packets.count);
+            const uint64_t hash = HashPackets(serial);
+            service->EndFrame(false);
+
+            const ExtractionMode mode{ true, true };
+            mode.Set();
+            calls = jobs->calls.load();
+            const RenderSnapshot& parallel = ExtractFrame(service, frame, views.Desc(f));
+            parallelCalls += jobs->calls.load() - calls;
+            CHECK(jobs->calls.load() - calls == mode.Calls(parallel.packets.count));
+            CHECK(HashPackets(parallel) == hash);
+            service->EndFrame(true);
+            ExtractionMode::Reset();
+        }
+        // the serial path allocates nothing in steady state either
+        uint32_t f = 11;
+        auto run = [&]()
+        {
+            scene.graph->Refresh(f);
+            (void)ExtractFrame(service, frame, views.Desc(f));
+            service->EndFrame(true);
+            ++f;
+        };
+        for (int i = 0; i < 6; ++i)
+            run();
+        const uint64_t newBefore = g_NewCount.load();
+        const uint64_t heapBefore = ecs::GetHeapAllocationCount();
+        for (int i = 0; i < 10; ++i)
+            run();
+        CHECK(g_NewCount.load() == newBefore && ecs::GetHeapAllocationCount() == heapBefore);
+        scene.graph->SetJobSystem(nullptr);
+        std::printf("  up to %u packets in 5 views: no job, no allocation; in parallel %u jobs in 10 frames\n", packets,
+                    parallelCalls);
+    }
+
     // A segment large enough for the parallel sort inside it (from 16,384 packets, nested in the segments' own parallel
     // loop), and the visibility ranges at 1, 2 and 8 workers: equal bytes.
     void test_parallel_sort_workers()
@@ -1348,6 +1432,7 @@ int main(int argc, char** argv)
         { "steady_state", test_steady_state },
         { "stale_leaves", test_stale_leaves },
         { "review_cases", test_review_cases },
+        { "small_extraction", test_small_extraction },
         { "parallel_sort_workers", test_parallel_sort_workers },
     };
     try

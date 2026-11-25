@@ -34,9 +34,13 @@
 //   free stack. A handle carries the slot's generation, so it stays complete when the slot is used again.
 // - A waiting thread runs tickets, of its job or others, until its job has finished. A Wait for a job with a range
 //   running lower on the same thread's stack returns at once (it could never finish), and a Wait blocked on a free
-//   external slot ends when its job finishes. An idle thread spins (pause, then yield) for spinCount rounds of looking
-//   for work, then sleeps on an event count that every new ticket, and every completion of a job that a sleeping
-//   thread waits for, signals.
+//   external slot ends when its job finishes. An idle worker looks for work (pause, then yield between the looks) for
+//   idleSpinMicroseconds, a waiting thread for spinCount rounds. Then it sleeps on an event count that every new ticket,
+//   and every completion of a job that a sleeping thread waits for, signals.
+// - An idle worker's spin is a time because rounds do not bound it: a round visits every slot's deque, and 4,096 rounds
+//   took 1.5 ms with the shared system's 79 slots, so that a process that ran one small job per 2 ms frame kept 6 cores
+//   busy (aggregate plan, "E5.8 fix", with the sweep behind the default of 30 us). A waiting thread keeps the rounds: it
+//   has nothing else to do, and its wake-up wakes every sleeping worker (Complete).
 
 #include <donut/engine/JobSystem.h>
 #include "SharedJobSystem.h"
@@ -595,7 +599,8 @@ namespace donut::engine::jobs
         uint32_t m_ExternalCount = 0;
         uint32_t m_WorkerCount = 0;
         uint32_t m_ThreadCount = 0;
-        uint32_t m_SpinCount = 0;
+        uint32_t m_SpinCount = 0;                    // a waiting thread's rounds
+        std::chrono::microseconds m_IdleSpin{ 0 };   // an idle worker's time
         char m_Name[64] = {};
         Shared* m_Shared = nullptr;
         JobSlot* m_Jobs = nullptr;
@@ -618,6 +623,7 @@ namespace donut::engine::jobs
         m_ExternalCount = desc.maxExternalThreads;
         m_ThreadCount = m_ExternalCount + m_WorkerCount;
         m_SpinCount = desc.spinCount;
+        m_IdleSpin = std::chrono::microseconds(desc.idleSpinMicroseconds);
         std::snprintf(m_Name, sizeof(m_Name), "%s", desc.debugName ? desc.debugName : "JobSystem");
 
         m_Shared = new (std::nothrow) Shared;
@@ -1169,6 +1175,7 @@ namespace donut::engine::jobs
     {
         EventCount& events = m_Shared->events;
         uint32_t idle = 0;
+        uint32_t retries = 0;
         while (!IsFinished(index, generation))
         {
             uint32_t ticket;
@@ -1177,6 +1184,7 @@ namespace donut::engine::jobs
             {
                 RunTicket(ticket, self, fromShared);
                 idle = 0;
+                retries = 0;
                 continue;
             }
             if (idle < m_SpinCount)
@@ -1187,13 +1195,20 @@ namespace donut::engine::jobs
             // A slot that has moved on to another job only gets a spurious notification.
             m_Jobs[index].hasWaiters.store(1, std::memory_order_relaxed);
             const uint32_t key = events.PrepareWait();
-            if (IsFinished(index, generation) || MayHaveWork())
+            if (IsFinished(index, generation))
             {
                 events.CancelWait();
+                return;
+            }
+            if (MayHaveWork())
+            {
+                events.CancelWait();
+                Relax(retries++);   // as in WorkerMain
                 continue;
             }
             events.Wait(key);
             idle = 0;
+            retries = 0;
         }
     }
 
@@ -1296,7 +1311,9 @@ namespace donut::engine::jobs
         t_ThreadFrames = &frame;
         Shared& shared = *m_Shared;
         shared.runningWorkers.fetch_add(1, std::memory_order_release);
-        uint32_t idle = 0;
+        uint32_t idle = 0;                                 // the spin's rounds since the last work or sleep,
+        std::chrono::steady_clock::time_point spinEnd{};   // when their time is up (set by the first of them),
+        uint32_t retries = 0;                              // and the rounds after it that did not sleep either
         for (;;)
         {
             uint32_t ticket;
@@ -1305,6 +1322,7 @@ namespace donut::engine::jobs
             {
                 RunTicket(ticket, self, fromShared);
                 idle = 0;
+                retries = 0;
                 continue;
             }
             const uint32_t stop = shared.stop.load(std::memory_order_acquire);
@@ -1317,19 +1335,34 @@ namespace donut::engine::jobs
                     break;
                 Park();   // StopWorkers parked this worker, or parks them all
             }
-            if (idle < m_SpinCount)
+            if (m_IdleSpin.count() != 0)
             {
-                Relax(idle++);
-                continue;
+                // Reading the clock touches no C runtime state of the thread (Initialize).
+                const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+                if (idle == 0)
+                    spinEnd = now + m_IdleSpin;
+                if (now < spinEnd)
+                {
+                    Relax(idle++);
+                    continue;
+                }
             }
             const uint32_t key = shared.events.PrepareWait();
             if (MayHaveWork() || shared.stop.load(std::memory_order_relaxed) != c_StopNone)
             {
+                // A ticket came after FindWork's look; the next look usually takes it, or finds it taken. But a thread
+                // preempted between claiming a cell of the shared queue and publishing its ticket there leaves a queue
+                // that looks full and yields nothing, and a loop without a pause could hold the core it needs. The
+                // pause delays that next look as any look of the spin is delayed: 8 pause instructions in the first 64
+                // such rounds, then a yield, which gives way only to a thread that is ready to run; a sleeping worker's
+                // wake-up costs far more.
                 shared.events.CancelWait();
+                Relax(retries++);
                 continue;
             }
             shared.events.Wait(key);
             idle = 0;
+            retries = 0;
         }
         t_ThreadFrames = frame.previous;
     }

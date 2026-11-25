@@ -60,8 +60,8 @@ namespace donut::engine
         const char* debugName = nullptr;
         uint32_t workerThreadCount = 0;    // 0: hardware threads minus one
         uint32_t maxExternalThreads = 2;   // threads that are not workers and drive the system at the same time
-        uint32_t spinCount = 4096;         // spins before a worker sleeps
-        uint32_t reserved = 0;
+        uint32_t spinCount = 4096;         // a waiting thread's looks for work before it sleeps; 0: it sleeps at once
+        uint32_t idleSpinMicroseconds = 30;   // how long an idle worker looks for work before it sleeps; 0: at once
     };
     static_assert(sizeof(void*) != 8 || sizeof(JobSystemDesc) == 24, "JobSystemDesc layout");
 
@@ -95,6 +95,9 @@ namespace donut::engine
         // elsewhere can deadlock. A Wait for a job with a range running lower on the calling thread's stack, which
         // could never finish, returns at once without waiting (Debug builds log a warning).
         virtual void Wait(JobHandle job) noexcept = 0;
+        // Whether the job is marked finished, which happens after its dependents were released: a dependent may run, and
+        // even finish, while IsComplete of its dependency is still false. Wait for every job you ask about, not only for
+        // the last one of a chain.
         virtual bool IsComplete(JobHandle job) noexcept = 0;
 
         // Schedule and Wait in one call, without a handle: the calling thread works too.

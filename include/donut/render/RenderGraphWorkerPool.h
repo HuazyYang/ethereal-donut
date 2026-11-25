@@ -23,9 +23,12 @@
 // A host task scheduler for ExecuteDesc::parallelFor (design 10.1), for applications without a task system of their
 // own: the samples, the render graph's tests and rdg_bench. It owns a job system (donut/engine/JobSystem.h; aggregate
 // docs/ecs-design.md, D10) with `threads` workers and runs the graph's tasks on it through JobSystemParallelFor; the
-// calling thread works too. A call allocates nothing. Workers spin briefly before they sleep, so that a frame's
-// recording does not wait for a thread to wake. An application that has an IJobSystem already sets
-// ExecuteDesc::parallelFor = &donut::engine::JobSystemParallelFor and schedulerContext to it instead.
+// calling thread works too. A call allocates nothing. An idle worker looks for work for idleSpinMicroseconds before it
+// sleeps (JobSystemDesc): with the default of 30 us the workers sleep between the frames of an application, which costs
+// its recording a wake-up (async_compute_rdg, 4 threads: 10 and 12 us against a spin of 480 us, aggregate plan, "E5.8
+// fix") and takes 28 to 35 % less CPU time, with a higher GPU clock and a frame 1 to 2 % shorter. An application that
+// has an IJobSystem already sets ExecuteDesc::parallelFor = &donut::engine::JobSystemParallelFor and schedulerContext to
+// it instead.
 //
 //     RenderGraphWorkerPool pool(3);                      // three workers and the caller
 //     execute.parallelFor = &RenderGraphWorkerPool::ParallelFor;
@@ -45,13 +48,15 @@ namespace donut::render
     {
     public:
         // `threads` workers besides the caller. With none, or if the job system cannot start, the caller records alone.
-        explicit RenderGraphWorkerPool(uint32_t threads)
+        explicit RenderGraphWorkerPool(uint32_t threads, uint32_t idleSpinMicroseconds =
+                                                             donut::engine::JobSystemDesc{}.idleSpinMicroseconds)
         {
             if (threads == 0)
                 return;
             donut::engine::JobSystemDesc desc;
             desc.debugName = "RenderGraphWorkerPool";
             desc.workerThreadCount = threads;
+            desc.idleSpinMicroseconds = idleSpinMicroseconds;
             if (donut::engine::CreateJobSystem(desc, &m_JobSystem) == nvrhi::FS_OK)
                 m_Workers = threads;
         }

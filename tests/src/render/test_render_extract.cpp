@@ -47,7 +47,9 @@
 #include <donut/core/query_cast.h>
 #include <donut/tests/utils.h>
 
-#include "EcsWorldImpl.h"   // ecs::GetHeapAllocationCount
+#include "CountingJobSystem.h"
+#include "EcsWorldImpl.h"       // ecs::GetHeapAllocationCount
+#include "RenderVisibility.h"   // the limits of the serial extraction
 
 using namespace donut::math;
 #include <donut/shaders/light_cb.h>
@@ -154,6 +156,8 @@ void operator delete[](void* memory, std::align_val_t, const std::nothrow_t&) no
 using namespace donut;
 using namespace donut::engine;
 using namespace donut::render;
+using donut::tests::CountingJobSystem;
+using donut::tests::ExtractionMode;
 
 namespace
 {
@@ -1426,19 +1430,29 @@ namespace
         g_Warnings.store(warningsBefore);
     }
 
-    // The same frames at 1, 2 and 8 workers give the same snapshot bytes; the graph scheduler has no ambiguity with
-    // the service's systems in it.
+    // The same frames extracted on the calling thread and at 1, 2 and 8 workers, with the ranges, the copy and sort, or
+    // both in parallel whatever their size, give the same snapshot bytes (the calls into the job system tell that each
+    // combination ran); the graph scheduler has no ambiguity with the service's systems in it.
     void test_workers()
     {
-        nvrhi::AutoPtr<IJobSystem> jobs[3];
+        constexpr uint32_t c_Runs = 6;
         const uint32_t workerCounts[3] = { 1, 2, 8 };
+        nvrhi::AutoPtr<CountingJobSystem> jobs[3];
         for (uint32_t k = 0; k < 3; ++k)
         {
             JobSystemDesc desc;
             desc.debugName = "test_render_extract";
             desc.workerThreadCount = workerCounts[k];
-            CHECK(CreateJobSystem(desc, &jobs[k]) == nvrhi::FS_OK);
+            nvrhi::AutoPtr<IJobSystem> inner;
+            CHECK(CreateJobSystem(desc, &inner) == nvrhi::FS_OK);
+            jobs[k] = MAKE_RC_OBJ_PTR(CountingJobSystem, inner.Get());
         }
+        const struct
+        {
+            uint32_t jobs;
+            ExtractionMode mode;
+        } runs[c_Runs] = { { 0, { false, false } }, { 0, { true, true } }, { 1, { true, true } }, { 2, { true, true } },
+                           { 2, { false, true } }, { 2, { true, false } } };
 
         TestViews views;
         TraceScene s(0x2005, c_LargeProfile);
@@ -1451,22 +1465,28 @@ namespace
             if (f > 0)
                 Step(s, f);
             s.graph->Refresh(f);
-            uint64_t hashes[3] = {};
-            for (uint32_t k = 0; k < 3; ++k)
+            uint64_t hashes[c_Runs] = {};
+            for (uint32_t k = 0; k < c_Runs; ++k)
             {
-                s.graph->SetJobSystem(jobs[k]);
+                CountingJobSystem* runJobs = jobs[runs[k].jobs];
+                s.graph->SetJobSystem(runJobs);
+                runs[k].mode.Set();
                 const ExtractDesc desc = views.Desc(f);
+                const uint32_t calls = runJobs->calls.load();
                 const RenderSnapshot& snapshot = ExtractFrame(service, frame, desc);
+                CHECK(runJobs->calls.load() - calls == runs[k].mode.Calls(snapshot.packets.count));
                 hashes[k] = HashSnapshot(snapshot, false);
                 if (k == 0)
                     CheckSnapshot(s.graph, snapshot, desc);
                 IScheduler* scheduler = s.graph->GetScheduler();
                 CHECK(scheduler->Build() == nvrhi::FS_OK);
                 CHECK(scheduler->GetAmbiguityCount() == 0);
-                service->EndFrame(k == 2);   // the first-frame flags are set once, after the last extraction
+                service->EndFrame(k == c_Runs - 1);   // the first-frame flags are set once, after the last extraction
             }
-            CHECK(hashes[0] == hashes[1] && hashes[1] == hashes[2]);
+            for (uint32_t k = 1; k < c_Runs; ++k)
+                CHECK(hashes[k] == hashes[0]);
         }
+        ExtractionMode::Reset();
         s.graph->SetJobSystem(nullptr);
         service = nullptr;
         CHECK(g_Warnings.load() == 0);

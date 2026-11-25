@@ -23,7 +23,7 @@
 // The render-graph path of the GPU scene on a device (aggregate docs/plans/2026-11-21-donut-ecs-e5.md, item E5.4),
 // under the debug runtime and the nvrhi validation layer:
 //
-//     test_render_extract_gpu d3d11 | d3d12 | vulkan
+//     test_render_extract_gpu d3d11 | d3d12 | vulkan [steady]      steady: the allocation counts alone
 //
 // A Scene on the graph path (SetGpuSceneUploadMode(Scatter) before anything is made) is driven as the render service
 // drives it at extraction (CreateMeshBufferObjects, GpuScene::Update, CreateBuffers, BindMeshInstanceBuffers), its
@@ -42,7 +42,9 @@
 // (its load-time upload: the first frame is no resend), with item E5.1's device-only checks. Then the skinning pass of
 // item E5.5 against Scene::UpdateSkinnedMeshes (RunSkinning): skinned vertex buffers and joint buffers byte-identical
 // to the CPU path's after every executed frame, the first frame, a skinned instance attached at runtime, a detach and
-// re-attach, and a dropped frame that keeps a first frame for the next one. A GPU program: one at a time.
+// re-attach, and a dropped frame that keeps a first frame for the next one. Then, on a second device without the nvrhi
+// validation layer, the steady-state heap allocations of extraction, upload, skinning and recording (RunSteadyState).
+// A GPU program: one at a time.
 
 #include <donut/app/ApplicationBase.h>
 #include <donut/app/DeviceManager.h>
@@ -64,24 +66,167 @@
 #include <donut/render/RenderExtract.h>
 #include <donut/render/RenderGraph.h>
 #include <donut/render/RenderGraphLambdaPass.h>
+#include <donut/render/RenderGraphWorkerPool.h>
+
+#include "../../../src/engine/EcsWorldImpl.h"   // ecs::GetHeapAllocationCount
 
 using namespace donut::math;
 #include <donut/shaders/bindless.h>
+#include <donut/shaders/gbuffer_cb.h>
 #include <donut/shaders/gpu_scene_scatter_cb.h>
 #include <donut/shaders/material_cb.h>
+#include <donut/shaders/skinning_cb.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <iterator>
+#include <map>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dbghelp.h>
+#include <malloc.h>
+#endif
+
 using namespace donut;
 using namespace donut::engine;
 using namespace donut::render;
+
+// ------------------------------------------------------------------------------- allocation counter (RunSteadyState)
+
+namespace allocation_counter
+{
+    enum Kind : uint32_t { OperatorNew, NvrhiAllocator, KindCount };
+    const char* const c_KindNames[KindCount] = { "operator new", "nvrhi allocator" };
+
+    std::atomic<bool> g_Counting{ false };
+    std::atomic<uint32_t> g_Counts[KindCount];
+    struct Record
+    {
+        Kind kind;
+        uint32_t depth;
+        void* stack[60];
+    };
+    std::atomic<uint32_t> g_RecordCount{ 0 };
+    Record g_Records[2048];   // of one scope
+
+    void Count(Kind kind) noexcept
+    {
+        if (!g_Counting.load(std::memory_order_relaxed))
+            return;
+        g_Counts[kind].fetch_add(1, std::memory_order_relaxed);
+        const uint32_t index = g_RecordCount.fetch_add(1, std::memory_order_relaxed);
+        if (index >= std::size(g_Records))
+            return;
+        Record& record = g_Records[index];
+        record.kind = kind;
+#ifdef _WIN32
+        record.depth = CaptureStackBackTrace(0, DWORD(std::size(record.stack)), record.stack, nullptr);
+#endif
+    }
+
+    // Counts every thread's allocations while it lives.
+    struct Scope
+    {
+        Scope()
+        {
+            for (std::atomic<uint32_t>& count : g_Counts)
+                count = 0;
+            g_RecordCount = 0;
+            g_Counting = true;
+        }
+        ~Scope() { g_Counting = false; }
+    };
+
+    // Counts nvrhi's default allocator while it lives: RC objects (MAKE_RC_OBJ), nvrhi's containers and the ECS storage
+    // allocate through it, in nvrhi_core.dll, which the operator new below does not reach. The allocator is one
+    // stateless object per process, called through its virtual functions: its vtable pointer is exchanged for that of a
+    // forwarding class.
+    class AllocatorHook
+    {
+        static inline std::atomic<void*> s_Original{ nullptr };   // an object with the original's vtable pointer alone
+
+        struct Forwarding final : nvrhi::IMemoryAllocator   // its `this` is nvrhi's object: no members
+        {
+            static nvrhi::IMemoryAllocator* Original() noexcept
+            {
+                return reinterpret_cast<nvrhi::IMemoryAllocator*>(&s_Original);
+            }
+            void* Allocate(size_t size) noexcept override
+            {
+                Count(NvrhiAllocator);
+                return Original()->Allocate(size);
+            }
+            void Free(void* memory) noexcept override { Original()->Free(memory); }
+            void* AllocateAligned(size_t size, size_t alignment) noexcept override
+            {
+                Count(NvrhiAllocator);
+                return Original()->AllocateAligned(size, alignment);
+            }
+            void FreeAligned(void* memory) noexcept override { Original()->FreeAligned(memory); }
+        };
+        Forwarding m_Forwarding;
+
+        static std::atomic<void*>& VtableOf(nvrhi::IMemoryAllocator* allocator) noexcept
+        {
+            static_assert(sizeof(std::atomic<void*>) == sizeof(void*) && sizeof(Forwarding) == sizeof(void*));
+            return *reinterpret_cast<std::atomic<void*>*>(allocator);
+        }
+
+    public:
+        AllocatorHook()
+        {
+            s_Original = VtableOf(nvrhi::GetDefaultMemAllocator()).load();
+            VtableOf(nvrhi::GetDefaultMemAllocator()) = VtableOf(&m_Forwarding).load();
+        }
+        ~AllocatorHook() { VtableOf(nvrhi::GetDefaultMemAllocator()) = s_Original.load(); }
+        AllocatorHook(const AllocatorHook&) = delete;
+        AllocatorHook& operator=(const AllocatorHook&) = delete;
+    };
+}
+
+// This module: donut, the render graph, nvrhi and its backends, which are static libraries. The native runtimes and
+// their debug layers allocate in their own modules and are not counted. The library's other forms (array, nothrow,
+// sized) call these four.
+void* operator new(size_t size)
+{
+    allocation_counter::Count(allocation_counter::OperatorNew);
+    if (void* memory = std::malloc(size ? size : 1))
+        return memory;
+    throw std::bad_alloc();
+}
+void* operator new(size_t size, std::align_val_t alignment)
+{
+    allocation_counter::Count(allocation_counter::OperatorNew);
+#ifdef _WIN32
+    if (void* memory = _aligned_malloc(size ? size : 1, size_t(alignment)))
+        return memory;
+#else
+    if (void* memory = std::aligned_alloc(size_t(alignment), (size + size_t(alignment) - 1) & ~(size_t(alignment) - 1)))
+        return memory;
+#endif
+    throw std::bad_alloc();
+}
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::align_val_t) noexcept
+{
+#ifdef _WIN32
+    _aligned_free(memory);
+#else
+    std::free(memory);
+#endif
+}
 
 namespace
 {
@@ -1802,6 +1947,770 @@ namespace
         device->runGarbageCollection();
     }
 
+    // ---------------------------------------------------------------------- steady-state allocations (E5's target)
+
+#ifdef _WIN32
+    // The functions of this executable by address, from the linker's map beside it (the target links with /MAP): the
+    // functions of the static libraries and the internal ones too, with or without debug information. Nothing is asked of
+    // a symbol path or server. /OPT:NOICF: no function has the name of another one it was folded with.
+    class FunctionMap
+    {
+        struct Function
+        {
+            std::string decorated;
+            std::string object;
+        };
+        std::map<uint64_t, Function> m_Functions;   // by relative address
+        std::map<void*, std::string> m_Names;
+        uint64_t m_Base = 0;
+        uint64_t m_Size = 0;
+
+    public:
+        FunctionMap()
+        {
+            char path[MAX_PATH] = {};
+            GetModuleFileNameA(nullptr, path, MAX_PATH);
+            m_Base = uint64_t(GetModuleHandleA(nullptr));
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m_Base);
+            const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS*>(m_Base + dos->e_lfanew);
+            m_Size = headers->OptionalHeader.SizeOfImage;
+            const std::string mapPath = std::string(path, std::strrchr(path, '.')) + ".map";
+            std::FILE* file = std::fopen(mapPath.c_str(), "r");
+            check(file != nullptr, "the linker's map of this executable: " + mapPath);
+            std::vector<char> line(64 * 1024), name(line.size()), object(line.size());
+            unsigned timestamp = 0, section = 0, offset = 0;
+            unsigned long long base = 0, address = 0;
+            while (std::fgets(line.data(), int(line.size()), file))
+            {
+                std::sscanf(line.data(), " Timestamp is %x", &timestamp);
+                std::sscanf(line.data(), " Preferred load address is %llx", &base);
+                // section:offset, name, address, f (a function), i (an inline one), library:object
+                if (std::sscanf(line.data(), " %x:%x %s %llx f i %s", &section, &offset, name.data(), &address,
+                                object.data()) == 5 ||
+                    std::sscanf(line.data(), " %x:%x %s %llx f %s", &section, &offset, name.data(), &address,
+                                object.data()) == 5)
+                    m_Functions.emplace(address - base, Function{ name.data(), object.data() });
+            }
+            std::fclose(file);
+            check(timestamp == headers->FileHeader.TimeDateStamp && m_Functions.size() > 1000,
+                  mapPath + " is the map of this executable");
+        }
+
+        // The qualified name of the function at a return address and, in brackets, its object file. Empty outside this
+        // executable (the system's modules, nvrhi_core.dll).
+        const std::string& NameOf(void* returnAddress)
+        {
+            auto [it, inserted] = m_Names.try_emplace(returnAddress);
+            const uint64_t relative = uint64_t(returnAddress) - m_Base - 1;   // in the call
+            auto function = m_Functions.upper_bound(relative);
+            if (!inserted || relative >= m_Size || function == m_Functions.begin())
+                return it->second;
+            --function;
+            char name[4096] = {};
+            if (!UnDecorateSymbolName(function->second.decorated.c_str(), name, sizeof(name), UNDNAME_NAME_ONLY))
+                std::snprintf(name, sizeof(name), "%s", function->second.decorated.c_str());
+            return it->second = std::string(name) + " [" + function->second.object + "]";
+        }
+    };
+#endif
+
+    bool StartsWith(const std::string& text, const char* prefix) { return text.rfind(prefix, 0) == 0; }
+
+    // nvrhi's own code: its backends, and the state tracker in their command lists.
+    bool IsNvrhi(const std::string& name)
+    {
+        return StartsWith(name, "nvrhi::d3d11::") || StartsWith(name, "nvrhi::d3d12::") ||
+               StartsWith(name, "nvrhi::vulkan::") || StartsWith(name, "nvrhi::CommandListResourceStateTracker::");
+    }
+
+    // Functions that allocate for their callers: the rest of nvrhi (containers, descriptors, RC objects), the standard
+    // library, lambdas (their names have no scope), and the counter.
+    bool IsTransparent(const std::string& name)
+    {
+        return name.empty() || (StartsWith(name, "nvrhi::") && !IsNvrhi(name)) || StartsWith(name, "std::") ||
+               StartsWith(name, "operator ") || StartsWith(name, "<lambda_") || StartsWith(name, "allocation_counter::");
+    }
+
+    // One scope's allocations: how many of each kind, and how many of each site. A site is the innermost function that
+    // is not transparent, and its innermost caller outside nvrhi.
+    struct Allocations
+    {
+        uint32_t counts[allocation_counter::KindCount] = {};
+        std::map<std::string, uint32_t> sites;
+        std::string first;       // the first one's site and stack
+        std::string foreign;     // those of the first one not made by nvrhi, or made to create an object
+        uint32_t growths = 0;    // of vulkan's TrackedCommandBuffer::referencedResources, not among the sites
+
+        uint32_t Total() const { return counts[0] + counts[1]; }
+    };
+
+    // The allocations of the scope that closed last.
+    Allocations TakeAllocations()
+    {
+        using namespace allocation_counter;
+        Allocations result;
+        for (uint32_t k = 0; k < KindCount; ++k)
+            result.counts[k] = g_Counts[k];
+        check(g_RecordCount <= std::size(g_Records), "room for every allocation's stack");
+#ifdef _WIN32
+        static FunctionMap functions;
+        for (uint32_t r = 0; r < g_RecordCount; ++r)
+        {
+            const Record& record = g_Records[r];
+            std::string owner, caller, stack;
+            bool creation = false, growth = false;
+            for (uint32_t i = 0; i < record.depth; ++i)
+            {
+                const std::string& name = functions.NameOf(record.stack[i]);
+                stack += name.empty() ? "" : "\n        " + name;
+                // Device::create* ends in a tail call of utils::ReturnObject
+                creation = creation || StartsWith(name, "nvrhi::utils::ReturnObject") ||
+                           (IsNvrhi(name) && name.find("::Device::create") != std::string::npos);
+                growth = growth || (owner.empty() && StartsWith(name, "std::vector<nvrhi::AutoPtr<nvrhi::IRHIObject>"));
+                if (owner.empty() && !IsTransparent(name))
+                    owner = name;
+                if (caller.empty() && !IsTransparent(name) && !IsNvrhi(name))
+                    caller = name;
+            }
+            const std::string site = std::string(c_KindNames[record.kind]) + ": " + owner + " from " + caller;
+            if (r == 0)
+                result.first = site + stack;
+            if (result.foreign.empty() && (creation || !IsNvrhi(owner)))
+                result.foreign = site + stack;
+            if (growth && StartsWith(owner, "nvrhi::vulkan::CommandList::"))
+                ++result.growths;
+            else
+                ++result.sites[site];
+        }
+#endif
+        return result;
+    }
+
+    // Runs `body` counted.
+    template <typename F>
+    Allocations CountAllocations(F&& body)
+    {
+        {
+            allocation_counter::Scope scope;
+            body();
+        }
+        return TakeAllocations();
+    }
+
+    // The counters see each form of both allocators, exactly once: without them every count would be 0.
+    void CheckCounters(const std::string& tag)
+    {
+        void* volatile memory = nullptr;
+        nvrhi::IMemoryAllocator* allocator = nvrhi::GetDefaultMemAllocator();
+        auto counted = [&tag](const char* what, uint32_t news, uint32_t allocations, auto&& body)
+        {
+            {
+                allocation_counter::Scope scope;
+                body();
+            }
+            check(allocation_counter::g_Counts[allocation_counter::OperatorNew] == news &&
+                  allocation_counter::g_Counts[allocation_counter::NvrhiAllocator] == allocations,
+                  tag + ": positive control, " + what);
+        };
+        counted("operator new", 1, 0, [&] { memory = ::operator new(16); });
+        ::operator delete(memory);
+        counted("nothrow array new", 1, 0, [&] { memory = ::operator new[](16, std::nothrow); });
+        ::operator delete[](memory);
+        counted("aligned new", 1, 0, [&] { memory = ::operator new(16, std::align_val_t(64)); });
+        ::operator delete(memory, std::align_val_t(64));
+        counted("nvrhi's default allocator", 0, 1, [&] { memory = allocator->Allocate(16); });
+        allocator->Free(memory);
+        counted("nvrhi's default allocator, aligned", 0, 1, [&] { memory = allocator->AllocateAligned(16, 64); });
+        allocator->FreeAligned(memory);
+    }
+
+    // GBufferFillPass, counting its draws and, while `capture` is set, keeping them by use (the pass holds the pipelines
+    // and binding sets their states name).
+    class CapturingGBufferPass : public GBufferFillPass
+    {
+        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        using GBufferFillPass::GBufferFillPass;
+        using Draws = std::vector<std::pair<nvrhi::GraphicsState, nvrhi::DrawArguments>>;
+        std::vector<Draws>* capture = nullptr;
+        uint32_t draws = 0;
+
+        nvrhi::IBuffer* GetConstantBuffer() const noexcept { return m_GBufferCB; }
+
+        void SetupView(GeometryPassContext& context, nvrhi::ICommandList* commandList, const IView* view,
+                       const IView* viewPrev) override
+        {
+            GBufferFillPass::SetupView(context, commandList, view, viewPrev);
+            if (capture)
+                capture->emplace_back();
+        }
+
+        void SetPushConstants(GeometryPassContext& context, nvrhi::ICommandList* commandList, nvrhi::GraphicsState& state,
+                              nvrhi::DrawArguments& args) override
+        {
+            GBufferFillPass::SetPushConstants(context, commandList, state, args);
+            ++draws;
+            if (capture)
+                capture->back().emplace_back(state, args);
+        }
+    };
+
+    // The steady-state allocations of step E5's device part (the sub-plan's target: 0 per frame in extraction, upload,
+    // skinning and recording; device-free: test_render_extract, test_gpu_scene). The scene: 180 quad instances of which
+    // a fifth moves every frame (36 transform records, 36 settle slots), and two skinned characters posed in every
+    // frame (the scripts' period is 10 frames); two views, each drawn by a GBufferFillPass of its own through
+    // strategies bound to the packets, opaque then transparent. 32 frames to warm up, then 32 counted: operator new of
+    // this module (donut, the render graph, nvrhi and its backends) and nvrhi's default allocator (RC objects, nvrhi
+    // containers, the ECS storage). The device has the debug runtime but not the nvrhi validation layer, which allocates.
+    // Serial recording, and (D3D12, Vulkan) parallel recording, one segment per pass on 4 threads. Every counted frame
+    // has the same records, skinned instances, draws, segments and passes, and a cached plan.
+    //
+    // - The scene's refresh, Extract, AddUploadPasses, AddSkinningPasses, the geometry passes' AddToGraph, Reset and
+    //   Compile, and EndFrame allocate nothing in any frame; no ECS storage block and no graph object is made.
+    // - Execute records through nvrhi, whose backends allocate (state-tracking nodes, upload and descriptor
+    //   bookkeeping, command-list instances, submissions). Windows: every allocation is attributed by its stack, and one
+    //   that nvrhi's backends did not make (a pass body, donut, the graph, also through nvrhi's inline helpers), or that
+    //   they made to create an object, fails the case. The linker's map must be there.
+    // - All platforms: it allocates exactly as much as the same nvrhi calls recorded by hand, without donut or the graph
+    //   (the plan's lists, markers, barriers, tracked states, clears, writes, dispatches and draws, the draws with the
+    //   graphics states the geometry passes set), in the median; each loop's frames all allocate the same at the same
+    //   sites. The exception is Vulkan with parallel recording: a queue's command buffers go first in, first out to the
+    //   lists in the order the threads open them, so that a buffer can meet a list with more pipelines, framebuffers and
+    //   binding sets than any it recorded before, and the growth of its vector of them (TrackedCommandBuffer::
+    //   referencedResources, pushed to at vulkan-graphics.cpp:554) falls into a counted frame: those growths only, in
+    //   fewer than half of the frames.
+    //
+    // Not covered: the shadow passes, lights, the Forward, Depth and Deferred passes, the input assembler, growth of the
+    // scene's buffers, dropped frames, parallel extraction (the scene is too small), and nvrhi's garbage collection,
+    // which runs every fourth frame outside the counted code. E5_ALLOC_TRACE=1 prints the sites of Execute.
+    void RunSteadyState(app::DeviceManager* deviceManager, nvrhi::GraphicsAPI api, bool parallel)
+    {
+        nvrhi::IDevice* device = deviceManager->GetDevice();
+        const bool bindless = api != nvrhi::GraphicsAPI::D3D11;
+        const std::string tag = std::string(app::GetShaderTypeName(api)) + ", steady state, " +
+                                (parallel ? "parallel" : "serial") + " recording";
+        const uint32_t warningsBefore = g_Warnings.load();
+        Fixture fixture(device, api, bindless);
+        nvrhi::AutoPtr<Scene> scene = fixture.MakeScene(true);
+        SceneGraph* graph = scene->GetSceneGraph();
+        SceneGraphNode* root = graph->GetRootNode();
+
+        auto material = [](const char* name, MaterialDomain domain, bool doubleSided)
+        {
+            auto m = MAKE_RC_OBJ_PTR(Material);
+            m->name = name;
+            m->domain = domain;
+            m->doubleSided = doubleSided;
+            return m;
+        };
+        nvrhi::AutoPtr<Material> red = material("red", MaterialDomain::Opaque, false);
+        nvrhi::AutoPtr<Material> green = material("green", MaterialDomain::AlphaTested, false);
+        nvrhi::AutoPtr<Material> cyan = material("cyan", MaterialDomain::AlphaBlended, true);
+        nvrhi::AutoPtr<MeshInfo> meshes[3] = {
+            MakeQuadMesh("quad", { red }, MAKE_RC_OBJ_PTR(BufferGroup)),
+            MakeQuadMesh("pair", { green, red }, MAKE_RC_OBJ_PTR(BufferGroup)),
+            MakeQuadMesh("glass", { cyan, green }, MAKE_RC_OBJ_PTR(BufferGroup)),
+        };
+        std::vector<SceneGraphNode*> nodes;
+        std::vector<double3> positions;
+        for (uint32_t i = 0; i < 180; ++i)
+        {
+            auto node = MAKE_RC_OBJ_PTR(SceneGraphNode);
+            positions.push_back(double3(-6.0 + 0.9 * double(i % 14), -3.8 + 0.85 * double((i / 14) % 9),
+                                        4.0 + 0.31 * double((i * 37) % 61)));
+            node->SetTranslation(positions.back());
+            node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, meshes[(i / 60) % 3].Get()));
+            nodes.push_back(graph->Attach(root, node));
+        }
+        nvrhi::AutoPtr<Material> skinMaterial = material("skin", MaterialDomain::Opaque, true);
+        nvrhi::AutoPtr<MeshInfo> prototype = MakeSkinPrototype("p0", 300, 4, true, false, skinMaterial);
+        auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+        Character characters[2] = { MakeCharacter(graph, factory, prototype, 4, "A", 0.0),
+                                    MakeCharacter(graph, factory, prototype, 4, "B", 0.0) };
+        for (uint32_t c = 0; c < 2; ++c)
+        {
+            characters[c].id = c;
+            characters[c].root->SetTranslation(double3(c ? 1.6 : -1.2, -1.5, 2.5));
+            graph->Attach(root, characters[c].root);
+        }
+
+        // two views side by side, each drawn by a pass object of its own (the unit of parallel recording), opaque and
+        // transparent packets
+        constexpr uint32_t viewCount = 2;
+        nvrhi::AutoPtr<PlanarView> viewObjects[viewCount];
+        const IView* views[viewCount];
+        auto commonPasses = MAKE_RC_OBJ_PTR(CommonRenderPasses, device, fixture.shaderFactory);
+        nvrhi::AutoPtr<CapturingGBufferPass> gbuffers[viewCount];
+        nvrhi::AutoPtr<InstancedOpaqueDrawStrategy> opaque[viewCount];
+        nvrhi::AutoPtr<TransparentDrawStrategy> transparent[viewCount];
+        const nvrhi::Format formats[5] = { nvrhi::Format::SRGBA8_UNORM, nvrhi::Format::SRGBA8_UNORM,
+                                           nvrhi::Format::RGBA16_SNORM, nvrhi::Format::RGBA16_FLOAT, nvrhi::Format::D32 };
+        nvrhi::TextureHandle targets[viewCount][5];
+        for (uint32_t v = 0; v < viewCount; ++v)
+        {
+            viewObjects[v] = MAKE_RC_OBJ_PTR(PlanarView);
+            viewObjects[v]->SetViewport(nvrhi::Viewport(192.f, 128.f));
+            viewObjects[v]->SetMatrices(inverse(translation(float3(v ? 0.15f : -0.15f, 0.f, 0.f))),
+                                        perspProjD3DStyleReverse(radians(70.f), 1.5f, 0.1f));
+            viewObjects[v]->UpdateCache();
+            views[v] = viewObjects[v];
+            gbuffers[v] = MAKE_RC_OBJ_PTR(CapturingGBufferPass, device, commonPasses);
+            GBufferFillPass::CreateParameters gbufferParams;
+            gbufferParams.numConstantBufferVersions = 64;
+            gbuffers[v]->Init(*fixture.shaderFactory, gbufferParams);
+            opaque[v] = MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy);
+            transparent[v] = MAKE_RC_OBJ_PTR(TransparentDrawStrategy);
+            for (uint32_t t = 0; t < 5; ++t)
+                targets[v][t] = MakeTarget(device, formats[t], "SteadyStateTarget");
+        }
+
+        nvrhi::AutoPtr<IResourceRegistry> registry;
+        nvrhi::AutoPtr<IRenderGraph> renderGraph;
+        check(CreateResourceRegistry(device, &registry) == nvrhi::FS_OK, "registry");
+        check(CreateRenderGraph(registry, &renderGraph) == nvrhi::FS_OK, "render graph");
+        BackendProfile profile;
+        check(ComputeBackendProfile(device, &profile) == nvrhi::FS_OK, "profile");
+        for (uint8_t& lanes : profile.queueLanes)
+            lanes = 1;
+        RenderServiceDesc serviceDesc;
+        serviceDesc.scene = scene;
+        serviceDesc.shaderFactory = fixture.shaderFactory;
+        auto service = MAKE_RC_OBJ_PTR(RenderService, device, serviceDesc);
+        scene->FinishedLoading(0);
+        device->waitForIdle();
+        RenderGraphWorkerPool pool(parallel ? 3 : 0);
+        CompileOptions options;
+        options.recordGranularity = parallel ? 1 : 0;
+        ExecuteDesc executeDesc;
+        if (parallel)
+        {
+            executeDesc.parallelFor = &RenderGraphWorkerPool::ParallelFor;
+            executeDesc.schedulerContext = &pool;
+            executeDesc.workerCount = pool.ThreadCount();
+        }
+
+        const uint32_t warmup = 32, measured = 32, passCount = 7;
+        const uint32_t segmentCount = parallel ? passCount : 1;
+        const bool planBarriers = profile.barrierModel != BarrierModel::Implicit;
+        const uint32_t trackedPerPass = 8 + (bindless ? 2 : 0);   // 5 targets, the instance and 2 skinned buffers
+        GBufferFillPass::Context contexts[viewCount][2];
+        std::vector<CapturingGBufferPass::Draws> captured[viewCount];
+        std::vector<Allocations> graphFrames, handFrames;
+        GpuSceneScatterRecords records;
+        RegistryStatistics registryBefore{}, registryAfter{};
+        uint64_t storageBlocks = 0;
+        uint32_t draws = 0;
+
+        allocation_counter::AllocatorHook hook;
+        CheckCounters(tag);
+        for (uint32_t i = 0; i < warmup + measured; ++i)
+        {
+            const uint32_t frame = i + 1;
+            const std::string where = tag + ", frame " + std::to_string(frame);
+            const bool counted = i >= warmup;
+            if (i == warmup)
+            {
+                registry->GetRegistryStatistics(registryBefore);
+                storageBlocks = ecs::GetHeapAllocationCount();
+            }
+            for (uint32_t v = 0; v < viewCount; ++v)
+            {
+                gbuffers[v]->capture = i + 1 == warmup ? &captured[v] : nullptr;
+                gbuffers[v]->draws = 0;
+            }
+            // a phase that allocates nothing in a counted frame
+            auto phase = [&](const char* name, auto&& body)
+            {
+                if (!counted)
+                    return body();
+                const Allocations allocations = CountAllocations(body);
+                check(allocations.Total() == 0, where + ": " + name + " makes " + std::to_string(allocations.Total()) +
+                                                    " allocations; " + allocations.first);
+            };
+            SceneFrame* sceneFrame = nullptr;
+            nvrhi::AutoPtr<ICompiledRenderGraph> plan;
+            nvrhi::FRESULT extracted = nvrhi::FE_GENERIC_ERROR, uploads = extracted, skinning = extracted;
+            nvrhi::FRESULT compiled = extracted, executed = extracted;
+            phase("refresh", [&]
+            {
+                for (size_t n = frame % 5; n < nodes.size(); n += 5)
+                    nodes[n]->SetTranslation(positions[n] + double3(0.0, 0.0, 0.05 * double((frame / 5) % 2)));
+                for (Character& character : characters)
+                    Pose(character, frame % 10);
+                scene->RefreshSceneGraph(frame);
+            });
+            ExtractDesc extractDesc;
+            extractDesc.views = views;
+            extractDesc.viewCount = viewCount;
+            extractDesc.frameIndex = frame;
+            phase("Reset", [&] { renderGraph->Reset(); });
+            phase("Extract", [&] { extracted = service->Extract(renderGraph, nullptr, extractDesc, &sceneFrame); });
+            check(extracted == nvrhi::FS_OK && sceneFrame, where + ": Extract");
+            phase("AddUploadPasses", [&] { uploads = service->AddUploadPasses(renderGraph, sceneFrame); });
+            phase("AddSkinningPasses", [&] { skinning = service->AddSkinningPasses(renderGraph, sceneFrame); });
+            check(uploads == nvrhi::FS_OK && skinning == nvrhi::FS_OK, where + ": AddUploadPasses, AddSkinningPasses");
+            phase("the geometry passes' AddToGraph", [&]
+            {
+                for (uint32_t v = 0; v < viewCount; ++v)
+                {
+                    opaque[v]->SetPackets(sceneFrame->snapshot);
+                    transparent[v]->SetPackets(sceneFrame->snapshot);
+                    GeometryGraphInputs inputs;
+                    inputs.name = "GBuffer";
+                    inputs.view = viewObjects[v];
+                    inputs.viewPrev = viewObjects[v];
+                    inputs.colorTargetCount = 4;
+                    for (uint32_t t = 0; t < 4; ++t)
+                        inputs.colorTargets[t] = renderGraph->ImportTexture(targets[v][t], TargetState(formats[t]),
+                                                                            TargetState(formats[t]));
+                    inputs.depth = renderGraph->ImportTexture(targets[v][4], TargetState(formats[4]),
+                                                              TargetState(formats[4]));
+                    inputs.clearTargets = true;
+                    inputs.bufferReads = sceneFrame->bufferReads;
+                    inputs.bufferReadCount = sceneFrame->bufferReadCount;
+                    inputs.drawStrategy = opaque[v];
+                    inputs.passContext = &contexts[v][0];
+                    const GeometryGraphOutputs outputs = gbuffers[v]->AddToGraph(renderGraph, inputs);
+                    for (uint32_t t = 0; t < 4; ++t)
+                        inputs.colorTargets[t] = outputs.colorTargets[t];
+                    inputs.depth = outputs.depth;
+                    inputs.clearTargets = false;
+                    inputs.drawStrategy = transparent[v];
+                    inputs.passContext = &contexts[v][1];
+                    gbuffers[v]->AddToGraph(renderGraph, inputs);
+                }
+            });
+            scene->GetGpuScene()->GetScatterRecords(records);
+            phase("Compile", [&] { compiled = renderGraph->Compile(profile, options, &plan); });
+            check(compiled == nvrhi::FS_OK, where + ": Compile");
+            auto execute = [&] { executed = renderGraph->Execute(plan, executeDesc); };
+            if (counted)
+                graphFrames.push_back(CountAllocations(execute));
+            else
+                execute();
+            check(executed == nvrhi::FS_OK, where + ": Execute");
+            phase("EndFrame", [&] { service->EndFrame(true); });
+
+            // the same work in every counted frame
+            RunStatistics run{};
+            registry->GetRunStatistics(run);
+            PlanStatistics statistics{};
+            plan->GetStatistics(statistics);
+            if (i + 1 == warmup)
+                draws = gbuffers[0]->draws;
+            if (counted)
+            {
+                check(records.rowCount == 0 && records.transformCount == 36 && records.settleCount == 36 &&
+                      sceneFrame->snapshot->skinnedInstanceCount == 2, where + ": the moved and posed instances");
+                check(draws != 0 && gbuffers[0]->draws == draws && gbuffers[1]->draws == draws, where + ": the draws");
+                check(statistics.cacheHit && !run.planSwitched && run.passes == passCount &&
+                      run.segments == segmentCount && run.recordTasks == (parallel ? 4u : 1u) && run.submissions == 1 &&
+                      run.stateCalls == (planBarriers ? 4 * 2 * trackedPerPass : 0),
+                      where + ": the plan and its recording");
+                check(graphFrames.back().foreign.empty(), where + ": Execute allocates outside nvrhi, or an object; " +
+                                                              graphFrames.back().foreign);
+            }
+            if (i % 4 == 3)
+            {
+                device->waitForIdle();
+                device->runGarbageCollection();
+            }
+        }
+        registry->GetRegistryStatistics(registryAfter);
+        check(registryAfter.objectsCreated == registryBefore.objectsCreated, tag + ": no graph object is made");
+        check(ecs::GetHeapAllocationCount() == storageBlocks, tag + ": no ECS storage block is made");
+        for (uint32_t v = 0; v < viewCount; ++v)
+            check(captured[v].size() == 2 && !captured[v][0].empty() && !captured[v][1].empty(),
+                  tag + ": captured draws");
+
+        // the baseline: the executor's lists (the upload list, then a list per segment) and their contents
+        const bool vulkan = api == nvrhi::GraphicsAPI::VULKAN;
+        std::vector<nvrhi::CommandListHandle> lists(1 + segmentCount);
+        std::vector<nvrhi::ICommandList*> segments;
+        for (nvrhi::CommandListHandle& list : lists)
+        {
+            device->createCommandList(nvrhi::CommandListParameters().setEnableImmediateExecution(!planBarriers), &list);
+            check(list != nullptr, tag + ": a command list");
+            if (&list != &lists[0])
+                segments.push_back(list);
+        }
+        nvrhi::FenceHandle fence;
+        const bool fences = device->createFence(nvrhi::FenceDesc(), &fence) == nvrhi::FS_OK;
+        uint64_t fenceValue = 0;
+        nvrhi::BufferDesc stagingDesc;
+        stagingDesc.byteSize = 64 * 1024;
+        stagingDesc.canHaveRawViews = true;
+        stagingDesc.debugName = "BaselineRecords";
+        nvrhi::BufferHandle staging;
+        device->createBuffer(stagingDesc, &staging);
+        GpuScene* gpuScene = scene->GetGpuScene();
+        nvrhi::IBuffer* instanceBuffer = gpuScene->GetInstanceBuffer();
+        nvrhi::IBuffer* skinnedBuffers[2];
+        SkinningConstants skinningConstants[2];
+        GpuSceneScatterConstants scatterConstants = {};   // no records: the dispatch writes nothing
+        scatterConstants.instanceRowStride = uint32_t(sizeof(InstanceData));
+        scatterConstants.groupsX = 1;
+        nvrhi::ShaderHandle shaders[2];
+        nvrhi::BindingLayoutHandle layouts[2];
+        nvrhi::ComputePipelineHandle pipelines[2];   // scatter, skinning
+        for (uint32_t k = 0; k < 2; ++k)
+        {
+            shaders[k] = fixture.shaderFactory->CreateShader(k ? "donut/skinning_cs" : "donut/gpu_scene_scatter_cs",
+                                                             "main", nullptr, nvrhi::ShaderType::Compute);
+            auto layoutDesc = nvrhi::BindingLayoutDesc().setVisibility(nvrhi::ShaderType::Compute)
+                .addItem(nvrhi::BindingLayoutItem::PushConstants(0, k ? sizeof(SkinningConstants)
+                                                                      : sizeof(GpuSceneScatterConstants)))
+                .addItem(nvrhi::BindingLayoutItem::RawBuffer_SRV(0)).addItem(nvrhi::BindingLayoutItem::RawBuffer_UAV(0));
+            if (k)
+                layoutDesc.addItem(nvrhi::BindingLayoutItem::RawBuffer_SRV(1));
+            device->createBindingLayout(layoutDesc, &layouts[k]);
+            nvrhi::ComputePipelineDesc pipelineDesc;
+            pipelineDesc.CS = shaders[k];
+            pipelineDesc.bindingLayouts = { layouts[k] };
+            device->createComputePipeline(pipelineDesc, &pipelines[k]);
+            check(pipelines[k] != nullptr, tag + ": the baseline's pipelines");
+        }
+        nvrhi::BindingSetHandle scatterSet, skinningSets[2];
+        device->createBindingSet(nvrhi::BindingSetDesc()
+            .addItem(nvrhi::BindingSetItem::PushConstants(0, sizeof(GpuSceneScatterConstants)))
+            .addItem(nvrhi::BindingSetItem::RawBuffer_SRV(0, staging))
+            .addItem(nvrhi::BindingSetItem::RawBuffer_UAV(0, instanceBuffer)), layouts[0], &scatterSet);
+        for (uint32_t k = 0; k < 2; ++k)
+        {
+            const SkinnedMeshInstance* leaf = characters[k].skinned;
+            skinnedBuffers[k] = leaf->GetMesh()->buffers->vertexBuffer;
+            device->createBindingSet(nvrhi::BindingSetDesc()
+                .addItem(nvrhi::BindingSetItem::PushConstants(0, sizeof(SkinningConstants)))
+                .addItem(nvrhi::BindingSetItem::RawBuffer_SRV(0, leaf->GetPrototypeMesh()->buffers->vertexBuffer))
+                .addItem(nvrhi::BindingSetItem::RawBuffer_SRV(1, leaf->jointBuffer))
+                .addItem(nvrhi::BindingSetItem::RawBuffer_UAV(0, skinnedBuffers[k])), layouts[1], &skinningSets[k]);
+            FillSkinningConstants(*leaf->GetPrototypeMesh(), *leaf->GetMesh(), false, skinningConstants[k]);
+        }
+        const std::vector<uint8_t> bytes(64 * 1024);
+        const GBufferFillConstants viewConstants = {};
+        const GBufferPushConstants drawConstants = {};
+
+        using nvrhi::ResourceStates;
+        using Barriers = std::vector<nvrhi::ResourceBarrier>;
+        auto to = [](nvrhi::IResource* resource, ResourceStates before, ResourceStates after)
+        {
+            return nvrhi::ResourceBarrier::Transition(resource, before, after);
+        };
+        const ResourceStates drawState = ResourceStates::VertexBuffer | ResourceStates::ShaderResource;
+        const ResourceStates uav = ResourceStates::UnorderedAccess, copyDest = ResourceStates::CopyDest;
+        const Barriers beforeRecords = { to(staging, ResourceStates::Unknown, copyDest) };
+        const Barriers beforeScatter = { to(staging, copyDest, ResourceStates::ShaderResource),
+                                         to(instanceBuffer, c_GpuSceneRestingState, uav) };
+        const Barriers beforeSkinning = { to(skinnedBuffers[0], c_SkinnedVertexBufferRestingState, uav),
+                                          to(skinnedBuffers[1], c_SkinnedVertexBufferRestingState, uav) };
+        const Barriers beforeGeometry = { to(instanceBuffer, uav, drawState), to(skinnedBuffers[0], uav, drawState),
+                                          to(skinnedBuffers[1], uav, drawState) };
+        const Barriers afterGeometry = { to(instanceBuffer, drawState, c_GpuSceneRestingState) };
+        Barriers toClear[viewCount], toDraw[viewCount], drawToDraw[viewCount];   // Vulkan
+        for (uint32_t v = 0; v < viewCount; ++v)
+        {
+            for (uint32_t t = 0; t < 5; ++t)
+            {
+                toClear[v].push_back(to(targets[v][t], TargetState(formats[t]), copyDest));
+                toDraw[v].push_back(to(targets[v][t], copyDest, TargetState(formats[t])));
+                drawToDraw[v].push_back(to(targets[v][t], TargetState(formats[t]), TargetState(formats[t])));
+            }
+        }
+        std::vector<std::pair<nvrhi::IBuffer*, ResourceStates>> trackedBuffers = {
+            { instanceBuffer, drawState }, { skinnedBuffers[0], drawState }, { skinnedBuffers[1], drawState } };
+        if (bindless)
+        {
+            trackedBuffers.emplace_back(gpuScene->GetGeometryBuffer(), ResourceStates::ShaderResource);
+            trackedBuffers.emplace_back(gpuScene->GetMaterialBuffer(), ResourceStates::ShaderResource);
+        }
+        auto barriers = [&](nvrhi::ICommandList* list, const Barriers& batch)
+        {
+            if (planBarriers)
+                list->barriers(batch.data(), uint32_t(batch.size()));
+        };
+        auto nativePass = [&](nvrhi::ICommandList* list, const char* name, const Barriers& batch, auto&& body)
+        {
+            list->beginMarker(name);
+            barriers(list, batch);
+            if (planBarriers)
+                list->setExplicitBarrierScope(name);
+            body();
+            if (planBarriers)
+                list->setExplicitBarrierScope(nullptr);
+            list->endMarker();
+        };
+        auto dispatch = [&](nvrhi::ICommandList* list, uint32_t kernel, nvrhi::IBindingSet* set, const void* constants,
+                            size_t size, uint32_t groups)
+        {
+            nvrhi::ComputeState state;
+            state.pipeline = pipelines[kernel];
+            state.bindings = { set };
+            list->setComputeState(state);
+            list->setPushConstants(constants, size);
+            list->dispatch(groups);
+        };
+        auto geometryPass = [&](nvrhi::ICommandList* list, uint32_t v, uint32_t use)
+        {
+            list->beginMarker("GBuffer");
+            if (v == 0 && use == 0)
+                barriers(list, beforeGeometry);
+            if (use == 0)
+            {
+                if (vulkan)
+                    barriers(list, toClear[v]);
+                for (uint32_t t = 0; t < 4; ++t)
+                    list->clearTextureFloat(targets[v][t], nvrhi::AllSubresources, nvrhi::Color(0.f));
+                list->clearDepthStencilTexture(targets[v][4], nvrhi::AllSubresources, true, 0.f, false, 0);
+            }
+            if (vulkan)
+                barriers(list, use ? drawToDraw[v] : toDraw[v]);
+            if (planBarriers)
+            {
+                for (uint32_t t = 0; t < 5; ++t)
+                    list->beginTrackingTextureState(targets[v][t], nvrhi::AllSubresources, TargetState(formats[t]));
+                for (const auto& [buffer, state] : trackedBuffers)
+                    list->beginTrackingBufferState(buffer, state);
+                list->setEnableAutomaticBarriers(true);
+            }
+            list->writeBuffer(gbuffers[v]->GetConstantBuffer(), &viewConstants, sizeof(viewConstants));
+            const nvrhi::GraphicsState* last = nullptr;
+            for (const auto& [state, arguments] : captured[v][use])
+            {
+                // RenderView sets the state at a change of material, cull mode or buffers
+                if (!last || last->pipeline != state.pipeline || last->indexBuffer.buffer != state.indexBuffer.buffer ||
+                    !std::equal(last->bindings.begin(), last->bindings.end(), state.bindings.begin(),
+                                state.bindings.end()))
+                    list->setGraphicsState(state);
+                last = &state;
+                list->setPushConstants(&drawConstants, sizeof(drawConstants));
+                list->drawIndexed(arguments);
+            }
+            if (planBarriers)
+            {
+                for (uint32_t t = 0; t < 5; ++t)
+                    list->setTextureState(targets[v][t], nvrhi::AllSubresources, TargetState(formats[t]));
+                for (const auto& [buffer, state] : trackedBuffers)
+                    list->setBufferState(buffer, state);
+                list->commitBarriers();
+                list->setEnableAutomaticBarriers(false);
+            }
+            if (v + 1 == viewCount && use == 1)
+                barriers(list, afterGeometry);
+            list->endMarker();
+        };
+        auto recordByHand = [&]
+        {
+            lists[0]->open();
+            for (const Character& character : characters)
+                lists[0]->writeBuffer(character.skinned->jointBuffer, bytes.data(),
+                                      size_t(character.skinned->jointBuffer->getDesc().byteSize));
+            lists[0]->close();
+            for (uint32_t pass = 0; pass < passCount; ++pass)
+            {
+                nvrhi::ICommandList* list = segments[parallel ? pass : 0];
+                if (parallel || pass == 0)
+                {
+                    list->open();
+                    if (planBarriers)
+                        list->setEnableAutomaticBarriers(false);
+                }
+                if (pass == 0)
+                    nativePass(list, "GpuSceneRecords", beforeRecords, [&]
+                    {
+                        const size_t transforms = records.transformCount * sizeof(GpuSceneTransformRecord);
+                        list->writeBuffer(staging, bytes.data(), transforms);
+                        list->writeBuffer(staging, bytes.data(), records.settleCount * sizeof(uint32_t), transforms);
+                    });
+                else if (pass == 1)
+                    nativePass(list, "GpuSceneScatter", beforeScatter, [&]
+                    {
+                        dispatch(list, 0, scatterSet, &scatterConstants, sizeof(scatterConstants), 2);
+                    });
+                else if (pass == 2)
+                    nativePass(list, "Skinning", beforeSkinning, [&]
+                    {
+                        for (uint32_t k = 0; k < 2; ++k)
+                        {
+                            list->beginMarker(characters[k].name.c_str());
+                            dispatch(list, 1, skinningSets[k], &skinningConstants[k], sizeof(skinningConstants[k]),
+                                     dm::div_ceil(skinningConstants[k].numVertices, 256u));
+                            list->endMarker();
+                        }
+                    });
+                else
+                    geometryPass(list, (pass - 3) / 2, (pass - 3) % 2);
+                if (parallel || pass + 1 == passCount)
+                    list->close();
+            }
+            nvrhi::ICommandList* const upload[] = { lists[0] };
+            if (!fences)
+            {
+                device->executeCommandList(lists[0]);
+                device->executeCommandList(segments[0]);
+                return;
+            }
+            const nvrhi::FenceValue first{ fence, ++fenceValue }, second{ fence, ++fenceValue };
+            device->submit(nvrhi::SubmitDesc().setCommandLists(upload, 1).setSignals(&first, 1));
+            device->submit(nvrhi::SubmitDesc().setCommandLists(segments.data(), segmentCount).setSignals(&second, 1));
+        };
+        device->waitForIdle();
+        device->runGarbageCollection();
+        for (uint32_t i = 0; i < warmup + measured; ++i)
+        {
+            if (i < warmup)
+                recordByHand();
+            else
+                handFrames.push_back(CountAllocations(recordByHand));
+            if (i % 4 == 3)
+            {
+                device->waitForIdle();
+                device->runGarbageCollection();
+            }
+        }
+        device->waitForIdle();
+        CheckCounters(tag);
+
+        // a loop's median; its frames differ in growths alone
+        uint32_t growingFrames = 0;
+        auto median = [&](const char* loop, const std::vector<Allocations>& frames)
+        {
+            std::vector<uint32_t> totals;
+            for (const Allocations& frame : frames)
+            {
+                totals.push_back(frame.Total());
+                growingFrames += frame.growths ? 1 : 0;
+                const auto differs = std::mismatch(frame.sites.begin(), frame.sites.end(), frames[0].sites.begin(),
+                                                   frames[0].sites.end()).first;
+                check(frame.sites == frames[0].sites && (frame.growths == 0 || (vulkan && parallel)),
+                      tag + ": " + loop + ": every frame allocates at the same sites; " +
+                          (differs == frame.sites.end() ? std::string() : differs->first));
+            }
+            std::sort(totals.begin(), totals.end());
+            return totals[totals.size() / 2];
+        };
+        const uint32_t throughAllocator = graphFrames[0].counts[allocation_counter::NvrhiAllocator];
+        const uint32_t byGraph = median("the graph", graphFrames), byHand = median("by hand", handFrames);
+        std::printf("%s: %u frames of %u draws per view: execute %u allocations per frame (operator new %u, nvrhi "
+                    "allocator %u), the same calls by hand %u; frames with a growth %u; every other phase 0\n",
+                    tag.c_str(), measured, draws, byGraph, byGraph - throughAllocator, throughAllocator, byHand,
+                    growingFrames);
+        if (std::getenv("E5_ALLOC_TRACE"))
+            for (const auto& [site, count] : graphFrames[0].sites)
+                std::printf("  %u x %s\n", count, site.c_str());
+        check(handFrames[0].foreign.empty(), tag + ": the baseline allocates outside nvrhi; " + handFrames[0].foreign);
+        check(growingFrames < measured / 2, tag + ": growths in " + std::to_string(growingFrames) + " frames");
+        check(byGraph == byHand, tag + ": execute allocates as much as the same nvrhi calls by hand (" +
+                                     std::to_string(byGraph) + " and " + std::to_string(byHand) + ")");
+        check(g_Warnings.load() == warningsBefore, tag + ": no warning");
+        std::printf("ok: %s\n", tag.c_str());
+
+        service = nullptr;
+        renderGraph = nullptr;
+        registry = nullptr;
+        device->waitForIdle();
+        device->runGarbageCollection();
+    }
+
     // E5.1's device-only checks: a scene not on the graph path is refused; an empty scene on it adds nothing and warns
     // about nothing.
     void ServiceChecks(app::DeviceManager* deviceManager, nvrhi::GraphicsAPI api)
@@ -1871,7 +2780,8 @@ int main(int argc, char** argv)
     });
     try
     {
-        check(argc == 2, "specify d3d11, d3d12 or vulkan");
+        const bool steadyOnly = argc == 3 && std::string(argv[2]) == "steady";
+        check(argc == 2 || steadyOnly, "specify d3d11, d3d12 or vulkan (and steady, for that case alone)");
         const std::string backend = argv[1];
         const nvrhi::GraphicsAPI api = backend == "d3d11" ? nvrhi::GraphicsAPI::D3D11
             : backend == "d3d12" ? nvrhi::GraphicsAPI::D3D12 : nvrhi::GraphicsAPI::VULKAN;
@@ -1904,21 +2814,38 @@ int main(int argc, char** argv)
         check(deviceManager->CreateHeadlessDevice(params), "headless device");
         std::printf("device: %s\n", deviceManager->GetRendererString());
 
-        RunBufferGroupSwitch(deviceManager, api);
-
-        for (bool useService : { false, true })
+        if (!steadyOnly)
         {
-            Run(deviceManager, api, false, useService);
-            if (api != nvrhi::GraphicsAPI::D3D11)
-                Run(deviceManager, api, true, useService);
-        }
-        ServiceChecks(deviceManager, api);
-        RunSkinning(deviceManager, api, false);
-        if (api != nvrhi::GraphicsAPI::D3D11)
-            RunSkinning(deviceManager, api, true);
-        for (bool inputAssembler : { false, true })
-            RunGeometry(deviceManager, api, api != nvrhi::GraphicsAPI::D3D11, inputAssembler);
+            RunBufferGroupSwitch(deviceManager, api);
 
+            for (bool useService : { false, true })
+            {
+                Run(deviceManager, api, false, useService);
+                if (api != nvrhi::GraphicsAPI::D3D11)
+                    Run(deviceManager, api, true, useService);
+            }
+            ServiceChecks(deviceManager, api);
+            RunSkinning(deviceManager, api, false);
+            if (api != nvrhi::GraphicsAPI::D3D11)
+                RunSkinning(deviceManager, api, true);
+            for (bool inputAssembler : { false, true })
+                RunGeometry(deviceManager, api, api != nvrhi::GraphicsAPI::D3D11, inputAssembler);
+        }
+
+        deviceManager->Shutdown();
+        deviceManager = nullptr;
+
+        // the allocation counts, on a device without the nvrhi validation layer (it allocates; the cases above have it)
+        deviceManager = nvrhi::TakeOver(app::DeviceManager::Create(api));
+        check(deviceManager != nullptr, "device manager");
+        params.enableGPUValidation = false;
+        params.enableNvrhiValidationLayer = false;
+        check(deviceManager->CreateInstance(params), "graphics instance");
+        check(deviceManager->CreateHeadlessDevice(params), "headless device");
+        std::printf("device: %s\n", deviceManager->GetRendererString());
+        for (bool parallel : { false, true })
+            if (!parallel || api != nvrhi::GraphicsAPI::D3D11)
+                RunSteadyState(deviceManager, api, parallel);
         deviceManager->Shutdown();
         deviceManager = nullptr;
         check(g_Errors == 0, "no errors were logged (" + std::to_string(g_Errors.load()) + ")");

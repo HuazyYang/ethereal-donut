@@ -42,10 +42,12 @@ add_test(NAME test_render_graph_passes COMMAND test_render_graph_passes)
 set_property(TARGET test_render_graph_passes PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
 # The render service's extraction into the frame snapshot, device-free (ECS step E5, sub-plan item E5.1). It reaches
-# the ECS allocation counter through the private headers in src/engine, as the engine's GPU scene test does.
+# the ECS allocation counter through the private headers in src/engine, as the engine's GPU scene test does, and the
+# limits of the serial extraction through src/render (RenderVisibility.h).
 add_executable(test_render_extract src/render/test_render_extract.cpp)
 target_link_libraries(test_render_extract donut_render donut_engine donut_core donut_tests_utils)
-target_include_directories(test_render_extract PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
+target_include_directories(test_render_extract PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/engine"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/render")
 add_dependencies(donut_all_tests test_render_extract)
 add_test(NAME test_render_extract COMMAND test_render_extract)
 set_property(TARGET test_render_extract PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
@@ -187,6 +189,14 @@ set_property(TARGET test_render_graph_layer PROPERTY FOLDER "Donut/donut_tests/d
 # the buffers read back equal a CPU-mode GpuScene's images, under the debug runtime and the nvrhi validation layer.
 add_executable(test_render_extract_gpu src/render/test_render_extract_gpu.cpp)
 target_link_libraries(test_render_extract_gpu donut_app donut_render donut_engine donut_core)
+if(MSVC)
+    # The steady-state case attributes its counted allocations with the linker's map: it has every function, those of the
+    # static libraries and their internal ones too, whether or not the configuration makes debug information. No folding:
+    # a folded function has the name of another one (a link item, so that it comes after ASTEROIDS_MATCH_CODEGEN's
+    # /OPT:ICF). dbghelp: UnDecorateSymbolName.
+    target_link_options(test_render_extract_gpu PRIVATE /MAP /INCREMENTAL:NO)
+    target_link_libraries(test_render_extract_gpu dbghelp -OPT:NOICF)
+endif()
 foreach(_backend d3d11 d3d12 vulkan)
     if((_backend STREQUAL "d3d11" AND DONUT_WITH_DX11) OR (_backend STREQUAL "d3d12" AND DONUT_WITH_DX12) OR
        (_backend STREQUAL "vulkan" AND DONUT_WITH_VULKAN))

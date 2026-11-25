@@ -25,8 +25,9 @@
 // diamonds) in a valid order with every job and every index run exactly once, nested waits, more external threads than
 // slots, a full job table and edge pool, shutdown with pending work, zero allocations in steady state, a seeded stress
 // run at 1, 2 and 8 workers with jobs scheduled from inside jobs, a Wait for a job lower on the same stack, a Wait
-// blocked on an external slot, and overflowing deques. After each test the job table and edge pool must be whole
-// again. A watchdog ends the process if a case hangs; the deadlock cases have a 20 s guard of their own.
+// blocked on an external slot, overflowing deques, and idle workers that soon sleep, wake again, and look for work again
+// before their next sleep. After each test the job table and edge pool must be whole again. A watchdog ends the process
+// if a case hangs; the deadlock cases have a 20 s guard of their own.
 
 #include <donut/core/log.h>
 #include <donut/engine/JobSystem.h>
@@ -50,6 +51,17 @@
 
 #if defined(_MSC_VER)
 #include <malloc.h>
+#endif
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <ctime>
 #endif
 
 // ------------------------------------------------------------------------------- global allocation counter
@@ -189,13 +201,15 @@ namespace
         return count ? (count - 1) / grain + 1 : 0;
     }
 
-    nvrhi::AutoPtr<IJobSystem> CreateSystem(uint32_t workers, uint32_t externalThreads = 2, uint32_t spinCount = 4096)
+    nvrhi::AutoPtr<IJobSystem> CreateSystem(uint32_t workers, uint32_t externalThreads = 2, uint32_t spinCount = 4096,
+                                            uint32_t idleSpinMicroseconds = 30)
     {
         JobSystemDesc desc;
         desc.debugName = "test_job_system";
         desc.workerThreadCount = workers;
         desc.maxExternalThreads = externalThreads;
         desc.spinCount = spinCount;
+        desc.idleSpinMicroseconds = idleSpinMicroseconds;
         IJobSystem* system = nullptr;
         CHECK(CreateJobSystem(desc, &system) == nvrhi::FS_OK && system != nullptr);
         return nvrhi::TakeOver(system);
@@ -1016,6 +1030,9 @@ static void test_dependency_graphs()
         CHECK(!jobs->IsComplete(empties.Handle(0)));
         gate.open.store(true);
         jobs->Wait(empties.Handle(3000));
+        // A job is marked finished after its dependents were released, so the last one can finish first: Verify asks
+        // whether every job is complete.
+        empties.WaitAll(jobs);
         CheckJobs("empty chain");
         empties.Verify(jobs, "empty chain");
         CheckFullCapacity(jobs);
@@ -1108,7 +1125,7 @@ static void test_nested_waits()
     {
         for (uint32_t workers : { 1u, 2u, 8u })
         {
-            nvrhi::AutoPtr<IJobSystem> jobs = CreateSystem(workers, 2, spinCount);
+            nvrhi::AutoPtr<IJobSystem> jobs = CreateSystem(workers, 2, spinCount, spinCount ? 30 : 0);
 
             Tree tree{ jobs, {}, 4 };
             TreeNode root{ &tree, 0 };
@@ -1635,7 +1652,7 @@ static void test_wait_on_own_stack()
     uint32_t nested = 0;
     for (uint32_t spinCount : { 4096u, 0u })
     {
-        nvrhi::AutoPtr<IJobSystem> jobs = CreateSystem(1, 2, spinCount);
+        nvrhi::AutoPtr<IJobSystem> jobs = CreateSystem(1, 2, spinCount, spinCount ? 30 : 0);
         RunGuarded("a Wait for a job lower on the same stack", 20, [&] {
             for (uint32_t round = 0; round < 5; ++round)
             {
@@ -1786,6 +1803,174 @@ static void test_deque_overflow()
     CheckFullCapacity(jobs);
 }
 
+// The CPU time of every thread of the process but the calling one: cycles on Windows (GetProcessTimes counts whole clock
+// ticks), scaled by a busy loop of this thread, so that they are milliseconds at its speed.
+namespace
+{
+#if defined(_WIN32)
+    double CyclesPerMillisecond()
+    {
+        double best = 0.0;
+        for (uint32_t attempt = 0; attempt < 5; ++attempt)
+        {
+            ULONG64 before = 0, after = 0;
+            QueryThreadCycleTime(GetCurrentThread(), &before);
+            const auto start = std::chrono::steady_clock::now();
+            while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(4))
+                Spin(100);
+            QueryThreadCycleTime(GetCurrentThread(), &after);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            best = std::max(best, double(after - before) / ms);   // a preempted attempt counts fewer
+        }
+        return best;
+    }
+    double OtherThreadsCpuMilliseconds()
+    {
+        static const double s_PerMillisecond = CyclesPerMillisecond();
+        ULONG64 process = 0, own = 0;
+        QueryThreadCycleTime(GetCurrentThread(), &own);
+        QueryProcessCycleTime(GetCurrentProcess(), &process);
+        return (double(process) - double(own)) / s_PerMillisecond;
+    }
+#else
+    double OtherThreadsCpuMilliseconds()
+    {
+        timespec process{}, own{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &own);
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &process);
+        return double(process.tv_sec - own.tv_sec) * 1e3 + double(process.tv_nsec - own.tv_nsec) * 1e-6;
+    }
+#endif
+
+    // The workers' CPU time per worker and frame, in milliseconds. A frame: `run`, which wakes the workers, then a pause
+    // in which they look for work and fall asleep. A sleeping worker costs nothing, so the time is the wake-up's and the
+    // looks'.
+    template <typename Frame>
+    double IdleCpuPerWorkerAndFrame(uint32_t workers, uint32_t frames, Frame&& run)
+    {
+        OtherThreadsCpuMilliseconds();   // the scale
+        const double before = OtherThreadsCpuMilliseconds();
+        for (uint32_t frame = 0; frame < frames; ++frame)
+        {
+            run();
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        }
+        return (OtherThreadsCpuMilliseconds() - before) / (double(workers) * frames);
+    }
+}
+
+// Idle workers sleep soon whatever a look for work costs (E5.8: the rounds of the spin took 1.5 ms with many slots, so
+// that one small job per frame kept the workers busy for the whole frame). Only an upper bound on the CPU time, far
+// above the spin's 30 us per worker and frame and far below a millisecond: a busy machine makes it smaller, not larger.
+static void test_idle_workers_sleep()
+{
+    constexpr uint32_t c_Workers = 8;
+    constexpr uint32_t c_Frames = 60;
+    JobSystemDesc desc;   // the defaults of the shared system
+    desc.debugName = "test_job_system";
+    desc.workerThreadCount = c_Workers;
+    desc.maxExternalThreads = 64;
+    IJobSystem* system = nullptr;
+    CHECK(CreateJobSystem(desc, &system) == nvrhi::FS_OK && system != nullptr);
+    nvrhi::AutoPtr<IJobSystem> jobs = nvrhi::TakeOver(system);
+
+    Counter counter;
+    const double perWorkerFrame = IdleCpuPerWorkerAndFrame(c_Workers, c_Frames, [&] {
+        jobs->ParallelFor(64, 1, &Counter::Run, &counter);   // a ticket for every worker, and next to nothing to do
+    });
+    std::printf("test_job_system: idle workers: %.3f ms of CPU per worker and frame\n", perWorkerFrame);
+    CHECK(counter.value.load() == 64ull * c_Frames);
+    CHECK(perWorkerFrame < 0.25);
+    CheckFullCapacity(jobs);
+}
+
+// They look for work again after every sleep, whether or not they found any in between. A frame: one worker sleeps in a
+// job, the caller sleeps in its Wait (spinCount 0), and the job's end wakes every worker. With idleSpinMicroseconds = 500
+// they spend 0.5 ms of CPU each (a busy machine takes some of it away: the best of several attempts counts), workers that
+// look only before their first sleep 0.03 ms, and workers that look again only after a job 0.1 ms.
+static void test_idle_workers_spin_again()
+{
+    constexpr uint32_t c_Workers = 8;
+    constexpr uint32_t c_Attempts = 20;
+    constexpr double c_LowerBound = 0.15;
+    nvrhi::AutoPtr<IJobSystem> jobs = CreateSystem(c_Workers, 2, 0, 500);
+
+    struct SleepingJob
+    {
+        std::atomic<bool> started{ false };
+        static void Run(void* context, uint32_t, uint32_t, uint32_t)
+        {
+            static_cast<SleepingJob*>(context)->started.store(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
+    auto run = [&] {
+        SleepingJob sleeping;
+        const JobHandle job = Schedule(jobs, JobDesc{ &SleepingJob::Run, &sleeping, 1, 0, "sleeping" });
+        while (!sleeping.started.load())   // by a worker: this thread runs no job before its Wait
+            std::this_thread::yield();
+        jobs->Wait(job);
+    };
+    (void)IdleCpuPerWorkerAndFrame(c_Workers, 3, run);   // every worker has slept
+    double best = 0.0;
+    uint32_t attempts = 0;
+    while (attempts < c_Attempts && best <= c_LowerBound)
+    {
+        best = std::max(best, IdleCpuPerWorkerAndFrame(c_Workers, 10, run));
+        ++attempts;
+    }
+    std::printf("test_job_system: idle workers with a spin of 0.5 ms: %.3f ms of CPU per worker and frame, %u attempts\n",
+                best, attempts);
+    CHECK(best > c_LowerBound);
+    CheckFullCapacity(jobs);
+}
+
+// The wake path: jobs that arrive while workers go to sleep or have just slept. Pauses from 0 to 60 us around the length
+// of the spin, so that the last look for work, the announcement and the sleep all meet new tickets; each round a
+// ParallelFor, a job scheduled by a thread without a slot and not waited for at first, and a dependency chain. A lost
+// wake-up would leave the detached job unfinished: only a worker runs it, as nobody waits (a guard reports it).
+static void test_wake_path()
+{
+    struct Spins
+    {
+        uint32_t spinCount, idleSpinMicroseconds;
+    };
+    for (const Spins spins : { Spins{ 4096, 30 }, Spins{ 1, 1 }, Spins{ 0, 0 } })
+    {
+        for (uint32_t workers : { 1u, 2u, 8u })
+        {
+            nvrhi::AutoPtr<IJobSystem> jobs = CreateSystem(workers, 2, spins.spinCount, spins.idleSpinMicroseconds);
+            Counter counter;
+            Random random(0x5eed + workers + spins.spinCount);
+            uint64_t expected = 0;
+            for (uint32_t round = 0; round < 2000; ++round)
+            {
+                const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(random.Below(61));
+                while (std::chrono::steady_clock::now() < end)
+                    Spin(10);
+                // no Wait: the workers alone run these
+                const JobHandle first = Schedule(jobs, JobDesc{ &Counter::Run, &counter, 4, 1, "detached" });
+                const JobHandle second = Schedule(jobs, JobDesc{ &Counter::Run, &counter, 1, 0, "chained" }, &first, 1);
+                expected += 5;
+                if (round % 3 == 0)
+                {
+                    jobs->ParallelFor(16, 1, &Counter::Run, &counter);
+                    expected += 16;
+                }
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+                // a job is marked finished after its dependents were released, so the second may be complete first
+                while (!jobs->IsComplete(first) || !jobs->IsComplete(second))
+                {
+                    CHECK(std::chrono::steady_clock::now() < deadline);   // a lost wake-up
+                    std::this_thread::yield();
+                }
+                CHECK(counter.value.load() == expected);
+            }
+            CheckFullCapacity(jobs);
+        }
+    }
+}
+
 int main(int, char**)
 {
     struct Test
@@ -1806,6 +1991,9 @@ int main(int, char**)
         { "wait_on_own_stack", &test_wait_on_own_stack },
         { "wait_for_slot_ends", &test_wait_for_slot_ends },
         { "deque_overflow", &test_deque_overflow },
+        { "idle_workers_sleep", &test_idle_workers_sleep },
+        { "idle_workers_spin_again", &test_idle_workers_spin_again },
+        { "wake_path", &test_wake_path },
     };
     std::thread watchdog(&Watchdog);
     int result = 0;

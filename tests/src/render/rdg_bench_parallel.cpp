@@ -28,7 +28,9 @@
 // measured on one list (no scheduler, one segment) and on four threads (RenderGraphWorkerPool with three workers and the caller,
 // 16 passes per segment). Protocol 10.4: Release, the NVIDIA adapter, no validation layers, 100 warm-up frames per
 // mode, then 300 frames per mode in alternating blocks of 50; medians. The budget: four threads take at most 60 % of
-// the single list's time.
+// the single list's time. It is a budget for recording with awake workers: each frame waits for the device to be idle
+// before the next one records, so the pool's workers get a longer idle spin than its default (c_IdleSpinMicroseconds).
+// With the default of 30 us they sleep in between, and the wake-ups count as recording time.
 
 #include "rdg_corpus.h"
 #include <donut/render/RenderGraphWorkerPool.h>
@@ -207,6 +209,8 @@ namespace
         return samples.empty() ? 0.0 : samples[samples.size() / 2];
     }
 
+    constexpr uint32_t c_IdleSpinMicroseconds = 480;
+
     int Measure(nvrhi::IDevice* device, const char* api, const char* shaderType, bool quick, bool gate)
     {
         Bench bench;
@@ -215,7 +219,7 @@ namespace
             std::fprintf(stderr, "rdg_bench --parallel: setup failed\n");
             return 1;
         }
-        donut::render::RenderGraphWorkerPool pool(3);
+        donut::render::RenderGraphWorkerPool pool(3, c_IdleSpinMicroseconds);
         const uint32_t warmup = quick ? 5 : 100;
         const uint32_t blocks = quick ? 1 : 6;
         const uint32_t perBlock = quick ? 5 : 50;

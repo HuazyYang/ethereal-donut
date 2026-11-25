@@ -543,7 +543,9 @@ namespace donut::render::visibility
                 return nvrhi::FE_OUT_OF_MEMORY;
             }
 
-            // 1. Visibility and packets per range.
+            // 1. Visibility and packets per range. The ranges and their output are the same either way.
+            const bool parallelRanges = jobs && rangeCount > 1 &&
+                uint64_t(iquery->CountEntities()) * viewCount >= s_SerialRowTests.load(std::memory_order_relaxed);
             RangeJob job;
             job.self = this;
             job.query = iquery;
@@ -553,7 +555,7 @@ namespace donut::render::visibility
             job.viewCount = viewCount;
             job.grain = grain;
             job.separateDoubleSided = frame.drawDoubleSidedMaterialsSeparately;
-            if (rangeCount > 1 && jobs)
+            if (parallelRanges)
                 jobs->ParallelFor(chunkCount, grain, &RangeJob::Run, &job);
             else if (chunkCount != 0)
                 RangeJob::Run(&job, 0, chunkCount, 0);
@@ -624,11 +626,14 @@ namespace donut::render::visibility
             }
 
             // 3. The instances into the arena, the packets into the sort's input.
+            const uint32_t serialRecords =
+                (parallelRanges ? s_SerialRecords : s_SerialRecordsAlone).load(std::memory_order_relaxed);
+            const bool parallelRecords = jobs && instanceTotal + packetTotal >= serialRecords;
             CopyJob copy;
             copy.self = this;
             copy.out = &out;
             copy.viewCount = viewCount;
-            if (rangeCount > 1 && jobs)
+            if (rangeCount > 1 && parallelRecords)
                 jobs->ParallelFor(rangeCount, 1, &CopyJob::Run, &copy);
             else if (rangeCount != 0)
                 CopyJob::Run(&copy, 0, rangeCount, 0);
@@ -638,7 +643,7 @@ namespace donut::render::visibility
             SortJob sort;
             sort.self = this;
             sort.jobs = jobs;
-            if (jobs && segmentCount > 1)
+            if (segmentCount > 1 && parallelRecords)
                 jobs->ParallelFor(segmentCount, 1, &SortJob::Run, &sort);
             else
                 SortJob::Run(&sort, 0, segmentCount, 0);
@@ -684,6 +689,32 @@ namespace donut::render::visibility
 #endif
             return nvrhi::FS_OK;
         }
+
+        // Less work than this runs on the calling thread: in the frames of a small scene the workers sleep, and waking
+        // them can take longer than the work. Row tests (the query's rows times the views) decide for the ranges, records
+        // (instances and packets) for the copy and the sort, with a limit of their own after serial ranges. Measured with
+        // sleeping workers and with all of them awake and looking for work, 1, 2, 8 and 15 of them, over scenes with
+        // every instance visible (1.75 and 6 packets each), five views, and mostly culled rows (aggregate plan, "E5.8
+        // fix", the sweep; us per extraction):
+        // - 512 to 640 row tests: parallel takes from 23 less to 3 more than serial (asleep), 54 less to 1 more (awake).
+        //   Below 512: 4 less to 5 more, and 28 less to 14 more. Row tests are a rough measure of the work: with six
+        //   packets per instance the two are even (asleep, 8 and 15 workers) from 192 to 384 row tests, and where every
+        //   chunk is culled, parallel takes up to 10 more (asleep) at any size.
+        // - The serial copy and sort below 1,536 records, after parallel ranges: from 17 less to 2 more than in parallel
+        //   (asleep; 5 less on average), 4 less to 6 more (awake).
+        // - The parallel copy and sort after serial ranges: from 2 less to 51 more than serial (asleep; more in 123 of
+        //   128 points), 19 less to 50 more (awake; more in 96 of 128), for 69 to 11,264 records.
+        // Tests set the limits, to run every combination. They are per module: an executable or DLL that links this code
+        // statically has its own, so a test reaches only the extractions of its own module.
+        static void SetSerialLimits(uint32_t rowTests, uint32_t records, uint32_t recordsAlone) noexcept
+        {
+            s_SerialRowTests.store(rowTests, std::memory_order_relaxed);
+            s_SerialRecords.store(records, std::memory_order_relaxed);
+            s_SerialRecordsAlone.store(recordsAlone, std::memory_order_relaxed);
+        }
+        static constexpr uint32_t c_SerialRowTests = 512;
+        static constexpr uint32_t c_SerialRecords = 1536;                                  // after parallel ranges
+        static constexpr uint32_t c_SerialRecordsAlone = RadixSorter::c_ParallelThreshold;   // after serial ranges
 
         // Extractions so far (the Debug sampled check runs at every 64th).
         [[nodiscard]] uint64_t GetRunCount() const noexcept { return m_Runs; }
@@ -1217,5 +1248,9 @@ namespace donut::render::visibility
         uint32_t m_PacketCapacity = 0;
         uint64_t m_Runs = 0;
         uint32_t m_LeafCheckCursor = 0;   // Debug: the next chunk CheckLeaves looks at
+
+        inline static std::atomic<uint32_t> s_SerialRowTests{ c_SerialRowTests };
+        inline static std::atomic<uint32_t> s_SerialRecords{ c_SerialRecords };
+        inline static std::atomic<uint32_t> s_SerialRecordsAlone{ c_SerialRecordsAlone };
     };
 }
