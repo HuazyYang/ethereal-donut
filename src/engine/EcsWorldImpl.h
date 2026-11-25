@@ -582,6 +582,10 @@ namespace donut::engine::ecs
         void EndPhase() noexcept { m_InPhase = false; }
         void BeginExclusive() noexcept { ++m_ExclusiveDepth; }
         void EndExclusive() noexcept { --m_ExclusiveDepth; }
+        // The scheduler delivers the entities that a simulation domain finds or leaves behind by itself (E6.1): its
+        // callbacks run under an observer's rules, so no structure changes while it walks the chunks.
+        void BeginObserver() noexcept { ++m_ObserverDepth; }
+        void EndObserver() noexcept { --m_ObserverDepth; }
         bool CanChangeStructure() const noexcept
         {
             return m_ObserverDepth == 0 && (!m_InPhase || m_ExclusiveDepth > 0);

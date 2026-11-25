@@ -96,6 +96,23 @@ namespace donut::engine::ecs
         // Whether the archetype has what the terms require and lacks what they exclude (Sparse terms aside): E1.4's
         // observer filters test the archetypes of each report with it, without the chunk list.
         bool Matches(const Archetype& archetype) const noexcept;
+        // Where chunk `index` of the list is, for the column views and captures of simulation domains (E6.1), which
+        // name components that are no terms. After GetChunkCount, which refreshes the list; stamps nothing.
+        struct ChunkPlace
+        {
+            const Archetype* archetype;
+            uint8_t* memory;                // Archetype::chunks' memory: a Data column is at its offset
+            uint64_t* versions;             // Archetype::Versions
+            const Entity* entities;
+            uint32_t count;
+        };
+        ChunkPlace GetChunkPlace(uint32_t index) const noexcept
+        {
+            const ChunkEntry& entry = m_Chunks[index];
+            return ChunkPlace{ &m_World->GetArchetypeStorage(m_Matched[entry.matched].archetype),
+                               reinterpret_cast<uint8_t*>(const_cast<Entity*>(entry.entities)), entry.versions,
+                               entry.entities, entry.count };
+        }
 
     private:
         struct Term

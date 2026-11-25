@@ -134,8 +134,9 @@ namespace donut::engine
         // Step and in the lifetime callbacks both calls return 0, so steps declare nothing and independent domains step
         // in parallel. Both also return 0, with one validation report, for a component that is not declared, not
         // Relocatable (D14; a construct hook is allowed, the other hooks exclude Relocatable), or without one value per
-        // row (tags, buffers, shared, chunk and sparse components). Views carry no enabled bits: a domain that needs
-        // them uses a query of its own (GetSystemContext).
+        // row (tags, buffers, shared, chunk and sparse components). A domain without lifetime terms has no entities: it
+        // gets 0, without a report. Views carry no enabled bits: a domain that needs them uses a query of its own
+        // (GetSystemContext).
         virtual uint32_t GetColumnCount(ComponentId component) noexcept = 0;
         virtual uint32_t GetColumns(ComponentId component, uint32_t first, uint64_t sinceVersion, uint32_t capacity,
                                     _Out_writes_to_(capacity, return) ColumnView* views) noexcept = 0;

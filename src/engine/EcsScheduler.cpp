@@ -36,17 +36,30 @@
 //    commands from an earlier run gets a sync point before it runs again, so that every playback holds one run's
 //    commands and sort keys stay unique per system. Commands recorded after a frame's last sync point (in
 //    TransformPropagation, Bounds and EndFrame) stay pending until the next frame's PostSimulation: a snapshot taken
-//    between frames does not hold them (a concern for the rewinds of design 8.5 and 11.4; E6/E7 may add a flush).
+//    between frames does not hold them. SaveSimulationState and LoadSimulationState play them back first.
 //
-// Simulation domains (8.1, 8.4): a domain adds three systems, `<name>.gather` (PreSimulation, its inputs),
-// `<name>.step` (FixedSimulation, no column access; Exclusive when the domain changes structure) and `<name>.scatter`
-// (PostSimulation, its outputs). SetFrameTime adds the frame's delta to each domain's accumulator; the step system runs
-// floor(accumulated / fixedTimeStep) steps, at most maxStepsPerFrame, keeps the remainder fraction and drops whole
-// steps beyond the limit. After each step of a ChangesStructure domain a sync point plays back, in order, the pending
-// systems, the phase's systems that ran before the step, and the step's own commands. Column views, the lifetime
-// query's observers and GPU queues are E6 (the seams are marked below).
+// Simulation domains (8.1, 8.4; plan step E6.1): a domain adds three systems, `<name>.gather` (PreSimulation, its
+// inputs), `<name>.step` (FixedSimulation, no column access; Exclusive when the domain changes structure) and
+// `<name>.scatter` (PostSimulation, its outputs); those of a GPU domain run on the calling thread.
+// - Time. SetFrameTime adds the frame's delta to each domain's accumulator and plans floor(accumulator / fixedTimeStep)
+//   steps, at most maxStepsPerFrame. The step system takes the planned steps, keeps the remainder fraction and drops
+//   the whole steps beyond the limit or from a failed one on. The working state is the DomainRecord's, which its own
+//   systems alone touch while a phase runs; the driving thread copies it to the FixedStepState resource where no system
+//   runs.
+// - After each step of a ChangesStructure domain a sync point plays back, in order, the pending systems, the phase's
+//   systems that ran before the step, and the step's own commands.
+// - Entities. The lifetime query is cached per domain, and one IObserver (DomainObserver) is registered for its OnMatch
+//   and OnUnmatch. The world holds its observers and the domain's queries may hold the world, so the observer has a raw
+//   pointer to the record, which is cleared before the record goes. What matches already when the domain is added, and
+//   what still matches when it is removed, is delivered by DeliverMembers.
+// - The last reference to the scheduler may go away in user code that it calls (a callback, a system): every entry that
+//   calls user code holds one (`self`) until it returns, and DomainObserver does for a change made from outside.
+// - Column views and captures walk the lifetime query's chunks (QueryImpl::GetChunkPlace), which stamps nothing.
+// - Capture: a header, the domains' payload, the XXH64 of both. A load reads and checks all of it before it writes.
 
 #include "EcsSchedulerImpl.h"
+#include "EcsQueryImpl.h"
+#include "EcsSnapshot.h"
 
 #include <donut/core/log.h>
 #include <donut/engine/EcsSimulation.h>
@@ -59,6 +72,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <new>
 
 namespace donut::engine::ecs
@@ -68,6 +82,7 @@ namespace donut::engine::ecs
         constexpr uint32_t c_None = 0xffffffffu;
         constexpr uint32_t c_MainBit = 0x80000000u;    // a script entry that runs on the calling thread
         constexpr double c_StatsSmoothing = 0.125;     // weight of the newest run in SystemStats::averageMilliseconds
+        constexpr double c_ExactSteps = 9007199254740992.0;   // 2^53
         constexpr Phase c_NoPhase = Phase(0xffffffffu);
         constexpr SystemFlags c_KnownSystemFlags =
             SystemFlags::Exclusive | SystemFlags::MainThread | SystemFlags::StartDisabled;
@@ -115,6 +130,178 @@ namespace donut::engine::ecs
             accesses.resize(kept);
         }
 
+        // A version slot may be stamped by other threads (StampVersion): read it as a whole.
+        uint64_t LoadVersion(const uint64_t* slot) noexcept
+        {
+#if defined(_MSC_VER)
+            return uint64_t(*reinterpret_cast<const volatile long long*>(slot));
+#else
+            return __atomic_load_n(slot, __ATOMIC_RELAXED);
+#endif
+        }
+
+        // A batch column, as observers get it (EcsObserver.cpp): null for a tag.
+        void* BatchColumn(const QueryImpl::ChunkPlace& place, uint32_t column) noexcept
+        {
+            const ArchetypeColumn& c = place.archetype->columns[column];
+            switch (c.kind)
+            {
+            case StorageKind::Data:
+            case StorageKind::Buffer:
+            case StorageKind::Chunk:
+                return place.memory + c.offset;
+            case StorageKind::Shared:
+                return place.archetype->sharedValues + c.offset;
+            default:
+                return nullptr;
+            }
+        }
+
+        // The enabled mask of an Enableable column (Archetype::EnabledMask).
+        uint64_t* EnabledMaskOf(const QueryImpl::ChunkPlace& place, uint32_t column) noexcept
+        {
+            return reinterpret_cast<uint64_t*>(place.memory + place.archetype->columns[column].enabledOffset);
+        }
+
+        // ----------------------------------------------------------------------- simulation state streams (8.5)
+
+        // Integers as the machine stores them: a rewind stays on its machine.
+        constexpr char c_StateMagic[8] = { 'D', 'O', 'N', 'U', 'T', 'S', 'I', 'M' };
+        constexpr uint32_t c_StateVersion = 1;
+        struct StateHeader
+        {
+            char magic[8];
+            uint32_t version;
+            uint32_t domainCount;
+            uint64_t payloadBytes;
+        };
+        static_assert(sizeof(StateHeader) == 24, "StateHeader layout");
+        constexpr uint64_t c_StatePieceBytes = 1024 * 1024;
+
+        // Bytes that grow without aborting when out of memory: `failed` sticks.
+        struct StateBuffer
+        {
+            uint8_t* data = nullptr;
+            uint64_t size = 0;
+            uint64_t capacity = 0;
+            bool failed = false;
+
+            StateBuffer() noexcept = default;
+            StateBuffer(const StateBuffer&) = delete;
+            StateBuffer& operator=(const StateBuffer&) = delete;
+            ~StateBuffer() { HeapFree(data); }
+
+            // `bytes` more at the end, uninitialised; null when out of memory. The address holds until the next growth.
+            uint8_t* Grow(uint64_t bytes) noexcept
+            {
+                if (failed || bytes > SIZE_MAX / 4 - size)
+                {
+                    failed = true;
+                    return nullptr;
+                }
+                if (size + bytes > capacity)
+                {
+                    const uint64_t grown = std::max(size + bytes, std::max(capacity * 2, uint64_t(4096)));
+                    uint8_t* memory = static_cast<uint8_t*>(HeapAllocate(size_t(grown), 16));
+                    if (!memory)
+                    {
+                        failed = true;
+                        return nullptr;
+                    }
+                    if (size != 0)
+                        std::memcpy(memory, data, size_t(size));
+                    HeapFree(data);
+                    data = memory;
+                    capacity = grown;
+                }
+                uint8_t* end = data + size;
+                size += bytes;
+                return end;
+            }
+            void Append(const void* source, uint64_t bytes) noexcept
+            {
+                if (uint8_t* end = bytes != 0 ? Grow(bytes) : nullptr)
+                    std::memcpy(end, source, size_t(bytes));
+            }
+            template <typename T> void Put(const T& value) noexcept { Append(&value, sizeof(T)); }
+        };
+
+        // What a load reads from; `malformed` sticks.
+        struct StateCursor
+        {
+            const uint8_t* data = nullptr;
+            uint64_t size = 0;
+            uint64_t position = 0;
+            bool malformed = false;
+
+            const uint8_t* Take(uint64_t bytes) noexcept
+            {
+                if (malformed || bytes > size - position)
+                {
+                    malformed = true;
+                    return nullptr;
+                }
+                const uint8_t* begin = data + position;
+                position += bytes;
+                return begin;
+            }
+            template <typename T> T Get() noexcept
+            {
+                T value{};
+                if (const uint8_t* bytes = Take(sizeof(T)))
+                    std::memcpy(&value, bytes, sizeof(T));
+                return value;
+            }
+        };
+
+        // What ISimulationDomain::CaptureState writes to and RestoreState reads from.
+        class StateWriter final : public nvrhi::ObjectImpl<IStateWriter>
+        {
+        public:
+            NVRHI_BEGIN_INTERFACE_TABLE_INLINE(StateWriter)
+            NVRHI_IMPLEMENTS_INTERFACE(IStateWriter)
+            NVRHI_END_INTERFACE_TABLE()
+
+            explicit StateWriter(StateBuffer* buffer) noexcept : m_Buffer(buffer) { }
+            nvrhi::FRESULT Write(const void* data, uint64_t size) noexcept override
+            {
+                if (!m_Buffer || (!data && size != 0))
+                    return nvrhi::FE_INVALID_ARGS;
+                m_Buffer->Append(data, size);
+                return m_Buffer->failed ? nvrhi::FE_OUT_OF_MEMORY : nvrhi::FS_OK;
+            }
+            // The call it was handed to has returned: a domain that kept it writes nowhere.
+            void Close() noexcept { m_Buffer = nullptr; }
+
+        private:
+            StateBuffer* m_Buffer;
+        };
+
+        class StateReader final : public nvrhi::ObjectImpl<IStateReader>
+        {
+        public:
+            NVRHI_BEGIN_INTERFACE_TABLE_INLINE(StateReader)
+            NVRHI_IMPLEMENTS_INTERFACE(IStateReader)
+            NVRHI_END_INTERFACE_TABLE()
+
+            StateReader(const uint8_t* data, uint64_t size) noexcept : m_Data(data), m_Size(size) { }
+            nvrhi::FRESULT Read(uint64_t size, void* data) noexcept override
+            {
+                if (size > m_Size || (!data && size != 0))
+                    return nvrhi::FE_INVALID_ARGS;
+                if (size != 0)
+                    std::memcpy(data, m_Data, size_t(size));
+                m_Data += size;
+                m_Size -= size;
+                return nvrhi::FS_OK;
+            }
+            void Close() noexcept { m_Size = 0; }
+
+        private:
+            const uint8_t* m_Data;
+            uint64_t m_Size;
+        };
+
         // Rows of bits over a phase's systems: reachability in schedule order.
         class BitMatrix
         {
@@ -151,6 +338,7 @@ namespace donut::engine::ecs
 
     class SchedulerImpl;
     class SystemContextImpl;
+    class DomainObserver;
     struct DomainRecord;
 
     enum class RunKind : uint8_t
@@ -248,24 +436,61 @@ namespace donut::engine::ecs
         uint32_t pendingCount = 0;       // systems of this phase in the pending list
     };
 
+    // The call a domain is in, for ISimulationContext.
+    enum class DomainCall : uint8_t { None, Gather, Step, Scatter, Lifetime };
+
     struct DomainRecord
     {
         SchedulerImpl* scheduler = nullptr;
         nvrhi::AutoPtr<ISimulationDomain> domain;
         nvrhi::AutoPtr<ISimulationContext> context;
         nvrhi::string name;
-        Vector<ComponentAccess> inputs;
-        Vector<ComponentAccess> outputs;
+        Vector<ComponentAccess> inputs;               // NormalizeAccesses
+        Vector<ComponentAccess> outputs;              // NormalizeAccesses
         double fixedTimeStep = 0.0;
-        double accumulator = 0.0;        // seconds not yet stepped
-        uint64_t stepIndex = 0;          // fixed steps since the domain was added
         uint32_t maxStepsPerFrame = 1;
         uint32_t substeps = 1;
         SimulationDomainFlags flags = SimulationDomainFlags::None;
+        SimulationQueue queue = SimulationQueue::Cpu;
         SimulationDomainId id = SimulationDomainId::Invalid;
         SystemId systems[3] = { SystemId::Invalid, SystemId::Invalid, SystemId::Invalid };   // gather, step, scatter
         SystemRecord* gather = nullptr;
-        ISystemContext* current = nullptr;   // the running domain system's context, for GetCommandBuffer
+        nvrhi::ICommandList* commandList = nullptr;   // SetSimulationCommandList, until PostSimulation has run
+
+        // The domain's entities; null and empty without lifetime terms.
+        nvrhi::AutoPtr<IQuery> lifetimeReference;
+        QueryImpl* lifetime = nullptr;                // the same object
+        Vector<QueryTerm> lifetimeDataTerms;          // the batch columns, in term order
+        Vector<void*> batchColumns;                   // DeliverMembers' scratch
+        nvrhi::AutoPtr<DomainObserver> observer;
+        ObserverId observers[2] = { ObserverId::Invalid, ObserverId::Invalid };   // OnMatch, OnUnmatch
+
+        // The working time state (8.4): the driving thread's between phases, the step system's in its run.
+        double accumulator = 0.0;            // seconds not yet stepped
+        uint64_t stepIndex = 0;              // steps completed since the domain was added
+        uint32_t stepsPlanned = 0;           // what the next run of the step system takes
+        uint32_t stepsTaken = 0;             // since the last SetFrameTime
+        uint32_t stepsDropped = 0;           // since the last SetFrameTime
+        uint32_t stepsInRun = 0;             // the steps that the running step system was to take
+        uint32_t stepInRun = 0;              // ... and the one it is at
+
+        // The call it is in: written by the thread that makes it.
+        ISystemContext* current = nullptr;            // the running domain system's context; null in lifetime callbacks
+        ICommandBuffer* lifetimeCommands = nullptr;   // what a lifetime callback records into
+        DomainCall call = DomainCall::None;
+
+        nvrhi::FRESULT CallLifetime(bool added, const EntityBatch& batch, ICommandBuffer* commands) noexcept;
+        // The whole steps that the accumulator holds. It is finite and not negative, so this is a number from 0 up, but
+        // it may be beyond any integer and, when the division overflows, infinity.
+        double WholeSteps() const noexcept
+        {
+            return accumulator >= fixedTimeStep ? std::floor(accumulator / fixedTimeStep) : 0.0;
+        }
+        void Plan() noexcept
+        {
+            const double whole = WholeSteps();
+            stepsPlanned = whole >= double(maxStepsPerFrame) ? maxStepsPerFrame : uint32_t(whole);
+        }
     };
 
     // ---------------------------------------------------------------------------------------------- the context
@@ -319,13 +544,9 @@ namespace donut::engine::ecs
         nvrhi::FRESULT SetSystemEnabled(SystemId system, bool enabled) noexcept override;
         nvrhi::FRESULT AddSimulationDomain(ISimulationDomain* domain, SimulationDomainId& outId) noexcept override;
         nvrhi::FRESULT RemoveSimulationDomain(SimulationDomainId domain) noexcept override;
-        // Stubs: item E6.1 of the E6 sub-plan implements these.
-        nvrhi::FRESULT SetSimulationCommandList(SimulationDomainId, nvrhi::ICommandList*) noexcept override
-        {
-            return nvrhi::FE_UNSUPPORTED;
-        }
-        nvrhi::FRESULT SaveSimulationState(IStateWriter*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
-        nvrhi::FRESULT LoadSimulationState(IStateReader*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
+        nvrhi::FRESULT SetSimulationCommandList(SimulationDomainId domain, nvrhi::ICommandList* list) noexcept override;
+        nvrhi::FRESULT SaveSimulationState(IStateWriter* writer) noexcept override;
+        nvrhi::FRESULT LoadSimulationState(IStateReader* reader) noexcept override;
         nvrhi::FRESULT Build() noexcept override;
         uint32_t GetAmbiguityCount() noexcept override;
         void GetDiagnostics(nvrhi::string& out) noexcept override;
@@ -385,6 +606,36 @@ namespace donut::engine::ecs
         uint32_t FindPhasePosition(Phase phase) const noexcept;
         bool IsRunning() const noexcept { return m_Running.load(std::memory_order_acquire); }
         bool RefuseWhileRunning(const char* operation) noexcept;
+        // For what calls domains or reads their columns: not inside another scheduler's phase or an observer either.
+        bool RefuseUnlessIdle(const char* operation) noexcept;
+
+        DomainRecord* FindDomain(SimulationDomainId id) const noexcept
+        {
+            return uint32_t(id) < m_Domains.size() ? m_Domains[uint32_t(id)] : nullptr;
+        }
+        // The lifetime query and its observers; nothing without lifetime terms.
+        nvrhi::FRESULT ObserveDomain(DomainRecord& record, const QueryDesc& lifetime) noexcept;
+        // Disconnects the observer, then removes it where observers can be removed.
+        void UnobserveDomain(DomainRecord& record) noexcept;
+        // One batch per chunk to OnEntitiesAdded, in chunk order, or to OnEntitiesRemoved, the last chunk first.
+        void DeliverMembers(DomainRecord& record, bool added) noexcept;
+        // Plays back what the callbacks of DeliverMembers recorded.
+        void PlayLifetimeCommands(const DomainRecord& record) noexcept;
+        // The copy of the working time state for readers, where no system runs.
+        void PublishFixedStep(const DomainRecord& record) noexcept;
+        void PublishFixedSteps() noexcept;
+
+        // Captures (8.5). The components, by id: those declared Write that are plain Relocatable columns (with their
+        // enabled bits), or Enableable tags (their bits). Buffers and columns that are not Relocatable are not captured,
+        // and neither are their enabled bits.
+        void GetCapturedComponents(const DomainRecord& record, Vector<ComponentId>& out) const noexcept;
+        nvrhi::FRESULT SaveDomain(DomainRecord& record, StateBuffer& buffer) noexcept;
+        // Compares the stream with the domain (FE_OUT_OF_DATE, FE_INVALID_ARGS); with `apply`, after that passed, also
+        // writes the times, columns and bits. `engine` becomes the domain's CaptureState bytes.
+        nvrhi::FRESULT ReadDomain(DomainRecord& record, StateCursor& cursor, bool apply, uint64_t version,
+                                  StateCursor& engine) noexcept;
+        nvrhi::FRESULT SaveDomains(IStateWriter* writer) noexcept;
+        nvrhi::FRESULT LoadDomains(IStateReader* reader) noexcept;
 
         nvrhi::FRESULT AddSystemInternal(ISystem* system, DomainRecord* domain, SystemId& outId) noexcept;
         void RemoveSystemInternal(SystemRecord& record) noexcept;
@@ -400,6 +651,7 @@ namespace donut::engine::ecs
 
         // Running.
         void RunPhaseInternal(PhaseRecord& phase) noexcept;
+        void ForgetCommandLists() noexcept;        // SetSimulationCommandList, every domain
         void ScheduleSystem(PhaseRecord& phase, uint32_t index) noexcept;
         void RunOnCallingThread(PhaseRecord& phase, uint32_t index) noexcept;
         void FinishJobs(PhaseRecord& phase) noexcept;
@@ -419,6 +671,8 @@ namespace donut::engine::ecs
         uint32_t m_ThreadCount = 0;                // IJobSystem::GetThreadCount; buffers per system are one more
         ComponentId m_FrameTimeId = ComponentId::Invalid;
         FrameTime* m_FrameTime = nullptr;          // the world's resource
+        ComponentId m_FixedStepId = ComponentId::Invalid;
+        FixedStepState* m_FixedStep = nullptr;     // the world's resource
 
         Vector<SystemRecord*> m_Systems;           // by SystemId; null for free ids
         Vector<uint32_t> m_FreeSystemIds;
@@ -428,6 +682,7 @@ namespace donut::engine::ecs
         Vector<Phase> m_PhaseOrder;                // the run order, named phases included
         Vector<DomainRecord*> m_Domains;           // by SimulationDomainId; null for free ids
         Vector<uint32_t> m_FreeDomainIds;
+        nvrhi::AutoPtr<ICommandBuffer> m_LifetimeCommands;   // the callbacks of DeliverMembers record into it
 
         bool m_OrderDirty = true;
         bool m_ExecutionDirty = true;
@@ -471,7 +726,7 @@ namespace donut::engine::ecs
 
     // ------------------------------------------------------------------------------------ simulation domains
 
-    // The context a domain's calls receive (EcsSimulation.h). E6 fills in the column views and GPU command lists.
+    // The context a domain's calls receive (EcsSimulation.h).
     NVRHI_CLASS_CLSID(SimulationContextImpl, "297c7982-d1d9-4e5a-bd51-9d0b5899eb16")
     class SimulationContextImpl final : public nvrhi::ObjectImpl<ISimulationContext>
     {
@@ -486,30 +741,143 @@ namespace donut::engine::ecs
 
         IWorld* GetWorld() noexcept override { return &m_Domain->scheduler->GetWorldImpl(); }
         SimulationDomainId GetDomainId() noexcept override { return m_Domain->id; }
-        // E6: views over the lifetime query's chunks.
-        uint32_t GetColumnCount(ComponentId) noexcept override { return 0; }
-        uint32_t GetColumns(ComponentId, uint32_t, uint64_t, uint32_t, ColumnView*) noexcept override { return 0; }
+        uint32_t GetColumnCount(ComponentId component) noexcept override
+        {
+            return FindView(component, "ISimulationContext::GetColumnCount") ? m_Domain->lifetime->GetChunkCount() : 0;
+        }
+        uint32_t GetColumns(ComponentId component, uint32_t first, uint64_t sinceVersion, uint32_t capacity,
+                            ColumnView* views) noexcept override
+        {
+            const ComponentAccess* access = FindView(component, "ISimulationContext::GetColumns");
+            if (!access || !views)
+                return 0;
+            // Like IQuery::GetChunks: of the chunks [first, first + capacity), those that have the column and a version
+            // of it newer than sinceVersion.
+            QueryImpl& query = *m_Domain->lifetime;
+            const uint64_t chunkCount = query.GetChunkCount();
+            const uint64_t end = std::min(uint64_t(first) + capacity, chunkCount);
+            uint32_t written = 0;
+            for (uint64_t i = first; i < end; ++i)
+            {
+                const QueryImpl::ChunkPlace place = query.GetChunkPlace(uint32_t(i));
+                const uint32_t column = place.archetype->FindColumn(component);
+                if (column == c_NoColumn)
+                    continue;
+                uint64_t* slot = place.versions + column;
+                if (sinceVersion != c_AllVersions && LoadVersion(slot) <= sinceVersion)
+                    continue;
+                if (access->access == Access::Write)
+                    StampVersion(slot, m_Domain->current->GetVersion());
+                const ArchetypeColumn& c = place.archetype->columns[column];
+                views[written++] = ColumnView{ place.memory + c.offset, c.stride, place.count, component, uint32_t(i),
+                                               LoadVersion(slot) };
+            }
+            return written;
+        }
         uint64_t GetLastGatherVersion() noexcept override
         {
             return m_Domain->gather ? m_Domain->gather->lastRunVersion : c_AllVersions;
         }
-        // E6: GPU queues. AddSimulationDomain accepts CPU domains only.
-        nvrhi::ICommandList* GetCommandList() noexcept override { return nullptr; }
+        nvrhi::ICommandList* GetCommandList() noexcept override { return m_Domain->commandList; }
         ICommandBuffer* GetCommandBuffer() noexcept override
         {
-            return m_Domain->current ? m_Domain->current->GetCommandBuffer() : nullptr;
+            return m_Domain->call == DomainCall::Lifetime ? m_Domain->lifetimeCommands
+                 : m_Domain->current ? m_Domain->current->GetCommandBuffer() : nullptr;
         }
         uint64_t GetStepIndex() noexcept override { return m_Domain->stepIndex; }
-        // Stubs: item E6.1 of the E6 sub-plan implements these.
-        uint32_t GetStepsThisFrame() noexcept override { return 0; }
-        uint32_t GetStepInFrame() noexcept override { return 0; }
-        IJobSystem* GetJobSystem() noexcept override { return nullptr; }
-        // The running system's: E6.1, which delivers lifetime callbacks, makes it null in them.
+        uint32_t GetStepsThisFrame() noexcept override
+        {
+            switch (m_Domain->call)
+            {
+            case DomainCall::Gather: return m_Domain->stepsPlanned;
+            case DomainCall::Step: return m_Domain->stepsInRun;
+            case DomainCall::Scatter: return m_Domain->stepsTaken;
+            default: return 0;
+            }
+        }
+        uint32_t GetStepInFrame() noexcept override
+        {
+            return m_Domain->call == DomainCall::Step ? m_Domain->stepInRun : 0;
+        }
+        IJobSystem* GetJobSystem() noexcept override { return &m_Domain->scheduler->GetJobs(); }
         ISystemContext* GetSystemContext() noexcept override { return m_Domain->current; }
+
+    private:
+        // The declared access behind a component's views; null where there are none (EcsSimulation.h). A domain without
+        // lifetime terms has no entities, so it has none.
+        const ComponentAccess* FindView(ComponentId component, const char* operation) noexcept
+        {
+            const DomainRecord& domain = *m_Domain;
+            const bool gather = domain.call == DomainCall::Gather;
+            if ((!gather && domain.call != DomainCall::Scatter) || !domain.lifetime)
+                return nullptr;
+            WorldImpl& world = domain.scheduler->GetWorldImpl();
+            const ComponentType* type = world.GetType(component);
+            const ComponentAccess* declared = nullptr;
+            for (const ComponentAccess& access : gather ? domain.inputs : domain.outputs)
+                if (access.component == component && access.access != Access::Filter)
+                    declared = &access;
+            const char* reason = nullptr;
+            if (!type)
+                reason = "it is not registered";
+            else if (!declared)
+                reason = gather ? "it is not among the inputs" : "it is not among the outputs";
+            else if (type->kind != StorageKind::Data)
+                reason = "it has no value per row (a tag, buffer, shared, chunk or sparse component, or a resource)";
+            else if (!(type->desc.flags & ComponentFlags::Relocatable))
+                reason = "it is not Relocatable (D14)";
+            if (!reason)
+                return declared;
+            world.ReportValidation(operation, "domain '%s': no views of '%s': %s", domain.name.c_str(),
+                                   type && type->desc.name ? type->desc.name : "(unnamed)", reason);
+            return nullptr;
+        }
+
+        DomainRecord* m_Domain;
+    };
+
+    // The OnMatch and OnUnmatch observer of a domain's lifetime query. The world holds it: it has no reference to
+    // anything, only a raw pointer to the record, which Disconnect clears before the record goes.
+    class DomainObserver final : public nvrhi::ObjectImpl<IObserver>
+    {
+    public:
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(DomainObserver)
+        NVRHI_IMPLEMENTS_INTERFACE(IObserver)
+        NVRHI_END_INTERFACE_TABLE()
+
+        explicit DomainObserver(DomainRecord* domain) noexcept : m_Domain(domain) { }
+        void Disconnect() noexcept { m_Domain = nullptr; }
+
+        nvrhi::FRESULT OnEntities(ObserverEvent event, const EntityBatch& batch,
+                                  ICommandBuffer* commands) noexcept override
+        {
+            if (!m_Domain)
+                return nvrhi::FS_OK;
+            // A callback may drop the last reference to the scheduler, which owns the record.
+            const nvrhi::AutoPtr<IScheduler> scheduler(m_Domain->scheduler);
+            return m_Domain->CallLifetime(event == ObserverEvent::OnMatch, batch, commands);
+        }
 
     private:
         DomainRecord* m_Domain;
     };
+
+    nvrhi::FRESULT DomainRecord::CallLifetime(bool added, const EntityBatch& batch, ICommandBuffer* commands) noexcept
+    {
+        // It may come from the sync point inside this domain's own step system.
+        ISystemContext* const outerContext = current;
+        ICommandBuffer* const outerCommands = lifetimeCommands;
+        const DomainCall outerCall = call;
+        current = nullptr;
+        lifetimeCommands = commands;
+        call = DomainCall::Lifetime;
+        const nvrhi::FRESULT result = added ? domain->OnEntitiesAdded(batch, context.Get())
+                                            : domain->OnEntitiesRemoved(batch, context.Get());
+        current = outerContext;
+        lifetimeCommands = outerCommands;
+        call = outerCall;
+        return result;
+    }
 
     enum class DomainRole : uint8_t { Gather, Step, Scatter };
 
@@ -532,8 +900,8 @@ namespace donut::engine::ecs
             else if (role == DomainRole::Scatter)
                 for (const ComponentAccess& access : domain->outputs)
                     m_Accesses.push_back(access);
-            // The step declares nothing while ISimulationContext::GetColumns returns no views; once E6 gives the step
-            // column views, it must declare the domain's column accesses.
+            // The step declares nothing: ISimulationContext::GetColumns has no views for it, so the steps of
+            // independent domains run in parallel.
         }
 
         SystemDesc& GetDesc(SystemDesc& retVal) noexcept override
@@ -546,7 +914,9 @@ namespace donut::engine::ecs
                          : m_Role == DomainRole::Step ? Phase::FixedSimulation : Phase::PostSimulation;
             // Structural commands of a step are played back before the next step, which needs the phase to itself.
             const bool changesStructure = Has(m_Domain->flags, SimulationDomainFlags::ChangesStructure);
-            retVal.flags = m_Role == DomainRole::Step && changesStructure ? SystemFlags::Exclusive : SystemFlags::None;
+            // An engine on a GPU queue records into one list on one thread.
+            retVal.flags = m_Role == DomainRole::Step && changesStructure ? SystemFlags::Exclusive
+                         : m_Domain->queue != SimulationQueue::Cpu ? SystemFlags::MainThread : SystemFlags::None;
             return retVal;
         }
 
@@ -554,21 +924,27 @@ namespace donut::engine::ecs
         {
             DomainRecord& domain = *m_Domain;
             ISimulationContext* simulation = domain.context.Get();
+            ISystemContext* const outerContext = domain.current;
+            const DomainCall outerCall = domain.call;
             domain.current = context;
             nvrhi::FRESULT result = nvrhi::FS_OK;
             switch (m_Role)
             {
             case DomainRole::Gather:
+                domain.call = DomainCall::Gather;
                 result = domain.domain->GatherInputs(simulation);
                 break;
             case DomainRole::Scatter:
+                domain.call = DomainCall::Scatter;
                 result = domain.domain->ScatterOutputs(simulation);
                 break;
             case DomainRole::Step:
+                domain.call = DomainCall::Step;
                 result = Step(context, simulation);
                 break;
             }
-            domain.current = nullptr;
+            domain.call = outerCall;
+            domain.current = outerContext;
             return result;
         }
 
@@ -576,26 +952,41 @@ namespace donut::engine::ecs
         nvrhi::FRESULT Step(ISystemContext* context, ISimulationContext* simulation) noexcept
         {
             DomainRecord& domain = *m_Domain;
+            if (domain.stepsPlanned == 0)
+                return nvrhi::FS_OK;   // nothing is planned, so nothing is consumed
+            // The plan was made from the accumulator as it is (SetFrameTime). All its whole steps are consumed, the
+            // remainder fraction stays; the steps not taken are dropped: beyond maxStepsPerFrame, and from a failed one
+            // on (8.4).
             const double dt = domain.fixedTimeStep;
-            // floor(accumulated / dt) steps, at most maxStepsPerFrame; the remainder fraction stays, whole steps beyond
-            // the limit are dropped (8.4).
-            const double whole = domain.accumulator >= dt ? std::floor(domain.accumulator / dt) : 0.0;
-            domain.accumulator = std::max(0.0, domain.accumulator - whole * dt);
-            const uint32_t steps = whole >= double(domain.maxStepsPerFrame) ? domain.maxStepsPerFrame : uint32_t(whole);
+            const double whole = domain.WholeSteps();
+            // Beyond 2^53 steps the accumulator has no fraction left, and the product's error may exceed many steps.
+            domain.accumulator = whole < c_ExactSteps ? std::max(0.0, domain.accumulator - whole * dt) : 0.0;
+            domain.stepsInRun = domain.stepsPlanned;
+            domain.stepsPlanned = 0;
             const bool sync = Has(domain.flags, SimulationDomainFlags::ChangesStructure);
             SystemRecord* record = static_cast<SystemContextImpl*>(context)->GetRecord();
-            nvrhi::FRESULT first = nvrhi::FS_OK;
-            for (uint32_t s = 0; s < steps; ++s)
+            nvrhi::FRESULT result = nvrhi::FS_OK;
+            uint32_t taken = 0;
+            while (taken < domain.stepsInRun && NVRHI_SUCCEEDED(result))
             {
-                const nvrhi::FRESULT result = domain.domain->Step(dt, simulation);
-                if (NVRHI_FAILED(result) && first == nvrhi::FS_OK)
-                    first = result;
-                ++domain.stepIndex;
+                domain.stepInRun = taken;
+                result = domain.domain->Step(dt, simulation);
                 domain.scheduler->CountFixedStep();
+                if (NVRHI_SUCCEEDED(result))
+                {
+                    ++domain.stepIndex;
+                    ++taken;
+                }
+                // After a failed step, too: what it recorded is played back like any step's.
                 if (sync)
                     domain.scheduler->SyncInsideStep(*record);
             }
-            return first;
+            domain.stepsInRun = 0;
+            domain.stepInRun = 0;
+            domain.stepsTaken += taken;
+            const double dropped = double(domain.stepsDropped) + (whole - double(taken));
+            domain.stepsDropped = dropped >= double(c_None) ? c_None : uint32_t(dropped);
+            return result;
         }
 
         DomainRecord* m_Domain;
@@ -615,6 +1006,11 @@ namespace donut::engine::ecs
 
     SchedulerImpl::~SchedulerImpl()
     {
+        // The domains hear nothing (EcsSimulation.h). Where observers cannot be removed (a callback dropped the last
+        // reference) theirs stay in the world, disconnected.
+        for (DomainRecord* domain : m_Domains)
+            if (domain)
+                UnobserveDomain(*domain);
         // Pending commands are dropped with their buffers.
         for (SystemRecord* record : m_Systems)
             delete record;
@@ -636,6 +1032,14 @@ namespace donut::engine::ecs
         m_FrameTime = static_cast<FrameTime*>(m_World->GetResource(m_FrameTimeId));
         if (!m_FrameTime)
             return nvrhi::FE_INVALID_ARGS;
+        // Registering again keeps the value: a scheduler made later on the same world starts it at zero.
+        result = m_World->RegisterResource(ComponentTraits<FixedStepState>::Desc(), nullptr, m_FixedStepId);
+        if (NVRHI_FAILED(result))
+            return result;
+        m_FixedStep = static_cast<FixedStepState*>(m_World->GetResource(m_FixedStepId));
+        if (!m_FixedStep)
+            return nvrhi::FE_INVALID_ARGS;
+        *m_FixedStep = FixedStepState{};
 
         for (uint32_t p = 0; p < uint32_t(Phase::Count); ++p)
         {
@@ -657,6 +1061,16 @@ namespace donut::engine::ecs
         if (!IsRunning())
             return false;
         log::warning("ECS scheduler: %s while a phase runs; refused", operation);
+        return true;
+    }
+
+    bool SchedulerImpl::RefuseUnlessIdle(const char* operation) noexcept
+    {
+        if (RefuseWhileRunning(operation))
+            return true;
+        if (!m_World->IsInPhase() && m_World->CanChangeStructure())
+            return false;
+        log::warning("ECS scheduler: %s inside an observer or another scheduler's phase; refused", operation);
         return true;
     }
 
@@ -712,6 +1126,7 @@ namespace donut::engine::ecs
     nvrhi::FRESULT SchedulerImpl::AddSystem(ISystem* system, SystemId& outId) noexcept
     {
         outId = SystemId::Invalid;
+        const nvrhi::AutoPtr<SchedulerImpl> self(this);
         if (RefuseWhileRunning("AddSystem"))
             return nvrhi::FE_INVALID_ARGS;
         return AddSystemInternal(system, nullptr, outId);
@@ -829,6 +1244,7 @@ namespace donut::engine::ecs
 
     nvrhi::FRESULT SchedulerImpl::RemoveSystem(SystemId system) noexcept
     {
+        const nvrhi::AutoPtr<SchedulerImpl> self(this);
         if (RefuseWhileRunning("RemoveSystem"))
             return nvrhi::FE_INVALID_ARGS;
         SystemRecord* record = FindSystem(system);
@@ -903,7 +1319,8 @@ namespace donut::engine::ecs
     nvrhi::FRESULT SchedulerImpl::AddSimulationDomain(ISimulationDomain* domain, SimulationDomainId& outId) noexcept
     {
         outId = SimulationDomainId::Invalid;
-        if (RefuseWhileRunning("AddSimulationDomain"))
+        const nvrhi::AutoPtr<SchedulerImpl> self(this);
+        if (RefuseUnlessIdle("AddSimulationDomain"))
             return nvrhi::FE_INVALID_ARGS;
         if (!domain)
             return nvrhi::FE_INVALID_ARGS;
@@ -925,8 +1342,12 @@ namespace donut::engine::ecs
             return fail(nvrhi::FE_INVALID_ARGS, "an access count without its array");
         if (!!(desc.flags & ~c_KnownDomainFlags))
             return fail(nvrhi::FE_INVALID_ARGS, "unknown flags");
-        if (desc.queue != SimulationQueue::Cpu)
-            return fail(nvrhi::FE_UNSUPPORTED, "GPU queues come with plan step E6; CPU domains only");
+        if (uint8_t(desc.queue) > uint8_t(SimulationQueue::Cuda))
+            return fail(nvrhi::FE_INVALID_ARGS, "unknown queue");
+        if (desc.lifetime.termCount != 0 && !desc.lifetime.terms)
+            return fail(nvrhi::FE_INVALID_ARGS, "a lifetime term count without its array");
+        if (m_FreeDomainIds.empty() && m_Domains.size() >= c_MaxSimulationDomains)
+            return fail(nvrhi::FE_OUT_OF_MEMORY, "the scheduler has c_MaxSimulationDomains domains");
 
         DomainRecord* record = new (std::nothrow) DomainRecord();
         if (!record)
@@ -938,10 +1359,13 @@ namespace donut::engine::ecs
             record->inputs.push_back(desc.inputs[i]);
         for (uint32_t i = 0; i < desc.outputCount; ++i)
             record->outputs.push_back(desc.outputs[i]);
+        NormalizeAccesses(record->inputs);
+        NormalizeAccesses(record->outputs);
         record->fixedTimeStep = desc.fixedTimeStep;
         record->maxStepsPerFrame = desc.maxStepsPerFrame;
         record->substeps = desc.substeps;
         record->flags = desc.flags;
+        record->queue = desc.queue;
 
         uint32_t index;
         if (!m_FreeDomainIds.empty())
@@ -959,6 +1383,7 @@ namespace donut::engine::ecs
 
         auto discard = [&](nvrhi::FRESULT result) noexcept
         {
+            UnobserveDomain(*record);
             for (SystemId& id : record->systems)
             {
                 if (SystemRecord* system = FindSystem(id))
@@ -997,19 +1422,161 @@ namespace donut::engine::ecs
                 return discard(result);
         }
         record->gather = FindSystem(record->systems[0]);
-        // E6: observers on desc.lifetime (OnMatch/OnUnmatch) that call OnEntitiesAdded/OnEntitiesRemoved.
+        const nvrhi::FRESULT observed = ObserveDomain(*record, desc.lifetime);
+        if (NVRHI_FAILED(observed))
+        {
+            log::warning("ECS scheduler: AddSimulationDomain('%s'): the lifetime query cannot be observed (0x%08x)", name,
+                         uint32_t(observed));
+            return discard(observed);
+        }
         outId = record->id;
+        PublishFixedStep(*record);
+        DeliverMembers(*record, true);
+        PlayLifetimeCommands(*record);
         return nvrhi::FS_OK;
+    }
+
+    nvrhi::FRESULT SchedulerImpl::ObserveDomain(DomainRecord& record, const QueryDesc& lifetime) noexcept
+    {
+        if (lifetime.termCount == 0)
+            return nvrhi::FS_OK;
+        nvrhi::FRESULT result = nvrhi::FS_OK;
+        if (!m_LifetimeCommands)
+            result = m_World->CreateCommandBuffer(m_LifetimeCommands.ReleaseAndGetAddressOf());
+        if (NVRHI_FAILED(result))
+            return result;
+        QueryDesc desc = lifetime;
+        desc.debugName = record.name.c_str();
+        result = m_World->CreateQuery(desc, record.lifetimeReference.ReleaseAndGetAddressOf());
+        if (NVRHI_FAILED(result))
+            return result;
+        record.lifetime = donut::query_cast<QueryImpl>(record.lifetimeReference.Get());
+        NVRHI_ASSERT(record.lifetime != nullptr);
+        for (uint32_t i = 0; i < lifetime.termCount; ++i)
+            if (IsDataTerm(lifetime.terms[i]))
+                record.lifetimeDataTerms.push_back(lifetime.terms[i]);
+        record.batchColumns.resize(record.lifetimeDataTerms.size() + 1, nullptr);   // data() is never null
+
+        try
+        {
+            record.observer = MAKE_RC_OBJ_PTR(DomainObserver, &record);
+        }
+        catch (...)
+        {
+        }
+        if (!record.observer)
+            return nvrhi::FE_OUT_OF_MEMORY;
+        static const ObserverEvent events[2] = { ObserverEvent::OnMatch, ObserverEvent::OnUnmatch };
+        for (uint32_t e = 0; e < 2; ++e)
+        {
+            nvrhi::string name = record.name;
+            name.append(e == 0 ? ".added" : ".removed");
+            ObserverDesc observer{};
+            observer.debugName = name.c_str();
+            observer.filterTerms = lifetime.terms;
+            observer.filterTermCount = lifetime.termCount;
+            observer.component = ComponentId::Invalid;
+            observer.event = events[e];
+            result = m_World->AddObserver(observer, record.observer.Get(), record.observers[e]);
+            if (NVRHI_FAILED(result))
+                return result;
+        }
+        return nvrhi::FS_OK;
+    }
+
+    void SchedulerImpl::UnobserveDomain(DomainRecord& record) noexcept
+    {
+        if (record.observer)
+            record.observer->Disconnect();
+        for (ObserverId& id : record.observers)
+        {
+            if (id != ObserverId::Invalid && m_World->CanChangeStructure())
+                m_World->RemoveObserver(id);
+            id = ObserverId::Invalid;
+        }
+    }
+
+    void SchedulerImpl::DeliverMembers(DomainRecord& record, bool added) noexcept
+    {
+        if (!record.lifetime)
+            return;
+        // Batches as ObserverRegistry::Call makes them, under an observer's rules: the write columns are stamped, and
+        // nothing changes structure before the last one.
+        const uint64_t version = m_World->GetVersion();
+        const uint32_t count = record.lifetime->GetChunkCount();
+        nvrhi::FRESULT first = nvrhi::FS_OK;
+        m_World->BeginObserver();
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const QueryImpl::ChunkPlace place = record.lifetime->GetChunkPlace(added ? i : count - 1 - i);
+            for (size_t t = 0; t < record.lifetimeDataTerms.size(); ++t)
+            {
+                const QueryTerm& term = record.lifetimeDataTerms[t];
+                const uint32_t column = place.archetype->FindColumn(term.component);
+                record.batchColumns[t] = column != c_NoColumn ? BatchColumn(place, column) : nullptr;
+                if (column != c_NoColumn && term.access == Access::Write)
+                    StampVersion(place.versions + column, version);
+            }
+            EntityBatch batch{};
+            batch.entities = place.entities;
+            batch.columns = record.batchColumns.data();
+            batch.count = place.count;
+            batch.archetypeIndex = place.archetype->index;
+            const nvrhi::FRESULT result = record.CallLifetime(added, batch, m_LifetimeCommands.Get());
+            if (NVRHI_FAILED(result) && NVRHI_SUCCEEDED(first))
+                first = result;
+        }
+        m_World->EndObserver();
+        if (NVRHI_FAILED(first))
+            log::warning("ECS scheduler: domain '%s': %s failed (0x%08x)", record.name.c_str(),
+                         added ? "OnEntitiesAdded" : "OnEntitiesRemoved", uint32_t(first));
+    }
+
+    void SchedulerImpl::PlayLifetimeCommands(const DomainRecord& record) noexcept
+    {
+        if (!record.lifetime || m_LifetimeCommands->GetCommandCount() == 0)
+            return;
+        ICommandBuffer* const buffers[1] = { m_LifetimeCommands.Get() };
+        const nvrhi::FRESULT result = m_World->Playback(buffers, 1);
+        ++m_Counters.playbacks;
+        if (NVRHI_FAILED(result))
+            log::warning("ECS scheduler: domain '%s': commands of its lifetime callbacks failed (0x%08x)",
+                         record.name.c_str(), uint32_t(result));
+    }
+
+    void SchedulerImpl::PublishFixedStep(const DomainRecord& record) noexcept
+    {
+        FixedStepEntry& entry = m_FixedStep->domains[uint32_t(record.id)];
+        entry.accumulator = record.accumulator;
+        entry.fixedTimeStep = record.fixedTimeStep;
+        entry.stepIndex = record.stepIndex;
+        entry.stepsPlanned = record.stepsPlanned;
+        entry.stepsTaken = record.stepsTaken;
+        entry.stepsDropped = record.stepsDropped;
+        entry.reserved = 0;
+    }
+
+    void SchedulerImpl::PublishFixedSteps() noexcept
+    {
+        for (const DomainRecord* domain : m_Domains)
+            if (domain)
+                PublishFixedStep(*domain);
     }
 
     nvrhi::FRESULT SchedulerImpl::RemoveSimulationDomain(SimulationDomainId domain) noexcept
     {
-        if (RefuseWhileRunning("RemoveSimulationDomain"))
+        const nvrhi::AutoPtr<SchedulerImpl> self(this);
+        if (RefuseUnlessIdle("RemoveSimulationDomain"))
             return nvrhi::FE_INVALID_ARGS;
         const uint32_t index = uint32_t(domain);
-        DomainRecord* record = index < m_Domains.size() ? m_Domains[index] : nullptr;
+        DomainRecord* record = FindDomain(domain);
         if (!record)
             return nvrhi::FE_INVALID_ARGS;
+        // The observers go before the commands are played back: an entity whose removal the domain heard must not leave
+        // a second time, and nothing new may come.
+        DeliverMembers(*record, false);
+        UnobserveDomain(*record);
+        PlayLifetimeCommands(*record);
         for (SystemId id : record->systems)
         {
             if (SystemRecord* system = FindSystem(id))
@@ -1021,7 +1588,375 @@ namespace donut::engine::ecs
         }
         m_Domains[index] = nullptr;
         m_FreeDomainIds.push_back(index);
+        m_FixedStep->domains[index] = FixedStepEntry{};
         delete record;
+        return nvrhi::FS_OK;
+    }
+
+    nvrhi::FRESULT SchedulerImpl::SetSimulationCommandList(SimulationDomainId domain,
+                                                           nvrhi::ICommandList* list) noexcept
+    {
+        if (RefuseWhileRunning("SetSimulationCommandList"))
+            return nvrhi::FE_INVALID_ARGS;
+        DomainRecord* record = FindDomain(domain);
+        if (!record || record->queue == SimulationQueue::Cpu)
+        {
+            log::warning("ECS scheduler: SetSimulationCommandList: %s", record ? "a CPU domain takes no command list"
+                         : "no domain has this id");
+            return nvrhi::FE_INVALID_ARGS;
+        }
+        record->commandList = list;
+        return nvrhi::FS_OK;
+    }
+
+    // ------------------------------------------------------------------------------------ simulation state (8.5)
+
+    void SchedulerImpl::GetCapturedComponents(const DomainRecord& record, Vector<ComponentId>& out) const noexcept
+    {
+        out.clear();
+        for (const Vector<ComponentAccess>* accesses : { &record.outputs, &record.inputs })
+        {
+            for (const ComponentAccess& access : *accesses)
+            {
+                if (access.access != Access::Write)
+                    continue;
+                const ComponentType& type = *m_World->GetType(access.component);
+                const bool column = type.kind == StorageKind::Data && !!(type.desc.flags & ComponentFlags::Relocatable);
+                const bool bits = type.kind == StorageKind::Tag && type.enableable;
+                if ((column || bits) && std::find(out.begin(), out.end(), access.component) == out.end())
+                    out.push_back(access.component);
+            }
+        }
+        std::sort(out.begin(), out.end());
+    }
+
+    // Per domain: the identity (id, name, time step), the working time state, the entities in chunk order; per captured
+    // component its GUID, size and whether it is Enableable, a bit per entity for "has it", if Enableable a bit per
+    // entity for "enabled", the values of those that have it; the length and bytes of the engine's state. Bits are per
+    // entity, not per chunk: the same entities in the same order match however they are split into chunks.
+    nvrhi::FRESULT SchedulerImpl::SaveDomain(DomainRecord& record, StateBuffer& buffer) noexcept
+    {
+        buffer.Put(uint32_t(record.id));
+        buffer.Put(uint32_t(record.name.size()));
+        buffer.Append(record.name.c_str(), record.name.size());
+        buffer.Put(record.fixedTimeStep);
+        buffer.Put(record.accumulator);
+        buffer.Put(record.stepIndex);
+        buffer.Put(record.stepsPlanned);
+        buffer.Put(record.stepsTaken);
+        buffer.Put(record.stepsDropped);
+
+        const uint32_t chunkCount = record.lifetime ? record.lifetime->GetChunkCount() : 0;
+        const uint32_t entityCount = record.lifetime ? record.lifetime->CountEntities() : 0;
+        const uint64_t maskBytes = (uint64_t(entityCount) + 7) / 8;
+        buffer.Put(entityCount);
+        for (uint32_t i = 0; i < chunkCount; ++i)
+        {
+            const QueryImpl::ChunkPlace place = record.lifetime->GetChunkPlace(i);
+            buffer.Append(place.entities, uint64_t(place.count) * sizeof(Entity));
+        }
+
+        Vector<ComponentId> components;
+        GetCapturedComponents(record, components);
+        buffer.Put(uint32_t(components.size()));
+        for (ComponentId component : components)
+        {
+            const ComponentType& type = *m_World->GetType(component);
+            buffer.Put(type.desc.uuid);
+            buffer.Put(type.desc.size);
+            buffer.Put(uint32_t(type.enableable ? 1 : 0));
+            for (uint32_t mask = 0; mask < (type.enableable ? 2u : 1u); ++mask)
+            {
+                uint8_t* const bits = buffer.Grow(maskBytes);
+                if (!bits)
+                    return nvrhi::FE_OUT_OF_MEMORY;
+                std::memset(bits, 0, size_t(maskBytes));
+                uint32_t entity = 0;
+                for (uint32_t i = 0; i < chunkCount; ++i)
+                {
+                    const QueryImpl::ChunkPlace place = record.lifetime->GetChunkPlace(i);
+                    const uint32_t column = place.archetype->FindColumn(component);
+                    for (uint32_t row = 0; row < place.count && column != c_NoColumn; ++row)
+                        if (mask == 0 || GetMaskBit(EnabledMaskOf(place, column), row))
+                            bits[(entity + row) >> 3] |= uint8_t(1u << ((entity + row) & 7));
+                    entity += place.count;
+                }
+            }
+            for (uint32_t i = 0; i < chunkCount; ++i)
+            {
+                const QueryImpl::ChunkPlace place = record.lifetime->GetChunkPlace(i);
+                const uint32_t column = place.archetype->FindColumn(component);
+                if (column != c_NoColumn)
+                    buffer.Append(place.memory + place.archetype->columns[column].offset,
+                                  uint64_t(place.count) * type.desc.size);
+            }
+        }
+
+        StateBuffer engine;
+        nvrhi::AutoPtr<StateWriter> writer;
+        try
+        {
+            writer = MAKE_RC_OBJ_PTR(StateWriter, &engine);
+        }
+        catch (...)
+        {
+        }
+        if (!writer)
+            return nvrhi::FE_OUT_OF_MEMORY;
+        const nvrhi::FRESULT result = record.domain->CaptureState(writer.Get());
+        writer->Close();
+        if (NVRHI_FAILED(result))
+            return result;
+        buffer.Put(engine.size);
+        buffer.Append(engine.data, engine.size);
+        return buffer.failed || engine.failed ? nvrhi::FE_OUT_OF_MEMORY : nvrhi::FS_OK;
+    }
+
+    nvrhi::FRESULT SchedulerImpl::ReadDomain(DomainRecord& record, StateCursor& cursor, bool apply, uint64_t version,
+                                             StateCursor& engine) noexcept
+    {
+        const auto differs = [&cursor]() noexcept
+        {
+            return cursor.malformed ? nvrhi::FE_INVALID_ARGS : nvrhi::FE_OUT_OF_DATE;
+        };
+        const uint32_t id = cursor.Get<uint32_t>();
+        const uint32_t nameBytes = cursor.Get<uint32_t>();
+        const uint8_t* name = cursor.Take(nameBytes);
+        const double fixedTimeStep = cursor.Get<double>();
+        const double accumulator = cursor.Get<double>();
+        const uint64_t stepIndex = cursor.Get<uint64_t>();
+        const uint32_t stepsPlanned = cursor.Get<uint32_t>();
+        const uint32_t stepsTaken = cursor.Get<uint32_t>();
+        const uint32_t stepsDropped = cursor.Get<uint32_t>();
+        if (cursor.malformed || id != uint32_t(record.id) || nameBytes != record.name.size() ||
+            std::memcmp(name, record.name.c_str(), nameBytes) != 0 || fixedTimeStep != record.fixedTimeStep)
+            return differs();
+        if (!(accumulator >= 0.0) || !std::isfinite(accumulator))
+            return nvrhi::FE_INVALID_ARGS;
+        if (apply)
+        {
+            record.accumulator = accumulator;
+            record.stepIndex = stepIndex;
+            // The plan of the save, as far as the accumulator and the domain's limit of now allow it.
+            record.Plan();
+            record.stepsPlanned = std::min(record.stepsPlanned, stepsPlanned);
+            record.stepsTaken = stepsTaken;
+            record.stepsDropped = stepsDropped;
+        }
+
+        const uint32_t chunkCount = record.lifetime ? record.lifetime->GetChunkCount() : 0;
+        const uint32_t entityCount = record.lifetime ? record.lifetime->CountEntities() : 0;
+        const uint64_t maskBytes = (uint64_t(entityCount) + 7) / 8;
+        if (cursor.Get<uint32_t>() != entityCount)
+            return differs();
+        for (uint32_t i = 0; i < chunkCount; ++i)
+        {
+            const QueryImpl::ChunkPlace place = record.lifetime->GetChunkPlace(i);
+            const uint64_t bytes = uint64_t(place.count) * sizeof(Entity);
+            const uint8_t* entities = cursor.Take(bytes);
+            if (!entities || std::memcmp(entities, place.entities, size_t(bytes)) != 0)
+                return differs();
+        }
+
+        Vector<ComponentId> components;
+        GetCapturedComponents(record, components);
+        if (cursor.Get<uint32_t>() != components.size())
+            return differs();
+        for (ComponentId component : components)
+        {
+            const ComponentType& type = *m_World->GetType(component);
+            const nvrhi::GUID uuid = cursor.Get<nvrhi::GUID>();
+            const uint32_t size = cursor.Get<uint32_t>();
+            const uint32_t enableable = cursor.Get<uint32_t>();
+            if (cursor.malformed || !(uuid == type.desc.uuid) || size != type.desc.size ||
+                (enableable != 0) != type.enableable)
+                return differs();
+            const uint8_t* presence = cursor.Take(maskBytes);
+            const uint8_t* enabled = type.enableable ? cursor.Take(maskBytes) : nullptr;
+            if (cursor.malformed)
+                return nvrhi::FE_INVALID_ARGS;
+            const auto bit = [](const uint8_t* bits, uint32_t index) noexcept
+            {
+                return ((bits[index >> 3] >> (index & 7)) & 1) != 0;
+            };
+            uint32_t entity = 0;
+            for (uint32_t i = 0; i < chunkCount; ++i)
+            {
+                const QueryImpl::ChunkPlace place = record.lifetime->GetChunkPlace(i);
+                const uint32_t column = place.archetype->FindColumn(component);
+                for (uint32_t row = 0; row < place.count; ++row)
+                    if (bit(presence, entity + row) != (column != c_NoColumn))
+                        return nvrhi::FE_OUT_OF_DATE;
+                if (column != c_NoColumn)
+                {
+                    const uint64_t bytes = uint64_t(place.count) * size;
+                    const uint8_t* values = cursor.Take(bytes);
+                    if (!values)
+                        return nvrhi::FE_INVALID_ARGS;
+                    if (apply)
+                    {
+                        if (bytes != 0)
+                            std::memcpy(place.memory + place.archetype->columns[column].offset, values, size_t(bytes));
+                        for (uint32_t row = 0; row < place.count && enabled; ++row)
+                            SetMaskBit(EnabledMaskOf(place, column), row, bit(enabled, entity + row));
+                        StampVersion(place.versions + column, version);
+                    }
+                }
+                entity += place.count;
+            }
+        }
+        engine = StateCursor{};
+        engine.size = cursor.Get<uint64_t>();
+        engine.data = cursor.Take(engine.size);
+        return cursor.malformed ? nvrhi::FE_INVALID_ARGS : nvrhi::FS_OK;
+    }
+
+    nvrhi::FRESULT SchedulerImpl::SaveSimulationState(IStateWriter* writer) noexcept
+    {
+        const nvrhi::AutoPtr<SchedulerImpl> self(this);
+        if (RefuseUnlessIdle("SaveSimulationState") || !writer)
+            return nvrhi::FE_INVALID_ARGS;
+        // Busy: a domain's CaptureState must not add, remove or run anything here.
+        m_Running.store(true, std::memory_order_release);
+        const nvrhi::FRESULT result = SaveDomains(writer);
+        m_Running.store(false, std::memory_order_release);
+        return result;
+    }
+
+    nvrhi::FRESULT SchedulerImpl::LoadSimulationState(IStateReader* reader) noexcept
+    {
+        const nvrhi::AutoPtr<SchedulerImpl> self(this);
+        if (RefuseUnlessIdle("LoadSimulationState") || !reader)
+            return nvrhi::FE_INVALID_ARGS;
+        m_Running.store(true, std::memory_order_release);
+        const nvrhi::FRESULT result = LoadDomains(reader);
+        m_Running.store(false, std::memory_order_release);
+        return result;
+    }
+
+    nvrhi::FRESULT SchedulerImpl::SaveDomains(IStateWriter* writer) noexcept
+    {
+        if (!m_Pending.empty())
+            SyncPoint();
+        // Everything is gathered first: a domain that cannot capture leaves the stream untouched.
+        StateBuffer buffer;
+        StateHeader header{};
+        std::memcpy(header.magic, c_StateMagic, sizeof(c_StateMagic));
+        header.version = c_StateVersion;
+        buffer.Put(header);
+        for (DomainRecord* domain : m_Domains)
+        {
+            if (!domain)
+                continue;
+            const nvrhi::FRESULT result = SaveDomain(*domain, buffer);
+            if (NVRHI_FAILED(result))
+            {
+                log::warning("ECS scheduler: SaveSimulationState: domain '%s' failed (0x%08x); nothing was written",
+                             domain->name.c_str(), uint32_t(result));
+                return result;
+            }
+            ++header.domainCount;
+        }
+        if (buffer.failed)
+            return nvrhi::FE_OUT_OF_MEMORY;
+        header.payloadBytes = buffer.size - sizeof(header);
+        std::memcpy(buffer.data, &header, sizeof(header));
+        buffer.Put(Xxh64(buffer.data, size_t(buffer.size)));
+        return buffer.failed ? nvrhi::FE_OUT_OF_MEMORY : writer->Write(buffer.data, buffer.size);
+    }
+
+    nvrhi::FRESULT SchedulerImpl::LoadDomains(IStateReader* reader) noexcept
+    {
+        // The whole stream first, in pieces: a corrupt size allocates no more than the stream holds, and nothing is read
+        // past its end.
+        StateHeader header{};
+        nvrhi::FRESULT result = reader->Read(sizeof(header), &header);
+        if (NVRHI_FAILED(result))
+            return result;
+        if (std::memcmp(header.magic, c_StateMagic, sizeof(c_StateMagic)) != 0)
+            return nvrhi::FE_INVALID_ARGS;
+        if (header.version != c_StateVersion)
+            return nvrhi::FE_UNSUPPORTED;
+        StateBuffer buffer;
+        buffer.Put(header);
+        for (uint64_t left = header.payloadBytes; left != 0;)
+        {
+            const uint64_t piece = std::min(left, c_StatePieceBytes);
+            uint8_t* bytes = buffer.Grow(piece);
+            if (!bytes)
+                return nvrhi::FE_OUT_OF_MEMORY;
+            result = reader->Read(piece, bytes);
+            if (NVRHI_FAILED(result))
+                return result;
+            left -= piece;
+        }
+        uint64_t checksum = 0;
+        result = reader->Read(sizeof(checksum), &checksum);
+        if (NVRHI_FAILED(result))
+            return result;
+        if (buffer.failed)
+            return nvrhi::FE_OUT_OF_MEMORY;
+        if (checksum != Xxh64(buffer.data, size_t(buffer.size)))
+        {
+            log::warning("ECS scheduler: LoadSimulationState: the stream is corrupt; nothing was written");
+            return nvrhi::FE_INVALID_ARGS;
+        }
+
+        // As a save does: commands of the frames that are rewound must not be played back over the restored state.
+        if (!m_Pending.empty())
+            SyncPoint();
+
+        // The domains and entities of the save, or nothing is written.
+        StateCursor payload;
+        payload.data = buffer.data + sizeof(header);
+        payload.size = header.payloadBytes;
+        uint32_t domainCount = 0;
+        for (const DomainRecord* domain : m_Domains)
+            domainCount += domain ? 1 : 0;
+        result = domainCount != header.domainCount ? nvrhi::FE_OUT_OF_DATE : nvrhi::FS_OK;
+        StateCursor engines[c_MaxSimulationDomains];
+        for (size_t d = 0; d < m_Domains.size() && NVRHI_SUCCEEDED(result); ++d)
+            if (m_Domains[d])
+                result = ReadDomain(*m_Domains[d], payload, false, 0, engines[d]);
+        if (NVRHI_SUCCEEDED(result) && payload.position != payload.size)
+            result = nvrhi::FE_INVALID_ARGS;   // bytes that no domain wrote
+        if (NVRHI_FAILED(result))
+        {
+            log::warning("ECS scheduler: LoadSimulationState: %s; nothing was written", result == nvrhi::FE_OUT_OF_DATE
+                         ? "the domains or their entities are not those of the save" : "the stream is malformed");
+            return result;
+        }
+
+        const uint64_t version = m_World->AdvanceVersion();
+        payload.position = 0;
+        for (size_t d = 0; d < m_Domains.size(); ++d)
+            if (m_Domains[d])
+                ReadDomain(*m_Domains[d], payload, true, version, engines[d]);
+        PublishFixedSteps();
+
+        // The engines last, domain by domain; the first failure ends the call.
+        for (size_t d = 0; d < m_Domains.size(); ++d)
+        {
+            if (!m_Domains[d])
+                continue;
+            nvrhi::AutoPtr<StateReader> state;
+            try
+            {
+                state = MAKE_RC_OBJ_PTR(StateReader, engines[d].data, engines[d].size);
+            }
+            catch (...)
+            {
+            }
+            result = state ? m_Domains[d]->domain->RestoreState(state.Get()) : nvrhi::FE_OUT_OF_MEMORY;
+            if (state)
+                state->Close();
+            if (NVRHI_FAILED(result))
+            {
+                log::warning("ECS scheduler: LoadSimulationState: RestoreState of domain '%s' failed (0x%08x); the state "
+                             "is partly restored", m_Domains[d]->name.c_str(), uint32_t(result));
+                return result;
+            }
+        }
         return nvrhi::FS_OK;
     }
 
@@ -1456,11 +2391,24 @@ namespace donut::engine::ecs
     {
         if (RefuseWhileRunning("SetFrameTime"))
             return;
+        if (m_World->IsInPhase())
+        {
+            log::warning("ECS scheduler: SetFrameTime inside another scheduler's phase; refused");
+            return;
+        }
         *m_FrameTime = time;
         const double delta = std::isfinite(time.deltaTime) && time.deltaTime > 0.0 ? time.deltaTime : 0.0;
         for (DomainRecord* domain : m_Domains)
-            if (domain)
-                domain->accumulator += delta;
+        {
+            if (!domain)
+                continue;
+            // Planned again from the whole accumulator: the step system consumes, this does not.
+            domain->accumulator = std::min(domain->accumulator + delta, std::numeric_limits<double>::max());
+            domain->Plan();
+            domain->stepsTaken = 0;
+            domain->stepsDropped = 0;
+            PublishFixedStep(*domain);
+        }
     }
 
     nvrhi::FRESULT SchedulerImpl::RunPhase(Phase phase) noexcept
@@ -1470,6 +2418,7 @@ namespace donut::engine::ecs
 
     nvrhi::FRESULT SchedulerImpl::RunPhases(Phase first, Phase last) noexcept
     {
+        const nvrhi::AutoPtr<SchedulerImpl> self(this);
         const uint32_t begin = FindPhasePosition(first);
         const uint32_t end = FindPhasePosition(last);
         if (begin == c_None || end == c_None || begin > end)
@@ -1483,10 +2432,11 @@ namespace donut::engine::ecs
             log::warning("ECS scheduler: RunPhase while a phase runs (from a system?); refused");
             return nvrhi::FE_INVALID_ARGS;
         }
-        if (m_World->IsInPhase())
+        // In an observer, an idle scheduler would run its domains in the middle of their own lifetime callbacks.
+        if (m_World->IsInPhase() || !m_World->CanChangeStructure())
         {
             m_Running.store(false, std::memory_order_release);
-            log::warning("ECS scheduler: RunPhase while the world is in a phase of another scheduler; refused");
+            log::warning("ECS scheduler: RunPhase inside an observer or another scheduler's phase; refused");
             return nvrhi::FE_INVALID_ARGS;
         }
         EnsureBuilt();
@@ -1495,6 +2445,10 @@ namespace donut::engine::ecs
         {
             if (!m_Phases[uint32_t(m_PhaseOrder[i])]->valid)
             {
+                // The frame's simulation phases are over all the same.
+                const uint32_t post = FindPhasePosition(Phase::PostSimulation);
+                if (begin <= post && post <= end)
+                    ForgetCommandLists();
                 m_Running.store(false, std::memory_order_release);
                 return nvrhi::FE_INVALID_ARGS;
             }
@@ -1522,6 +2476,10 @@ namespace donut::engine::ecs
             record.version = world.AdvanceVersion();
         }
 
+        const bool stepsDomains = !m_Domains.empty() && phase.id == Phase::FixedSimulation;
+        if (stepsDomains)
+            PublishFixedSteps();
+
         m_CurrentPhase = &phase;
         if (world.IsValidationEnabled())
             world.SetWriteAccessCheck(&SchedulerImpl::CheckWriteAccess, this);
@@ -1538,6 +2496,8 @@ namespace donut::engine::ecs
         world.EndPhase();
         world.SetWriteAccessCheck(nullptr, nullptr);
         m_CurrentPhase = nullptr;
+        if (stepsDomains)
+            PublishFixedSteps();
 
         // For writes outside phases, and what the sync point's playback stamps: newer than every run of the phase.
         world.AdvanceVersion();
@@ -1545,6 +2505,16 @@ namespace donut::engine::ecs
         CollectPending(phase);
         if (phase.syncAfter)
             SyncPoint();
+        // The frame's simulation phases have run: the lists handed over for them are no longer the domains'.
+        if (!m_Domains.empty() && phase.id == Phase::PostSimulation)
+            ForgetCommandLists();
+    }
+
+    void SchedulerImpl::ForgetCommandLists() noexcept
+    {
+        for (DomainRecord* domain : m_Domains)
+            if (domain)
+                domain->commandList = nullptr;
     }
 
     void SchedulerImpl::ScheduleSystem(PhaseRecord& phase, uint32_t index) noexcept
@@ -1825,6 +2795,12 @@ namespace donut::engine
         {
             log::warning("CreateScheduler: %s", !jobs ? "the job system is null"
                          : "the world is null or not a world of this module");
+            return nvrhi::FE_INVALID_ARGS;
+        }
+        if (impl->IsInPhase())
+        {
+            // It resets FixedStepState, which systems that declare Read may be reading.
+            log::warning("CreateScheduler: inside a phase of the world; refused");
             return nvrhi::FE_INVALID_ARGS;
         }
         ecs::SchedulerImpl* scheduler = nullptr;

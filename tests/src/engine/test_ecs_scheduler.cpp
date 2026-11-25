@@ -1172,7 +1172,8 @@ static void test_fixed_simulation()
     CHECK(env.scheduler->AddSimulationDomain(bad.Get(), badId) == nvrhi::FE_INVALID_ARGS);
     bad->desc.maxStepsPerFrame = 1;
     bad->desc.queue = SimulationQueue::Compute;
-    CHECK(env.scheduler->AddSimulationDomain(bad.Get(), badId) == nvrhi::FE_UNSUPPORTED);
+    CHECK(env.scheduler->AddSimulationDomain(bad.Get(), badId) == nvrhi::FS_OK);
+    CHECK(env.scheduler->RemoveSimulationDomain(badId) == nvrhi::FS_OK);
     bad->desc.queue = SimulationQueue::Cpu;
     bad->desc.name = "dom";   // dom.gather is taken
     CHECK(env.scheduler->AddSimulationDomain(bad.Get(), badId) == nvrhi::FE_INVALID_ARGS);

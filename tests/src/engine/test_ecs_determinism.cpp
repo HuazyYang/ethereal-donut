@@ -30,6 +30,12 @@
 // FrameTime values at 1, 2 and 8 workers, three times each, and requires the same IWorld::ComputeHash and the same
 // snapshot bytes (which also pin row order, E1.5) after every frame, Added changes seen exactly once, and the first
 // run equal to the golden file.
+//
+// The second scenario (aggregate docs/plans/2026-11-21-donut-ecs-e6.md, item E6.1) has simulation domains with entities:
+// lifetime events, engine indices, column views, consumed requests, a domain on a GPU queue, one whose steps change
+// structure, beside a system that records structural commands on many workers. Per frame the world hash, the snapshot
+// bytes and the bytes of IScheduler::SaveSimulationState must be equal at 1, 2 and 8 workers, three times each, and
+// equal to a golden file of their own.
 
 #include <donut/engine/EcsQuery.h>
 #include <donut/engine/EcsScheduler.h>
@@ -108,6 +114,17 @@ namespace det_test
     // Made by the forge domain's steps, played back at the sync point after each step.
     struct Ember { uint64_t step; };
     DONUT_ECS_COMPONENT(Ember, "03229de2-1edc-4d6f-9c56-b2f880a18c47", DONUT_ECS_FIELDS(step));
+
+    // The second scenario: the engine index of a flock entity, a consumed request (its enabled bit), and its tag.
+    struct FlockBody { uint32_t domain = ~0u; uint32_t index = ~0u; };
+    DONUT_ECS_COMPONENT(FlockBody, "57d5a66c-d43a-4cd3-a198-cd697b83ab9e", DONUT_ECS_FIELDS(domain, index));
+
+    struct Thrust { double x, y; };
+    DONUT_ECS_COMPONENT_EX(Thrust, "e6318032-de75-4cab-9a0e-d60438592f0f", ComponentFlags::Enableable, 0,
+                           DONUT_ECS_FIELDS(x, y));
+
+    struct Flocker { };
+    DONUT_ECS_TAG(Flocker, "f82b7f4a-3455-417e-87bb-c33a5fec7556");
 
     // What the systems saw: their versions, last-run versions and Added/Changed counts, folded in after every frame so
     // that the world hash covers them.
@@ -869,6 +886,491 @@ static void test_determinism()
     }
 }
 
+// ------------------------------------------------------------------------- simulation domains with entities
+
+namespace
+{
+    constexpr uint32_t c_FlockFrames = 60;
+
+    // A CPU engine whose steps change structure: bodies in a dense array, indices from a free list in event order, the
+    // requests of Thrust consumed by their enabled bit, positions and velocities scattered through views.
+    class FlockDomain final : public nvrhi::ObjectImpl<ISimulationDomain>
+    {
+    public:
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(FlockDomain)
+        NVRHI_IMPLEMENTS_INTERFACE(ISimulationDomain)
+        NVRHI_END_INTERFACE_TABLE()
+
+        struct State { double x, y, vx, vy; uint64_t entity; };
+
+        SimulationDomainDesc desc{};
+        ComponentId position, velocity, body, thrust, flocker;
+        nvrhi::AutoPtr<IQuery> requests;
+        std::vector<State> states;
+        std::vector<uint32_t> freeIndices;
+        uint64_t events = 0;        // additions and removals so far
+        uint64_t eventMix = 0;      // what they were, in order
+        uint32_t errors = 0;
+
+        SimulationDomainDesc& GetDesc(SimulationDomainDesc& retVal) noexcept override { return retVal = desc; }
+        nvrhi::FRESULT OnEntitiesAdded(const EntityBatch& batch, ISimulationContext* context) noexcept override
+        {
+            FlockBody* bodies = static_cast<FlockBody*>(batch.columns[0]);
+            const Position* positions = static_cast<const Position*>(batch.columns[1]);
+            for (uint32_t i = 0; i < batch.count; ++i)
+            {
+                uint32_t index = uint32_t(states.size());
+                if (freeIndices.empty())
+                    states.emplace_back();
+                else
+                {
+                    index = freeIndices.back();
+                    freeIndices.pop_back();
+                }
+                states[index] = State{ positions[i].x, positions[i].y, 1.0, 0.0, uint64_t(batch.entities[i]) };
+                bodies[i] = FlockBody{ uint32_t(context->GetDomainId()), index };
+                eventMix = Mix(Mix(eventMix, uint64_t(batch.entities[i])), index);
+                ++events;
+            }
+            return nvrhi::FS_OK;
+        }
+        nvrhi::FRESULT OnEntitiesRemoved(const EntityBatch& batch, ISimulationContext*) noexcept override
+        {
+            const FlockBody* bodies = static_cast<const FlockBody*>(batch.columns[0]);
+            for (uint32_t i = 0; i < batch.count; ++i)
+            {
+                const uint32_t index = bodies[i].index;
+                if (index >= states.size() || states[index].entity != uint64_t(batch.entities[i]))
+                {
+                    ++errors;
+                    continue;
+                }
+                states[index] = State{};
+                freeIndices.push_back(index);
+                eventMix = Mix(Mix(eventMix, ~uint64_t(batch.entities[i])), index);
+                ++events;
+            }
+            return nvrhi::FS_OK;
+        }
+        nvrhi::FRESULT GatherInputs(ISimulationContext* context) noexcept override
+        {
+            ChunkView view;
+            for (uint32_t c = 0; c < requests->GetChunkCount(); ++c)
+            {
+                if (requests->GetChunks(c, MakeChunkRequest(context->GetSystemContext()), 1, &view) != 1)
+                    continue;
+                for (uint32_t row = 0; row < view.count; ++row)
+                {
+                    if (!view.IsRowEnabled(1, row))
+                        continue;
+                    State& state = states[static_cast<const FlockBody*>(view.columns[0])[row].index];
+                    state.vx += static_cast<const Thrust*>(view.columns[1])[row].x;
+                    state.vy += static_cast<const Thrust*>(view.columns[1])[row].y;
+                    context->GetWorld()->SetEnabled(view.entities[row], thrust, false);
+                }
+            }
+            return nvrhi::FS_OK;
+        }
+        nvrhi::FRESULT Step(double dt, ISimulationContext* context) noexcept override
+        {
+            for (State& state : states)
+            {
+                state.vy -= 4.0 * dt;
+                state.x += state.vx * dt;
+                state.y += state.vy * dt;
+                if (state.y < 0.0)
+                {
+                    state.y = -state.y;
+                    state.vy = -state.vy * 0.5;
+                }
+            }
+            if (context->GetStepIndex() % 5 == 2)
+            {
+                const ComponentId list[4] = { flocker, body, position, velocity };
+                const Position value{ double(context->GetStepIndex()), 3.0 };
+                const void* values[4] = { nullptr, nullptr, &value, nullptr };
+                EntityCreateDesc create{};
+                create.components = list;
+                create.values = values;
+                create.componentCount = 4;
+                create.entityCount = 1;
+                Entity placeholder;
+                context->GetCommandBuffer()->CreateEntities(create, context->GetStepIndex(), &placeholder);
+            }
+            return nvrhi::FS_OK;
+        }
+        nvrhi::FRESULT ScatterOutputs(ISimulationContext* context) noexcept override
+        {
+            ColumnView bodies[2];
+            ColumnView positions[2];
+            ColumnView velocities[2];
+            const uint32_t count = context->GetColumnCount(body);
+            for (uint32_t first = 0; first < count; first += 2)
+            {
+                const uint32_t n = context->GetColumns(body, first, c_AllVersions, 2, bodies);
+                const uint32_t p = context->GetColumns(position, first, c_AllVersions, 2, positions);
+                const uint32_t v = context->GetColumns(velocity, first, c_AllVersions, 2, velocities);
+                if (p != n || v > n)
+                    ++errors;
+                uint32_t next = 0;
+                for (uint32_t c = 0; c < n; ++c)
+                {
+                    const bool moving = next < v && velocities[next].chunkIndex == bodies[c].chunkIndex;
+                    for (uint32_t row = 0; row < bodies[c].count; ++row)
+                    {
+                        const State& state = states[static_cast<const FlockBody*>(bodies[c].base)[row].index];
+                        static_cast<Position*>(positions[c].base)[row] = Position{ state.x, state.y };
+                        if (moving)
+                            static_cast<Velocity*>(velocities[next].base)[row] = Velocity{ state.vx, state.vy };
+                    }
+                    next += moving ? 1 : 0;
+                }
+            }
+            return nvrhi::FS_OK;
+        }
+        nvrhi::FRESULT CaptureState(IStateWriter* writer) noexcept override
+        {
+            nvrhi::FRESULT result = writer->Write(states.data(), states.size() * sizeof(State));
+            if (NVRHI_SUCCEEDED(result))
+                result = writer->Write(freeIndices.data(), freeIndices.size() * sizeof(uint32_t));
+            return NVRHI_SUCCEEDED(result) ? writer->Write(&eventMix, sizeof(eventMix)) : result;
+        }
+        nvrhi::FRESULT RestoreState(IStateReader*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
+    };
+
+    // On a GPU queue: gathers only the chunks of Position that changed since its last gather, scatters into Health.
+    class TideDomain final : public nvrhi::ObjectImpl<ISimulationDomain>
+    {
+    public:
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(TideDomain)
+        NVRHI_IMPLEMENTS_INTERFACE(ISimulationDomain)
+        NVRHI_END_INTERFACE_TABLE()
+
+        SimulationDomainDesc desc{};
+        ComponentId position, health;
+        double level = 0.0;
+        uint64_t changedViews = 0;
+        uint64_t mix = 0;
+
+        SimulationDomainDesc& GetDesc(SimulationDomainDesc& retVal) noexcept override { return retVal = desc; }
+        nvrhi::FRESULT OnEntitiesAdded(const EntityBatch& batch, ISimulationContext*) noexcept override
+        {
+            for (uint32_t i = 0; i < batch.count; ++i)
+                mix = Mix(mix, uint64_t(batch.entities[i]));
+            return nvrhi::FS_OK;
+        }
+        nvrhi::FRESULT OnEntitiesRemoved(const EntityBatch& batch, ISimulationContext*) noexcept override
+        {
+            for (uint32_t i = 0; i < batch.count; ++i)
+                mix = Mix(mix, ~uint64_t(batch.entities[i]));
+            return nvrhi::FS_OK;
+        }
+        nvrhi::FRESULT GatherInputs(ISimulationContext* context) noexcept override
+        {
+            ColumnView view;
+            for (uint32_t c = 0; c < context->GetColumnCount(position); ++c)
+            {
+                if (context->GetColumns(position, c, context->GetLastGatherVersion(), 1, &view) != 1)
+                    continue;
+                ++changedViews;
+                mix = Mix(Mix(mix, view.chunkIndex), view.version);
+                for (uint32_t row = 0; row < view.count; ++row)
+                    level += static_cast<const Position*>(view.base)[row].y * 0.0009765625;
+            }
+            return nvrhi::FS_OK;
+        }
+        nvrhi::FRESULT Step(double dt, ISimulationContext*) noexcept override
+        {
+            level -= level * dt;
+            return nvrhi::FS_OK;
+        }
+        nvrhi::FRESULT ScatterOutputs(ISimulationContext* context) noexcept override
+        {
+            ColumnView views[3];
+            const uint32_t count = context->GetColumnCount(health);
+            for (uint32_t first = 0; first < count && context->GetStepsThisFrame() != 0; first += 3)
+            {
+                const uint32_t n = context->GetColumns(health, first, c_AllVersions, 3, views);
+                for (uint32_t v = 0; v < n; ++v)
+                    for (uint32_t row = 0; row < views[v].count; ++row)
+                        static_cast<Health*>(views[v].base)[row].hp += int32_t(level) % 3 + int32_t(views[v].chunkIndex);
+            }
+            return nvrhi::FS_OK;
+        }
+        nvrhi::FRESULT CaptureState(IStateWriter* writer) noexcept override
+        {
+            const nvrhi::FRESULT result = writer->Write(&level, sizeof(level));
+            return NVRHI_SUCCEEDED(result) ? writer->Write(&mix, sizeof(mix)) : result;
+        }
+        nvrhi::FRESULT RestoreState(IStateReader*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
+    };
+
+    struct FlockResult
+    {
+        std::vector<uint64_t> worldHashes;
+        std::vector<uint64_t> snapshotHashes;
+        std::vector<uint64_t> stateHashes;
+        std::vector<uint64_t> events;
+        std::vector<uint64_t> changedViews;
+    };
+
+    FlockResult RunFlock(uint32_t workers)
+    {
+        WorldDesc worldDesc;
+        worldDesc.debugName = "flock";
+        worldDesc.validation = true;
+        nvrhi::AutoPtr<IWorld> world;
+        CHECK(CreateWorld(worldDesc, &world) == nvrhi::FS_OK);
+        JobSystemDesc jobDesc;
+        jobDesc.debugName = "flock";
+        jobDesc.workerThreadCount = workers;
+        nvrhi::AutoPtr<IJobSystem> jobs;
+        CHECK(CreateJobSystem(jobDesc, &jobs) == nvrhi::FS_OK);
+        nvrhi::AutoPtr<IScheduler> scheduler;
+        CHECK(CreateScheduler(world.Get(), jobs.Get(), &scheduler) == nvrhi::FS_OK);
+        IWorld* w = world.Get();
+        const ComponentId position = RegisterComponent<Position>(w);
+        const ComponentId velocity = RegisterComponent<Velocity>(w);
+        const ComponentId health = RegisterComponent<Health>(w);
+        const ComponentId body = RegisterComponent<FlockBody>(w);
+        const ComponentId thrust = RegisterComponent<Thrust>(w);
+        const ComponentId flocker = RegisterComponent<Flocker>(w);
+
+        auto create = [&](const std::vector<ComponentId>& components, uint32_t count, uint64_t& random)
+        {
+            std::vector<Position> positions(count);
+            std::vector<Thrust> thrusts(count);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                positions[i] = Position{ double(Xorshift(random) % 1000) * 0.25, double(Xorshift(random) % 64) };
+                thrusts[i] = Thrust{ double(Xorshift(random) % 9) - 4.0, double(Xorshift(random) % 8) * 0.5 };
+            }
+            std::vector<const void*> values;
+            for (ComponentId component : components)
+                values.push_back(component == position ? static_cast<const void*>(positions.data())
+                                 : component == thrust ? static_cast<const void*>(thrusts.data()) : nullptr);
+            EntityCreateDesc desc{};
+            desc.components = components.data();
+            desc.values = values.data();
+            desc.componentCount = uint32_t(components.size());
+            desc.entityCount = count;
+            std::vector<Entity> entities(count);
+            CHECK(w->CreateEntities(desc, entities.data()) == nvrhi::FS_OK);
+        };
+        uint64_t random = 0x2545f4914f6cdd1dull;
+        create({ flocker, body, position, velocity, thrust }, 700, random);
+        create({ flocker, body, position, health }, 500, random);               // no Velocity
+        create({ position, health }, 100, random);                              // in the tide only
+
+        Query<Read<Position>, Read<FlockBody>> qChurn(w, "churn");
+        uint32_t frame = 0;
+        auto add = [&](const char* name, Phase phase, const std::vector<ComponentAccess>& accesses,
+                       const std::vector<const char*>& after, const std::vector<const char*>& before, auto&& update)
+        {
+            SystemDesc desc{};
+            desc.name = name;
+            desc.accesses = accesses.data();
+            desc.accessCount = uint32_t(accesses.size());
+            desc.phase = phase;
+            desc.runAfter = after.data();
+            desc.runAfterCount = uint32_t(after.size());
+            desc.runBefore = before.data();
+            desc.runBeforeCount = uint32_t(before.size());
+            nvrhi::AutoPtr<ISystem> system;
+            CHECK(CreateLambdaSystem(desc, update, &system) == nvrhi::FS_OK);
+            SystemId id;
+            CHECK(scheduler->AddSystem(system.Get(), id) == nvrhi::FS_OK);
+        };
+        add("gate", Phase::FixedSimulation, {}, { "flock.step" }, { "tide.step" }, [](ISystemContext*) { });
+        add("churn", Phase::PostSimulation, { R(position), R(body) }, { "flock.scatter", "tide.scatter" }, {},
+            [&](ISystemContext* context)
+        {
+            qChurn.ParallelForChunks(context, 1, [&](const ChunkView& view, const Position* p, const FlockBody* b)
+            {
+                ICommandBuffer* commands = context->GetCommandBuffer();
+                std::vector<Entity> gone;
+                std::vector<Entity> pushed;
+                std::vector<Entity> moved;
+                for (uint32_t row = 0; row < view.count; ++row)
+                {
+                    const uint32_t pick = (b[row].index + 7 * frame) % 41;
+                    if (pick == 0)
+                        gone.push_back(view.entities[row]);
+                    else if (pick < 4 && p[row].y < 40.0)
+                        pushed.push_back(view.entities[row]);
+                    else if (pick == 5)
+                        moved.push_back(view.entities[row]);
+                }
+                if (!gone.empty())
+                    commands->DestroyEntities(gone.data(), uint32_t(gone.size()), MakeSortKey(0, view.chunkIndex, 0));
+                const std::vector<Thrust> values(pushed.size(), Thrust{ double(frame % 5) - 2.0, 1.5 });
+                if (!pushed.empty())
+                {
+                    commands->AddComponents(pushed.data(), uint32_t(pushed.size()), thrust, values.data(),
+                                            MakeSortKey(1, view.chunkIndex, 0));
+                    commands->SetEnabled(pushed.data(), uint32_t(pushed.size()), thrust, true,
+                                         MakeSortKey(2, view.chunkIndex, 0));
+                }
+                // Out of the domain for good.
+                if (!moved.empty())
+                    commands->RemoveComponents(moved.data(), uint32_t(moved.size()), flocker,
+                                               MakeSortKey(3, view.chunkIndex, 0));
+                const ComponentId list[4] = { flocker, body, position, view.chunkIndex % 2 ? velocity : health };
+                const Position at{ double(view.chunkIndex), double(frame % 7) };
+                const std::vector<Position> positions(3 + view.chunkIndex % 4, at);
+                const void* valueList[4] = { nullptr, nullptr, positions.data(), nullptr };
+                EntityCreateDesc desc{};
+                desc.components = list;
+                desc.values = valueList;
+                desc.componentCount = 4;
+                desc.entityCount = uint32_t(positions.size());
+                Entity placeholders[8];
+                commands->CreateEntities(desc, MakeSortKey(4, view.chunkIndex, 0), placeholders);
+            });
+        });
+
+        nvrhi::AutoPtr<FlockDomain> flock = MAKE_RC_OBJ_PTR(FlockDomain);
+        flock->position = position;
+        flock->velocity = velocity;
+        flock->body = body;
+        flock->thrust = thrust;
+        flock->flocker = flocker;
+        // Entities that left the domain keep a Thrust: only the flock's own requests are consumed.
+        const QueryTerm requestTerms[3] = { { body, TermOp::All, Access::Read, {} },
+                                            { thrust, TermOp::All, Access::Write, {} },
+                                            { flocker, TermOp::All, Access::Filter, {} } };
+        CHECK(w->CreateQuery(QueryDesc{ requestTerms, 3, 0, "requests" }, &flock->requests) == nvrhi::FS_OK);
+        const ComponentAccess flockInputs[2] = { R(body), W(thrust) };
+        const ComponentAccess flockOutputs[3] = { W(position), W(velocity), R(body) };
+        const QueryTerm flockLifetime[3] = { { flocker, TermOp::All, Access::Filter, {} },
+                                             { body, TermOp::All, Access::Write, {} },
+                                             { position, TermOp::All, Access::Read, {} } };
+        flock->desc.name = "flock";
+        flock->desc.inputs = flockInputs;
+        flock->desc.inputCount = 2;
+        flock->desc.outputs = flockOutputs;
+        flock->desc.outputCount = 3;
+        flock->desc.lifetime.terms = flockLifetime;
+        flock->desc.lifetime.termCount = 3;
+        flock->desc.substeps = 1;
+        flock->desc.maxStepsPerFrame = 3;
+        flock->desc.fixedTimeStep = 1.0 / 90;
+        flock->desc.flags = SimulationDomainFlags::ChangesStructure | SimulationDomainFlags::Deterministic;
+        SimulationDomainId flockId;
+        CHECK(scheduler->AddSimulationDomain(flock.Get(), flockId) == nvrhi::FS_OK && flock->events == 1200);
+
+        nvrhi::AutoPtr<TideDomain> tide = MAKE_RC_OBJ_PTR(TideDomain);
+        tide->position = position;
+        tide->health = health;
+        const ComponentAccess tideInputs[1] = { R(position) };
+        const ComponentAccess tideOutputs[1] = { W(health) };
+        const QueryTerm tideLifetime[1] = { { health, TermOp::All, Access::Filter, {} } };
+        tide->desc.name = "tide";
+        tide->desc.inputs = tideInputs;
+        tide->desc.inputCount = 1;
+        tide->desc.outputs = tideOutputs;
+        tide->desc.outputCount = 1;
+        tide->desc.lifetime.terms = tideLifetime;
+        tide->desc.lifetime.termCount = 1;
+        tide->desc.substeps = 1;
+        tide->desc.maxStepsPerFrame = 2;
+        tide->desc.fixedTimeStep = 1.0 / 40;
+        tide->desc.queue = SimulationQueue::Cuda;
+        tide->desc.flags = SimulationDomainFlags::Deterministic;
+        SimulationDomainId tideId;
+        CHECK(scheduler->AddSimulationDomain(tide.Get(), tideId) == nvrhi::FS_OK);
+        CHECK(scheduler->Build() == nvrhi::FS_OK && scheduler->GetAmbiguityCount() == 0);
+
+        FlockResult result;
+        double time = 0.0;
+        for (frame = 0; frame < c_FlockFrames; ++frame)
+        {
+            create({ flocker, body, position, velocity, thrust }, 1 + frame % 3, random);
+            const double delta = frame % 11 == 10 ? 0.07 : 1.0 / 60;
+            time += delta;
+            scheduler->SetFrameTime(FrameTime{ time, delta, frame });
+            CHECK(scheduler->RunPhases(Phase::BeginFrame, Phase::EndFrame) == nvrhi::FS_OK);
+            result.worldHashes.push_back(w->ComputeHash());
+            nvrhi::AutoPtr<MemoryWriter> snapshot = MAKE_RC_OBJ_PTR(MemoryWriter);
+            CHECK(w->SaveSnapshot(snapshot.Get()) == nvrhi::FS_OK);
+            result.snapshotHashes.push_back(Fnv1a(snapshot->bytes.data(), snapshot->bytes.size()));
+            nvrhi::AutoPtr<MemoryWriter> state = MAKE_RC_OBJ_PTR(MemoryWriter);
+            CHECK(scheduler->SaveSimulationState(state.Get()) == nvrhi::FS_OK);
+            result.stateHashes.push_back(Fnv1a(state->bytes.data(), state->bytes.size()));
+            result.events.push_back(flock->events);
+            result.changedViews.push_back(tide->changedViews);
+        }
+        CHECK(flock->errors == 0 && ecs::GetWorldImpl(w)->GetValidationErrorCount() == 0);
+        const FixedStepState& fixed = *GetResource<FixedStepState>(w);
+        CHECK(fixed.domains[uint32_t(flockId)].stepIndex > c_FlockFrames &&
+              fixed.domains[uint32_t(tideId)].stepIndex > c_FlockFrames / 2);
+        nvrhi::string diagnostics;
+        scheduler->GetDiagnostics(diagnostics);
+        CHECK(std::string(diagnostics.c_str()).find("failed") == std::string::npos);
+        return result;
+    }
+}
+
+// Like CheckGolden, for tests/src/engine/golden/ecs_simulation_frames.txt.
+static void CheckFlockGolden(const FlockResult& result)
+{
+    std::string actual = "# ECS simulation domains (test_ecs_determinism.cpp; ECS_UPDATE_GOLDEN=1 rewrites it)\n"
+                         "# frame world-hash snapshot-fnv1a simulation-state-fnv1a lifetime-events changed-views\n";
+    for (uint32_t f = 0; f < c_FlockFrames; ++f)
+    {
+        char line[128];
+        std::snprintf(line, sizeof(line), "%u %016llx %016llx %016llx %llu %llu\n", f,
+                      (unsigned long long)result.worldHashes[f], (unsigned long long)result.snapshotHashes[f],
+                      (unsigned long long)result.stateHashes[f], (unsigned long long)result.events[f],
+                      (unsigned long long)result.changedViews[f]);
+        actual += line;
+    }
+    const std::filesystem::path path = std::filesystem::path(DONUT_TEST_GOLDEN_DIR) / "ecs_simulation_frames.txt";
+    const char* update = std::getenv("ECS_UPDATE_GOLDEN");
+    if (update && std::strcmp(update, "1") == 0)
+    {
+        std::ofstream file(path, std::ios::binary);
+        file << actual;
+        CHECK(file.good());
+        printf("test_ecs_determinism: wrote %s\n", path.generic_string().c_str());
+        return;
+    }
+    std::ifstream file(path, std::ios::binary);
+    std::stringstream expected;
+    expected << file.rdbuf();
+    if (expected.str() != actual)
+    {
+        printf("test_ecs_determinism: the frames differ from %s (ECS_UPDATE_GOLDEN=1 rewrites it)\nexpected:\n%s"
+               "actual:\n%s", path.generic_string().c_str(), expected.str().c_str(), actual.c_str());
+        CHECK(false);
+    }
+}
+
+static void test_simulation_determinism()
+{
+    FlockResult reference;
+    for (uint32_t repeat = 0; repeat < 3; ++repeat)
+    {
+        for (uint32_t workers : { 1u, 2u, 8u })
+        {
+            const FlockResult result = RunFlock(workers);
+            if (reference.worldHashes.empty())
+            {
+                reference = result;
+                for (uint32_t f = 1; f < c_FlockFrames; ++f)
+                    CHECK(result.worldHashes[f] != result.worldHashes[f - 1] && result.events[f] > result.events[f - 1]);
+                CheckFlockGolden(result);
+            }
+            CHECK(result.worldHashes == reference.worldHashes && result.snapshotHashes == reference.snapshotHashes &&
+                  result.stateHashes == reference.stateHashes && result.events == reference.events &&
+                  result.changedViews == reference.changedViews);
+            printf("test_ecs_determinism: simulation, %u workers, repeat %u: final world hash %016llx, state %016llx, "
+                   "%llu lifetime events\n", workers, repeat, (unsigned long long)result.worldHashes.back(),
+                   (unsigned long long)result.stateHashes.back(), (unsigned long long)result.events.back());
+        }
+    }
+}
+
 int main(int, char**)
 {
     const int64_t blocks = ecs::GetHeapLiveBlockCount();
@@ -876,6 +1378,8 @@ int main(int, char**)
     {
         test_determinism();
         printf("test_ecs_determinism: determinism passed\n");
+        test_simulation_determinism();
+        printf("test_ecs_determinism: simulation_determinism passed\n");
         CHECK(ecs::GetHeapLiveBlockCount() == blocks);
     }
     catch (const std::runtime_error& err)
