@@ -224,6 +224,76 @@ namespace donut::engine
     struct DynamicBoundsLeaf { };
     DONUT_ECS_TAG(DynamicBoundsLeaf, "3f0f3c8e-5a0e-4c55-9d2e-6b8f2a6f1c41")
 
+    // ------------------------------------------------------------- simulation-driven entities (4.7, 5.2, 8.4)
+    //
+    //     node bound to a simulation (SceneGraph::SetSimulationDriven)   ... plus SimulationDriven, SimPose,
+    //                                SimPosePrevious, SimScale, SimBodyRef and a disabled SimTeleport
+    //
+    // While an entity is driven its pose has one home, the two SimPose columns: LocalTransform is neither read nor
+    // written, and WorldTransform is written by the interpolation after PostSimulation, not by transform propagation. The
+    // ones with data are Relocatable, so that a domain gets views of them (D14).
+
+    // The entity's WorldTransform comes from a simulation domain (TransformDriver::Simulation of 4.7).
+    struct SimulationDriven { };
+    DONUT_ECS_TAG(SimulationDriven, "08c0b0cd-f476-4f84-9dcd-7ea08d3ea3fa")
+
+    // The pose after the domain's last step, in world space. The domain's ScatterOutputs writes it and SimPosePrevious,
+    // only in frames with GetStepsThisFrame() > 0.
+    struct SimPose
+    {
+        dm::double3 translation;
+        dm::dquat rotation;
+    };
+    DONUT_ECS_COMPONENT(SimPose, "a458cc4b-7bf5-4f41-bdf1-2d7e2ed7facb", DONUT_ECS_FIELDS(translation, rotation))
+
+    // The pose before that step: the interpolation's value at alpha 0.
+    struct SimPosePrevious
+    {
+        dm::double3 translation;
+        dm::dquat rotation;
+    };
+    DONUT_ECS_COMPONENT(SimPosePrevious, "bfee0796-f435-4d44-a63a-487972f053c1", DONUT_ECS_FIELDS(translation, rotation))
+
+    // The world scale, taken when the entity is bound (engines move rigid poses); a teleport may replace it.
+    struct SimScale
+    {
+        dm::double3 scaling;
+    };
+    DONUT_ECS_COMPONENT(SimScale, "8597b8ec-dde0-4612-a644-10453fd55287", DONUT_ECS_FIELDS(scaling))
+
+    // The entity's object in its domain's engine (8.1), written by the domain when the entity is added to it.
+    constexpr uint32_t c_NoSimulationDomain = ~0u;   // uint32_t(SimulationDomainId::Invalid)
+    struct SimBodyRef
+    {
+        uint32_t domain = c_NoSimulationDomain;      // SimulationDomainId
+        uint32_t index = 0;                          // the engine's
+    };
+    DONUT_ECS_COMPONENT(SimBodyRef, "d4219345-9610-4d64-9578-e516c589e5d1", DONUT_ECS_FIELDS(domain, index))
+
+    // A pending request to move a driven entity (5.2): enabled while it is pending, and the request's only home. The
+    // node's transform setters fill and enable it; the domain applies it before its next step, sets both poses to the
+    // target (nothing smears) and disables it. In a frame without a step it stays pending, and its column has not
+    // changed at the next gather: a domain finds requests by the enabled bit, not by the column's version.
+    enum class SimTeleportSpace : uint32_t
+    {
+        Parent,   // as the setter wrote it
+        World,    // resolved through the parent's WorldTransform, before GatherInputs: what a domain sees
+    };
+    struct SimTeleport
+    {
+        dm::double3 translation;
+        dm::dquat rotation;
+        dm::double3 scaling;
+        SimTeleportSpace space;
+        uint32_t reserved;
+    };
+    static_assert(sizeof(SimTeleport) == 88, "SimTeleport layout");
+    DONUT_ECS_COMPONENT_EX(SimTeleport, "26830649-f042-4443-9bea-d8297d27f587",
+                           ::donut::engine::ComponentFlags::Enableable, 0,
+                           DONUT_ECS_FIELDS(translation, rotation, scaling, space, reserved))
+
+    // ------------------------------------------------------------------------------------- leaf classes (4.11)
+
     // What a leaf class keeps in columns (D19). One static instance per leaf class, returned by
     // SceneGraphLeaf::GetTypeDesc(); read once per leaf when it is attached, never per entity in a system.
     struct LeafTypeDesc
@@ -240,9 +310,16 @@ namespace donut::engine
         // read at the next Refresh that runs (or call InvalidateContent). Off: LocalBounds follows the leaf only at
         // attach, SetLeaf and InvalidateContent.
         bool dynamicBounds = false;
+        // The columns are the state's home (9.2): while the leaf is in no graph, their values live in a record that the
+        // leaf owns; attach and SetLeaf move them into the row as initial values, before any observer runs, and detach
+        // and teardown move them back (SceneGraphLeaf::Get, Edit). Off: the columns are derived from the leaf, start at
+        // zero, and their owner fills them (MeshInstance).
+        bool leafRecord = false;
     };
 
     // The state of an object that is in no graph (5.3): owned by the object, moved into rows when it is attached and
     // back when it is detached. Defined in the engine's private sources.
     class OrphanRecord;
+    // The column values of a leaf that is in no graph (LeafTypeDesc::leafRecord), likewise.
+    class LeafRecord;
 }

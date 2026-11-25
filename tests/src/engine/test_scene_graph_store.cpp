@@ -36,6 +36,7 @@
 #include <donut/core/log.h>
 
 #include <donut/engine/EcsScheduler.h>
+#include <donut/engine/EcsSimulation.h>
 
 #include "EcsWorldImpl.h"
 #include "SceneGraphStore.h"
@@ -952,6 +953,307 @@ void test_review_fixes()
     }
 }
 
+// HasStaleWorldTransforms: set by every structural and transform call of the API (the list is SceneGraph.h's), cleared
+// by the run of propagation that brings the world transforms up to date, and not set by anything else. Unlike the
+// pending flags it does not stay for the frame after a move, and a propagation run by hand clears it.
+void test_stale_world_transforms()
+{
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+    auto source = MAKE_RC_OBJ_PTR(SceneGraph);   // another graph, to copy from
+    CHECK(!graph->HasStaleWorldTransforms());    // no edit yet
+    uint32_t frame = 0;
+
+    auto expect = [](const char* what, bool condition, const char* problem)
+    {
+        if (!condition)
+            throw std::runtime_error(std::string("stale_world_transforms: ") + what + ": " + problem + "\n");
+    };
+    auto settle = [&](const char* what)
+    {
+        graph->Refresh(frame++);
+        graph->Refresh(frame++);   // the previous-frame transforms of a move in the frame before
+        expect(what, !graph->HasPendingStructureChanges() && !graph->HasPendingTransformChanges(), "not settled");
+        expect(what, !graph->HasStaleWorldTransforms(), "set before the call");
+    };
+    // `moves`: the call sets transforms, so the pending transform flag stays for the frame after the Refresh.
+    auto edit = [&](const char* what, bool moves, auto&& call)
+    {
+        settle(what);
+        call();
+        expect(what, graph->HasStaleWorldTransforms(), "not set by the call");
+        expect(what, graph->HasPendingTransformChanges() == moves, "the pending transform flag");
+        graph->Refresh(frame++);
+        expect(what, !graph->HasStaleWorldTransforms(), "not cleared by Refresh");
+        expect(what, graph->HasPendingTransformChanges() == moves, "the pending transform flag of the frame after");
+        if (graph->GetEntity(graph->GetRootNode()) != Entity::Null)   // the root that Detach leaves is in no graph
+            CheckWorlds(graph);
+        graph->Refresh(frame++);
+        expect(what, !graph->HasStaleWorldTransforms() && !graph->HasPendingTransformChanges(), "set in a still frame");
+    };
+    auto noEdit = [&](const char* what, auto&& call)
+    {
+        settle(what);
+        call();
+        expect(what, !graph->HasStaleWorldTransforms(), "set by a call that is no edit");
+    };
+
+    const dm::double3 t(1.0, 2.0, 3.0);
+    const dm::dquat r = dm::rotationQuat(dm::double3(0.1, 0.2, 0.3));
+    const dm::double3 scale(1.5);
+
+    // ---- structure: SetRootNode, Attach, AttachLeafNode, Detach
+    edit("SetRootNode", false, [&]() { graph->SetRootNode(MakeNode("root")); });
+    nvrhi::AutoPtr<SceneGraphNode> bare, moved, parent;
+    edit("Attach", false, [&]() { bare = graph->Attach(graph->GetRootNode(), MakeNode("bare")); });
+    auto withTransform = MakeNode("moved");
+    withTransform->SetTranslation(t);
+    edit("Attach with a transform", true, [&]() { moved = graph->Attach(graph->GetRootNode(), withTransform); });
+    auto subtree = MakeNode("parent");
+    auto subtreeChild = MakeNode("child");
+    subtreeChild->SetRotation(r);
+    graph->Attach(subtree, subtreeChild);
+    edit("Attach of a subtree", true, [&]() { parent = graph->Attach(graph->GetRootNode(), subtree); });
+    edit("Attach of a copy", true, [&]() { graph->Attach(bare, parent); });
+    source->SetRootNode(MakeNode("source"));
+    source->Refresh(0);
+    edit("Attach of another graph's node", false, [&]() { graph->Attach(bare, source->GetRootNode()); });
+    CHECK(!source->HasStaleWorldTransforms());
+    nvrhi::AutoPtr<SceneGraphNode> lightNode;
+    edit("AttachLeafNode", false, [&]()
+    {
+        lightNode = graph->AttachLeafNode(parent, MAKE_RC_OBJ_PTR(SpotLight));
+    });
+    edit("Detach", false, [&]() { graph->Detach(bare->GetFirstChild()); });
+    edit("Detach of a leaf node", false, [&]() { graph->Detach(lightNode); });
+    edit("Attach again", false, [&]() { graph->Attach(parent, lightNode); });
+
+    // ---- structure: SetLeaf
+    auto leafNode = graph->Attach(graph->GetRootNode(), MakeNode("leaf"));
+    edit("SetLeaf, the first", false, [&]() { leafNode->SetLeaf(MAKE_RC_OBJ_PTR(GrowingLeaf)); });
+    edit("SetLeaf, the same class", false, [&]() { leafNode->SetLeaf(MAKE_RC_OBJ_PTR(GrowingLeaf)); });
+    edit("SetLeaf, another class", false, [&]()
+    {
+        leafNode->SetLeaf(factory->CreateMeshInstance(MakeMesh(factory, 1.f)));
+    });
+    edit("SetLeaf, none", false, [&]() { leafNode->SetLeaf(nullptr); });
+
+    // ---- transforms: the four setters, each as the node's first and as a later one
+    auto setters = [&](const char* name, auto&& set)
+    {
+        auto node = graph->Attach(parent, MakeNode("set"));
+        edit((std::string(name) + ", the first").c_str(), true, [&]() { set(node.Get()); });
+        edit((std::string(name) + ", again").c_str(), true, [&]() { set(node.Get()); });
+    };
+    setters("SetTransform", [&](SceneGraphNode* node) { node->SetTransform(&t, &r, &scale); });
+    setters("SetTransform, no part", [&](SceneGraphNode* node) { node->SetTransform(nullptr, nullptr, nullptr); });
+    setters("SetTranslation", [&](SceneGraphNode* node) { node->SetTranslation(t); });
+    setters("SetRotation", [&](SceneGraphNode* node) { node->SetRotation(r); });
+    setters("SetScaling", [&](SceneGraphNode* node) { node->SetScaling(scale); });
+
+    // ---- transforms: the calls that go through the setters
+    const Light* light = query_cast<Light>(lightNode->GetLeaf());
+    CHECK(light);
+    edit("Light::SetPosition", true, [&]() { light->SetPosition(t); });
+    edit("Light::SetDirection", true, [&]() { light->SetDirection(dm::double3(0.0, -1.0, 0.5)); });
+    edit("SceneGraphAnimationChannel::Apply", true, [&]()
+    {
+        auto sampler = MAKE_RC_OBJ_PTR(animation::Sampler);
+        sampler->AddKeyframe({ 0.f, dm::float4(2.f, 0.f, 0.f, 0.f) });
+        auto channel = MAKE_RC_OBJ_PTR(SceneGraphAnimationChannel, sampler.Get(), moved.Get(),
+                                       AnimationAttribute::Translation);
+        CHECK(channel->Apply(0.f));
+    });
+    edit("SceneGraphAnimation::Apply", true, [&]()
+    {
+        auto sampler = MAKE_RC_OBJ_PTR(animation::Sampler);
+        sampler->AddKeyframe({ 0.f, dm::float4(0.f, 0.f, 0.f, 1.f) });
+        auto animation = MAKE_RC_OBJ_PTR(SceneGraphAnimation);
+        animation->AddChannel(MAKE_RC_OBJ_PTR(SceneGraphAnimationChannel, sampler.Get(), moved.Get(),
+                                              AnimationAttribute::Rotation));
+        (void)animation->Apply(0.f);   // its result does not tell whether the channels applied
+    });
+    edit("several edits before one Refresh", true, [&]()
+    {
+        moved->SetTranslation(dm::double3(4.0));
+        graph->Attach(moved, MakeNode("below"));
+        moved->SetTranslation(dm::double3(5.0));
+    });
+
+    // ---- what is no edit of this graph
+    auto orphan = MakeNode("orphan");
+    noEdit("getters", [&]()
+    {
+        (void)moved->GetLocalToWorldTransform();
+        (void)graph->GetRootNode()->GetGlobalBoundingBox();
+        (void)graph->GetRootNode()->GetSubgraphContentFlags();
+        (void)moved->GetDirtyFlags();
+        CHECK(graph->FindNode("/moved") == moved.Get());
+    });
+    noEdit("names, content and leaf properties", [&]()
+    {
+        moved->SetName("renamed");
+        light->SetName("renamed light");
+        lightNode->InvalidateContent();
+        CHECK(lightNode->GetLeaf()->SetProperty("color", dm::float4(1.f)));
+    });
+    noEdit("nodes in no graph", [&]()
+    {
+        auto child = MakeNode("child");
+        graph->Attach(orphan, child);
+        orphan->SetTransform(&t, &r, &scale);
+        child->SetTranslation(t);
+        child->SetLeaf(MAKE_RC_OBJ_PTR(PointLight));
+        graph->Detach(child);
+    });
+    noEdit("another graph", [&]()
+    {
+        source->GetRootNode()->SetTranslation(t);
+        CHECK(source->HasStaleWorldTransforms());
+    });
+    noEdit("a write through the world", [&]()
+    {
+        IWorld* world = graph->GetWorld();
+        LocalTransform* local = GetComponentForWrite<LocalTransform>(world, graph->GetEntity(moved));
+        local->scaling = local->scaling;
+    });
+    noEdit("RunReadOnlyPhase", [&]() { CHECK(graph->RunReadOnlyPhase(Phase::RenderExtract) == nvrhi::FS_OK); });
+    noEdit("SetJobSystem", [&]() { graph->SetJobSystem(MakeJobs(2)); });
+    CheckWorlds(graph);
+
+    // ---- calls that are refused: a structural one inside a phase sets nothing, a Refresh inside a phase clears nothing
+    IScheduler* scheduler = graph->GetScheduler();
+    uint32_t runs = 0;
+    SystemDesc desc{};
+    desc.name = "test.Refused";
+    desc.phase = Phase::PreSimulation;
+    desc.flags = SystemFlags::MainThread;
+    nvrhi::AutoPtr<ISystem> refused;
+    CHECK(CreateLambdaSystem(desc, [&](ISystemContext*) noexcept
+    {
+        ++runs;
+        graph->Attach(graph->GetRootNode(), orphan);
+        graph->Refresh(frame);
+    }, &refused) == nvrhi::FS_OK);
+    SystemId refusedId = SystemId::Invalid;
+    CHECK(scheduler->AddSystem(refused, refusedId) == nvrhi::FS_OK);
+    const uint32_t warnings = g_Warnings.load();
+    noEdit("Attach inside a phase", [&]() { CHECK(scheduler->RunPhase(Phase::PreSimulation) == nvrhi::FS_OK); });
+    CHECK(runs == 1 && !orphan->GetGraph());
+    edit("Refresh inside a phase", true, [&]()
+    {
+        moved->SetTranslation(dm::double3(6.0));
+        CHECK(scheduler->RunPhase(Phase::PreSimulation) == nvrhi::FS_OK);
+    });
+    CHECK(runs == 2 && g_Warnings.load() > warnings);
+    g_Warnings = warnings;
+    CHECK(scheduler->RemoveSystem(refusedId) == nvrhi::FS_OK);
+
+    // ---- propagation run by hand clears it, and leaves the pending flags to the next Refresh, which still runs
+    settle("by hand");
+    moved->SetTranslation(dm::double3(7.0));
+    graph->Attach(moved, MakeNode("below"));
+    CHECK(scheduler->RunPhase(Phase::Bounds) == nvrhi::FS_OK);
+    CHECK(graph->HasStaleWorldTransforms());
+    CHECK(scheduler->RunPhase(Phase::TransformPropagation) == nvrhi::FS_OK);
+    CHECK(!graph->HasStaleWorldTransforms());
+    CHECK(graph->HasPendingStructureChanges() && graph->HasPendingTransformChanges());
+    CheckWorlds(graph);
+    const uint64_t version = graph->GetWorld()->GetVersion();
+    graph->Refresh(frame++);
+    CHECK(graph->GetWorld()->GetVersion() != version);
+    CHECK(!graph->HasPendingStructureChanges() && graph->HasPendingTransformChanges());
+    CHECK(!graph->HasStaleWorldTransforms());
+    moved->SetTranslation(dm::double3(8.0));   // an edit after it is stale again
+    CHECK(graph->HasStaleWorldTransforms());
+    graph->Refresh(frame++);
+    CheckWorlds(graph);
+
+    // ---- the root: Detach leaves a root in no graph, SetRootNode replaces one
+    edit("SetRootNode, another", false, [&]() { graph->SetRootNode(MakeNode("other root")); });
+    edit("Detach of the root", false, [&]() { graph->Detach(graph->GetRootNode()); });
+    nvrhi::AutoPtr<SceneGraphNode> newRoot = MakeNode("new root");
+    newRoot->SetTranslation(t);
+    edit("Attach as the root", true, [&]() { graph->Attach(nullptr, newRoot); });
+}
+
+// The simulation components and the fixed-step resource register as what domains need them to be (Relocatable), and
+// their GUIDs are no other type's of a graph's world, with every leaf class of SceneGraph.h attached.
+void test_simulation_components()
+{
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+    graph->SetRootNode(MakeNode("root"));
+    auto skinned = factory->CreateSkinnedMeshInstance(factory, MakeMesh(factory, 1.f));
+    SceneGraphNode* root = graph->GetRootNode();
+    graph->AttachLeafNode(root, factory->CreateMeshInstance(MakeMesh(factory, 1.f)));
+    graph->AttachLeafNode(root, skinned);
+    graph->AttachLeafNode(root, MAKE_RC_OBJ_PTR(SkinnedMeshReference, skinned.Get()));
+    graph->AttachLeafNode(root, MAKE_RC_OBJ_PTR(PerspectiveCamera));
+    graph->AttachLeafNode(root, MAKE_RC_OBJ_PTR(OrthographicCamera));
+    graph->AttachLeafNode(root, MAKE_RC_OBJ_PTR(DirectionalLight));
+    graph->AttachLeafNode(root, MAKE_RC_OBJ_PTR(SpotLight));
+    graph->AttachLeafNode(root, MAKE_RC_OBJ_PTR(PointLight));
+    graph->AttachLeafNode(root, MAKE_RC_OBJ_PTR(SceneGraphAnimation));
+    RegisterComponent<DynamicBoundsLeaf>(graph->GetWorld());   // the tag of leaves with dynamic bounds
+    nvrhi::AutoPtr<IWorld> world;
+    WorldDesc worldDesc;
+    worldDesc.debugName = "test_scene_graph_store";
+    worldDesc.validation = true;
+    CHECK(CreateWorld(worldDesc, &world) == nvrhi::FS_OK);
+    const uint32_t typeCount = graph->GetWorld()->GetComponentTypeCount();
+    CHECK(typeCount >= 27);   // 14 of the store, FrameTime, 11 leaf-class tags, DynamicBoundsLeaf
+    auto ownGuid = [&](const ComponentTypeDesc& desc)
+    {
+        for (uint32_t i = 0; i < typeCount; ++i)
+        {
+            const ComponentTypeDesc* other = graph->GetWorld()->GetComponentTypeDesc(ComponentId(i));
+            CHECK(other);
+            CHECK(other->uuid != desc.uuid || std::strcmp(other->name, desc.name) == 0);
+        }
+    };
+    std::vector<ComponentId> ids;
+    auto component = [&](const ComponentTypeDesc& desc, uint32_t size, ComponentFlags flags)
+    {
+        ownGuid(desc);
+        ComponentId id = ComponentId::Invalid;
+        CHECK(world->FindComponent(desc.uuid) == ComponentId::Invalid);
+        CHECK(world->RegisterComponent(desc, id) == nvrhi::FS_OK);
+        CHECK(desc.size == size && desc.flags == flags);
+        ids.push_back(id);
+    };
+    component(ComponentTraits<SimulationDriven>::Desc(), 0, ComponentFlags::Tag | ComponentFlags::Relocatable);
+    component(ComponentTraits<SimPose>::Desc(), 56, ComponentFlags::Relocatable);
+    component(ComponentTraits<SimPosePrevious>::Desc(), 56, ComponentFlags::Relocatable);
+    component(ComponentTraits<SimScale>::Desc(), 24, ComponentFlags::Relocatable);
+    component(ComponentTraits<SimBodyRef>::Desc(), 8, ComponentFlags::Relocatable);
+    component(ComponentTraits<SimTeleport>::Desc(), 88, ComponentFlags::Enableable | ComponentFlags::Relocatable);
+
+    // a row bound to no domain yet
+    EntityCreateDesc create{};
+    create.components = ids.data();
+    create.componentCount = uint32_t(ids.size());
+    create.entityCount = 1;
+    Entity entity = Entity::Null;
+    CHECK(world->CreateEntities(create, &entity) == nvrhi::FS_OK);
+    CHECK(GetComponent<SimBodyRef>(world, entity)->domain == uint32_t(SimulationDomainId::Invalid));
+    CHECK(world->SetEnabled(entity, ids.back(), false) == nvrhi::FS_OK && !world->IsEnabled(entity, ids.back()));
+
+    // NoSerialize: what the scheduler publishes is not part of the world's hash
+    ComponentId id = ComponentId::Invalid;
+    ownGuid(ComponentTraits<FixedStepState>::Desc());
+    CHECK(world->FindComponent(ComponentTraits<FixedStepState>::Desc().uuid) == ComponentId::Invalid);
+    CHECK(world->RegisterResource(ComponentTraits<FixedStepState>::Desc(), nullptr, id) == nvrhi::FS_OK);
+    const uint64_t hash = world->ComputeHash();
+    FixedStepState* state = GetResource<FixedStepState>(world);
+    CHECK(state);
+    for (const FixedStepEntry& entry : state->domains)
+        CHECK(entry.accumulator == 0.0 && entry.fixedTimeStep == 0.0 && entry.stepIndex == 0 &&
+              entry.stepsPlanned == 0 && entry.stepsTaken == 0 && entry.stepsDropped == 0);
+    state->domains[c_MaxSimulationDomains - 1].stepIndex = 7;
+    CHECK(world->ComputeHash() == hash);
+}
+
 // Steady state: moves, refreshes and reads allocate nothing.
 void test_steady_state_allocations()
 {
@@ -1548,6 +1850,8 @@ int main(int argc, char** argv)
         { "subgraph_nan", test_subgraph_nan },
         { "walker_order", test_walker_order },
         { "pending", test_pending_changes_and_joints },
+        { "stale_world_transforms", test_stale_world_transforms },
+        { "simulation_components", test_simulation_components },
         { "row_hints", test_row_hints },
         { "review_fixes", test_review_fixes },
         { "steady_state", test_steady_state_allocations },

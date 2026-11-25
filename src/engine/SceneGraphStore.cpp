@@ -848,6 +848,7 @@ namespace donut::engine
         const bool created = CreateNodes(parentEntity, parent ? DepthOf(parentEntity) : 0);
 
         m_PendingStructure = true;
+        m_StaleWorldTransforms = true;
         m_PendingTransform |= anyLocal;
         BumpEpoch();
         return created ? result : nullptr;
@@ -950,6 +951,7 @@ namespace donut::engine
         const bool created = CreateNodes(parentEntity, parent ? DepthOf(parentEntity) : 0);
 
         m_PendingStructure = true;
+        m_StaleWorldTransforms = true;
         m_PendingTransform |= anyLocal;
         BumpEpoch();
         return created ? result : nullptr;
@@ -1416,6 +1418,7 @@ namespace donut::engine
 
         SyncArchetypes();
         m_PendingStructure = true;
+        m_StaleWorldTransforms = true;
         BumpEpoch();
         return result;
     }
@@ -1484,6 +1487,7 @@ namespace donut::engine
         if (Locate(entity, row))
             RememberRow(node, row);   // its row moved to another archetype
         m_PendingStructure = true;
+        m_StaleWorldTransforms = true;
         BumpEpoch();
     }
 
@@ -1525,6 +1529,7 @@ namespace donut::engine
                 RememberRow(node, row);   // its row moved to another archetype
         }
         m_PendingTransform = true;
+        m_StaleWorldTransforms = true;
     }
 
     void SceneGraphStore::InvalidateContent(SceneGraphNode* node)
@@ -2002,6 +2007,7 @@ namespace donut::engine
             m_Counters.propagatedRows += ctx.rows.load(std::memory_order_relaxed);
         }
         PropagateDeepBucket(jobs, since, version, levelAboveWrote);
+        m_StaleWorldTransforms = false;   // every edit so far is in the world transforms
         MarkSkinnedJoints(since);
         return nvrhi::FS_OK;
     }

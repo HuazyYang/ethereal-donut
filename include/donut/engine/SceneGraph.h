@@ -46,6 +46,7 @@ namespace donut::engine
     struct IWorld;
     struct IJobSystem;
     struct IScheduler;
+    struct FrameTime;              // EcsScheduler.h
     enum class Phase : uint32_t;   // EcsScheduler.h
 
     enum struct SceneContentFlags : uint32_t
@@ -76,12 +77,36 @@ namespace donut::engine
         nvrhi::WeakPtr<SceneGraphNode> m_Node;
         uint32_t m_RemovalPending = 0;   // unregistered this often in a Detach; SceneGraph compacts its vectors after it
         uint32_t m_RemovalTaken = 0;
+        LeafRecord* m_LeafRecord = nullptr;   // valid while in no graph; only classes whose type declares leafRecord
+
+        [[nodiscard]] const void* GetColumn(const ComponentTypeDesc& type) const noexcept;
+        [[nodiscard]] void* EditColumn(const ComponentTypeDesc& type) noexcept;
 
     protected:
+        // The leaf's value of a column that its class declares (LeafTypeDesc::columns): the row while the leaf is
+        // attached, its record otherwise. A leaf in no graph has a record once Edit made it or it left a graph
+        // (leafRecord only). Null when there is neither, or T is not one of the class's columns. The pointer is valid
+        // until the next structural change of the graph, or until the leaf enters or leaves one. Allocates nothing,
+        // makes no record. Several threads may call it between structural changes; in a phase the caller's system
+        // declares the access.
+        template <typename T> [[nodiscard]] const T* Get() const noexcept
+        {
+            return static_cast<const T*>(GetColumn(ComponentTraits<T>::Desc()));
+        }
+        // The same to write through: stamps the column with the world's version while attached, on the thread that uses
+        // the graph's API, outside phases (design 5.6). A leaf in no graph may be edited on any one thread; its first
+        // Edit makes the record, with every column of its class in its default value (null when out of memory), and is
+        // the only call here that allocates. The record's columns are the ones of GetTypeDesc at that call. A
+        // constructor runs with the GetTypeDesc of the class under construction: it may call Edit only in a class whose
+        // subclasses add no columns.
+        template <typename T> [[nodiscard]] T* Edit() noexcept
+        {
+            return static_cast<T*>(EditColumn(ComponentTraits<T>::Desc()));
+        }
 
     public:
         using WeakReferenceSourceImpl::WeakReferenceSourceImpl;
-        virtual ~SceneGraphLeaf() = default;
+        virtual ~SceneGraphLeaf();   // out of line: LeafRecord is only forward-declared here
 
         [[nodiscard]] SceneGraphNode* GetNode() const { return m_Node.Lock(); }
         [[nodiscard]] virtual dm::box3 GetLocalBoundingBox() { return dm::box3::empty(); }
@@ -802,6 +827,14 @@ namespace donut::engine
         // A transform set (or nodes with transforms attached) since the last Refresh, or the last Refresh moved
         // something: then the next one is still pending for the previous-frame transforms.
         [[nodiscard]] bool HasPendingTransformChanges() const;
+        // A transform or structural edit through this API (the node's setters and SetLeaf; Attach, AttachLeafNode,
+        // Detach, SetRootNode) that no run of transform propagation has processed: the world transforms are older than
+        // the edits. The edits of HasPendingStructureChanges and HasPendingTransformChanges, but any run of propagation
+        // clears it (Refresh, Simulate, the TransformPropagation phase run by hand), and it is not set in the frame
+        // after a move. Edits of nodes in no graph, InvalidateContent, writes through GetWorld() and teleport requests
+        // on a driven node do not set it; SetSimulationDriven(node, false) does. Read it on the thread that uses the
+        // API, or in a system of a phase other than TransformPropagation.
+        [[nodiscard]] bool HasStaleWorldTransforms() const;
 
         // One world per graph (D18). Nodes are entities of it while they are attached.
         [[nodiscard]] IWorld* GetWorld() const;
@@ -879,6 +912,27 @@ namespace donut::engine
         // changed. No other thread may read the graph while it runs; readers after it returned see its results.
         // Leaves with dynamic bounds (LeafTypeDesc::dynamicBounds) make every call run the Bounds phase.
         void Refresh(uint32_t frameIndex);
+
+        // One simulation frame (design 8.4), outside phases: transform propagation when HasStaleWorldTransforms(), so
+        // that kinematic inputs are this frame's; IScheduler::SetFrameTime(time); the phases BeginFrame to
+        // PostSimulation; the interpolation of simulation-driven entities. The caller gives the time; nothing here
+        // reads a clock. A Refresh after it is needed when a domain drives entities or the frame uses bounds that the
+        // simulation changed; a Refresh before it is allowed. What HasPendingStructureChanges and
+        // HasPendingTransformChanges report stays pending. A graph that never calls it runs no simulation.
+        // FE_INVALID_ARGS when the phases cannot run: inside a phase, without a scheduler, or with an ordering cycle.
+        // The failures of systems and domains are not returned: the frame goes on, and GetScheduler()->GetDiagnostics
+        // has them.
+        nvrhi::FRESULT Simulate(const FrameTime& time) noexcept;
+        // Binds a node of this graph to the simulation, or unbinds it (SceneComponents.h, simulation-driven entities).
+        // Structural: outside phases and leaf callbacks. Binding takes the poses and the scale from the node's current
+        // world transform (shear and mirroring are refused with a warning); the domain whose lifetime query then
+        // matches the entity adds it. While bound, the transform setters are teleport requests (a part that a setter
+        // does not give stays as a pending request has it, else as the simulation has it), and the local getters
+        // compute from the simulated world transform. Unbinding makes the simulated pose the local transform, and so
+        // does Detach: a node that is attached again or copied is authored. Binding a bound node, or unbinding another,
+        // does nothing. FE_INVALID_ARGS for a node that is not attached to this graph, a refused transform, or a wrong
+        // time.
+        nvrhi::FRESULT SetSimulationDriven(SceneGraphNode* node, bool driven) noexcept;
     };
 
     struct SceneImportResult

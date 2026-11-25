@@ -46,6 +46,19 @@ using namespace donut::engine;
 #define DONUT_SCENE_GRAPH_RENDER_READ_QUIET(store) ((void)0)
 #endif
 
+SceneGraphLeaf::~SceneGraphLeaf() = default;
+
+// Stubs: item E6.3 of the E6 sub-plan implements Get and Edit, and the leaf's record (no class declares leafRecord).
+const void* SceneGraphLeaf::GetColumn(const ComponentTypeDesc&) const noexcept
+{
+    return nullptr;
+}
+
+void* SceneGraphLeaf::EditColumn(const ComponentTypeDesc&) noexcept
+{
+    return nullptr;
+}
+
 const std::string& SceneGraphLeaf::GetName() const
 {
     auto node = GetNode();
@@ -1022,6 +1035,11 @@ bool SceneGraph::HasPendingTransformChanges() const
     return m_Store->HasPendingTransformChanges();
 }
 
+bool SceneGraph::HasStaleWorldTransforms() const
+{
+    return m_Store->HasStaleWorldTransforms();
+}
+
 void SceneGraph::RegisterLeaf(SceneGraphLeaf *leaf)
 {
     if (!leaf)
@@ -1333,6 +1351,18 @@ void SceneGraph::Refresh(uint32_t frameIndex)
     // table follows meshes whose geometries were edited in place since they were added.
     if (structureDirty)
         m_Store->ReconcileMeshes();
+}
+
+// Stub: item E6.2b of the E6 sub-plan implements it.
+nvrhi::FRESULT SceneGraph::Simulate(const FrameTime&) noexcept
+{
+    return nvrhi::FE_UNSUPPORTED;
+}
+
+// Stub: item E6.2a of the E6 sub-plan implements it.
+nvrhi::FRESULT SceneGraph::SetSimulationDriven(SceneGraphNode*, bool) noexcept
+{
+    return nvrhi::FE_UNSUPPORTED;
 }
 
 const size_t SceneGraph::GetGeometryInstancesCount() const

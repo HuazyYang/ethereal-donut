@@ -319,6 +319,13 @@ namespace donut::engine::ecs
         nvrhi::FRESULT SetSystemEnabled(SystemId system, bool enabled) noexcept override;
         nvrhi::FRESULT AddSimulationDomain(ISimulationDomain* domain, SimulationDomainId& outId) noexcept override;
         nvrhi::FRESULT RemoveSimulationDomain(SimulationDomainId domain) noexcept override;
+        // Stubs: item E6.1 of the E6 sub-plan implements these.
+        nvrhi::FRESULT SetSimulationCommandList(SimulationDomainId, nvrhi::ICommandList*) noexcept override
+        {
+            return nvrhi::FE_UNSUPPORTED;
+        }
+        nvrhi::FRESULT SaveSimulationState(IStateWriter*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
+        nvrhi::FRESULT LoadSimulationState(IStateReader*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
         nvrhi::FRESULT Build() noexcept override;
         uint32_t GetAmbiguityCount() noexcept override;
         void GetDiagnostics(nvrhi::string& out) noexcept override;
@@ -493,6 +500,12 @@ namespace donut::engine::ecs
             return m_Domain->current ? m_Domain->current->GetCommandBuffer() : nullptr;
         }
         uint64_t GetStepIndex() noexcept override { return m_Domain->stepIndex; }
+        // Stubs: item E6.1 of the E6 sub-plan implements these.
+        uint32_t GetStepsThisFrame() noexcept override { return 0; }
+        uint32_t GetStepInFrame() noexcept override { return 0; }
+        IJobSystem* GetJobSystem() noexcept override { return nullptr; }
+        // The running system's: E6.1, which delivers lifetime callbacks, makes it null in them.
+        ISystemContext* GetSystemContext() noexcept override { return m_Domain->current; }
 
     private:
         DomainRecord* m_Domain;

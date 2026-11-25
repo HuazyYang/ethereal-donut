@@ -48,6 +48,11 @@
 #undef None
 #endif
 
+namespace nvrhi
+{
+    struct ICommandList;   // GPU simulation domains record into one (8.1); the ECS headers do not include nvrhi.h
+}
+
 namespace donut::engine
 {
     struct ISimulationDomain;   // EcsSimulation.h
@@ -164,9 +169,32 @@ namespace donut::engine
 
         // Adds the domain's gather, step and scatter systems to PreSimulation, FixedSimulation and PostSimulation with
         // the accesses of its descriptor, observers on its lifetime query, and its fixed-step accumulator (8.1, 8.4).
-        // Holds a reference to the domain until RemoveSimulationDomain.
+        // Holds a reference to the domain until RemoveSimulationDomain or the scheduler's destruction. A domain may
+        // hold the world (a query of its own does) until it is destroyed, so nothing that the world holds, such as a
+        // component value or an observer, may hold the domain or the scheduler; the scheduler's own observers hold
+        // neither. Entities that match the lifetime query already are delivered before the call returns, in chunk
+        // order, one batch per chunk. A domain without lifetime terms has no entities. FE_OUT_OF_MEMORY beyond
+        // c_MaxSimulationDomains. One scheduler with domains per world (FixedStepState). Outside phases.
         virtual nvrhi::FRESULT AddSimulationDomain(ISimulationDomain* domain, SimulationDomainId& outId) noexcept = 0;
+        // Delivers the removal of the entities that still match, the last chunk first, then releases the domain.
+        // Outside phases.
         virtual nvrhi::FRESULT RemoveSimulationDomain(SimulationDomainId domain) noexcept = 0;
+        // The open list a GPU domain records into this frame (null: the engine's own). Not AddRef'd: it must stay open
+        // and alive until the frame's simulation phases have run; the scheduler forgets it after PostSimulation. On
+        // the thread that runs the phases. FE_INVALID_ARGS inside a phase, for a Cpu domain or an unknown id.
+        virtual nvrhi::FRESULT SetSimulationCommandList(SimulationDomainId domain,
+                                                        nvrhi::ICommandList* list) noexcept = 0;
+        // What a rewind of the simulation needs, of every domain (8.5): its time, its entities, the Relocatable columns
+        // of the outputs and inputs declared Write with their enabled bits, and its CaptureState. Pending commands are
+        // played back first. Outside phases. FE_UNSUPPORTED, with nothing written, when a domain cannot capture.
+        // Authored state (animation, kinematic parents, inputs declared Read, the application's commands) is not in it:
+        // a replay sets the authored values of the frames it repeats itself.
+        virtual nvrhi::FRESULT SaveSimulationState(IStateWriter* writer) noexcept = 0;
+        // Restores the saved state: the times and columns of every domain, with a new version, then the engines
+        // (RestoreState), domain by domain. Needs the domains and the entities of the save: FE_OUT_OF_DATE, with
+        // nothing written, when they differ. The first failure of a RestoreState ends the call and is returned, with
+        // the state partly restored: the caller loads another state or removes the domain. Outside phases.
+        virtual nvrhi::FRESULT LoadSimulationState(IStateReader* reader) noexcept = 0;
 
         // Orders every phase and validates it. FE_INVALID_ARGS on an ordering cycle. Ambiguities do not fail the build;
         // they are counted and described in the diagnostics. RunPhase builds when anything changed since.
@@ -174,7 +202,8 @@ namespace donut::engine
         virtual uint32_t GetAmbiguityCount() noexcept = 0;
         virtual void GetDiagnostics(nvrhi::string& out) noexcept = 0;
 
-        // Called once per frame, before the first phase. Writes the world's FrameTime resource.
+        // Called once per frame, before the first phase. Writes the world's FrameTime resource and adds the delta to
+        // the domains' accumulators (FixedStepState).
         virtual void SetFrameTime(const FrameTime& time) noexcept = 0;
         // Runs one phase, then its sync point if it has one (6.3). The calling thread works too, in an external slot of
         // the job system.

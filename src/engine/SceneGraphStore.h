@@ -241,6 +241,9 @@ namespace donut::engine
         void ReconcileMeshes();
         bool HasPendingStructureChanges() const noexcept { return m_PendingStructure; }
         bool HasPendingTransformChanges() const noexcept { return m_PendingTransform || m_LastRefreshMoved; }
+        // Set with every edit that sets m_PendingStructure or m_PendingTransform, cleared by the propagation system, not
+        // by Refresh: the pending flags outlive a propagation that another caller ran.
+        bool HasStaleWorldTransforms() const noexcept { return m_StaleWorldTransforms; }
 
         // The on-demand caches of SceneGraphNode (5.7).
         struct CacheFrame
@@ -599,6 +602,7 @@ namespace donut::engine
         bool m_PendingTransform = false;
         bool m_PendingContent = false;   // InvalidateContent: LocalBounds changed
         bool m_LastRefreshMoved = false;
+        bool m_StaleWorldTransforms = false;   // HasStaleWorldTransforms
         uint64_t m_RefreshedVersion = 0;
         uint64_t m_RefreshedStructuralVersion = 0;
         uint32_t m_FrameIndex = 0;
