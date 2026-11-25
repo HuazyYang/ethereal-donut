@@ -874,7 +874,7 @@ namespace donut::engine::ecs
     // ----------------------------------------------------------------------------- structural operations
 
     nvrhi::FRESULT WorldImpl::CreateEntitiesInternal(const EntityCreateDesc& desc, Entity* outEntities,
-                                                     uint64_t version) noexcept
+                                                     uint64_t version, const RowHooks* hooks) noexcept
     {
         const char* operation = "CreateEntities";
         const uint32_t n = desc.entityCount;
@@ -1120,6 +1120,8 @@ namespace donut::engine::ecs
             }
         }
 
+        if (hooks && hooks->rowsAdded && created != 0)
+            hooks->rowsAdded(hooks->context, created);
         for (const RowRun& run : m_ScratchRuns)
             ObserveRowsAdded(run.archetype, run.chunk, run.firstRow, run.count, c_NoArchetype);
         for (const SortedTerm& term : m_ScratchTerms)
@@ -1135,7 +1137,8 @@ namespace donut::engine::ecs
         return result;
     }
 
-    nvrhi::FRESULT WorldImpl::DestroyEntitiesInternal(const Entity* entities, uint32_t count, uint64_t version) noexcept
+    nvrhi::FRESULT WorldImpl::DestroyEntitiesInternal(const Entity* entities, uint32_t count, uint64_t version,
+                                                      const RowHooks* hooks) noexcept
     {
         nvrhi::FRESULT result = nvrhi::FS_OK;
         for (uint32_t i = 0; i < count; ++i)
@@ -1174,6 +1177,8 @@ namespace donut::engine::ecs
                     SparseErase(*set, entity, *record);
                 }
             }
+            if (hooks && hooks->rowRemoving)
+                hooks->rowRemoving(hooks->context, entity, archetype, chunk, row);
             DestructRow(archetype, chunk, row);
             RemoveRow(archetype, chunk, row, version);
             ReleaseIndex(index);
@@ -1362,6 +1367,47 @@ namespace donut::engine::ecs
             KeepFirstFailure(result, MoveEntity(entity, *record, target, NewValue{}, version));
         }
         return result;
+    }
+
+    nvrhi::FRESULT WorldImpl::ChangeComponentsInternal(Entity entity, ComponentChange& change, uint64_t version,
+                                                       const RowHooks* hooks) noexcept
+    {
+        EntityRecord* record = FindAliveRecord(entity);
+        if (!record)
+        {
+            ReportStale("ChangeComponents", entity);
+            return nvrhi::FE_INVALID_ARGS;
+        }
+        const uint32_t source = record->archetype;
+        if (change.source != source)
+        {
+            const nvrhi::FRESULT prepared = PrepareChange(source, change);
+            if (NVRHI_FAILED(prepared))
+                return prepared;
+        }
+        if (change.target != source)
+        {
+            const nvrhi::FRESULT moved = MoveEntity(entity, *record, change.target, change.added, change.addedCount,
+                                                    version, hooks);
+            if (NVRHI_FAILED(moved))
+                return moved;
+        }
+        // The values of what the entity had already. The report of the move is held at most: no observer has run.
+        for (uint32_t a = 0; change.addsPresent && a < change.addedCount; ++a)
+        {
+            const NewValue& value = change.added[a];
+            if (!value.value || m_Archetypes[source]->FindColumn(value.component) == c_NoColumn)
+                continue;
+            const Archetype& archetype = *m_Archetypes[change.target];
+            const uint32_t column = archetype.FindColumn(value.component);
+            if (archetype.columns[column].kind != StorageKind::Data)
+                continue;
+            uint8_t* dst = static_cast<uint8_t*>(archetype.ColumnData(record->chunk, column)) +
+                size_t(record->row) * archetype.columns[column].stride;
+            OverwriteValue(dst, *archetype.columns[column].type, value.value, value.transfer);
+            StampVersion(archetype.Versions(record->chunk) + column, version);
+        }
+        return nvrhi::FS_OK;
     }
 
     nvrhi::FRESULT WorldImpl::SetComponentsInternal(const Entity* entities, uint32_t count, ComponentId component,

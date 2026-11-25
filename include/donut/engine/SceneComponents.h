@@ -312,8 +312,11 @@ namespace donut::engine
         bool dynamicBounds = false;
         // The columns are the state's home (9.2): while the leaf is in no graph, their values live in a record that the
         // leaf owns; attach and SetLeaf move them into the row as initial values, before any observer runs, and detach
-        // and teardown move them back (SceneGraphLeaf::Get, Edit). Off: the columns are derived from the leaf, start at
-        // zero, and their owner fills them (MeshInstance).
+        // and teardown move them back, after the removal's observers ran (SceneGraphLeaf::Get, Edit). Columns may have
+        // hooks (a COM reference; a world never hands such a one to a domain). Only plain columns, one value per row,
+        // are kept (no buffer, Shared, Chunk or Sparse component), and the enabled bit of an Enableable one is not: a
+        // row starts enabled. Off: the columns are derived from the leaf, start at zero, and their owner fills them
+        // (MeshInstance).
         bool leafRecord = false;
     };
 

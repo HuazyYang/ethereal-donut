@@ -326,6 +326,16 @@ namespace donut::engine::ecs
         uint32_t archetype;
     };
 
+    // A cached target of removing and adding several components at once (WorldImpl::PrepareChange, E6.3).
+    struct ArchetypeTransition
+    {
+        uint32_t firstId;           // in Archetype::transitionIds: the removed components, then the added ones, as the
+        uint32_t removedCount;      // caller listed them
+        uint32_t addedCount;
+        uint32_t archetype;
+        bool addsPresent;           // some component to add is in the source already (and not removed): its value is
+    };                              // written there
+
     // A sorted set of components plus the values of its Shared components (4.3). Chunk layout: the Entity column; each
     // Data and Buffer column, 64-byte aligned; the inline storage of each Buffer column, 64-byte aligned; the enabled
     // masks of the Enableable columns; the change versions, one per column in column order and the added version last;
@@ -355,6 +365,8 @@ namespace donut::engine::ecs
         Vector<ChunkRecord> chunks;
         Vector<ArchetypeEdge> addEdges;     // cached targets of adding a component (not for Shared: the value decides)
         Vector<ArchetypeEdge> removeEdges;  // cached targets of removing one
+        Vector<ArchetypeTransition> transitions;   // cached targets of several changes at once; one per pair of lists
+        Vector<ComponentId> transitionIds;         // that was asked for, and kept as the edges are
 
         uint32_t FindColumn(ComponentId component) const noexcept;
         uint32_t GetChunkCount() const noexcept { return uint32_t(chunks.size()); }
@@ -653,6 +665,44 @@ namespace donut::engine::ecs
         // The observers' state; null before the first AddObserver.
         ObserverRegistry* GetObserverRegistry() const noexcept { return m_ObserverRegistry; }
 
+        // ------------------------------------------------------------------------------- row hooks (E6.3)
+
+        // For a caller in this module whose values have their home outside the world while no row has it (the scene
+        // graph's leaf records, design 9.2), so that every value has one home at any time and observers find it in the
+        // row. Passed to a batch operation below; null: nothing is called.
+        // - rowsAdded: the rows of the first `count` entities of the operation exist with their initial values, and no
+        //   observer has seen them: values may be moved into them.
+        // - rowRemoving: every observer of the row's removal has run, and the values that leave with it are destroyed
+        //   next: they may be moved out, each replaced by a constructed value.
+        // Neither may change structure or throw.
+        struct RowHooks
+        {
+            void* context;
+            void (*rowsAdded)(void* context, uint32_t count) noexcept;
+            void (*rowRemoving)(void* context, Entity entity, const Archetype& archetype, uint32_t chunk,
+                                uint32_t row) noexcept;
+        };
+        // A value the move of an entity writes into a column that only its new archetype has.
+        struct NewValue
+        {
+            ComponentId component = ComponentId::Invalid;
+            const void* value = nullptr;
+            ValueTransfer transfer = ValueTransfer::Copy;
+        };
+        // Components that one move of a row removes and adds (PrepareChange, ChangeComponentsInternal). Not Sparse and
+        // Shared ones; none in both lists. The lists are the caller's and stay as they are between the two calls.
+        struct ComponentChange
+        {
+            const ComponentId* removed = nullptr;
+            const NewValue* added = nullptr;
+            uint32_t removedCount = 0;
+            uint32_t addedCount = 0;
+            // PrepareChange's
+            uint32_t source = c_NoArchetype;
+            uint32_t target = c_NoArchetype;
+            bool addsPresent = false;
+        };
+
         // ------------------------------------------------------------------------- batch operations (E1.3)
 
         // The work of the IWorld entry points without their phase check and observer flush (validation reports stay).
@@ -667,15 +717,23 @@ namespace donut::engine::ecs
         // destroyed exactly once, with the destruct hook of the component it was given for. The one exception is a
         // value for a component id that is not registered, which cannot be destroyed. Shared values are copied into
         // the archetype key, so a relocated Shared value is always destroyed.
-        nvrhi::FRESULT CreateEntitiesInternal(const EntityCreateDesc& desc, Entity* outEntities,
-                                              uint64_t version) noexcept;
-        nvrhi::FRESULT DestroyEntitiesInternal(const Entity* entities, uint32_t count, uint64_t version) noexcept;
+        nvrhi::FRESULT CreateEntitiesInternal(const EntityCreateDesc& desc, Entity* outEntities, uint64_t version,
+                                              const RowHooks* hooks = nullptr) noexcept;
+        nvrhi::FRESULT DestroyEntitiesInternal(const Entity* entities, uint32_t count, uint64_t version,
+                                               const RowHooks* hooks = nullptr) noexcept;
         // `values`: `count` consecutive values, or null to default-construct. An entity that has the component gets
         // the value written (a Shared value moves it to the archetype of the new value); a null value leaves it.
         nvrhi::FRESULT AddComponentsInternal(const Entity* entities, uint32_t count, ComponentId component,
                                              const void* values, ValueTransfer transfer, uint64_t version) noexcept;
         nvrhi::FRESULT RemoveComponentsInternal(const Entity* entities, uint32_t count, ComponentId component,
                                                 uint64_t version) noexcept;
+        // Removes and adds components of one entity in one move, straight to its last archetype, so that the observers
+        // of all of them see one complete row before it and one after it (E6.3). Components to remove that the entity
+        // lacks are skipped. A component to add that it has gets the value written, as AddComponentsInternal does (a null
+        // value leaves it). Every value stays the caller's when the call fails; nothing changed then. `change` need not
+        // be prepared, or may be prepared for another archetype: it then is.
+        nvrhi::FRESULT ChangeComponentsInternal(Entity entity, ComponentChange& change, uint64_t version,
+                                                const RowHooks* hooks) noexcept;
         // Writes `count` consecutive values into components the entities have (FE_INVALID_ARGS where one is absent).
         // Not structural, except for Shared components, which move the entity.
         nvrhi::FRESULT SetComponentsInternal(const Entity* entities, uint32_t count, ComponentId component,
@@ -705,6 +763,10 @@ namespace donut::engine::ecs
         uint32_t GetAddTarget(uint32_t archetype, ComponentId component) noexcept;              // not Shared
         uint32_t GetSharedTarget(uint32_t archetype, ComponentId component, const void* value) noexcept;
         uint32_t GetRemoveTarget(uint32_t archetype, ComponentId component) noexcept;
+        // Finds the archetype without the removed and with the added components, cached per source archetype and lists,
+        // and changes no row: a caller that must not stop half way asks first. Fails, with a validation report, when a
+        // row does not fit, out of memory, or with components that a change cannot take.
+        nvrhi::FRESULT PrepareChange(uint32_t archetype, ComponentChange& change) noexcept;
         // Whether one row of these components fits the largest chunk, without making the archetype.
         bool RowFits(const ComponentId* components, uint32_t count) noexcept;
 
@@ -730,14 +792,6 @@ namespace donut::engine::ecs
             uint32_t chunk;
             uint32_t firstRow;
             uint32_t count;
-        };
-
-        // A value the move of an entity writes into a column that only its new archetype has.
-        struct NewValue
-        {
-            ComponentId component = ComponentId::Invalid;
-            const void* value = nullptr;
-            ValueTransfer transfer = ValueTransfer::Copy;
         };
 
         // Registry (EcsWorld.cpp).
@@ -778,10 +832,15 @@ namespace donut::engine::ecs
         void MoveRowWithin(Archetype& archetype, uint32_t srcChunk, uint32_t srcRow, uint32_t dstChunk,
                            uint32_t dstRow) noexcept;
         // Moves a live entity to another archetype: shared columns relocate, columns only the old one has are
-        // destroyed, columns only the new one has are constructed (or take `newValue`), enabled bits carry over.
+        // destroyed, columns only the new one has are constructed (or take their new value), enabled bits carry over.
         // Reports ObserveRowsRemoving before and ObserveRowsAdded after the move.
         nvrhi::FRESULT MoveEntity(Entity entity, EntityRecord& record, uint32_t target, const NewValue& newValue,
-                                  uint64_t version) noexcept;
+                                  uint64_t version) noexcept
+        {
+            return MoveEntity(entity, record, target, &newValue, 1, version, nullptr);
+        }
+        nvrhi::FRESULT MoveEntity(Entity entity, EntityRecord& record, uint32_t target, const NewValue* newValues,
+                                  uint32_t newValueCount, uint64_t version, const RowHooks* hooks) noexcept;
         void InitializeColumn(Archetype& archetype, uint32_t column, uint32_t chunk, uint32_t firstRow, uint32_t count,
                               const void* values, ValueTransfer transfer) noexcept;
         void DestructRow(Archetype& archetype, uint32_t chunk, uint32_t row) noexcept;

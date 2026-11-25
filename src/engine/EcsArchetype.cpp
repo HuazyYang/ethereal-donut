@@ -487,6 +487,111 @@ namespace donut::engine::ecs
         return target;
     }
 
+    nvrhi::FRESULT WorldImpl::PrepareChange(uint32_t archetype, ComponentChange& change) noexcept
+    {
+        Archetype& from = *m_Archetypes[archetype];
+        const ComponentId* const removed = change.removed;
+        const NewValue* const added = change.added;
+        const uint32_t removedCount = change.removedCount;
+        const uint32_t addedCount = change.addedCount;
+        change.source = c_NoArchetype;
+        for (const ArchetypeTransition& transition : from.transitions)
+        {
+            if (transition.removedCount != removedCount || transition.addedCount != addedCount)
+                continue;
+            const ComponentId* ids = from.transitionIds.data() + transition.firstId;
+            uint32_t same = 0;
+            while (same < removedCount && ids[same] == removed[same])
+                ++same;
+            while (same >= removedCount && same < removedCount + addedCount &&
+                   ids[same] == added[same - removedCount].component)
+                ++same;
+            if (same != removedCount + addedCount)
+                continue;
+            ++m_Counters.edgeHits;
+            change.source = archetype;
+            change.target = transition.archetype;
+            change.addsPresent = transition.addsPresent;
+            return nvrhi::FS_OK;
+        }
+
+        const char* operation = "ChangeComponents";
+        auto valid = [&](ComponentId component) noexcept
+        {
+            const ComponentType* type = GetType(component);
+            if (type && type->kind != StorageKind::Resource && type->kind != StorageKind::Sparse &&
+                type->kind != StorageKind::Shared)
+                return true;
+            ReportValidation(operation, "component %u is not a registered component, or Sparse or Shared",
+                             uint32_t(component));
+            return false;
+        };
+        for (uint32_t i = 0; i < removedCount; ++i)
+            if (!valid(removed[i]))
+                return nvrhi::FE_INVALID_ARGS;
+        m_ScratchTerms.clear();
+        for (uint32_t i = 0; i < addedCount; ++i)
+        {
+            if (!valid(added[i].component))
+                return nvrhi::FE_INVALID_ARGS;
+            m_ScratchTerms.push_back(SortedTerm{ added[i].component, i });
+        }
+        std::sort(m_ScratchTerms.begin(), m_ScratchTerms.end(),
+                  [](const SortedTerm& x, const SortedTerm& y) { return x.component < y.component; });
+
+        // Both lists are sorted: the source's components without the removed ones, merged with the added ones.
+        bool addsPresent = false;
+        m_ScratchIds.clear();
+        m_ScratchShared.clear();
+        uint32_t next = 0;
+        auto addBelow = [&](uint32_t bound) noexcept
+        {
+            for (; next < m_ScratchTerms.size() && uint32_t(m_ScratchTerms[next].component) < bound; ++next)
+            {
+                if (!m_ScratchIds.empty() && m_ScratchIds.back() == m_ScratchTerms[next].component)
+                    continue;   // listed twice
+                m_ScratchIds.push_back(m_ScratchTerms[next].component);
+                m_ScratchShared.push_back(nullptr);
+            }
+        };
+        for (uint32_t i = 0; i < from.components.size(); ++i)
+        {
+            const ComponentId component = from.components[i];
+            addBelow(uint32_t(component));
+            bool gone = false;
+            for (uint32_t r = 0; r < removedCount && !gone; ++r)
+                gone = removed[r] == component;
+            if (gone)
+                continue;
+            for (; next < m_ScratchTerms.size() && m_ScratchTerms[next].component == component; ++next)
+                addsPresent = true;
+            const ArchetypeColumn& column = from.columns[i];
+            m_ScratchIds.push_back(component);
+            m_ScratchShared.push_back(column.kind == StorageKind::Shared ? from.sharedValues + column.offset : nullptr);
+        }
+        addBelow(uint32_t(ComponentId::Invalid));
+        const uint32_t target =
+            FindOrCreateArchetype(m_ScratchIds.data(), uint32_t(m_ScratchIds.size()), m_ScratchShared.data());
+        if (IsArchetypeError(target))
+        {
+            if (target == c_ArchetypeTooLarge)
+                ReportValidation(operation, "one row of the changed components does not fit the largest chunk");
+            return ArchetypeErrorResult(target);
+        }
+
+        ArchetypeTransition transition{ uint32_t(from.transitionIds.size()), removedCount, addedCount, target,
+                                        addsPresent };
+        for (uint32_t i = 0; i < removedCount; ++i)
+            from.transitionIds.push_back(removed[i]);
+        for (uint32_t i = 0; i < addedCount; ++i)
+            from.transitionIds.push_back(added[i].component);
+        from.transitions.push_back(transition);
+        change.source = archetype;
+        change.target = target;
+        change.addsPresent = addsPresent;
+        return nvrhi::FS_OK;
+    }
+
     // ---------------------------------------------------------------------------------------------- chunks
 
     PagePool& WorldImpl::PoolFor(uint32_t chunkSize) noexcept
@@ -638,8 +743,9 @@ namespace donut::engine::ecs
         TransferValues(type, dst, value, 1, transfer);
     }
 
-    nvrhi::FRESULT WorldImpl::MoveEntity(Entity entity, EntityRecord& record, uint32_t target, const NewValue& newValue,
-                                         uint64_t version) noexcept
+    nvrhi::FRESULT WorldImpl::MoveEntity(Entity entity, EntityRecord& record, uint32_t target,
+                                         const NewValue* newValues, uint32_t newValueCount, uint64_t version,
+                                         const RowHooks* hooks) noexcept
     {
         Archetype& from = *m_Archetypes[record.archetype];
         Archetype& to = *m_Archetypes[target];
@@ -654,6 +760,8 @@ namespace donut::engine::ecs
         if (!ReserveRows(to, 1, version))
             return nvrhi::FE_OUT_OF_MEMORY;
         ObserveRowsRemoving(from.index, srcChunk, srcRow, 1, to.index);
+        if (hooks && hooks->rowRemoving)
+            hooks->rowRemoving(hooks->context, entity, from, srcChunk, srcRow);
 
         uint32_t dstChunk = 0;
         uint32_t dstRow = 0;
@@ -689,8 +797,17 @@ namespace donut::engine::ecs
             else if (i == fromCount || to.components[j] < from.components[i])
             {
                 // Only the new archetype has it: constructed, or the new value.
-                const void* value = to.components[j] == newValue.component ? newValue.value : nullptr;
-                InitializeColumn(to, j, dstChunk, dstRow, 1, value, newValue.transfer);
+                const NewValue* newValue = nullptr;
+                for (uint32_t n = 0; n < newValueCount; ++n)
+                {
+                    if (newValues[n].component == to.components[j])
+                    {
+                        newValue = newValues + n;
+                        break;
+                    }
+                }
+                InitializeColumn(to, j, dstChunk, dstRow, 1, newValue ? newValue->value : nullptr,
+                                 newValue ? newValue->transfer : ValueTransfer::Copy);
                 ++j;
             }
             else
@@ -716,6 +833,8 @@ namespace donut::engine::ecs
             MoveSparsePresence(entity, from.index, srcChunk, srcRow, target, dstChunk, dstRow);
         RemoveRow(from, srcChunk, srcRow, version);
         // The swap-remove changed only the old archetype: the entity's new row stands.
+        if (hooks && hooks->rowsAdded)
+            hooks->rowsAdded(hooks->context, 1);
         ObserveRowsAdded(target, dstChunk, dstRow, 1, from.index);
         return nvrhi::FS_OK;
     }

@@ -123,6 +123,10 @@ namespace donut::engine
         using namespace ecs;
 
         constexpr uint32_t c_None = ~0u;
+        // What a leaf's row has beside the class's components, and loses when the leaf goes and none comes.
+        constexpr SceneGraphStore::Slot c_BoundsSlots[] = { SceneGraphStore::SlotLocalBounds,
+                                                            SceneGraphStore::SlotWorldBounds,
+                                                            SceneGraphStore::SlotChunkBounds };
 
         // The local transform as the old SceneGraphNode::UpdateLocalTransform composed it; the trace goldens pin the
         // order of the operations bit for bit.
@@ -196,8 +200,13 @@ namespace donut::engine
             LeafObserver(SceneGraphStore* store, Register registerLeaf) noexcept
                 : m_Store(store), m_Register(registerLeaf) { }
 
+            // The world may outlive the store (someone holds it), and this observer with it: it then does nothing.
+            void Disconnect() noexcept { m_Store = nullptr; }
+
             nvrhi::FRESULT OnEntities(ObserverEvent event, const EntityBatch& batch, ICommandBuffer*) noexcept override
             {
+                if (!m_Store)
+                    return nvrhi::FS_OK;
                 const LeafObject* leaves = static_cast<const LeafObject*>(batch.columns[0]);
                 const bool added = event == ObserverEvent::OnAdd;
                 for (uint32_t i = 0; i < batch.count; ++i)
@@ -283,6 +292,245 @@ namespace donut::engine
         }
         for (size_t i = kept; i < count; ++i)
             ::operator delete(records[i]);
+    }
+
+    // ------------------------------------------------------------------------------- leaf records (E6.3)
+
+    namespace
+    {
+        // The value operations of a column by its descriptor, as EcsWorld.cpp's by its registered type: a null hook is
+        // the trivial operation.
+        void ConstructValue(const ComponentTypeDesc& desc, void* value) noexcept
+        {
+            if (desc.construct)
+                desc.construct(value, 1);
+            else
+                std::memset(value, 0, desc.size);
+        }
+        void DestructValue(const ComponentTypeDesc& desc, void* value) noexcept
+        {
+            if (desc.destruct)
+                desc.destruct(value, 1);
+        }
+        void RelocateValue(const ComponentTypeDesc& desc, void* dst, void* src) noexcept
+        {
+            if (desc.relocate)
+                desc.relocate(dst, src, 1);
+            else
+                std::memcpy(dst, src, desc.size);
+        }
+
+        // Where the row has a plain column of this GUID; null where it has none.
+        void* RowValue(WorldImpl& world, const Archetype& archetype, uint32_t chunk, uint32_t row,
+                       const nvrhi::GUID& uuid, uint32_t* outColumn = nullptr) noexcept
+        {
+            const ComponentId id = world.FindComponent(uuid);
+            const uint32_t column = id == ComponentId::Invalid ? c_NoColumn : archetype.FindColumn(id);
+            if (column == c_NoColumn || archetype.columns[column].kind != StorageKind::Data)
+                return nullptr;
+            if (outColumn)
+                *outColumn = column;
+            return static_cast<uint8_t*>(archetype.ColumnData(chunk, column)) +
+                size_t(row) * archetype.columns[column].stride;
+        }
+
+        // Freed blocks by size class (64 << class bytes), linked through LeafRecord::m_NextFree, so that giving one back
+        // allocates nothing. Bounded, never destroyed, like the pool of orphan records. Larger blocks (a row of these
+        // columns would not fit a chunk either) are not kept.
+        constexpr uint32_t c_LeafRecordClasses = 11;   // 64 bytes to 64 KiB
+        constexpr size_t c_MaxPooledLeafRecordBytes = size_t(16) << 20;
+        struct LeafRecordPool
+        {
+            std::mutex mutex;
+            LeafRecord* free[c_LeafRecordClasses] = {};
+            size_t bytes = 0;
+        };
+        LeafRecordPool& GetLeafRecordPool() noexcept
+        {
+            static LeafRecordPool* const s_Pool = new LeafRecordPool();
+            return *s_Pool;
+        }
+    }
+
+    bool IsPlainColumn(const ComponentTypeDesc& desc) noexcept
+    {
+        constexpr ComponentFlags c_NotPlain = ComponentFlags::Tag | ComponentFlags::Sparse | ComponentFlags::Shared |
+            ComponentFlags::Chunk | ComponentFlags::Buffer | ComponentFlags::Resource;
+        return desc.size != 0 && !(desc.flags & c_NotPlain);
+    }
+
+    std::atomic<int64_t> LeafRecord::s_LiveCount{ 0 };
+
+    template <typename Visit>
+    void LeafRecord::ForEachValue(Visit&& visit) noexcept
+    {
+        size_t offset = sizeof(LeafRecord);
+        for (uint32_t c = 0; c < m_ColumnCount; ++c)
+        {
+            const ComponentTypeDesc& desc = *m_Columns[c];
+            if (!IsPlainColumn(desc))
+                continue;
+            offset = (offset + desc.alignment - 1) & ~size_t(desc.alignment - 1);
+            visit(desc, static_cast<void*>(reinterpret_cast<uint8_t*>(this) + offset));
+            offset += desc.size;
+        }
+    }
+
+    LeafRecord* LeafRecord::Allocate(const LeafTypeDesc& type) noexcept
+    {
+        size_t bytes = sizeof(LeafRecord);
+        for (uint32_t c = 0; c < type.columnCount; ++c)
+        {
+            const ComponentTypeDesc& desc = *type.columns[c];
+            if (!IsPlainColumn(desc))
+                continue;
+            assert(desc.alignment <= c_ColumnAlignment);   // no world accepts more
+            bytes = ((bytes + desc.alignment - 1) & ~size_t(desc.alignment - 1)) + desc.size;
+        }
+        uint32_t sizeClass = 0;
+        while (sizeClass < c_LeafRecordClasses && (size_t(64) << sizeClass) < bytes)
+            ++sizeClass;
+
+        void* memory = nullptr;
+        if (sizeClass < c_LeafRecordClasses)
+        {
+            bytes = size_t(64) << sizeClass;
+            LeafRecordPool& pool = GetLeafRecordPool();
+            std::lock_guard<std::mutex> lock(pool.mutex);
+            if (LeafRecord* record = pool.free[sizeClass])
+            {
+                pool.free[sizeClass] = record->m_NextFree;
+                pool.bytes -= bytes;
+                memory = record;
+            }
+        }
+        if (!memory)
+            memory = HeapAllocate(bytes, c_ColumnAlignment);
+        if (!memory)
+            return nullptr;
+        s_LiveCount.fetch_add(1, std::memory_order_relaxed);
+        LeafRecord* record = new (memory) LeafRecord();
+        record->m_Columns = type.columns;
+        record->m_ColumnCount = type.columnCount;
+        record->m_SizeClass = sizeClass;
+        return record;
+    }
+
+    void LeafRecord::Free(LeafRecord* record) noexcept
+    {
+        s_LiveCount.fetch_sub(1, std::memory_order_relaxed);
+        if (record->m_SizeClass < c_LeafRecordClasses)
+        {
+            const size_t bytes = size_t(64) << record->m_SizeClass;
+            LeafRecordPool& pool = GetLeafRecordPool();
+            std::lock_guard<std::mutex> lock(pool.mutex);
+            if (pool.bytes + bytes <= c_MaxPooledLeafRecordBytes)
+            {
+                record->m_NextFree = pool.free[record->m_SizeClass];
+                pool.free[record->m_SizeClass] = record;
+                pool.bytes += bytes;
+                return;
+            }
+        }
+        HeapFree(record);
+    }
+
+    LeafRecord* LeafRecord::Create(const LeafTypeDesc& type) noexcept
+    {
+        LeafRecord* record = Allocate(type);
+        if (record)
+            record->ForEachValue(ConstructValue);
+        return record;
+    }
+
+    LeafRecord* LeafRecord::CreateInRow(const LeafTypeDesc& type, SceneGraphStore* store, Entity entity) noexcept
+    {
+        LeafRecord* record = Allocate(type);
+        if (record)
+        {
+            record->m_Store = store;
+            record->m_Entity = entity;
+        }
+        return record;
+    }
+
+    void LeafRecord::Destroy(LeafRecord* record) noexcept
+    {
+        if (!record)
+            return;
+        if (!record->IsInRow())
+            record->ForEachValue(DestructValue);
+        Free(record);
+    }
+
+    void* LeafRecord::Find(const nvrhi::GUID& uuid) noexcept
+    {
+        assert(!IsInRow());
+        void* found = nullptr;
+        ForEachValue([&](const ComponentTypeDesc& desc, void* value) noexcept
+        {
+            if (desc.uuid == uuid)
+                found = value;
+        });
+        return found;
+    }
+
+    bool LeafRecord::HasColumnsOf(const LeafTypeDesc& type) const noexcept
+    {
+        auto covers = [](const ComponentTypeDesc* const* columns, uint32_t count,
+                         const ComponentTypeDesc& column) noexcept
+        {
+            for (uint32_t c = 0; c < count; ++c)
+            {
+                if (columns[c]->uuid == column.uuid)
+                    return true;
+            }
+            return false;
+        };
+        for (uint32_t c = 0; c < type.columnCount; ++c)
+        {
+            if (!covers(m_Columns, m_ColumnCount, *type.columns[c]))
+                return false;
+        }
+        for (uint32_t c = 0; c < m_ColumnCount; ++c)
+        {
+            if (!covers(type.columns, type.columnCount, *m_Columns[c]))
+                return false;
+        }
+        return true;
+    }
+
+    void LeafRecord::MoveIntoRow(LeafRecord* record, WorldImpl& world, const Archetype& archetype, uint32_t chunk,
+                                 uint32_t row) noexcept
+    {
+        record->ForEachValue([&](const ComponentTypeDesc& desc, void* value) noexcept
+        {
+            if (void* target = RowValue(world, archetype, chunk, row, desc.uuid))
+            {
+                DestructValue(desc, target);   // the default value the row was made with
+                RelocateValue(desc, target, value);
+            }
+            else
+                DestructValue(desc, value);
+        });
+        Free(record);   // no value is left in it
+    }
+
+    void LeafRecord::TakeFromRow(WorldImpl& world, const Archetype& archetype, uint32_t chunk, uint32_t row) noexcept
+    {
+        assert(IsInRow());
+        ForEachValue([&](const ComponentTypeDesc& desc, void* value) noexcept
+        {
+            if (void* source = RowValue(world, archetype, chunk, row, desc.uuid))
+            {
+                RelocateValue(desc, value, source);
+                ConstructValue(desc, source);   // the row destroys it
+            }
+            else
+                ConstructValue(desc, value);
+        });
+        m_Store = nullptr;
+        m_Entity = Entity::Null;
     }
 
     namespace
@@ -509,7 +757,41 @@ namespace donut::engine
 
         // Nothing is delivered while the world is torn down: leaves are not unregistered, as before.
         m_Scheduler.Reset();
+        static_cast<LeafObserver*>(m_LeafObserver.Get())->Disconnect();
         m_LeafObserver.Reset();
+        // A world that someone else holds lives on with its rows: its nodes and leaves are in no graph all the same.
+        const bool worldIsHeld = ReferenceCount(m_World.Get()) > 1;
+        if (m_AnyLeafRecord)
+            TakeLeafValuesAtTeardown(worldIsHeld);
+        if (worldIsHeld)
+        {
+            const uint32_t archetypeCount = m_Impl->GetArchetypeStorageCount();
+            for (uint32_t a = 0; a < archetypeCount; ++a)
+            {
+                const Archetype& archetype = m_Impl->GetArchetypeStorage(a);
+                const uint8_t column = ColumnIndex(archetype, a, SlotNode);
+                const uint8_t leafColumn = ColumnIndex(archetype, a, SlotLeaf);
+                if (column == c_Absent)
+                    continue;
+                for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+                {
+                    const SceneNode* nodes = reinterpret_cast<const SceneNode*>(ColumnBase(archetype, c, column));
+                    const LeafObject* leaves = leafColumn == c_Absent ? nullptr :
+                        reinterpret_cast<const LeafObject*>(ColumnBase(archetype, c, leafColumn));
+                    for (uint32_t r = 0; r < archetype.chunks[c].count; ++r)
+                    {
+                        SceneGraphNode* node = nodes[r].object;
+                        if (!node || node->m_Store != this)
+                            continue;
+                        node->m_Store = nullptr;
+                        node->m_Entity = Entity::Null;
+                        ForgetRow(node);
+                        if (leaves && leaves[r].object && leaves[r].object->GetNode() == node)
+                            leaves[r].object->m_Node.Reset();   // the node has no leaf any more
+                    }
+                }
+            }
+        }
         m_Impl = nullptr;
         m_World.Reset();
         m_Jobs.Reset();
@@ -561,6 +843,12 @@ namespace donut::engine
         return depth;
     }
 
+    bool SceneGraphStore::IsSeparate(ComponentId id) const noexcept
+    {
+        const StorageKind kind = m_Impl->GetType(id)->kind;
+        return kind == StorageKind::Sparse || kind == StorageKind::Shared;
+    }
+
     uint32_t SceneGraphStore::ResolveLeafType(SceneGraphLeaf* leaf)
     {
         const LeafTypeDesc& desc = leaf->GetTypeDesc();
@@ -569,7 +857,8 @@ namespace donut::engine
             if (m_LeafTypes[i].desc == &desc)
                 return i;
         }
-        LeafType type{ &desc, uint32_t(m_LeafTypeTags.size()), 0, 0 };
+        m_LeafTypeTags.push_back(m_Ids[SlotLeaf]);
+        LeafType type{ &desc, uint32_t(m_LeafTypeTags.size()), 0, 0, false };
         for (uint32_t t = 0; t < desc.tagCount; ++t)
         {
             ComponentId id = ComponentId::Invalid;
@@ -595,7 +884,9 @@ namespace donut::engine
             else
                 log::warning("SceneGraph: cannot register the dynamic-bounds tag");
         }
-        // The class's columns (D19), zero until something fills them (the mesh-instance columns: OnLeaf).
+        // The class's columns (D19): with leafRecord, a row takes the leaf's values; else zero until something fills them
+        // (the mesh-instance columns: OnLeaf).
+        m_AnyLeafRecord |= desc.leafRecord;
         for (uint32_t c = 0; c < desc.columnCount; ++c)
         {
             ComponentId id = ComponentId::Invalid;
@@ -607,8 +898,181 @@ namespace donut::engine
             m_LeafTypeTags.push_back(id);
             ++type.columnCount;
         }
+        for (uint32_t t = 0; t < type.tagCount + type.columnCount; ++t)
+            type.separate |= IsSeparate(m_LeafTypeTags[type.firstTag + t]);
+        for (Slot slot : c_BoundsSlots)
+            m_LeafTypeTags.push_back(m_Ids[slot]);
         m_LeafTypes.push_back(type);
         return uint32_t(m_LeafTypes.size() - 1);
+    }
+
+    // --------------------------------------------------------------------------------- leaf columns (9.2)
+
+    bool SceneGraphStore::DeclaresColumn(const LeafTypeDesc& type, const nvrhi::GUID& uuid) noexcept
+    {
+        for (uint32_t c = 0; c < type.columnCount; ++c)
+        {
+            if (type.columns[c]->uuid == uuid)
+                return IsPlainColumn(*type.columns[c]);
+        }
+        return false;
+    }
+
+    void* SceneGraphStore::LeafColumn(const SceneGraphLeaf* leaf, const ComponentTypeDesc& type, bool write) noexcept
+    {
+        // The record first: it exists exactly while no row is the values' home, or names the row they are leaving.
+        SceneGraphStore* store = nullptr;
+        Entity entity = Entity::Null;
+        if (LeafRecord* record = leaf->m_LeafRecord)
+        {
+            if (!record->IsInRow())
+                return record->Find(type.uuid);
+            store = record->GetStore();
+            entity = record->GetEntity();
+        }
+        else
+        {
+            store = StoreOf(leaf);
+            if (!store)
+                return nullptr;
+            entity = leaf->GetNode()->m_Entity;
+        }
+        RowRef row;
+        if (!DeclaresColumn(leaf->GetTypeDesc(), type.uuid) || !store->Locate(entity, row))
+            return nullptr;
+        const LeafObject* object = static_cast<const LeafObject*>(store->Column(row, SlotLeaf));
+        if (!object || object->object != leaf)
+            return nullptr;   // the row of another leaf: this one is not in yet, or not any more
+        uint32_t column = c_NoColumn;
+        void* value = RowValue(*store->m_Impl, *row.archetype, row.chunk, row.row, type.uuid, &column);
+        if (value && write)
+            StampVersion(row.archetype->Versions(row.chunk) + column, store->m_Impl->GetStampVersion());
+        return value;
+    }
+
+    void SceneGraphStore::BeginLeavingRow(SceneGraphLeaf* leaf, const SceneGraphNode* node, Entity entity) noexcept
+    {
+        // A leaf that two nodes hold (no API makes one, SetLeaf of an attached leaf does) belongs to the node it names:
+        // its values in the other's row are not its own.
+        const LeafTypeDesc& type = leaf->GetTypeDesc();
+        if (!type.leafRecord || leaf->m_LeafRecord || leaf->GetNode() != node)
+            return;
+        leaf->m_LeafRecord = LeafRecord::CreateInRow(type, this, entity);
+        if (!leaf->m_LeafRecord)
+            log::warning("SceneGraph: out of memory for a leaf's record; its column values are lost");
+    }
+
+    void SceneGraphStore::OnRowRemoving(void* context, Entity entity, const Archetype& archetype, uint32_t chunk,
+                                        uint32_t row) noexcept
+    {
+        SceneGraphStore* store = static_cast<SceneGraphStore*>(context);
+        const uint32_t column = archetype.FindColumn(store->m_Ids[SlotLeaf]);
+        if (column == c_NoColumn)
+            return;
+        const LeafObject& leaf = static_cast<const LeafObject*>(archetype.ColumnData(chunk, column))[row];
+        LeafRecord* record = leaf.object ? leaf.object->m_LeafRecord : nullptr;
+        if (record && record->GetStore() == store && record->GetEntity() == entity)
+            record->TakeFromRow(*store->m_Impl, archetype, chunk, row);
+    }
+
+    void SceneGraphStore::OnRowsAdded(void* context, uint32_t count) noexcept
+    {
+        const LeafMove& move = *static_cast<const LeafMove*>(context);
+        SceneGraphStore* store = move.store;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            SceneGraphLeaf* leaf = move.nodes[i].leaf;
+            LeafRecord* record = leaf ? leaf->m_LeafRecord : nullptr;
+            RowRef row;
+            if (!record || leaf->GetNode() != move.nodes[i].node || !store->Locate(move.entities[i], row))
+                continue;   // a leaf without a record: the row's default values
+            // A record is made once and does not grow: it was made for this class, or (in a constructor of a base class)
+            // for one with other columns.
+            assert(record->HasColumnsOf(leaf->GetTypeDesc()) &&
+                   "a leaf's first Edit ran in a constructor whose class has other columns");
+            if (record->IsInRow())
+            {
+                // attached by a callback of its removal from another graph: it takes its values along now
+                const Entity leaving = record->GetEntity();
+                record->GetStore()->FinishLeavingRows(&leaving, 1);
+                if (record->IsInRow())   // the row is gone already (cannot happen while its removal runs)
+                {
+                    leaf->m_LeafRecord = nullptr;
+                    LeafRecord::Destroy(record);
+                    continue;
+                }
+            }
+            leaf->m_LeafRecord = nullptr;
+            LeafRecord::MoveIntoRow(record, *store->m_Impl, *row.archetype, row.chunk, row.row);
+        }
+    }
+
+    void SceneGraphStore::FinishLeavingRows(const Entity* entities, size_t count) noexcept
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            RowRef row;
+            if (Locate(entities[i], row))
+                OnRowRemoving(this, entities[i], *row.archetype, row.chunk, row.row);
+        }
+    }
+
+    void SceneGraphStore::FlushObservers(nvrhi::FRESULT& result) noexcept
+    {
+        const nvrhi::FRESULT flushed = m_Impl->FlushObservers();
+        if (NVRHI_SUCCEEDED(result))
+            result = flushed;
+    }
+
+    void SceneGraphStore::WarnObservers(const char* operation, nvrhi::FRESULT result) noexcept
+    {
+        if (NVRHI_FAILED(result))
+            log::warning("SceneGraph::%s: an observer failed, or the observers' commands did not settle (%d); the call "
+                         "stands", operation, int(result));
+    }
+
+    nvrhi::FRESULT SceneGraphStore::DestroyRows(const Entity* entities, size_t count, const char* operation) noexcept
+    {
+        const WorldImpl::RowHooks hooks = LeavingHooks();
+        const nvrhi::FRESULT result = m_Impl->DestroyEntitiesInternal(entities, uint32_t(count),
+            m_Impl->GetStampVersion(), m_AnyLeafRecord ? &hooks : nullptr);
+        if (NVRHI_FAILED(result) && m_AnyLeafRecord)
+            FinishLeavingRows(entities, count);
+        nvrhi::FRESULT observers = nvrhi::FS_OK;
+        FlushObservers(observers);
+        WarnObservers(operation, observers);
+        return result;
+    }
+
+    // The values of leaves that outlive the store move into their records: leaves that someone else references, and all
+    // of them when the world itself lives on. The others go with their rows.
+    void SceneGraphStore::TakeLeafValuesAtTeardown(bool worldIsHeld) noexcept
+    {
+        const uint32_t archetypeCount = m_Impl->GetArchetypeStorageCount();
+        for (uint32_t a = 0; a < archetypeCount; ++a)
+        {
+            const Archetype& archetype = m_Impl->GetArchetypeStorage(a);
+            const uint8_t column = ColumnIndex(archetype, a, SlotLeaf);
+            if (column == c_Absent)
+                continue;
+            for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+            {
+                const LeafObject* leaves = reinterpret_cast<const LeafObject*>(ColumnBase(archetype, c, column));
+                for (uint32_t r = 0; r < archetype.chunks[c].count; ++r)
+                {
+                    SceneGraphLeaf* leaf = leaves[r].object;
+                    if (!leaf)
+                        continue;
+                    const Entity entity = archetype.Entities(c)[r];
+                    // the leaves of the nodes detached above name their rows already (MoveToRecords)
+                    const SceneGraphNode* node = leaf->GetNode();
+                    if ((worldIsHeld || ReferenceCount(leaf) > 1) && node && node->m_Store == this &&
+                        node->m_Entity == entity)
+                        BeginLeavingRow(leaf, node, entity);
+                    OnRowRemoving(this, entity, archetype, c, r);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------------------------- orphan links
@@ -1047,6 +1511,7 @@ namespace donut::engine
         }
 
         static const OrphanRecord s_Defaults;
+        nvrhi::FRESULT observers = nvrhi::FS_OK;   // they undo no attach
         uint32_t first = 0;
         while (first < n)
         {
@@ -1166,6 +1631,11 @@ namespace donut::engine
                     nodes[i].leaf->AddRef();
             }
 
+            // The values of leaves with records move in when the rows exist, before the observers run.
+            LeafMove move{ this, nodes.data() + first, S.entities.data() + first };
+            const WorldImpl::RowHooks hooks{ &move, &SceneGraphStore::OnRowsAdded, nullptr };
+            const bool leafRecord = hasLeaf && m_LeafTypes[head.leafType].desc->leafRecord;
+
             EntityCreateDesc desc{};
             desc.components = S.runComponents.data();
             desc.values = S.runValues.data();
@@ -1173,10 +1643,13 @@ namespace donut::engine
             desc.componentCount = uint32_t(S.runComponents.size());
             desc.entityCount = count;
             desc.transfer = ValueTransfer::Relocate;   // the world takes the references and the values
-            const nvrhi::FRESULT result = m_World->CreateEntities(desc, nullptr);
+            const nvrhi::FRESULT result = m_Impl->CreateEntitiesInternal(desc, nullptr, m_Impl->GetStampVersion(),
+                                                                         leafRecord ? &hooks : nullptr);
+            FlushObservers(observers);
             ++m_Counters.createCalls;
             if (NVRHI_FAILED(result))
             {
+                WarnObservers("Attach", observers);
                 log::warning("SceneGraph: cannot create %u entities (%d); the nodes from there on stay in no graph",
                              count, int(result));
                 AbandonNodes(first);
@@ -1207,6 +1680,7 @@ namespace donut::engine
         if (parentEntity != Entity::Null)
             LinkUnder(parentEntity, S.entities[0]);
         SyncArchetypes();
+        WarnObservers("Attach", observers);
         return true;
     }
 
@@ -1219,7 +1693,16 @@ namespace donut::engine
         Scratch& S = *m_S;
         std::vector<NewNode>& nodes = S.newNodes;
         const uint32_t n = uint32_t(nodes.size());
-        if (NVRHI_FAILED(m_World->DestroyEntities(S.entities.data() + first, n - first)))
+        if (m_AnyLeafRecord)
+        {
+            for (uint32_t i = first; i < n; ++i)
+            {
+                RowRef row;   // of a batch that the world made in part: its leaves' values are in the rows
+                if (nodes[i].leaf && Locate(S.entities[i], row))
+                    BeginLeavingRow(nodes[i].leaf, nodes[i].node, S.entities[i]);
+            }
+        }
+        if (NVRHI_FAILED(DestroyRows(S.entities.data() + first, n - first, "Attach")))
             log::warning("SceneGraph: cannot release the reserved ids of a failed attach");
 
         // The created nodes' links to abandoned ones go: in pre-order, a node's created children are a prefix of its
@@ -1374,7 +1857,11 @@ namespace donut::engine
                 if (const WorldTransform* world = static_cast<const WorldTransform*>(Column(row, SlotWorld)))
                     record->world = *world;
                 if (const LeafObject* leaf = static_cast<const LeafObject*>(Column(row, SlotLeaf)))
+                {
                     record->leaf = leaf->object;
+                    if (m_AnyLeafRecord && leaf->object)
+                        BeginLeavingRow(leaf->object, node, m_S->entities[i]);
+                }
             }
             if (i > 0)
             {
@@ -1411,7 +1898,7 @@ namespace donut::engine
 
         // The leaf observer unregisters the leaves in pre-order; the graph removes them from its vectors in one pass.
         m_Graph->m_DeferLeafRemoval = true;
-        if (NVRHI_FAILED(m_World->DestroyEntities(m_S->entities.data(), uint32_t(m_S->entities.size()))))
+        if (NVRHI_FAILED(DestroyRows(m_S->entities.data(), m_S->entities.size(), "Detach")))
             log::warning("SceneGraph: cannot destroy the entities of a detached subgraph");
         m_Graph->m_DeferLeafRemoval = false;
         m_Graph->CompactLeafVectors();
@@ -1439,49 +1926,162 @@ namespace donut::engine
         const uint32_t oldType = old ? ResolveLeafType(old) : c_None;
         const uint32_t newType = leaf ? ResolveLeafType(leaf) : c_None;
 
-        // The old leaf leaves first (its OnRemove unregisters it), then the new one comes (OnAdd registers it), as
-        // the old SetLeaf unregistered and registered.
+        // The old leaf leaves first (its OnRemove unregisters it), then the new one comes (OnAdd registers it), as the
+        // old SetLeaf unregistered and registered. Each is one move of the row, with the class's tags and columns, also
+        // between leaves of one class: an observer on a class tag sees the complete row of every leaf that comes or goes
+        // (E6.3). Sparse and Shared components cannot take part: they come before the row and go after it.
+        // The lists first (they may allocate), and whether the world can make both rows: until then nothing has changed.
+        ScratchScope scope(*this);
+        std::vector<WorldImpl::NewValue>& added = m_S->newValues;
+        std::vector<ComponentId>& separate = m_S->separateIds;
+        WorldImpl::ComponentChange leaving, coming;
+        added.clear();
+        separate.clear();
+        LocalBounds bounds{ dm::box3::empty() };
+        const WorldBounds empty{ dm::box3::empty() };
+        LeafObject value;
         if (old)
         {
-            old->m_Node.Reset();
-            m_World->RemoveComponent(entity, m_Ids[SlotLeaf]);
-        }
-        if (oldType != newType)
-        {
-            if (old)
+            const LeafType& type = m_LeafTypes[oldType];
+            leaving.removed = m_LeafTypeTags.data() + type.firstTag - 1;
+            leaving.removedCount = 1 + type.tagCount + type.columnCount + (leaf ? 0 : uint32_t(std::size(c_BoundsSlots)));
+            if (type.separate)
             {
-                const LeafType& type = m_LeafTypes[oldType];
-                for (uint32_t t = 0; t < type.tagCount + type.columnCount; ++t)
-                    m_World->RemoveComponent(entity, m_LeafTypeTags[type.firstTag + t]);
-                if (!leaf)
+                std::vector<ComponentId>& removed = m_S->runComponents;
+                removed.clear();
+                for (uint32_t i = 0; i < leaving.removedCount; ++i)
                 {
-                    m_World->RemoveComponent(entity, m_Ids[SlotLocalBounds]);
-                    m_World->RemoveComponent(entity, m_Ids[SlotWorldBounds]);
-                    m_World->RemoveComponent(entity, m_Ids[SlotChunkBounds]);
+                    if (!IsSeparate(leaving.removed[i]))
+                        removed.push_back(leaving.removed[i]);
                 }
-            }
-            if (leaf)
-            {
-                if (!old)
-                {
-                    const WorldBounds empty{ dm::box3::empty() };
-                    m_World->AddComponent(entity, m_Ids[SlotWorldBounds], &empty);
-                    m_World->AddComponent(entity, m_Ids[SlotChunkBounds], nullptr);
-                }
-                const LeafType& type = m_LeafTypes[newType];
-                for (uint32_t t = 0; t < type.tagCount + type.columnCount; ++t)
-                    m_World->AddComponent(entity, m_LeafTypeTags[type.firstTag + t], nullptr);
+                leaving.removed = removed.data();
+                leaving.removedCount = uint32_t(removed.size());
             }
         }
         if (leaf)
         {
-            leaf->m_Node = nvrhi::WeakPtr<SceneGraphNode>(node);
-            const LocalBounds bounds{ leaf->GetLocalBoundingBox() };
-            m_World->AddComponent(entity, m_Ids[SlotLocalBounds], &bounds);   // writes it when it is there
-            LeafObject value(leaf);
-            leaf->AddRef();   // `value` holds one reference; AddComponent copies it into the row
-            m_World->AddComponent(entity, m_Ids[SlotLeaf], &value);
+            auto add = [&](ComponentId id, const void* initial)
+            {
+                added.push_back(WorldImpl::NewValue{ id, initial, ValueTransfer::Copy });
+            };
+            if (!old)
+            {
+                add(m_Ids[SlotWorldBounds], &empty);
+                add(m_Ids[SlotChunkBounds], nullptr);
+            }
+            const LeafType& type = m_LeafTypes[newType];
+            for (uint32_t t = 0; t < type.tagCount + type.columnCount; ++t)
+            {
+                if (!type.separate || !IsSeparate(m_LeafTypeTags[type.firstTag + t]))
+                    add(m_LeafTypeTags[type.firstTag + t], nullptr);   // the leaf's record (OnRowsAdded), or the leaf
+            }                                                         // observer, fills a column
+            add(m_Ids[SlotLocalBounds], &bounds);
+            add(m_Ids[SlotLeaf], &value);
+            separate.reserve(type.separate ? type.tagCount + type.columnCount : 0);
+            coming.added = added.data();
+            coming.addedCount = uint32_t(added.size());
         }
+        nvrhi::FRESULT fits = old ? m_Impl->PrepareChange(row.archetypeIndex, leaving) : nvrhi::FS_OK;
+        if (leaf && NVRHI_SUCCEEDED(fits))
+            fits = m_Impl->PrepareChange(old ? leaving.target : row.archetypeIndex, coming);
+        if (NVRHI_FAILED(fits))
+        {
+            log::warning("SceneGraph::SetLeaf: the world cannot make the node's new row (%d); nothing changed",
+                         int(fits));
+            return;
+        }
+
+        nvrhi::FRESULT observers = nvrhi::FS_OK;
+        if (old)
+        {
+            if (m_AnyLeafRecord)
+                BeginLeavingRow(old, node, entity);
+            old->m_Node.Reset();
+            const WorldImpl::RowHooks hooks = LeavingHooks();
+            const nvrhi::FRESULT result = m_Impl->ChangeComponentsInternal(entity, leaving, m_Impl->GetStampVersion(),
+                                                                           m_AnyLeafRecord ? &hooks : nullptr);
+            if (NVRHI_FAILED(result))
+            {
+                log::warning("SceneGraph::SetLeaf: the leaf cannot leave its row (%d); nothing changed", int(result));
+                if (m_AnyLeafRecord && old->m_LeafRecord && old->m_LeafRecord->IsInRow())
+                {
+                    LeafRecord::Destroy(old->m_LeafRecord);   // the row keeps the values
+                    old->m_LeafRecord = nullptr;
+                }
+                old->m_Node = nvrhi::WeakPtr<SceneGraphNode>(node);
+                return;
+            }
+            const LeafType type = m_LeafTypes[oldType];
+            for (uint32_t t = 0; type.separate && t < type.tagCount + type.columnCount; ++t)
+            {
+                if (IsSeparate(m_LeafTypeTags[type.firstTag + t]))
+                    m_World->RemoveComponent(entity, m_LeafTypeTags[type.firstTag + t]);
+            }
+            FlushObservers(observers);
+        }
+        if (leaf)
+        {
+            // When the leaf does not come after all (out of memory for the second move, or its box throws): the node has
+            // no leaf, and nothing of either stays in its row.
+            auto abandon = [&]() noexcept
+            {
+                leaf->m_Node.Reset();
+                for (ComponentId id : separate)
+                    m_World->RemoveComponent(entity, id);
+                if (!old)
+                    return;
+                const LeafType& type = m_LeafTypes[oldType];
+                WorldImpl::ComponentChange rest;
+                rest.removed = m_LeafTypeTags.data() + type.firstTag + type.tagCount + type.columnCount;
+                rest.removedCount = uint32_t(std::size(c_BoundsSlots));
+                if (NVRHI_FAILED(m_Impl->ChangeComponentsInternal(entity, rest, m_Impl->GetStampVersion(), nullptr)))
+                {
+                    m_World->AddComponent(entity, m_Ids[SlotLocalBounds], &bounds);   // empty, as no leaf's
+                    m_World->AddComponent(entity, m_Ids[SlotWorldBounds], &empty);
+                }
+                FlushObservers(observers);
+            };
+            leaf->m_Node = nvrhi::WeakPtr<SceneGraphNode>(node);
+            try
+            {
+                bounds.bounds = leaf->GetLocalBoundingBox();
+            }
+            catch (...)
+            {
+                abandon();
+                SyncArchetypes();
+                ForgetRow(node);
+                m_PendingStructure = true;
+                m_StaleWorldTransforms = true;
+                BumpEpoch();
+                throw;
+            }
+            leaf->AddRef();
+            value.object = leaf;   // holds that reference; the row takes a copy
+            const LeafType type = m_LeafTypes[newType];
+            for (uint32_t t = 0; type.separate && t < type.tagCount + type.columnCount; ++t)
+            {
+                const ComponentId id = m_LeafTypeTags[type.firstTag + t];
+                if (!IsSeparate(id) || m_World->HasComponent(entity, id))
+                    continue;
+                if (NVRHI_SUCCEEDED(m_World->AddComponent(entity, id, nullptr)))
+                    separate.push_back(id);
+            }
+            NewNode entry{ node, nullptr, leaf, c_None, newType, dm::box3::empty(), false };
+            LeafMove move{ this, &entry, &entity };
+            const WorldImpl::RowHooks hooks{ &move, &SceneGraphStore::OnRowsAdded, nullptr };
+            const nvrhi::FRESULT result = m_Impl->ChangeComponentsInternal(entity, coming, m_Impl->GetStampVersion(),
+                                                                           type.desc->leafRecord ? &hooks : nullptr);
+            if (NVRHI_FAILED(result))
+            {
+                log::warning("SceneGraph::SetLeaf: the new leaf cannot come into the row (%d); the node has no leaf",
+                             int(result));
+                bounds.bounds = dm::box3::empty();
+                abandon();
+            }
+            FlushObservers(observers);
+        }
+        WarnObservers("SetLeaf", observers);
 
         SyncArchetypes();
         if (Locate(entity, row))

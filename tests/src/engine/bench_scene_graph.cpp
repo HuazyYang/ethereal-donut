@@ -1,7 +1,7 @@
 // bench_scene_graph: baseline timings of today's SceneGraph (aggregate docs/plans/2026-11-21-donut-ecs.md, step E0.4;
 // the cases of docs/ecs-design.md 10.1 that exist before the ECS).
 //
-//     bench_scene_graph [--smoke] [--rounds N] [--workers N]
+//     bench_scene_graph [--smoke] [--rounds N] [--workers N] [--set-leaf]
 //
 // Cases (the sizes are divided by 100 with --smoke, which ctest runs):
 //     refresh_flat_moved        Refresh, 100k dynamic instances under the root, 10 % of them moved
@@ -12,6 +12,8 @@
 //     attach_orphan             Attach of an orphaned subgraph of 100k instances (100 groups of 1000)
 //     refresh_after_attach      the first Refresh after that Attach
 //     detach_subgraph           Detach of a subgraph of 10k instances from a graph of 100k
+//     set_leaf_same_class       only with --set-leaf (E6.3): SetLeaf of a new mesh instance on 2k instances
+//     set_leaf_other_class      ... of a point light on those nodes, and of a mesh instance again
 // Protocol: every round runs every case once, in this order, so the rounds alternate the cases; a run repeats the
 // timed operation and keeps its median; the table shows the median of the run medians and their range.
 // The numbers are meaningful in Release builds only; Debug runs only prove that the cases work.
@@ -184,6 +186,7 @@ namespace
         size_t detachTotal = 100000;
         size_t detachGroups = 10;
         size_t detachPerGroup = 1000;
+        size_t setLeafNodes = 2000;
         int iterations = 15;
         int staticIterations = 50;
         int structuralIterations = 3;
@@ -209,7 +212,11 @@ namespace
             RefreshDeep();
             AttachOrphan();
             DetachSubgraph();
+            if (setLeaf)
+                SetLeaf();
         }
+
+        bool setLeaf = false;   // --set-leaf: without it the cases and their order are those of E0.4
 
         void Print(const char* build, int rounds, int workers) const
         {
@@ -405,6 +412,43 @@ namespace
             }
             Record("detach_subgraph", m_Sizes.detachTotal + m_Sizes.detachGroups + 2, m_Sizes.structuralIterations, Median(samples));
         }
+
+        // The leaf changes of attached nodes, in a small graph (the leaf vectors' erase is linear); the new leaves are
+        // made untimed.
+        void SetLeaf()
+        {
+            Rng rng(7);
+            auto graph = NewGraph();
+            const auto nodes = AddFlat(graph, m_Assets, rng, m_Sizes.setLeafNodes);
+            uint32_t frame = 0;
+            Settle(graph, frame);
+
+            auto replace = [&](bool light)
+            {
+                std::vector<nvrhi::AutoPtr<SceneGraphLeaf>> leaves(nodes.size());
+                for (size_t i = 0; i < nodes.size(); i++)
+                {
+                    if (light)
+                        leaves[i] = MAKE_RC_OBJ_PTR(PointLight);
+                    else
+                        leaves[i] = m_Assets.factory->CreateMeshInstance(m_Assets.meshes[i % 4]);
+                }
+                const auto start = Clock::now();
+                for (size_t i = 0; i < nodes.size(); i++)
+                    nodes[i]->SetLeaf(leaves[i]);
+                return Milliseconds(start, Clock::now());
+            };
+            std::vector<double> sameSamples, otherSamples;
+            for (int it = 0; it < m_Sizes.iterations; it++)
+            {
+                sameSamples.push_back(replace(false));
+                const double toLight = replace(true);
+                otherSamples.push_back(toLight + replace(false));
+                Settle(graph, frame);
+            }
+            Record("set_leaf_same_class", nodes.size() + 1, m_Sizes.iterations, Median(sameSamples));
+            Record("set_leaf_other_class", nodes.size() + 1, m_Sizes.iterations, Median(otherSamples));
+        }
     };
 }
 
@@ -413,6 +457,7 @@ int main(int argc, char** argv)
     bool smoke = false;
     int rounds = 5;
     int workers = 0;
+    bool setLeaf = false;
     for (int i = 1; i < argc; i++)
     {
         if (std::strcmp(argv[i], "--smoke") == 0)
@@ -421,9 +466,11 @@ int main(int argc, char** argv)
             rounds = std::max(1, std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc)
             workers = std::max(1, std::atoi(argv[++i]));
+        else if (std::strcmp(argv[i], "--set-leaf") == 0)
+            setLeaf = true;
         else
         {
-            std::fprintf(stderr, "usage: bench_scene_graph [--smoke] [--rounds N] [--workers N]\n");
+            std::fprintf(stderr, "usage: bench_scene_graph [--smoke] [--rounds N] [--workers N] [--set-leaf]\n");
             return 2;
         }
     }
@@ -441,6 +488,7 @@ int main(int argc, char** argv)
         sizes.detachTotal /= 100;
         sizes.detachGroups = 1;
         sizes.detachPerGroup /= 10;
+        sizes.setLeafNodes /= 10;
         sizes.iterations = 2;
         sizes.staticIterations = 2;
         sizes.structuralIterations = 1;
@@ -466,6 +514,7 @@ int main(int argc, char** argv)
     }
 
     Bench bench(sizes);
+    bench.setLeaf = setLeaf;
     for (int round = 0; round < rounds; round++)
     {
         bench.Round();

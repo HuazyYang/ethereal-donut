@@ -52,11 +52,12 @@ target_compile_definitions(test_ecs_determinism PRIVATE
 
 # The ECS tests reach the world's internals (allocation counters, chunk layout, entity table) through the private
 # headers in src/engine (EcsWorldImpl.h and the ones beside it); so do the scene-graph storage test (step E3) and the
-# GPU scene test (step E4), for the allocation counter, and the exit test of the shared job system (SharedJobSystem.h).
+# GPU scene test (step E4), for the allocation counter, the leaf columns test (E6.3), for the records' counter and the
+# failure seams, and the exit test of the shared job system (SharedJobSystem.h).
 foreach(test_src ${donut_engine_tests})
     get_filename_component(test_name "${test_src}" NAME_WE)
     if(test_name MATCHES "^test_ecs_" OR test_name STREQUAL "test_scene_graph_store" OR test_name STREQUAL "test_gpu_scene"
-       OR test_name STREQUAL "test_job_system_exit")
+       OR test_name STREQUAL "test_scene_graph_leaf_columns" OR test_name STREQUAL "test_job_system_exit")
         target_include_directories("${test_name}" PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
     endif()
 endforeach()

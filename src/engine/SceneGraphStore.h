@@ -42,6 +42,11 @@
 //   (D9) and the parent's chunk version per row, which no public query exposes, and they stamp only the chunks they
 //   write. They run as systems of the graph's scheduler, in the TransformPropagation and Bounds phases. GpuScene reads
 //   the mesh-instance chunks the same way (plan step E4).
+// - Leaf columns (E6.3): the values of a leaf class with LeafTypeDesc::leafRecord have one home, the row while the leaf
+//   is attached and the leaf's LeafRecord otherwise. They move in when the rows exist and before any observer runs, and
+//   out after the last observer of the row's removal and before the row goes (WorldImpl::RowHooks). While a removal
+//   runs, the leaf's record names the row (LeafRecord::IsInRow), so that the observers' Get and Edit still find it.
+//   Graphs that never saw such a class (m_AnyLeafRecord) do none of this.
 // - Asset tables and slots (step E4): the leaf observer fills a mesh instance's MeshRef, RenderFlags and
 //   GpuInstanceSlot columns (table references, stable slots) before it calls RegisterLeaf, and releases them before it
 //   calls UnregisterLeaf. Every structural operation and InvalidateContent first advances the world's version, so that
@@ -65,7 +70,7 @@
 namespace donut::engine
 {
     // The state of a node that is in no graph (5.3). The node part is typed (it is the same for every node, and attach
-    // moves it with plain copies); leaf columns, keyed by GUID, join it with the first columnar leaf (step E4).
+    // moves it with plain copies); a leaf's columns have a record of their own, which the leaf owns (LeafRecord).
     class OrphanRecord
     {
     public:
@@ -89,6 +94,55 @@ namespace donut::engine
         static OrphanRecord* Create();
         static void Destroy(OrphanRecord* record) noexcept;
         static void Destroy(OrphanRecord* const* records, size_t count) noexcept;
+    };
+
+    // Whether a leaf column is one value per row, which a record can hold and Get and Edit hand out: no tag, buffer,
+    // Shared, Chunk or Sparse component.
+    bool IsPlainColumn(const ComponentTypeDesc& desc) noexcept;
+
+    // The column values of a leaf that is in no graph (LeafTypeDesc::leafRecord, E6.3): one block, this header and then
+    // the values of the class's plain columns in the order of LeafTypeDesc::columns, found by GUID. All of them are
+    // constructed, except while a removal runs (IsInRow): then the row still holds them.
+    class LeafRecord
+    {
+    public:
+        // Every value in its default state (the construct hook, zeros without one). Null when out of memory.
+        static LeafRecord* Create(const LeafTypeDesc& type) noexcept;
+        // A record whose values are still in the row of `entity`; TakeFromRow fetches them.
+        static LeafRecord* CreateInRow(const LeafTypeDesc& type, SceneGraphStore* store, Entity entity) noexcept;
+        // Destroys the values that it holds, and gives the block back: blocks are recycled through a process-wide pool
+        // (bounded), on any thread.
+        static void Destroy(LeafRecord* record) noexcept;
+
+        bool IsInRow() const noexcept { return m_Store != nullptr; }
+        SceneGraphStore* GetStore() const noexcept { return m_Store; }
+        Entity GetEntity() const noexcept { return m_Entity; }
+        // The value of a column; null when the record has none. Not while IsInRow.
+        void* Find(const nvrhi::GUID& uuid) noexcept;
+        // Whether the record's columns are the plain columns of `type`, in any order.
+        bool HasColumnsOf(const LeafTypeDesc& type) const noexcept;
+
+        // Moves every value out, destroying what the row lacks a column for, and gives the block back.
+        static void MoveIntoRow(LeafRecord* record, ecs::WorldImpl& world, const ecs::Archetype& archetype,
+                                uint32_t chunk, uint32_t row) noexcept;
+        // Moves the values in from the row, which keeps default ones; what the row lacks starts in its default state.
+        void TakeFromRow(ecs::WorldImpl& world, const ecs::Archetype& archetype, uint32_t chunk, uint32_t row) noexcept;
+
+        // Test seam: the records alive in the process.
+        static int64_t GetLiveCount() noexcept { return s_LiveCount.load(); }
+
+    private:
+        static LeafRecord* Allocate(const LeafTypeDesc& type) noexcept;
+        static void Free(LeafRecord* record) noexcept;
+        template <typename Visit> void ForEachValue(Visit&& visit) noexcept;
+
+        static std::atomic<int64_t> s_LiveCount;
+        const ComponentTypeDesc* const* m_Columns = nullptr;
+        uint32_t m_ColumnCount = 0;
+        uint32_t m_SizeClass = 0;
+        SceneGraphStore* m_Store = nullptr;   // while IsInRow
+        Entity m_Entity = Entity::Null;
+        LeafRecord* m_NextFree = nullptr;     // in the pool
     };
 
     class SceneGraphStore
@@ -219,6 +273,26 @@ namespace donut::engine
         // The GpuInstanceSlot of an attached mesh instance; null while it is in no graph or holds no slot (before the
         // leaf observer reached it, after it released it): MeshInstance::GetInstanceIndex.
         static const GpuInstanceSlot* InstanceSlotOf(const SceneGraphLeaf* leaf) noexcept;
+
+        // The store of an attached leaf, whose node's row exists; null for another.
+        static SceneGraphStore* StoreOf(const SceneGraphLeaf* leaf) noexcept
+        {
+            const SceneGraphNode* node = leaf->GetNode();
+            return node && !node->m_Record ? node->m_Store : nullptr;
+        }
+        // SceneGraphLeaf::Get and Edit of a leaf that has a record or is attached: the value of a column that its class
+        // declares, from its record or its row; `write` stamps the row's column. Null when there is none.
+        static void* LeafColumn(const SceneGraphLeaf* leaf, const ComponentTypeDesc& type, bool write) noexcept;
+        static bool DeclaresColumn(const LeafTypeDesc& type, const nvrhi::GUID& uuid) noexcept;
+        // Whether a leaf with a record (a class with leafRecord) is on another node than `node`: a second one would give
+        // its values two homes.
+        static bool IsOnAnotherNode(const SceneGraphLeaf* leaf, const SceneGraphNode* node) noexcept
+        {
+            if (!leaf->GetTypeDesc().leafRecord)
+                return false;
+            const SceneGraphNode* holder = leaf->GetNode();
+            return holder && holder != node;
+        }
 
         // ------------------------------------------------------------------------------- structure (5.3)
         // `child` is in no graph; `parent` is attached here, or null to make `child` the graph's root.
@@ -414,9 +488,19 @@ namespace donut::engine
         struct LeafType
         {
             const LeafTypeDesc* desc;
-            uint32_t firstTag;         // in m_LeafTypeTags: the tags, then the columns
+            uint32_t firstTag;         // in m_LeafTypeTags: the tags, then the columns; LeafObject is just before them,
+                                       // and the bounds' components just after, so that SetLeaf has its lists there
             uint32_t tagCount;
             uint32_t columnCount;      // the class's columns (LeafTypeDesc::columns), after its tags
+            bool separate;             // some of them are Sparse or Shared: not part of the row's move in SetLeaf
+        };
+
+        // The nodes of a structural change whose leaves' values move into the rows (the RowHooks of Attach and SetLeaf).
+        struct LeafMove
+        {
+            SceneGraphStore* store;
+            const NewNode* nodes;
+            const Entity* entities;
         };
 
         struct LevelArchetype
@@ -509,11 +593,31 @@ namespace donut::engine
         void RaiseAssetCallbacks(const MeshTable::Changes& changes);
         void SyncArchetypes() noexcept;
         uint32_t ResolveLeafType(SceneGraphLeaf* leaf);
+        bool IsSeparate(ComponentId id) const noexcept;   // Sparse or Shared (LeafType::separate)
         uint32_t DepthOf(Entity entity) const noexcept;
         void ResolveLeaves();
         bool CreateNodes(Entity parentEntity, uint32_t parentDepth);   // false when the world refused a batch
         void AbandonNodes(uint32_t first);
         void LinkUnder(Entity parentEntity, Entity child);
+        // Leaf records (E6.3). BeginLeavingRow: `leaf` is about to leave its row; its record names the row from now on.
+        // OnRowRemoving: the row's values move into that record. FinishLeavingRows: the same for entities that a failed
+        // DestroyEntities kept.
+        void BeginLeavingRow(SceneGraphLeaf* leaf, const SceneGraphNode* node, Entity entity) noexcept;
+        static void OnRowsAdded(void* context, uint32_t count) noexcept;
+        static void OnRowRemoving(void* context, Entity entity, const ecs::Archetype& archetype, uint32_t chunk,
+                                  uint32_t row) noexcept;
+        void FinishLeavingRows(const Entity* entities, size_t count) noexcept;
+        void TakeLeafValuesAtTeardown(bool worldIsHeld) noexcept;
+        ecs::WorldImpl::RowHooks LeavingHooks() noexcept
+        {
+            return ecs::WorldImpl::RowHooks{ this, nullptr, &SceneGraphStore::OnRowRemoving };
+        }
+        // Delivers the held batch and the observers' commands; the first failure joins `result` (WarnObservers).
+        void FlushObservers(nvrhi::FRESULT& result) noexcept;
+        // One warning, in every build, for the observers' failures of one call: they undo nothing.
+        static void WarnObservers(const char* operation, nvrhi::FRESULT result) noexcept;
+        // Destroys entities, moving their leaves' values out (BeginLeavingRow came before).
+        nvrhi::FRESULT DestroyRows(const Entity* entities, size_t count, const char* operation) noexcept;
         void GatherSubgraph(Entity root);
         void MoveToRecords(bool unlinkRoot);
         void BumpEpoch() noexcept { m_Epoch.fetch_add(1, std::memory_order_relaxed); }
@@ -560,6 +664,7 @@ namespace donut::engine
         // Leaf classes seen so far and their tag and column ids.
         std::vector<LeafType> m_LeafTypes;
         std::vector<ComponentId> m_LeafTypeTags;
+        bool m_AnyLeafRecord = false;      // one of them keeps its columns in records (LeafTypeDesc::leafRecord)
 
         // Stable slots of the mesh instances (step E4): instance-buffer rows and geometry-instance ranges.
         SlotAllocator m_InstanceSlots;
@@ -581,6 +686,8 @@ namespace donut::engine
             std::vector<uint32_t> firstChild, lastChild, prevSibling, nextSibling, depth;
             std::vector<ComponentId> runComponents;
             std::vector<const void*> runValues;
+            std::vector<ecs::WorldImpl::NewValue> newValues;
+            std::vector<ComponentId> separateIds;
             std::vector<uint8_t> valueBytes;
         };
         // The calling thread's scratch for one structural operation. Nested operations (a leaf callback of one graph

@@ -77,7 +77,7 @@ namespace donut::engine
         nvrhi::WeakPtr<SceneGraphNode> m_Node;
         uint32_t m_RemovalPending = 0;   // unregistered this often in a Detach; SceneGraph compacts its vectors after it
         uint32_t m_RemovalTaken = 0;
-        LeafRecord* m_LeafRecord = nullptr;   // valid while in no graph; only classes whose type declares leafRecord
+        LeafRecord* m_LeafRecord = nullptr;   // while no row is the values' home; only classes that declare leafRecord
 
         [[nodiscard]] const void* GetColumn(const ComponentTypeDesc& type) const noexcept;
         [[nodiscard]] void* EditColumn(const ComponentTypeDesc& type) noexcept;
@@ -85,10 +85,12 @@ namespace donut::engine
     protected:
         // The leaf's value of a column that its class declares (LeafTypeDesc::columns): the row while the leaf is
         // attached, its record otherwise. A leaf in no graph has a record once Edit made it or it left a graph
-        // (leafRecord only). Null when there is neither, or T is not one of the class's columns. The pointer is valid
-        // until the next structural change of the graph, or until the leaf enters or leaves one. Allocates nothing,
-        // makes no record. Several threads may call it between structural changes; in a phase the caller's system
-        // declares the access.
+        // (leafRecord only). Null when there is neither, or T is not one of the class's columns, or not one with a value
+        // per row (a tag, a buffer, a Shared, Chunk or Sparse component). A leaf that leaves a graph (Detach, SetLeaf)
+        // has its values in the row until the last observer of the removal has run, UnregisterLeaf included: they call
+        // Get and Edit as before. The pointer is valid until the next structural change of the graph, or until the leaf
+        // enters or leaves one. Allocates nothing, makes no record. Several threads may call it between structural
+        // changes; in a phase the caller's system declares the access.
         template <typename T> [[nodiscard]] const T* Get() const noexcept
         {
             return static_cast<const T*>(GetColumn(ComponentTraits<T>::Desc()));
@@ -531,6 +533,11 @@ namespace donut::engine
         void SetScaling(const dm::double3& scaling);
         void SetRotation(const dm::dquat& rotation);
         void SetTranslation(const dm::double3& translation);
+        // One node per leaf. A leaf of a class with LeafTypeDesc::leafRecord that is on another node is refused with a
+        // warning: take it from that node first (SetLeaf(nullptr) there), or clone it. Other leaves are taken as they
+        // always were (importers put one light or camera on several nodes): the leaf then names the last node only.
+        // When the world cannot make the node's new row, nothing changes; when it runs out of memory between the old
+        // leaf's going and the new one's coming, the node has none. Both warn.
         void SetLeaf(SceneGraphLeaf* leaf);
         void SetName(const std::string& name);
 
@@ -685,32 +692,63 @@ namespace donut::engine
     // A container that tracks unique resources of the same type used by some entity, for example unique meshes used in a scene graph.
     // It works by putting the resource shared pointers into a map and associating a reference count with each resource.
     // When the resource is added and released an equal number of times, its refrence count reaches zero, and it's removed from the container.
+    // It iterates in the order in which the resources were added (a resource that was removed and added again comes
+    // last), which no address decides (design 3.3.6). Nothing may be added or removed during an iteration.
     template<typename T>
     class ResourceTracker
     {
+    public:
+        ResourceTracker() = default;
+        ResourceTracker(const ResourceTracker&) = default;
+        ResourceTracker& operator=(const ResourceTracker&) = default;
+        // A moved-from tracker is empty.
+        ResourceTracker(ResourceTracker&& other) noexcept
+            : m_Map(std::move(other.m_Map))
+            , m_First(std::exchange(other.m_First, nullptr))
+            , m_Last(std::exchange(other.m_Last, nullptr))
+        {
+            other.m_Map.clear();
+        }
+        ResourceTracker& operator=(ResourceTracker&& other) noexcept
+        {
+            if (this != &other)
+            {
+                m_Map = std::move(other.m_Map);
+                other.m_Map.clear();
+                m_First = std::exchange(other.m_First, nullptr);
+                m_Last = std::exchange(other.m_Last, nullptr);
+            }
+            return *this;
+        }
+
     private:
         // Keyed by the raw pointer, so that a lookup makes no AutoPtr (two atomic operations); the entry holds the
-        // reference. The hash of a pointer equals the hash of its AutoPtr, so the iteration order is unchanged.
+        // reference. The entries form a list in the order in which they were added, linked by key, so that a copied
+        // tracker is a tracker too.
         struct Entry
         {
             nvrhi::AutoPtr<T> resource;
             uint32_t count = 0;
+            T* prev = nullptr;
+            T* next = nullptr;
         };
         std::unordered_map<T*, Entry> m_Map;
-        using UnderlyingConstIterator = typename std::unordered_map<T*, Entry>::const_iterator;
+        T* m_First = nullptr;
+        T* m_Last = nullptr;
 
     public:
         class ConstIterator
         {
         private:
-            UnderlyingConstIterator m_Iter;
+            const ResourceTracker* m_Tracker;
+            T* m_Resource;   // null at the end
         public:
-            ConstIterator(UnderlyingConstIterator iter) : m_Iter(std::move(iter)) {}
-            ConstIterator& operator++() { ++m_Iter; return *this; }
-            ConstIterator operator++(int) { ConstIterator res = *this; ++m_Iter; return res; }
-            bool operator==(ConstIterator other) const { return m_Iter == other.m_Iter; }
+            ConstIterator(const ResourceTracker* tracker, T* resource) : m_Tracker(tracker), m_Resource(resource) {}
+            ConstIterator& operator++() { m_Resource = m_Tracker->m_Map.find(m_Resource)->second.next; return *this; }
+            ConstIterator operator++(int) { ConstIterator res = *this; ++*this; return res; }
+            bool operator==(ConstIterator other) const { return m_Resource == other.m_Resource; }
             bool operator!=(ConstIterator other) const { return !(*this == other); }
-            T* operator*() { return m_Iter->first; }
+            T* operator*() { return m_Resource; }
         };
 
         // Adds a reference to the specified resource.
@@ -718,9 +756,15 @@ namespace donut::engine
         bool AddRef(const T *resource)
         {
             if (!resource) return false;
-            Entry& entry = m_Map[const_cast<T *>(resource)];
+            T* key = const_cast<T *>(resource);
+            Entry& entry = m_Map[key];
             if (entry.count++ == 0)
-                entry.resource = const_cast<T *>(resource);
+            {
+                entry.resource = key;
+                entry.prev = m_Last;
+                (m_Last ? m_Map.find(m_Last)->second.next : m_First) = key;
+                m_Last = key;
+            }
             return (entry.count == 1);
         }
 
@@ -743,14 +787,17 @@ namespace donut::engine
 
             if (it->second.count == 0)
             {
+                const Entry& entry = it->second;
+                (entry.prev ? m_Map.find(entry.prev)->second.next : m_First) = entry.next;
+                (entry.next ? m_Map.find(entry.next)->second.prev : m_Last) = entry.prev;
                 m_Map.erase(it);
                 return true;
             }
             return false;
         }
 
-        [[nodiscard]] ConstIterator begin() const { return ConstIterator(m_Map.cbegin()); }
-        [[nodiscard]] ConstIterator end() const { return ConstIterator(m_Map.cend()); }
+        [[nodiscard]] ConstIterator begin() const { return ConstIterator(this, m_First); }
+        [[nodiscard]] ConstIterator end() const { return ConstIterator(this, nullptr); }
         [[nodiscard]] bool empty() const { return m_Map.empty(); }
         [[nodiscard]] size_t size() const { return m_Map.size(); }
     };
@@ -792,6 +839,16 @@ namespace donut::engine
         // warning. An exception thrown from an override, or from OnMeshAdded and the other callbacks, is caught at
         // the observer, logged, and the leaf skipped (the observer is noexcept). During a Detach the vectors keep the
         // leaves unregistered before the current one until the Detach ends.
+        // New code adds an IObserver instead (GetWorld()->AddObserver): OnAdd and OnRemove on the tag of the leaf class
+        // (LeafTypeDesc::tags; RegisterComponent makes it known to the world), with LeafObject as a Read filter term,
+        // so that the batch has the leaves. It sees the leaves of that class and its subclasses in the order of these
+        // calls, right after the graph's own observer, with complete rows (the columns of a class with leafRecord
+        // hold the leaf's values), at Attach, Detach and SetLeaf, between two leaves of one class too. Exceptions: a
+        // Sparse or Shared tag changes apart from the row in SetLeaf, where an observer on it with the LeafObject term
+        // sees nothing (use archetype tags); and when a callback of a removal attaches the leaf to another graph, the
+        // leaf takes its values along, so that the later observers of that removal see default ones. What an observer
+        // returns undoes nothing (a warning). When a graph dies nothing is delivered and the world may outlive it, so a
+        // graph class that adds observers removes them in its own destructor.
         virtual void RegisterLeaf(SceneGraphLeaf *leaf);
         virtual void UnregisterLeaf(SceneGraphLeaf *leaf);
 

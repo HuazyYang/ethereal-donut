@@ -46,17 +46,39 @@ using namespace donut::engine;
 #define DONUT_SCENE_GRAPH_RENDER_READ_QUIET(store) ((void)0)
 #endif
 
-SceneGraphLeaf::~SceneGraphLeaf() = default;
-
-// Stubs: item E6.3 of the E6 sub-plan implements Get and Edit, and the leaf's record (no class declares leafRecord).
-const void* SceneGraphLeaf::GetColumn(const ComponentTypeDesc&) const noexcept
+SceneGraphLeaf::~SceneGraphLeaf()
 {
-    return nullptr;
+    if (m_LeafRecord)
+        LeafRecord::Destroy(m_LeafRecord);
 }
 
-void* SceneGraphLeaf::EditColumn(const ComponentTypeDesc&) noexcept
+const void* SceneGraphLeaf::GetColumn(const ComponentTypeDesc& type) const noexcept
 {
-    return nullptr;
+    return SceneGraphStore::LeafColumn(this, type, false);
+}
+
+void* SceneGraphLeaf::EditColumn(const ComponentTypeDesc& type) noexcept
+{
+    if (!m_LeafRecord)
+    {
+        if (const SceneGraphStore* store = SceneGraphStore::StoreOf(this))
+        {
+            assert(!store->GetWorld()->IsInPhase());   // design 5.6: the API writes outside phases
+            DONUT_SCENE_GRAPH_WARN_RENDER_READ(store, "Leaf::Edit");
+            (void)store;
+        }
+        else
+        {
+            // in no graph: the first Edit of one of the class's columns makes the record
+            const LeafTypeDesc& leafType = GetTypeDesc();
+            if (!leafType.leafRecord || !SceneGraphStore::DeclaresColumn(leafType, type.uuid))
+                return nullptr;
+            m_LeafRecord = LeafRecord::Create(leafType);
+            if (!m_LeafRecord)
+                return nullptr;
+        }
+    }
+    return SceneGraphStore::LeafColumn(this, type, true);
 }
 
 const std::string& SceneGraphLeaf::GetName() const
@@ -676,6 +698,12 @@ void SceneGraphNode::SetTranslation(const dm::double3& translation)
 
 void SceneGraphNode::SetLeaf(SceneGraphLeaf* leaf)
 {
+    if (leaf && SceneGraphStore::IsOnAnotherNode(leaf, this))
+    {
+        log::warning("SceneGraphNode::SetLeaf: the leaf is on another node, and its class keeps its columns in one place "
+                     "(LeafTypeDesc::leafRecord); nothing changed. Take it from that node first, or clone it");
+        return;
+    }
     if (m_Store && !m_Record)
     {
         DONUT_SCENE_GRAPH_WARN_RENDER_READ(m_Store, "SetLeaf");
