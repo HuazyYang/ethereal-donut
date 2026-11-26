@@ -1217,8 +1217,10 @@ void SceneGraph::CompactLeafVectors()
     m_RemovalMarked.clear();
 }
 
-void SceneGraph::BeginRenderRead() noexcept
+void SceneGraph::BeginRenderRead(RenderReadMode mode) noexcept
 {
+    if (mode == RenderReadMode::Defer)   // E7.8 implements deferred releases
+        log::warning("SceneGraph::BeginRenderRead: RenderReadMode::Defer is not implemented yet; the scope warns");
     m_Store->BeginRenderRead();
 }
 

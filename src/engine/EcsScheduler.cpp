@@ -556,6 +556,13 @@ namespace donut::engine::ecs
         IWorld* GetWorld() noexcept override { return m_World; }
         IJobSystem* GetJobSystem() noexcept override { return m_Jobs.Get(); }
         nvrhi::FRESULT GetSystemStats(SystemId system, SystemStats& out) noexcept override;
+        uint32_t GetSystemCount() noexcept override { return m_LiveSystemCount; }
+        nvrhi::FRESULT GetSystemInfo(uint32_t index, SystemInfo& out) noexcept override;
+        const char* GetPhaseName(Phase phase) noexcept override
+        {
+            const PhaseRecord* record = FindPhase(phase);
+            return record ? record->name.c_str() : nullptr;
+        }
 
         // ------------------------------------------------------------------------------- module-internal access
 
@@ -1313,6 +1320,13 @@ namespace donut::engine::ecs
         }
         out = record->stats;
         return nvrhi::FS_OK;
+    }
+
+    nvrhi::FRESULT SchedulerImpl::GetSystemInfo(uint32_t index, SystemInfo& out) noexcept
+    {
+        (void)index;
+        out = SystemInfo{};
+        return nvrhi::FE_NOT_IMPLEMENT;   // a stub of plan step E7, item E7.0; item E7.7 implements it
     }
 
     // ------------------------------------------------------------------------------------ simulation domains

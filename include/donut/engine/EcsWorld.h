@@ -163,6 +163,20 @@ namespace donut::engine
     };
     static_assert(sizeof(void*) != 8 || sizeof(ArchetypeInfo) == 32, "ArchetypeInfo layout");
 
+    // One chunk of an archetype, for inspectors (11.4). The pointers address the chunk itself: valid until the next
+    // structural change, and the versions move with every write.
+    struct ChunkInfo
+    {
+        const Entity* entities;         // `count` ids, in row order
+        const uint64_t* versions;       // the chunk's change version of each ArchetypeInfo::components entry, in that
+                                        // order: what Changed terms compare (a tag's, Shared or Chunk value's
+                                        // entry is whatever the chunk keeps)
+        uint64_t addedVersion;          // the version at which rows were last added: what Added terms compare
+        uint32_t count;                 // rows in use
+        uint32_t capacity;              // ArchetypeInfo::rowsPerChunk
+    };
+    static_assert(sizeof(void*) != 8 || sizeof(ChunkInfo) == 32, "ChunkInfo layout");
+
     NVRHI_IID(IWorld, "c2bb40bd-b7a3-44b9-bd7e-51467522f190")
     struct IWorld : nvrhi::IObject
     {
@@ -256,6 +270,10 @@ namespace donut::engine
         virtual WorldStats& GetStats(WorldStats& retVal) noexcept = 0;
         virtual uint32_t GetArchetypeCount() noexcept = 0;
         virtual nvrhi::FRESULT GetArchetypeInfo(uint32_t archetype, ArchetypeInfo& out) noexcept = 0;
+        // Chunk `chunk` of archetype `archetype` (both indices as GetArchetypeCount and ArchetypeInfo::chunkCount
+        // count them). Outside phases or from an exclusive system: systems may be writing rows and versions; else
+        // FE_OUT_OF_DATE. FE_INVALID_ARGS for an index out of range. `out` is zeroed on failure.
+        virtual nvrhi::FRESULT GetChunkInfo(uint32_t archetype, uint32_t chunk, ChunkInfo& out) noexcept = 0;
     };
 
     nvrhi::FRESULT CreateWorld(const WorldDesc& desc, IWorld** ppWorld) noexcept;

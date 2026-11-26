@@ -2016,6 +2016,14 @@ namespace donut::engine::ecs
         out.rowsPerChunk = a.rowsPerChunk;
         return nvrhi::FS_OK;
     }
+
+    nvrhi::FRESULT WorldImpl::GetChunkInfo(uint32_t archetype, uint32_t chunk, ChunkInfo& out) noexcept
+    {
+        (void)archetype;
+        (void)chunk;
+        out = ChunkInfo{};
+        return nvrhi::FE_NOT_IMPLEMENT;   // a stub of plan step E7, item E7.0; item E7.7 implements it
+    }
 }
 
 namespace donut::engine

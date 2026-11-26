@@ -507,6 +507,7 @@ namespace donut::engine::ecs
         WorldStats& GetStats(WorldStats& retVal) noexcept override;
         uint32_t GetArchetypeCount() noexcept override { return uint32_t(m_Archetypes.size()); }
         nvrhi::FRESULT GetArchetypeInfo(uint32_t archetype, ArchetypeInfo& out) noexcept override;
+        nvrhi::FRESULT GetChunkInfo(uint32_t archetype, uint32_t chunk, ChunkInfo& out) noexcept override;
 
         // ------------------------------------------------------------------------------- module-internal access
 

@@ -130,6 +130,18 @@ namespace donut::engine
     };
     static_assert(sizeof(SystemStats) == 24, "SystemStats layout");
 
+    // A system as an inspector lists it (11.4): IScheduler::GetSystemInfo.
+    struct SystemInfo
+    {
+        const char* name;             // the scheduler's copy; valid while the system is registered
+        SystemId id;
+        Phase phase;
+        SystemFlags flags;
+        uint32_t enabled;             // 1 when enabled (IScheduler::SetSystemEnabled), else 0
+        SystemStats stats;            // as GetSystemStats gives them
+    };
+    static_assert(sizeof(void*) != 8 || sizeof(SystemInfo) == 48, "SystemInfo layout");
+
     // Valid during ISystem::Update, on any thread that works for the system.
     NVRHI_IID(ISystemContext, "161e575e-334c-4040-9bf4-938b192e2f5e")
     struct ISystemContext : nvrhi::IObject
@@ -222,6 +234,19 @@ namespace donut::engine
         virtual IWorld* GetWorld() noexcept = 0;                    // not AddRef'd
         virtual IJobSystem* GetJobSystem() noexcept = 0;            // not AddRef'd
         virtual nvrhi::FRESULT GetSystemStats(SystemId system, SystemStats& out) noexcept = 0;
+
+        // The systems for an inspector (11.4), domains' systems included, removed ones not. GetSystemInfo's index runs
+        // in run order: the phases as RunPhases runs them (named phases included), each phase's systems in schedule
+        // order; a phase with an ordering cycle lists its systems in registration order (it does not run). The order is
+        // built first when anything changed, as RunPhase and GetDiagnostics do, with the same effects: the build's
+        // report is replaced and the cycle warnings are logged again. Outside phases: the threads that run systems
+        // write the statistics; FE_OUT_OF_DATE inside one, FE_INVALID_ARGS for an index of GetSystemCount or above. A
+        // cycle is no failure here. `out` is zeroed on failure.
+        virtual uint32_t GetSystemCount() noexcept = 0;
+        virtual nvrhi::FRESULT GetSystemInfo(uint32_t index, SystemInfo& out) noexcept = 0;
+        // The built-in phases' names (BeginFrame ... EndFrame) and those AddPhase gave; null for a phase this scheduler
+        // does not have. The scheduler's copy, valid while it lives.
+        virtual const char* GetPhaseName(Phase phase) noexcept = 0;
     };
 
     // The scheduler keeps references to the world and the job system. FE_INVALID_ARGS inside a phase of the world

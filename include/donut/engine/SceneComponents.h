@@ -302,6 +302,43 @@ namespace donut::engine
                            ::donut::engine::ComponentFlags::Enableable, 0,
                            DONUT_ECS_FIELDS(translation, rotation, scaling, space, reserved))
 
+    // -------------------------------------------------------- runtime-only mesh instances (5.8, plan step E7)
+    //
+    //     runtime-only mesh instance   RuntimeMeshInstance, LocalTransform, WorldTransform, LocalBounds, WorldBounds,
+    //                                  the chunk's ChunkWorldBounds, MeshRef, RenderFlags, GpuInstanceSlot
+    //     driven by a domain           ... plus SimulationDriven, SimPose, SimPosePrevious, SimScale, SimBodyRef (no
+    //                                  SimTeleport: such a row has no setter that would fill it)
+    //
+    // A mesh instance that systems make in the graph's world, with no node or leaf object: no LocalMatrix, Parent,
+    // SceneLinks, HierarchyDepth, SceneNode or LeafObject. SceneGraph::GetRuntimeMeshInstanceComponents lists the
+    // components. The creator gives LocalTransform and MeshRef (an id of SceneGraph::AcquireRuntimeMesh); the graph's
+    // observer on this tag fills the derived ones when the row appears (slots, RenderFlags, LocalBounds from the mesh)
+    // and takes one mesh reference per row, which it returns when the row goes. Such rows are roots (depth 0); they
+    // render and simulate like a node's rows but are not seen by SceneGraphWalker, GetMeshInstances or the root's
+    // subgraph bounds. Leaf observers do not see them either: they filter with LeafObject, which these rows lack.
+    struct RuntimeMeshInstance { };
+    DONUT_ECS_TAG(RuntimeMeshInstance, "6ad8bdeb-5ffa-4f0e-b4e0-c705b8abd49c")
+
+    // --------------------------------------------------------------------- the inspector's read-only list (11.4)
+
+    // A world resource (4.9) that the graph's store registers in its world (plan step E7, item E7.7): the components
+    // that a generic editor (app::WorldInspector) shows but never edits, because an edit of one through the world
+    // corrupts the graph. They are the hierarchy columns (SceneLinks, Parent, HierarchyDepth), the derived ones that
+    // systems overwrite (LocalMatrix, WorldTransform, LocalBounds, WorldBounds, ChunkWorldBounds), the slot and
+    // reference columns (GpuInstanceSlot, MeshRef, RenderFlags, SimBodyRef) and the hooked ones (SceneNode,
+    // LeafObject). A fixed list in the world, so that it outlives the graph with the world and the inspector finds it
+    // by GUID through IWorld alone. NoSerialize: snapshots and world hashes leave it out.
+    constexpr uint32_t c_MaxInspectorReadOnlyComponents = 31;
+    struct InspectorReadOnlyComponents
+    {
+        ComponentId components[c_MaxInspectorReadOnlyComponents];
+        uint32_t count;
+    };
+    static_assert(sizeof(InspectorReadOnlyComponents) == 128, "InspectorReadOnlyComponents layout");
+    DONUT_ECS_COMPONENT_EX(InspectorReadOnlyComponents, "9cd6c57b-4aab-46a8-94f3-be19a1b2ff18",
+                           ::donut::engine::ComponentFlags::Resource | ::donut::engine::ComponentFlags::NoSerialize, 0,
+                           DONUT_ECS_FIELDS(components, count))
+
     // ------------------------------------------------------------------------------------- leaf classes (4.11)
 
     // What a leaf class keeps in columns (D19). One static instance per leaf class, returned by

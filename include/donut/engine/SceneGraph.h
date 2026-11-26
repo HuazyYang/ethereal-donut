@@ -885,6 +885,7 @@ namespace donut::engine
         [[nodiscard]] const size_t GetGeometryInstancesCount() const;
         // The size of an array indexed by instance slot (MeshInstance::GetInstanceIndex), likewise.
         [[nodiscard]] size_t GetInstanceSlotCount() const;
+        // The leaves: runtime-only mesh instances (RuntimeMeshInstance, SceneComponents.h) are not in it.
         [[nodiscard]] const std::vector<nvrhi::AutoPtr<MeshInstance>>& GetMeshInstances() const { return m_MeshInstances; }
         [[nodiscard]] const std::vector<nvrhi::AutoPtr<SkinnedMeshInstance>>& GetSkinnedMeshInstances() const { return m_SkinnedMeshInstances; }
         [[nodiscard]] const std::vector<nvrhi::AutoPtr<SceneGraphAnimation>>& GetAnimations() const { return m_Animations; }
@@ -930,7 +931,18 @@ namespace donut::engine
         // graph's leaves and assets: in Debug builds every write through this API (structural calls, transforms,
         // SetLeaf, InvalidateContent) logs a warning there, beside the phase check of design 5.6, and still applies.
         // Release builds check nothing. Scopes nest.
-        void BeginRenderRead() noexcept;
+        // RenderReadMode::Defer (plan step E7, item E7.8; RenderServiceDesc::pipelined) is the pipelined frame's scope:
+        // writes are allowed and do not warn, and the last reference that the graph, its world or its tables drop to a
+        // leaf, node, mesh or material while a scope of this mode is open goes to a retire list that EndRenderRead
+        // releases, on the thread that calls it. Mixed scopes: while any Defer scope is open the graph defers, and writes
+        // do not warn, also inside a Warn scope nested in it; the EndRenderRead that closes the last open Defer scope
+        // releases the list. Until E7.8 implements it, Defer logs a warning and acts as Warn.
+        enum class RenderReadMode : uint8_t
+        {
+            Warn,    // the serial frame's isolation guard, as above
+            Defer,   // the pipelined frame's: deferred releases
+        };
+        void BeginRenderRead(RenderReadMode mode = RenderReadMode::Warn) noexcept;
         void EndRenderRead() noexcept;
         [[nodiscard]] bool IsInRenderRead() const noexcept;
         // Runs a phase of GetScheduler() whose systems only read (the render service's RenderExtract, plan step E5.1),
@@ -1022,6 +1034,35 @@ namespace donut::engine
         // memory): a warning, and nothing changed. A failing observer or domain callback is a warning only: the call
         // stands.
         nvrhi::FRESULT SetSimulationDriven(SceneGraphNode* node, bool driven) noexcept;
+
+        // Runtime-only mesh instances (design 5.8; plan step E7, item E7.1; RuntimeMeshInstance in SceneComponents.h).
+        // Rows that the application or its systems create in GetWorld() with the components that
+        // GetRuntimeMeshInstanceComponents lists, through IWorld::CreateEntities, Instantiate or command buffers, at sync
+        // points or outside phases (rule 3.3.3). They are roots, render through the render service's packets and
+        // simulate like a node's rows, and are invisible to SceneGraphWalker, GetMeshInstances, GetNode (null) and
+        // the root's subgraph bounds. Only rows made in this graph's world: rows copied from another world
+        // (IWorld::CopyEntitiesFrom) carry ids of another table. A Parent on such a row is not supported (a warning;
+        // the row stays a root).
+        //
+        // A reference to `mesh` in the graph's mesh table, held for the caller until ReleaseRuntimeMesh; raises
+        // OnMeshAdded for a mesh new to the graph. Its id is what MeshRef of the caller's rows names: the graph's
+        // observer takes one more reference per row while the row lives, so the caller may release its own once the
+        // rows exist; a LoadSnapshot of the world re-adds rows by id, so a rewind needs the caller's reference to be
+        // held across it. Outside phases and leaf callbacks; MeshId::Invalid, with a warning, for a null mesh, inside
+        // a phase or out of memory.
+        MeshId AcquireRuntimeMesh(MeshInfo* mesh) noexcept;
+        // Returns a reference of AcquireRuntimeMesh; the last one of the mesh raises OnMeshRemoved. Outside phases and
+        // leaf callbacks; a warning for an id that the caller holds no reference to.
+        void ReleaseRuntimeMesh(MeshId mesh) noexcept;
+        // The components of a runtime-only mesh instance (SceneComponents.h), with the simulation-driven ones when
+        // `simulationDriven`, as ids of GetWorld() for EntityCreateDesc and command buffers. Writes at most `capacity`
+        // ids to `out` (null with capacity 0 to ask) and returns how many there are; at most
+        // c_MaxRuntimeMeshInstanceComponents.
+        static constexpr uint32_t c_MaxRuntimeMeshInstanceComponents = 14;
+        uint32_t GetRuntimeMeshInstanceComponents(ComponentId* out, uint32_t capacity,
+                                                  bool simulationDriven = false) const noexcept;
+        // The runtime-only mesh instances in the world that hold slots (the observer took them), for statistics.
+        [[nodiscard]] uint32_t GetRuntimeMeshInstanceCount() const noexcept;
     };
 
     struct SceneImportResult

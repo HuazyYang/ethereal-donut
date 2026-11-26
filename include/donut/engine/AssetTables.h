@@ -248,6 +248,14 @@ namespace donut::engine
         MeshId Acquire(MeshInfo* mesh, MaterialTable& materials, Changes& changes);
         // Removes a reference; the last one frees the row, its geometry slots, and its references.
         void Release(MeshId id, MaterialTable& materials, Changes& changes);
+        // References in bulk, for the observer of runtime-only mesh instances (plan step E7, item E7.1): one call per run
+        // of rows that name one mesh. AddReferences adds `count` references to a row that is in the table, without
+        // changes; false, and nothing added, for an id that is not in it (Invalid, freed) or a count that would
+        // overflow. ReleaseReferences removes `count` of them; reaching zero frees the row as Release does. A count
+        // above the row's references is clamped to them, with a log::warning (misuse); an id that is not in the table
+        // releases nothing, with a log::warning.
+        bool AddReferences(MeshId id, uint32_t count);
+        void ReleaseReferences(MeshId id, uint32_t count, MaterialTable& materials, Changes& changes);
 
         // Brings a row in line with its mesh after the mesh was edited in place: a changed geometry count gets new
         // geometry slots (returns true), replaced geometries get their slots written, and changed materials are

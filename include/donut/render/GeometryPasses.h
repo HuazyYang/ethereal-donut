@@ -41,9 +41,12 @@ namespace donut::render
 {
     class IDrawStrategy;
 
+    // DrawItem::instanceSlot of an item that takes its slot from `instance` (MeshInstance::GetInstanceIndex).
+    constexpr uint32_t c_DrawItemSlotFromInstance = ~0u;
+
     struct DrawItem
     {
-        const engine::MeshInstance* instance;
+        const engine::MeshInstance* instance;   // null for a runtime-only mesh instance (SceneComponents.h)
         const engine::MeshInfo* mesh;
         const engine::MeshGeometry* geometry;
         const engine::Material* material;
@@ -51,6 +54,11 @@ namespace donut::render
         float distanceToCamera;
         nvrhi::RasterCullMode cullMode;
         void* userData;
+        // The instance's row in the instance buffer (GpuInstanceSlot::instance), which RenderView draws with: the
+        // packet adapters set it from the snapshot for every item, so that recording reads no leaf (design 7.5; plan
+        // step E7, item E7.2). Items made by hand or by walking strategies keep the default and take the slot from
+        // `instance`. Until E7.2, RenderView reads `instance` always.
+        uint32_t instanceSlot = c_DrawItemSlotFromInstance;
     };
 
     class GeometryPassContext

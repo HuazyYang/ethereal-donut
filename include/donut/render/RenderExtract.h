@@ -219,7 +219,10 @@ namespace donut::render
         const engine::MeshId* meshes = nullptr;               // MeshRef::mesh
         const uint32_t* firstGeometryInstanceSlots = nullptr; // GpuInstanceSlot::firstGeometryInstance
         const uint32_t* geometryCounts = nullptr;             // GpuInstanceSlot::geometryCount
-        const engine::MeshInstance* const* leaves = nullptr;  // DrawItem::instance (MeshInstanceLeaf guarantees the class)
+        // DrawItem::instance (MeshInstanceLeaf guarantees the class). From plan step E7, item E7.2, null for a
+        // runtime-only mesh instance (SceneComponents.h): the instance query then takes rows of both kinds (Read of
+        // MeshRef and GpuInstanceSlot, with SceneLinks, SceneNode and LeafObject Optional).
+        const engine::MeshInstance* const* leaves = nullptr;
         // The instance's mesh, taken at extraction (MeshInstance::GetMesh()): the adapters read it from here, so that
         // recording reads the snapshot and not the leaf (D8, 7.5).
         const engine::MeshInfo* const* meshInfos = nullptr;
@@ -393,6 +396,11 @@ namespace donut::render
         // either, served lights get a table entry but no map and keep their leaf's map).
         CreateShadowTextureFunction createShadowTexture = nullptr;
         void* createShadowTextureContext = nullptr;
+        // Pipelined rendering (design 7.5; plan step E7, items E7.8 and E7.9): the graph records frame N on another
+        // thread while the world runs frame N+1, and the service opens the graph's render-read scope in its deferring
+        // mode (SceneGraph::RenderReadMode::Defer). Off by default, enabled only after the A/B steps of E7.9 pass;
+        // ignored (the frame stays serial) until E7.8 implements it.
+        bool pipelined = false;
     };
 
     // The last frame's counts.
