@@ -50,6 +50,9 @@ target_compile_definitions(test_ecs_snapshot PRIVATE
 # (ecs_simulation_frames.txt), the same way.
 target_compile_definitions(test_ecs_determinism PRIVATE
     DONUT_TEST_GOLDEN_DIR="${CMAKE_CURRENT_LIST_DIR}/src/engine/golden")
+# The per-frame hashes of the replayed simulation script (simulation_frames.txt), the same way.
+target_compile_definitions(test_scene_graph_simulation PRIVATE
+    DONUT_TEST_GOLDEN_DIR="${CMAKE_CURRENT_LIST_DIR}/src/engine/golden")
 
 # The ECS tests reach the world's internals (allocation counters, chunk layout, entity table) through the private
 # headers in src/engine (EcsWorldImpl.h and the ones beside it); so do the scene-graph storage test (step E3) and the

@@ -582,6 +582,7 @@ namespace donut::engine::ecs
         }
         uint32_t GetScheduleOrder(Phase phase, SystemId* out, uint32_t capacity) noexcept;
         bool PhaseDeclaresWrites(Phase phase) noexcept;
+        uint32_t GetDomainCount() const noexcept;
         uint32_t GetCommandBuffers(SystemId system, ICommandBuffer** out, uint32_t capacity) const noexcept
         {
             const SystemRecord* record = FindSystem(system);
@@ -2385,6 +2386,14 @@ namespace donut::engine::ecs
         return false;
     }
 
+    uint32_t SchedulerImpl::GetDomainCount() const noexcept
+    {
+        uint32_t count = 0;
+        for (const DomainRecord* domain : m_Domains)
+            count += domain ? 1 : 0;
+        return count;
+    }
+
     // -------------------------------------------------------------------------------------------- running
 
     void SchedulerImpl::SetFrameTime(const FrameTime& time) noexcept
@@ -2773,6 +2782,12 @@ namespace donut::engine::ecs
     {
         SchedulerImpl* impl = donut::query_cast<SchedulerImpl>(scheduler);
         return impl ? impl->PhaseDeclaresWrites(phase) : true;
+    }
+
+    uint32_t GetSimulationDomainCount(IScheduler* scheduler) noexcept
+    {
+        SchedulerImpl* impl = donut::query_cast<SchedulerImpl>(scheduler);
+        return impl ? impl->GetDomainCount() : 0;
     }
 
     uint32_t GetSystemCommandBuffers(IScheduler* scheduler, SystemId system, ICommandBuffer** out,

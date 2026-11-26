@@ -124,6 +124,8 @@ namespace donut::engine
         using namespace ecs;
 
         constexpr uint32_t c_None = ~0u;
+        // ComposeWorld: local transforms on the stack, and the pieces of a longer chain.
+        constexpr uint32_t c_ComposeBlock = 64;
         // What a leaf's row has beside the class's components, and loses when the leaf goes and none comes.
         constexpr SceneGraphStore::Slot c_BoundsSlots[] = { SceneGraphStore::SlotLocalBounds,
                                                             SceneGraphStore::SlotWorldBounds,
@@ -229,6 +231,18 @@ namespace donut::engine
         }
         // The shear that a decomposition may lose: above what float rotations and their products leave.
         constexpr double c_MaxShear = 1e-5;
+        // Whether the axes of `a` are those of `b`, within as much. No number that is not finite is.
+        bool SameAxes(const dm::daffine3& a, const dm::daffine3& b) noexcept
+        {
+            bool same = true;
+            for (int i = 0; i < 3; ++i)
+            {
+                const dm::double3 axis = b.m_linear[i];
+                const dm::double3 difference = a.m_linear[i] - axis;
+                same = same && dm::dot(difference, difference) <= c_MaxShear * c_MaxShear * dm::dot(axis, axis);
+            }
+            return same;
+        }
 
         // `world` relative to `parent`: what times `parent` gives `world`. When `parent` has no inverse, `world` itself;
         // then `outInverse` tells.
@@ -254,6 +268,88 @@ namespace donut::engine
             }
             outInverse = finite;
             return finite ? result : world;
+        }
+
+        bool IsFinite(const LocalTransform& t) noexcept
+        {
+            bool finite = std::isfinite(t.rotation.w) && std::isfinite(t.rotation.x) && std::isfinite(t.rotation.y) &&
+                          std::isfinite(t.rotation.z);
+            for (int i = 0; i < 3; ++i)
+                finite = finite && std::isfinite(t.translation[i]) && std::isfinite(t.scaling[i]);
+            return finite;
+        }
+
+        // The parts of a driven node's transform in its parent's space and in the world. The two functions are inverse to
+        // each other, up to rounding, below every parent, one that shears the result included: what the getters return
+        // gives the same pose when it is set again, and a request for one part leaves the others alone. Where a scaling,
+        // a rotation and a translation can express the product (the quotient) of the matrices, they are its parts; the
+        // mirror of a mirrored parent, which Decompose takes along x, goes into scaling.x and the rotation. A parent
+        // without an inverse counts as none, as in RelativeTo; so does one that gives a number that is not finite.
+        struct ParentParts
+        {
+            bool usable = false;
+            bool mirrored = false;
+            bool conformal = false;   // a turn and one scale (and a mirror): the parts are the matrix's, exactly enough
+            dm::dquat rotation = dm::dquat::identity();
+
+            explicit ParentParts(const dm::daffine3& parent) noexcept
+            {
+                RelativeTo(dm::daffine3::identity(), parent, usable);
+                const Decomposition parts = Decompose(parent);
+                usable = usable && !parts.degenerate;
+                mirrored = parts.mirrored;
+                rotation = parts.transform.rotation;
+                const dm::double3 lengths = dm::abs(parts.transform.scaling);
+                const double largest = std::max({ lengths.x, lengths.y, lengths.z });
+                conformal = usable && parts.shear <= c_MaxShear &&
+                            largest - std::min({ lengths.x, lengths.y, lengths.z }) <= c_MaxShear * largest;
+            }
+            // x -> -x, rotation, x -> -x
+            dm::dquat Mirror(const dm::dquat& q) const noexcept
+            {
+                return mirrored ? dm::dquat(q.w, q.x, -q.y, -q.z) : q;
+            }
+        };
+        // The lengths that `parent` gives to the axes of the local rotation `q`.
+        dm::double3 AxisLengths(const dm::dquat& q, const dm::daffine3& parent) noexcept
+        {
+            const dm::daffine3 axes = ComposePose(dm::double3(0.0), q, dm::double3(1.0)) * parent;
+            const dm::double3x3& m = axes.m_linear;
+            return dm::double3(std::sqrt(dm::dot(m.row0, m.row0)), std::sqrt(dm::dot(m.row1, m.row1)),
+                               std::sqrt(dm::dot(m.row2, m.row2)));
+        }
+        // `outCounts`: the parent counts; `outConformal`: its parts are the matrix's (ParentParts).
+        LocalTransform PartsInParent(const LocalTransform& world, const dm::daffine3& parent, bool& outCounts,
+                                     bool* outConformal = nullptr) noexcept
+        {
+            const ParentParts p(parent);
+            outCounts = p.usable;
+            if (outConformal)
+                *outConformal = p.conformal;
+            if (!p.usable)
+                return world;
+            bool inverse;
+            LocalTransform local;
+            local.translation = RelativeTo(dm::translation(world.translation), parent, inverse).m_translation;
+            local.rotation = p.Mirror(dm::conjugate(p.rotation) * world.rotation);
+            local.scaling = world.scaling / AxisLengths(local.rotation, parent);
+            if (p.mirrored)
+                local.scaling.x = -local.scaling.x;
+            outCounts = inverse && IsFinite(local);
+            return outCounts ? local : world;
+        }
+        LocalTransform PartsInWorld(const LocalTransform& local, const dm::daffine3& parent) noexcept
+        {
+            const ParentParts p(parent);
+            if (!p.usable)
+                return local;
+            LocalTransform world;
+            world.translation = parent.transformPoint(local.translation);
+            world.rotation = p.rotation * p.Mirror(local.rotation);
+            world.scaling = local.scaling * AxisLengths(local.rotation, parent);
+            if (p.mirrored)
+                world.scaling.x = -world.scaling.x;
+            return IsFinite(world) ? world : local;
         }
 
         // The threads that can take ranges: IJobSystem::GetThreadCount also counts the external slots (64 in the shared
@@ -694,6 +790,13 @@ namespace donut::engine
         std::atomic<uint64_t> chunks{ 0 };
     };
 
+    struct SceneGraphStore::TeleportContext
+    {
+        const SceneGraphStore* store;
+        uint64_t version;
+        std::atomic<uint64_t> resolved{ 0 };
+    };
+
     struct SceneGraphStore::BoundsContext
     {
         SceneGraphStore* store;
@@ -759,19 +862,29 @@ namespace donut::engine
         m_World->AddObserver(observer, m_LeafObserver, id);
 
         m_Jobs = GetSharedJobSystem();
-        CreateSystems();
+        Systems systems;
+        CreateSystems(m_Jobs, systems);   // what cannot be made is warned about; the graph lives with the rest
+        TakeSystems(systems);
     }
 
-    void SceneGraphStore::CreateSystems() noexcept
+    void SceneGraphStore::TakeSystems(const Systems& systems) noexcept
     {
-        m_Scheduler.Reset();
+        m_Scheduler = systems.scheduler;
+        m_InterpolationPhase = systems.interpolation;
+        m_TeleportPhase = systems.teleport;
         ++m_SchedulerGeneration;
-        m_InterpolationPhase = c_NoPhase;
-        if (!m_Jobs || NVRHI_FAILED(CreateScheduler(m_World, m_Jobs, &m_Scheduler)))
+        m_JointsMarkedVersion = 0;   // the new propagation has not run: its first run treats every chunk as changed
+    }
+
+    bool SceneGraphStore::CreateSystems(IJobSystem* jobs, Systems& out) noexcept
+    {
+        if (!jobs || NVRHI_FAILED(CreateScheduler(m_World, jobs, &out.scheduler)))
         {
             log::warning("SceneGraph: cannot create the scheduler");
-            return;
+            return false;
         }
+        IScheduler* scheduler = out.scheduler;
+        bool complete = true;
 
         const ComponentAccess propagationAccess[] = {
             { m_Ids[SlotLocal], Access::Read, {} },
@@ -804,8 +917,8 @@ namespace donut::engine
         // The interpolation of driven entities (8.4) has a phase of its own: the domains' scatter systems register later
         // than it, so in PostSimulation the pair would run in registration order and be reported as ambiguous (6.4).
         m_FixedStepId = FindComponent<FixedStepState>(m_World);   // the scheduler registered it
-        if (NVRHI_FAILED(m_Scheduler->AddPhase("SimulationInterpolation", Phase::PostSimulation, m_InterpolationPhase)))
-            m_InterpolationPhase = c_NoPhase;
+        if (NVRHI_FAILED(scheduler->AddPhase("SimulationInterpolation", Phase::PostSimulation, out.interpolation)))
+            out.interpolation = c_NoPhase;
         const ComponentAccess interpolationAccess[] = {
             { m_Ids[SlotSimPose], Access::Read, {} },
             { m_SimPreviousId, Access::Read, {} },
@@ -818,25 +931,47 @@ namespace donut::engine
         interpolation.name = "SceneGraph.SimulationInterpolation";
         interpolation.accesses = interpolationAccess;
         interpolation.accessCount = uint32_t(std::size(interpolationAccess));
-        interpolation.phase = m_InterpolationPhase;
+        interpolation.phase = out.interpolation;
+
+        // So has the resolving of teleport requests: in BeginFrame itself it would be ambiguous with every system of the
+        // application that moves nodes there, and after it it sees what they wrote.
+        if (NVRHI_FAILED(scheduler->AddPhase("SimulationTeleports", Phase::BeginFrame, out.teleport)))
+            out.teleport = c_NoPhase;
+        const ComponentAccess teleportAccess[] = {
+            { m_SimTeleportId, Access::Write, {} },
+            { m_Ids[SlotParent], Access::Read, {} },
+            { m_Ids[SlotLocal], Access::Read, {} },
+            { m_Ids[SlotSimPose], Access::Read, {} },
+            { m_Ids[SlotSimScale], Access::Read, {} },
+            { m_Ids[SlotWorld], Access::Read, {} },    // of a driven ancestor without a pose
+        };
+        SystemDesc teleports{};
+        teleports.name = "SceneGraph.SimulationTeleports";
+        teleports.accesses = teleportAccess;
+        teleports.accessCount = uint32_t(std::size(teleportAccess));
+        teleports.phase = out.teleport;
 
         SceneGraphStore* self = this;
-        nvrhi::AutoPtr<ISystem> system;
-        SystemId id = SystemId::Invalid;
-        if (NVRHI_SUCCEEDED(CreateLambdaSystem(propagation,
-                [self](ISystemContext* context) noexcept { return self->RunPropagation(context); }, &system)))
-            m_Scheduler->AddSystem(system, id);
-        system.Reset();
-        if (NVRHI_SUCCEEDED(CreateLambdaSystem(bounds,
-                [self](ISystemContext* context) noexcept { return self->RunBounds(context); }, &system)))
-            m_Scheduler->AddSystem(system, id);
-        system.Reset();
-        if (m_InterpolationPhase == c_NoPhase || NVRHI_FAILED(CreateLambdaSystem(interpolation,
-                [self](ISystemContext* context) noexcept { return self->RunInterpolation(context); }, &system)) ||
-            NVRHI_FAILED(m_Scheduler->AddSystem(system, id)))
-            log::warning("SceneGraph: cannot add the interpolation of simulation-driven nodes");
-        if (NVRHI_FAILED(m_Scheduler->Build()))
+        auto add = [&](const SystemDesc& desc, auto update) noexcept
+        {
+            nvrhi::AutoPtr<ISystem> system;
+            SystemId id = SystemId::Invalid;
+            if (desc.phase != c_NoPhase && NVRHI_SUCCEEDED(CreateLambdaSystem(desc, update, &system)) &&
+                NVRHI_SUCCEEDED(scheduler->AddSystem(system, id)))
+                return;
+            log::warning("SceneGraph: cannot add the system '%s'", desc.name);
+            complete = false;
+        };
+        add(propagation, [self](ISystemContext* context) noexcept { return self->RunPropagation(context); });
+        add(bounds, [self](ISystemContext* context) noexcept { return self->RunBounds(context); });
+        add(interpolation, [self](ISystemContext* context) noexcept { return self->RunInterpolation(context); });
+        add(teleports, [self](ISystemContext* context) noexcept { return self->RunTeleports(context); });
+        if (NVRHI_FAILED(scheduler->Build()))
+        {
             log::warning("SceneGraph: the scheduler's phases do not build");
+            complete = false;
+        }
+        return complete;
     }
 
     void SceneGraphStore::SetJobSystem(IJobSystem* jobSystem) noexcept
@@ -844,8 +979,26 @@ namespace donut::engine
         nvrhi::AutoPtr<IJobSystem> jobs = jobSystem ? jobSystem : GetSharedJobSystem();
         if (jobs == m_Jobs)
             return;
+        // Refused before anything changes: inside a phase no scheduler can be made, and the graph must keep its own.
+        if (m_World->IsInPhase() || !m_Impl->CanChangeStructure())
+        {
+            log::warning("SceneGraph::SetJobSystem: inside a phase or a leaf callback; nothing changed");
+            return;
+        }
+        if (GetSimulationDomainCount(m_Scheduler) != 0)
+        {
+            log::warning("SceneGraph::SetJobSystem: the new scheduler would not have the simulation domains; nothing "
+                         "changed (remove them first)");
+            return;
+        }
+        Systems systems;
+        if (!CreateSystems(jobs, systems))
+        {
+            log::warning("SceneGraph::SetJobSystem: the new scheduler is not complete; nothing changed");
+            return;
+        }
         m_Jobs = jobs;
-        CreateSystems();
+        TakeSystems(systems);
         // the new systems have not run: their first run treats every chunk as changed
     }
 
@@ -1499,7 +1652,7 @@ namespace donut::engine
         std::vector<NewNode>& nodes = m_S->newNodes;
         nodes.clear();
         std::unordered_map<SceneGraphNode*, uint32_t> nodeMap;
-        ParentWorld parentWorld{ m_ComposeChain };
+        ParentWorld parentWorld;
         bool anyLocal = false;
         uint32_t parentIndex = c_None;
         SceneGraphWalker walker(source);
@@ -2017,7 +2170,7 @@ namespace donut::engine
             }
         }
 
-        ParentWorld parentWorld{ m_ComposeChain };
+        ParentWorld parentWorld;
         for (uint32_t i = 0; i < n; ++i)
         {
             SceneGraphNode* node = m_S->nodes[i];
@@ -2296,9 +2449,7 @@ namespace donut::engine
         {
             if (IsDriven(row))
             {
-                // Item E6.2b makes this a teleport request (SimTeleport).
-                log::warning("SceneGraph::SetTransform: a simulation drives the node (SetSimulationDriven); nothing "
-                             "changed");
+                RequestTeleport(node, translation, rotation, scaling);   // no edit: the pose is the domain's
                 return;
             }
             // the first transform of a node adds the component (a structural change, outside phases)
@@ -2549,13 +2700,19 @@ namespace donut::engine
             return false;
         }
 
+        // a Refresh that a system of another's phases calls is refused below, and must not change that one's marks
+        const uint32_t outerFrameIndex = m_FrameIndex;
+        const bool outerMarks = m_MarkJoints;
         m_FrameIndex = frameIndex;
         PrepareSubgraphs();
+        m_MarkJoints = true;
         const nvrhi::FRESULT result = !m_Scheduler ? nvrhi::FE_INVALID_ARGS
             : dynamicOnly ? m_Scheduler->RunPhases(Phase::Bounds, Phase::Bounds)
                           : m_Scheduler->RunPhases(Phase::TransformPropagation, Phase::Bounds);
+        m_MarkJoints = outerMarks;
         if (NVRHI_FAILED(result))
         {
+            m_FrameIndex = outerFrameIndex;
             m_SubgraphPrepared = false;
             m_SubgraphForceFull = true;
             // the changes stay pending for the next Refresh
@@ -2587,6 +2744,30 @@ namespace donut::engine
         if (!IsSubgraphCurrent())
             BumpEpoch();
         return structure;
+    }
+
+    nvrhi::FRESULT SceneGraphStore::Simulate(const FrameTime& time) noexcept
+    {
+        if (!m_Scheduler || m_TeleportPhase == c_NoPhase || m_InterpolationPhase == c_NoPhase)
+        {
+            log::warning("SceneGraph::Simulate: the graph has no scheduler with the simulation phases; nothing ran");
+            return nvrhi::FE_INVALID_ARGS;
+        }
+        // Refused before the time advances: SetFrameTime takes it in an observer.
+        if (m_World->IsInPhase() || !m_Impl->CanChangeStructure())
+        {
+            log::warning("SceneGraph::Simulate: inside a phase or a leaf callback; nothing ran");
+            return nvrhi::FE_INVALID_ARGS;
+        }
+        SyncArchetypes();
+        if (m_StaleWorldTransforms)
+        {
+            const nvrhi::FRESULT result = m_Scheduler->RunPhase(Phase::TransformPropagation);
+            if (NVRHI_FAILED(result))
+                return result;
+        }
+        m_Scheduler->SetFrameTime(time);
+        return m_Scheduler->RunPhases(Phase::BeginFrame, m_InterpolationPhase);
     }
 
     void SceneGraphStore::UpdateSystemLists() noexcept
@@ -2633,7 +2814,8 @@ namespace donut::engine
                 m_JointArchetypes.push_back(JointArchetype{ a, moved, leaf });
 
             const DrivenArchetype poses{ a, column(m_Ids[SlotSimPose]), column(m_SimPreviousId),
-                                         column(m_Ids[SlotSimScale]), column(m_SimBodyId), world };
+                                         column(m_Ids[SlotSimScale]), column(m_SimBodyId), world,
+                                         column(m_SimTeleportId), column(m_Ids[SlotParent]) };
             if (driven && poses.pose != c_Absent && poses.previous != c_Absent && poses.scale != c_Absent &&
                 poses.body != c_Absent && poses.world != c_Absent)
                 m_DrivenArchetypes.push_back(poses);
@@ -2812,7 +2994,11 @@ namespace donut::engine
         }
         PropagateDeepBucket(jobs, since, version, levelAboveWrote);
         m_StaleWorldTransforms = false;   // every edit so far is in the world transforms
-        MarkSkinnedJoints(since);
+        if (m_MarkJoints)
+        {
+            MarkSkinnedJoints(m_JointsMarkedVersion);
+            m_JointsMarkedVersion = version;
+        }
         return nvrhi::FS_OK;
     }
 
@@ -3110,11 +3296,23 @@ namespace donut::engine
         return world ? world->transform : dm::daffine3::identity();
     }
 
-    dm::daffine3 SceneGraphStore::ComposeWorld(Entity entity, std::vector<Entity>& chain) const
+    LocalTransform SceneGraphStore::SimulatedParts(const RowRef& row) const noexcept
     {
-        chain.clear();   // from the entity up, without the driven one that ends it
+        const SimPose* pose = static_cast<const SimPose*>(Column(row, SlotSimPose));
+        const SimScale* scale = static_cast<const SimScale*>(Column(row, SlotSimScale));
+        if (pose && scale)
+            return LocalTransform{ pose->translation, pose->rotation, scale->scaling };
+        return Decompose(SimulatedPose(row)).transform;
+    }
+
+    dm::daffine3 SceneGraphStore::ComposeWorld(Entity entity) const noexcept
+    {
+        // the local transforms from the entity up, without the driven ancestor that ends the walk
+        const LocalTransform* locals[c_ComposeBlock];
+        uint32_t count = 0;
         dm::daffine3 world = dm::daffine3::identity();
-        bool hasParent = false;
+        bool hasParent = false;   // the topmost of the locals multiplies a world above it
+        const Entity bottom = entity;
         RowRef row;
         while (Locate(entity, row))
         {
@@ -3124,41 +3322,114 @@ namespace donut::engine
                 hasParent = true;
                 break;
             }
-            chain.push_back(entity);
+            const LocalTransform* local = static_cast<const LocalTransform*>(Column(row, SlotLocal));
+            if (local && count == c_ComposeBlock)
+                return ComposeLongChain(bottom);
+            if (local)
+                locals[count++] = local;
+            hasParent = !local;   // of the rows so far; a row without a local transform takes its parent's world
             const Parent* parent = static_cast<const Parent*>(Column(row, SlotParent));
             if (!parent)
                 break;
             entity = parent->entity;
         }
-        // as PropagateRow, bit for bit: a row without a local transform takes its parent's world
-        for (size_t i = chain.size(); i-- > 0; hasParent = true)
+        // as PropagateRow, bit for bit
+        for (uint32_t i = count; i-- > 0; hasParent = true)
+            world = hasParent ? ComposeLocal(*locals[i]) * world : ComposeLocal(*locals[i]);
+        return world;
+    }
+
+    // The links lead upwards and the products start at the top: the chain is cut into at most c_ComposeBlock pieces, the
+    // topmost piece first, and so on, until a piece fits the block of locals. Every cut reads the rows of its piece once;
+    // what is left to do is a stack of at most c_ComposeBlock - 1 pieces per size of piece.
+#if defined(_MSC_VER)
+    __declspec(noinline)   // out of ComposeWorld's frame
+#endif
+    dm::daffine3 SceneGraphStore::ComposeLongChain(Entity entity) const noexcept
+    {
+        struct Piece
         {
-            const LocalTransform* local = Get<LocalTransform>(chain[i], SlotLocal);
-            if (local)
-                world = hasParent ? ComposeLocal(*local) * world : ComposeLocal(*local);
+            Entity bottom;
+            uint32_t rows;   // from it upwards
+        };
+        constexpr uint32_t c_MaxPieces = (c_ComposeBlock - 1) * 5 + 1;   // 2^32 rows are cut five times
+        Piece pieces[c_MaxPieces];
+        uint32_t pieceCount = 0;
+
+        dm::daffine3 world = dm::daffine3::identity();
+        bool hasParent = false;
+        RowRef row;
+        auto above = [&](Entity at) noexcept
+        {
+            const Parent* parent = Locate(at, row) ? static_cast<const Parent*>(Column(row, SlotParent)) : nullptr;
+            return parent ? parent->entity : Entity::Null;
+        };
+        uint32_t rows = 0;
+        for (Entity at = entity; Locate(at, row);)
+        {
+            if (IsDriven(row))
+            {
+                world = SimulatedPose(row);
+                hasParent = true;
+                break;
+            }
+            ++rows;
+            const Parent* parent = static_cast<const Parent*>(Column(row, SlotParent));
+            if (!parent)
+                break;
+            at = parent->entity;
+        }
+        pieces[pieceCount++] = Piece{ entity, rows };
+        while (pieceCount != 0)
+        {
+            const Piece piece = pieces[--pieceCount];
+            Entity at = piece.bottom;
+            if (piece.rows <= c_ComposeBlock)
+            {
+                const LocalTransform* locals[c_ComposeBlock];
+                for (uint32_t i = 0; i < piece.rows; ++i, at = above(at))
+                    locals[i] = Get<LocalTransform>(at, SlotLocal);
+                // as PropagateRow, bit for bit: a row without a local transform takes its parent's world
+                for (uint32_t i = piece.rows; i-- > 0; hasParent = true)
+                {
+                    if (locals[i])
+                        world = hasParent ? ComposeLocal(*locals[i]) * world : ComposeLocal(*locals[i]);
+                }
+                continue;
+            }
+            const uint32_t size = (piece.rows - 1) / c_ComposeBlock + 1;
+            for (uint32_t done = 0; done < piece.rows; done += size)
+            {
+                assert(pieceCount < c_MaxPieces);
+                pieces[pieceCount++] = Piece{ at, std::min(size, piece.rows - done) };
+                for (uint32_t i = 0; i < size && done + i + 1 < piece.rows; ++i)
+                    at = above(at);
+            }
         }
         return world;
     }
 
     LocalTransform SceneGraphStore::SimulatedLocal(const RowRef& row, ParentWorld& cache, const char* operation) const
     {
-        dm::daffine3 local = SimulatedPose(row);
-        bool inverse = true;
+        LocalTransform local = SimulatedParts(row);
+        bool counts = true;
+        bool conformal = true;   // the parts give the pose: no need to compare the matrices
         if (const Parent* parent = static_cast<const Parent*>(Column(row, SlotParent)))
         {
             if (cache.parent != parent->entity)
             {
                 cache.parent = parent->entity;
-                cache.world = ComposeWorld(parent->entity, cache.chain);
+                cache.world = ComposeWorld(parent->entity);
             }
-            local = RelativeTo(local, cache.world, inverse);
+            local = PartsInParent(local, cache.world, counts, &conformal);
         }
-        const Decomposition parts = Decompose(local);
-        if (!inverse || parts.degenerate || parts.shear > c_MaxShear)
+        const bool same = conformal ? IsFinite(local)
+                                    : SameAxes(ComposeLocal(local) * cache.world, SimulatedPose(row));
+        if (!counts || !same)
             log::warning("SceneGraph::%s: no local transform gives a simulated node its pose (its parent's scale shears "
-                         "it or is 0, or its own is 0, or a number is not finite); %s is taken", operation,
-                         inverse ? "the nearest" : "its pose in the world");
-        return parts.transform;
+                         "it or has no inverse, or a number is not finite); %s is taken", operation,
+                         counts ? "the nearest" : "its pose in the world");
+        return local;
     }
 
     bool SceneGraphStore::GetDrivenLocal(const SceneGraphNode* node, dm::daffine3& outMatrix) const noexcept
@@ -3166,22 +3437,88 @@ namespace donut::engine
         RowRef row;
         if (!LocateNode(node, row) || !IsDriven(row))
             return false;
-        const WorldTransform* world = static_cast<const WorldTransform*>(Column(row, SlotWorld));
-        const Parent* parent = static_cast<const Parent*>(Column(row, SlotParent));
-        const WorldTransform* parentWorld = parent ? Get<WorldTransform>(parent->entity, SlotWorld) : nullptr;
+        outMatrix = SimulatedPose(row);
         bool inverse;
-        outMatrix = !world ? dm::daffine3::identity()
-                    : parentWorld ? RelativeTo(world->transform, parentWorld->transform, inverse) : world->transform;
+        if (const Parent* parent = static_cast<const Parent*>(Column(row, SlotParent)))
+            outMatrix = RelativeTo(outMatrix, ComposeWorld(parent->entity), inverse);
         return true;
     }
 
     bool SceneGraphStore::GetDrivenLocal(const SceneGraphNode* node, LocalTransform& out) const noexcept
     {
-        dm::daffine3 matrix;
-        if (!GetDrivenLocal(node, matrix))
+        RowRef row;
+        if (!LocateNode(node, row) || !IsDriven(row))
             return false;
-        out = Decompose(matrix).transform;
+        out = InParentOf(row, SimulatedParts(row));
         return true;
+    }
+
+    LocalTransform SceneGraphStore::InParentOf(const RowRef& row, const LocalTransform& world) const noexcept
+    {
+        const Parent* parent = static_cast<const Parent*>(Column(row, SlotParent));
+        bool counts;
+        return parent ? PartsInParent(world, ComposeWorld(parent->entity), counts) : world;
+    }
+
+    bool SceneGraphStore::ToDrivenLocal(const SceneGraphNode* node, const dm::daffine3& world,
+                                        LocalTransform& out) noexcept
+    {
+        const SceneGraphStore* store = node->m_Record ? nullptr : node->m_Store;
+        RowRef row;
+        if (!store || !store->LocateNode(node, row) || !store->IsDriven(row))
+            return false;
+        const Decomposition parts = Decompose(world);
+        if (parts.degenerate)
+            return false;
+        out = store->InParentOf(row, parts.transform);
+        return true;
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)   // out of SetTransform's hot path
+#endif
+    void SceneGraphStore::RequestTeleport(const SceneGraphNode* node, const dm::double3* translation,
+                                          const dm::dquat* rotation, const dm::double3* scaling) noexcept
+    {
+        RowRef row;
+        if ((!translation && !rotation && !scaling) || !LocateNode(node, row))
+            return;
+        const uint32_t column = row.archetype->FindColumn(m_SimTeleportId);
+        LocalTransform given{ dm::double3(0.0), dm::dquat::identity(), dm::double3(1.0) };
+        if (translation) given.translation = *translation;
+        if (scaling) given.scaling = *scaling;
+        double length = 1.0;
+        if (rotation)
+        {
+            length = std::sqrt(dm::dot(*rotation, *rotation));
+            given.rotation = *rotation / length;   // engines want it normalised
+        }
+        if (column == c_NoColumn || !IsFinite(given) || !std::isfinite(length))
+        {
+            log::warning("SceneGraph::SetTransform: %s; nothing changed", column == c_NoColumn
+                         ? "the row of a node that a simulation drives has no SimTeleport"
+                         : "a simulation drives the node, and no body has such a pose (a number is not finite, or the "
+                           "rotation is 0)");
+            return;
+        }
+        SimTeleport& request =
+            reinterpret_cast<SimTeleport*>(ColumnBase(*row.archetype, row.chunk, uint8_t(column)))[row.row];
+        uint64_t* enabled = row.archetype->EnabledMask(row.chunk, column);
+        if (!translation || !rotation || !scaling)
+        {
+            // the parts that are not given: of the pending request, else where the simulation has the node now
+            const bool pending = GetMaskBit(enabled, row.row);
+            LocalTransform rest = pending ? LocalTransform{ request.translation, request.rotation, request.scaling }
+                                          : SimulatedParts(row);
+            if (!pending || request.space == SimTeleportSpace::World)
+                rest = InParentOf(row, rest);
+            if (!translation) given.translation = rest.translation;
+            if (!rotation) given.rotation = rest.rotation;
+            if (!scaling) given.scaling = rest.scaling;
+        }
+        request = SimTeleport{ given.translation, given.rotation, given.scaling, SimTeleportSpace::Parent, 0 };
+        SetMaskBit(enabled, row.row, true);
+        StampVersion(row.archetype->Versions(row.chunk) + column, m_Impl->GetStampVersion());
     }
 
     nvrhi::FRESULT SceneGraphStore::SetSimulationDriven(SceneGraphNode* node, bool driven)
@@ -3227,7 +3564,7 @@ namespace donut::engine
         // their simulated poses, so that the engine's bodies are of one time and unbinding gives the local transform
         // back.
         const Entity entity = node->m_Entity;
-        const WorldTransform world{ ComposeWorld(entity, m_ComposeChain) };
+        const WorldTransform world{ ComposeWorld(entity) };
         const Decomposition parts = Decompose(world.transform);
         if (parts.degenerate || parts.mirrored || parts.shear > c_MaxShear)
         {
@@ -3272,7 +3609,7 @@ namespace donut::engine
 
     nvrhi::FRESULT SceneGraphStore::UnbindFromSimulation(SceneGraphNode* node, const RowRef& boundRow)
     {
-        ParentWorld parentWorld{ m_ComposeChain };
+        ParentWorld parentWorld;
         const LocalTransform local = SimulatedLocal(boundRow, parentWorld, "SetSimulationDriven");
         const ComponentId removed[] = { m_Ids[SlotDriven], m_Ids[SlotSimPose], m_SimPreviousId, m_Ids[SlotSimScale],
                                         m_SimBodyId, m_SimTeleportId };
@@ -3292,6 +3629,99 @@ namespace donut::engine
             m_StaleWorldTransforms = true;
         }
         return result;
+    }
+
+    // Every request is resolved from the rows as they are: from other rows it reads poses and local transforms, which no
+    // request changes, so the order of the rows does not matter. A pending request of an ancestor does not count.
+    void SceneGraphStore::RunTeleportTasks(void* context, uint32_t begin, uint32_t end, uint32_t) noexcept
+    {
+        TeleportContext& ctx = *static_cast<TeleportContext*>(context);
+        const SceneGraphStore& store = *ctx.store;
+        uint64_t resolved = 0;
+        for (uint32_t t = begin; t < end; ++t)
+        {
+            const Task& task = store.m_Tasks[t];
+            const DrivenArchetype& driven = store.m_DrivenArchetypes[task.archetype];
+            const Archetype& archetype = store.m_Impl->GetArchetypeStorage(driven.archetype);
+            SimTeleport* requests =
+                reinterpret_cast<SimTeleport*>(ColumnBase(archetype, task.chunk, driven.teleport));
+            const uint64_t* enabled = archetype.EnabledMask(task.chunk, driven.teleport);
+            const Parent* parents = driven.parent != c_Absent
+                ? reinterpret_cast<const Parent*>(ColumnBase(archetype, task.chunk, driven.parent)) : nullptr;
+            ParentWorld above;
+            uint64_t written = 0;
+            for (uint32_t r = 0; r < archetype.chunks[task.chunk].count; ++r)
+            {
+                SimTeleport& request = requests[r];
+                if (!GetMaskBit(enabled, r) || request.space != SimTeleportSpace::Parent)
+                    continue;
+                if (parents)
+                {
+                    if (above.parent != parents[r].entity)
+                    {
+                        above.parent = parents[r].entity;
+                        above.world = store.ComposeWorld(above.parent);
+                    }
+                    const LocalTransform world =
+                        PartsInWorld({ request.translation, request.rotation, request.scaling }, above.world);
+                    request.translation = world.translation;
+                    request.rotation = world.rotation;
+                    request.scaling = world.scaling;
+                }
+                request.space = SimTeleportSpace::World;
+                ++written;
+            }
+            if (written)
+                StampVersion(archetype.Versions(task.chunk) + driven.teleport, ctx.version);
+            resolved += written;
+        }
+        ctx.resolved.fetch_add(resolved, std::memory_order_relaxed);
+    }
+
+    nvrhi::FRESULT SceneGraphStore::RunTeleports(ISystemContext* context) noexcept
+    {
+        IJobSystem* jobs = context->GetJobSystem();
+        UpdateSystemLists();
+        m_Tasks.clear();
+        for (uint32_t i = 0; i < uint32_t(m_DrivenArchetypes.size()); ++i)
+        {
+            const DrivenArchetype& driven = m_DrivenArchetypes[i];
+            if (driven.teleport == c_Absent)
+                continue;
+            const Archetype& archetype = m_Impl->GetArchetypeStorage(driven.archetype);
+            for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+            {
+                // by the bits, not by the column's version: a pending request may be older than the last run
+                const uint32_t count = archetype.chunks[c].count;
+                const uint64_t* enabled = archetype.EnabledMask(c, driven.teleport);
+                uint64_t any = 0;
+                for (uint32_t word = 0; word * 64 < count; ++word)
+                    any |= enabled[word];
+                if (any == 0)
+                    continue;
+                try
+                {
+                    m_Tasks.push_back(Task{ i, c, false });
+                }
+                catch (...)
+                {
+                    return nvrhi::FE_OUT_OF_MEMORY;   // none is resolved: the domains leave them to the next run
+                }
+            }
+        }
+        if (m_Tasks.empty())
+            return nvrhi::FS_OK;
+        TeleportContext ctx;
+        ctx.store = this;
+        ctx.version = context->GetVersion();
+        const uint32_t taskCount = uint32_t(m_Tasks.size());
+        const uint32_t grain = std::max(1u, taskCount / (WorkingThreads(jobs) * 4));
+        if (!jobs || grain >= taskCount)
+            RunTeleportTasks(&ctx, 0, taskCount, 0);
+        else
+            jobs->ParallelFor(taskCount, grain, &RunTeleportTasks, &ctx);
+        m_Counters.resolvedTeleports += ctx.resolved.load(std::memory_order_relaxed);
+        return nvrhi::FS_OK;
     }
 
     void SceneGraphStore::RunInterpolationTasks(void* context, uint32_t begin, uint32_t end, uint32_t) noexcept

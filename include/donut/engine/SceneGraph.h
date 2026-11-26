@@ -319,6 +319,8 @@ namespace donut::engine
         [[nodiscard]] dm::double3 GetPosition() const;
         [[nodiscard]] dm::double3 GetDirection() const;
 
+        // Through the node's setters, over the parent's world as it is shown; on a node that a simulation drives (a
+        // teleport request) over the parent's simulated world, as the node's getters are.
         void SetPosition(const dm::double3& position) const;
         void SetDirection(const dm::double3& direction) const;
     protected:
@@ -529,6 +531,15 @@ namespace donut::engine
 
         void InvalidateContent();
 
+        // Writes the parts that are given (not null). On a node that a simulation drives
+        // (SceneGraph::SetSimulationDriven) it is a teleport request instead: neither the node's pose nor what the
+        // getters return changes before the domain takes it, in the next Simulate with a step of it. The request is in
+        // the space of the parent, where the simulation has that at the next Simulate (a pending request of the parent
+        // itself does not count; a parent without an inverse counts as none: the request is then in the world), so
+        // setting what the getters returned moves nothing. A part that is not given is that of the pending request, or
+        // else where the simulation has the node now; a later request replaces the parts it gives. The rotation is
+        // normalised; numbers that are not finite and a rotation of 0 are refused with a warning. Unbinding and Detach
+        // drop a pending request; the request of a node of no domain waits for one.
         void SetTransform(const dm::double3* translation, const dm::dquat* rotation, const dm::double3* scaling);
         void SetScaling(const dm::double3& scaling);
         void SetRotation(const dm::dquat& rotation);
@@ -909,7 +920,9 @@ namespace donut::engine
         // links donut_engine and is unloaded gives its graphs a job system of its own and releases it first.
         // Elsewhere a shared object registers the handler too, and it runs at dlclose (glibc runs a shared object's
         // atexit handlers then); a dlclose from inside a job is not supported. Set it between frames; null returns
-        // to the shared one.
+        // to the shared one. Refused with a warning, nothing changed, inside a phase or a leaf callback, while the
+        // graph's scheduler has simulation domains (the new one would not have them), and when the new scheduler or one
+        // of the graph's phases and systems cannot be made: the graph keeps the scheduler and job system it has.
         void SetJobSystem(IJobSystem* jobSystem);
 
         // The render service's isolation guard (plan step E5, sub-plan item E5.1, open point 12), module-private. Between
@@ -978,9 +991,16 @@ namespace donut::engine
         // reads a clock. A Refresh after it is needed when a domain drives entities or the frame uses bounds that the
         // simulation changed; a Refresh before it is allowed. What HasPendingStructureChanges and
         // HasPendingTransformChanges report stays pending. A graph that never calls it runs no simulation.
-        // FE_INVALID_ARGS when the phases cannot run: inside a phase, without a scheduler, or with an ordering cycle.
-        // The failures of systems and domains are not returned: the frame goes on, and GetScheduler()->GetDiagnostics
-        // has them.
+        // Teleport requests (SceneGraphNode::SetTransform on a driven node) are resolved by a system of a named phase
+        // "SimulationTeleports" right after BeginFrame, over the simulated poses as they are then: it sees what the
+        // systems of BeginFrame wrote. A phase that the application adds after BeginFrame runs before it
+        // (IScheduler::AddPhase puts a new phase right after the one it names), so it is seen too; a request made in
+        // PreSimulation or later waits for the next frame's Simulate.
+        // FE_INVALID_ARGS when the phases cannot run: inside a phase or a callback of the world, without a scheduler, or
+        // with an ordering cycle. With a cycle in one of the phases BeginFrame to PostSimulation none of them runs, but
+        // the time has been taken: the steps are taken once the phases run again, as far as maxStepsPerFrame allows. When
+        // propagation is due and cannot run, nothing is done. The failures of systems and domains are not returned: the
+        // frame goes on, and GetScheduler()->GetDiagnostics has them.
         nvrhi::FRESULT Simulate(const FrameTime& time) noexcept;
         // Binds a node of this graph to the simulation, or unbinds it (SceneComponents.h, simulation-driven entities).
         // Structural: outside phases and leaf callbacks. Binding takes both poses and the scale from the node's current
@@ -989,14 +1009,18 @@ namespace donut::engine
         // and binding and unbinding on a moving parent gives the local transform back. The node is shown there at once:
         // below a driven ancestor that the interpolation shows behind its pose, that is a jump of at most one fixed step
         // of the ancestor's motion. Shear and mirroring are refused with a warning; the domain whose lifetime query then
-        // matches the entity adds it. While bound, the transform setters are teleport requests (a part that a setter
-        // does not give stays as a pending request has it, else as the simulation has it), and the local getters
-        // compute from the simulated world transform. Unbinding makes the simulated pose the local transform, relative
-        // to the simulated world of the parent, and so does Detach: a node that is attached again or copied is authored.
-        // Binding a bound node, or unbinding another, does nothing. FE_INVALID_ARGS for a node that is not attached to
-        // this graph, a refused transform (also a scale of 0, or numbers that are not finite), or a wrong time; also, or
-        // FE_OUT_OF_MEMORY, when the world cannot make the node's new row (it fits no chunk; no memory): a warning, and
-        // nothing changed. A failing observer or domain callback is a warning only: the call stands.
+        // matches the entity adds it. While bound, the transform setters are teleport requests (SceneGraphNode::
+        // SetTransform), and the local getters give the last simulated pose, in the space of the parent's simulated
+        // world, not the place that is shown: whenever the interpolation shows the node between two poses (alpha below
+        // 1), after Refresh too and under an unmoved parent, they differ from what GetLocalToWorldTransform gives, by at
+        // most the motion of a fixed step. They cost O(depth) (about 600 ns below 8 levels, against 90 ns of a getter of
+        // an authored node). Unbinding makes the same parts the local transform, and so does Detach (with a warning where
+        // their matrix is not the pose: a parent that shears it, or has no inverse): a node that is attached again or
+        // copied is authored. Binding a bound node, or unbinding another, does nothing. FE_INVALID_ARGS for a node that
+        // is not attached to this graph, a refused transform (also a scale of 0, or numbers that are not finite), or a
+        // wrong time; also, or FE_OUT_OF_MEMORY, when the world cannot make the node's new row (it fits no chunk; no
+        // memory): a warning, and nothing changed. A failing observer or domain callback is a warning only: the call
+        // stands.
         nvrhi::FRESULT SetSimulationDriven(SceneGraphNode* node, bool driven) noexcept;
     };
 

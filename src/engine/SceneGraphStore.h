@@ -52,6 +52,10 @@
 //   (a phase of its own after PostSimulation), and their children follow them. A LocalTransform that such a row has is
 //   neither read nor written: the column table hides it (SlotLocal is absent there), so that the paths of authored nodes
 //   stay as they were; the few that find none ask whether the row is driven.
+// - Teleports (E6.2b): a setter on a driven node fills the row's SimTeleport, its request's only home, in the parent's
+//   space. A system of a phase of its own after BeginFrame resolves the enabled ones to the world, over the simulated
+//   poses of driven ancestors, as binding, unbinding and the local getters are: what a getter returned, set again, moves
+//   nothing, whatever the interpolation shows. The domain consumes them.
 // - Asset tables and slots (step E4): the leaf observer fills a mesh instance's MeshRef, RenderFlags and
 //   GpuInstanceSlot columns (table references, stable slots) before it calls RegisterLeaf, and releases them before it
 //   calls UnregisterLeaf. Every structural operation and InvalidateContent first advances the world's version, so that
@@ -322,13 +326,22 @@ namespace donut::engine
         }
         // SceneGraph::SetSimulationDriven of a node that is attached here.
         nvrhi::FRESULT SetSimulationDriven(SceneGraphNode* node, bool driven);
-        // The local getters of a driven node, from its WorldTransform and its parent's (nothing is stored): the matrix,
-        // and its parts as far as a translation, a rotation and a scaling can express it. False for another node.
+        // The local getters of a driven node, from its simulated pose and the simulated world of its parent (nothing is
+        // stored), not from what is shown: the matrix, and the parts that a teleport request (SetTransform) and unbinding
+        // take. Below a parent that shears, no parts can express the matrix; they are the ones that give the pose again
+        // when they are requested. O(depth). False for another node.
         bool GetDrivenLocal(const SceneGraphNode* node, dm::daffine3& outMatrix) const noexcept;
         bool GetDrivenLocal(const SceneGraphNode* node, LocalTransform& out) const noexcept;
+        // For Light: what a driven node's setters take so that its simulated world becomes `world` (its parts). False for
+        // another node, and for a matrix without parts.
+        static bool ToDrivenLocal(const SceneGraphNode* node, const dm::daffine3& world, LocalTransform& out) noexcept;
         // The phase of the interpolation system, right after PostSimulation; c_NoPhase when there is none.
         static constexpr Phase c_NoPhase = Phase(~0u);   // Phase::Count is the first named phase
         Phase GetInterpolationPhase() const noexcept { return m_InterpolationPhase; }
+        // The phase of the system that resolves teleport requests, right after BeginFrame; likewise.
+        Phase GetTeleportPhase() const noexcept { return m_TeleportPhase; }
+        // SceneGraph::Simulate.
+        nvrhi::FRESULT Simulate(const FrameTime& time) noexcept;
 
         // ------------------------------------------------------------------------------ refresh (5.4, 5.7)
         // Runs the phases when anything changed; returns whether structure changed since the last refresh.
@@ -411,6 +424,7 @@ namespace donut::engine
         // The systems' bodies (SceneGraphStore.cpp).
         nvrhi::FRESULT RunPropagation(ISystemContext* context) noexcept;
         nvrhi::FRESULT RunBounds(ISystemContext* context) noexcept;
+        nvrhi::FRESULT RunTeleports(ISystemContext* context) noexcept;
         nvrhi::FRESULT RunInterpolation(ISystemContext* context) noexcept;
         // Before the phases of a Refresh: the pass's marks and summaries ready, so that the Bounds system marks the paths
         // of the rows whose boxes changed (incremental mode). After them: the subgraph values of the nodes with children
@@ -474,6 +488,7 @@ namespace donut::engine
             uint64_t propagatedRows = 0;
             uint64_t boundsChunks = 0;         // chunks the Bounds system wrote
             uint64_t interpolatedChunks = 0;   // chunks of driven rows the interpolation wrote
+            uint64_t resolvedTeleports = 0;    // requests resolved to the world
             uint64_t deepRows = 0;             // rows of the last depth bucket visited (c_MaxHierarchyDepth)
             uint64_t createCalls = 0;          // CreateEntities calls of attach and copy (one per batch)
             uint64_t subgraphPasses = 0;       // UpdateSubgraphs runs (full ones included)
@@ -547,13 +562,13 @@ namespace donut::engine
             uint8_t scale;
             uint8_t body;
             uint8_t world;
+            uint8_t teleport;          // c_Absent: no requests
+            uint8_t parent;            // c_Absent: no parent
         };
 
-        // The simulated world of a row's parent, kept for the next row with the same parent (SimulatedLocal); `chain` is
-        // the calling store's scratch (m_ComposeChain).
+        // The simulated world of a row's parent, kept for the next row with the same parent.
         struct ParentWorld
         {
-            std::vector<Entity>& chain;
             Entity parent = Entity::Null;
             dm::daffine3 world = dm::daffine3::identity();
         };
@@ -585,6 +600,7 @@ namespace donut::engine
         struct PropagationContext;
         struct BoundsContext;
         struct InterpolationContext;
+        struct TeleportContext;
         struct DeepContext;
         struct SubgraphContext;
 
@@ -632,7 +648,17 @@ namespace donut::engine
 
         friend class GpuScene;
 
-        void CreateSystems() noexcept;
+        // A scheduler with the graph's phases and systems.
+        struct Systems
+        {
+            nvrhi::AutoPtr<IScheduler> scheduler;
+            Phase interpolation = c_NoPhase;
+            Phase teleport = c_NoPhase;
+        };
+        // Makes them on `jobs`, and nothing else: a warning for each one that cannot be made, and false then.
+        bool CreateSystems(IJobSystem* jobs, Systems& out) noexcept;
+        // Makes them the graph's, in place of the ones it has.
+        void TakeSystems(const Systems& systems) noexcept;
         // The leaf observer's work per leaf (OnAdd, OnRemove), and the mesh-instance columns it fills and releases.
         void OnLeaf(Entity entity, SceneGraphLeaf* leaf, bool added);
         void AcquireInstance(const RowRef& row, MeshInstance* instance, MeshTable::Changes& changes);
@@ -683,6 +709,7 @@ namespace donut::engine
         void MarkSkinnedJoints(uint64_t since);
         static void RunPropagationTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
         static void RunBoundsTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
+        static void RunTeleportTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
         static void RunInterpolationTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
 
         nvrhi::FRESULT BindToSimulation(SceneGraphNode* node);
@@ -690,15 +717,26 @@ namespace donut::engine
         // The move of the row of `node`; what both share around it.
         nvrhi::FRESULT ChangeDriven(SceneGraphNode* node, ecs::WorldImpl::ComponentChange& change,
                                     const ecs::WorldImpl::RowHooks* hooks);
-        // A driven row's simulated world: its SimPose and SimScale (its WorldTransform when it lacks them).
+        // SetTransform of a driven node: fills and enables its teleport request.
+        void RequestTeleport(const SceneGraphNode* node, const dm::double3* translation, const dm::dquat* rotation,
+                             const dm::double3* scaling) noexcept;
+        // A driven row's simulated world: its SimPose and SimScale (its WorldTransform when it lacks them); its parts.
         dm::daffine3 SimulatedPose(const RowRef& row) const noexcept;
+        LocalTransform SimulatedParts(const RowRef& row) const noexcept;
+        // Parts in the world made relative to the simulated world of the row's parent (PartsInParent).
+        LocalTransform InParentOf(const RowRef& row, const LocalTransform& world) const noexcept;
         // The simulated world transform of an entity: composed from the local transforms as they are now, propagated or
         // not, from the simulated pose of the nearest driven ancestor (or of the entity itself) down, else from the root.
-        // Where nothing is driven it is what propagation gives, bit for bit. `chain` is scratch.
-        dm::daffine3 ComposeWorld(Entity entity, std::vector<Entity>& chain) const;
-        // The local transform that a driven row gets when it is not driven any more: its simulated pose relative to the
-        // simulated world of its parent, so that both are of the same time. Warns when no local transform can express it
-        // (a parent whose scale shears it or has no inverse); `operation` names the call.
+        // Where nothing is driven it is what propagation gives, bit for bit. It only reads, allocates nothing and does
+        // not recurse: getters on several threads and the jobs of the teleport system call it. O(depth): the rows are
+        // read once, or (more than 64 rows with a local transform) once per cut of the chain into 64 pieces and twice
+        // more: 200,000 rows four times.
+        dm::daffine3 ComposeWorld(Entity entity) const noexcept;
+        dm::daffine3 ComposeLongChain(Entity entity) const noexcept;
+        // The local transform that a driven row gets when it is not driven any more: what the local getters give (the
+        // parts of its simulated pose in the space of its parent, at its simulated world, so that both are of the same
+        // time). Warns when its matrix does not give the pose (a parent whose scale shears it or has no inverse);
+        // `operation` names the call.
         LocalTransform SimulatedLocal(const RowRef& row, ParentWorld& cache, const char* operation) const;
 
         static std::atomic<int32_t> s_FailCreateCountdown;
@@ -782,6 +820,11 @@ namespace donut::engine
         uint64_t m_RefreshedVersion = 0;
         uint64_t m_RefreshedStructuralVersion = 0;
         uint32_t m_FrameIndex = 0;
+        // Skinned instances are marked with the frame of a Refresh, so only the propagation of a Refresh marks, against
+        // the version of the last one that did: what a propagation in between (Simulate's, the phase run by hand)
+        // propagated is still found.
+        bool m_MarkJoints = false;             // while Refresh runs its phases
+        uint64_t m_JointsMarkedVersion = 0;    // of this scheduler's propagation; 0: every joint counts as moved
         std::atomic<uint64_t> m_Epoch{ 1 };
 
         // Render-read scopes (BeginRenderRead) and the nesting of API calls that warn once (RenderReadQuiet).
@@ -790,6 +833,7 @@ namespace donut::engine
         std::atomic<bool> m_RenderServiceClaimed{ false };
         uint64_t m_SchedulerGeneration = 0;   // CreateSystems calls
         Phase m_InterpolationPhase = c_NoPhase;
+        Phase m_TeleportPhase = c_NoPhase;
         // The interpolation's alpha per domain at its last run: a chunk is computed again when its poses changed or the
         // alpha of a domain of its rows did.
         double m_LastAlphas[c_MaxSimulationDomains] = {};
@@ -801,7 +845,6 @@ namespace donut::engine
         std::vector<BoundsArchetype> m_BoundsArchetypes;
         std::vector<JointArchetype> m_JointArchetypes;
         std::vector<DrivenArchetype> m_DrivenArchetypes;
-        std::vector<Entity> m_ComposeChain;      // ComposeWorld's, of the structural call that runs; capacity kept
         uint32_t m_SystemArchetypesSeen = 0;
         std::vector<Task> m_Tasks;
         std::vector<uint8_t> m_DeepMarks;        // per entity index, the rows of the last bucket visited and written

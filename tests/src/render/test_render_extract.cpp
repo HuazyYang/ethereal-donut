@@ -2149,6 +2149,79 @@ namespace
         service = nullptr;
     }
 
+    // SceneGraph::Simulate (E6 sub-plan, item E6.2b) propagates joints before Refresh does: what is extracted equals that
+    // of the same script without it, frame by frame, instances and matrices, with joints moved before Simulate, between
+    // it and Refresh, in both places and not at all, also in the frame after a move and in the one after that.
+    void test_skinned_simulate()
+    {
+        struct Extracted
+        {
+            std::vector<uint32_t> instances;   // by their index in the graph's vector
+            std::vector<dm::float4x4> matrices;
+        };
+        std::vector<Extracted> results[2];
+        for (int simulate = 0; simulate < 2; ++simulate)
+        {
+            TestViews views;
+            TraceScene s(0x1008, c_SmallProfile);
+            BuildCrowd(s, 3);
+            RenderFrame frame;
+            auto service = MakeService(s.graph);
+            const auto& leaves = s.graph->GetSkinnedMeshInstances();
+            CHECK(leaves.size() == 3);
+            for (const auto& instance : leaves)
+                instance->skinningInitialized = true;   // the rule of the frames alone selects
+            s.graph->Refresh(0);
+            for (uint32_t f = 2; f <= 60; ++f)
+            {
+                const SkinnedMeshInstance* leaf = leaves[f / 9 % 3];
+                auto move = [&](double offset)
+                {
+                    for (const SkinnedMeshJoint& joint : leaf->joints)
+                        if (nvrhi::AutoPtr<SceneGraphNode> node = joint.node.Lock())
+                            node->SetTranslation(dm::double3(offset, 0.01 * double(f), 0.0));
+                };
+                const uint32_t what = f % 9;   // 1: before, 4: between, 7: both, else none
+                if (what == 1 || what == 7)
+                    move(1.0);
+                if (simulate)
+                    CHECK(s.graph->Simulate(FrameTime{ double(f) / 60.0, 1.0 / 60.0, f }) == nvrhi::FS_OK);
+                if (what == 4 || what == 7)
+                    move(2.0);
+                s.graph->Refresh(f);
+                const ExtractDesc desc = views.Desc(f);
+                const RenderSnapshot& snapshot = ExtractFrame(service, frame, desc);
+                CheckSnapshot(s.graph, snapshot, desc);
+                Extracted extracted;
+                bool moved = false;
+                for (uint32_t i = 0; i < snapshot.skinnedInstanceCount; ++i)
+                {
+                    for (uint32_t k = 0; k < uint32_t(leaves.size()); ++k)
+                    {
+                        if (leaves[k].Get() == snapshot.skinnedInstances[i].leaf)
+                            extracted.instances.push_back(k);
+                    }
+                    moved = moved || snapshot.skinnedInstances[i].leaf == leaf;
+                }
+                extracted.matrices.assign(snapshot.jointMatrices, snapshot.jointMatrices + snapshot.jointMatrixCount);
+                // moved in this frame or the one before; after that nothing is
+                CHECK(what % 3 == 0 || f < 3 || moved);
+                CHECK(what % 3 != 0 || f < 3 || extracted.instances.empty());
+                results[simulate].push_back(std::move(extracted));
+                service->EndFrame(true);
+            }
+            service = nullptr;
+        }
+        for (size_t f = 0; f < results[0].size(); ++f)
+        {
+            CHECK(results[0][f].instances == results[1][f].instances);
+            CHECK(results[0][f].matrices.size() == results[1][f].matrices.size());
+            CHECK(results[0][f].matrices.empty() ||
+                  SameBits(results[0][f].matrices.data(), results[1][f].matrices.data(),
+                           results[0][f].matrices.size() * sizeof(dm::float4x4)));
+        }
+    }
+
     // A skinned instance whose joint nodes were destroyed: their matrices are the identity.
     void test_destroyed_joint()
     {
@@ -2358,6 +2431,7 @@ int main(int argc, char** argv)
         { "destroyed_joint", test_destroyed_joint },
         { "skinned_detach", test_skinned_detach },
         { "skinned_pending", test_skinned_pending },
+        { "skinned_simulate", test_skinned_simulate },
         { "shadow_map_reassigned", test_shadow_map_reassigned },
         { "scheduler_release", test_scheduler_release },
         { "repeated_calls", test_repeated_calls },

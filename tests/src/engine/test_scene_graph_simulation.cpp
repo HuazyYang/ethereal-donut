@@ -20,18 +20,22 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-// Simulation-driven nodes (aggregate docs/plans/2026-11-21-donut-ecs-e6.md, item E6.2a; design 4.7, 8.4): binding and
-// unbinding, the driver in propagation (shallow levels and the last bucket), detach, copies, SetRootNode, destruction and
-// teardown, the local getters, refusals, the stale flag, joints, the interpolation (its formula bit for bit, which
-// chunks it writes, its phase), the scatter contract over a toy engine, a random script against a model that computes
-// every world transform, box and subtree value from scratch, equal hashes at 1, 2 and 8 workers, and an allocation
-// counter. The phases are driven by hand (SceneGraph::Simulate is item E6.2b). The cases `driver_*` and
-// `interpolation_*` each name the behaviour they fix; the private headers give the counters and column versions.
+// Simulation-driven nodes (aggregate docs/plans/2026-11-21-donut-ecs-e6.md, items E6.2a and E6.2b; design 4.7, 5.2, 8.4,
+// 8.5). E6.2a, the cases `driver_*` and `interpolation_*`, mostly with the phases driven by hand: binding and unbinding,
+// the driver in propagation (shallow levels and the last bucket), detach, copies, SetRootNode, destruction and teardown,
+// the local getters, refusals, the stale flag, joints, the interpolation (its formula bit for bit, which chunks it
+// writes, its phase), the scatter contract over a toy engine, a random script against a model that computes every world
+// transform, box and subtree value from scratch, equal hashes at 1, 2 and 8 workers, and an allocation counter. E6.2b,
+// the cases `simulate_*`, `teleport_*` and `replay_*`: SceneGraph::Simulate, the frames of the skinned instances with and
+// without it, teleport requests through the setters, their resolving and their consumption by the toy engine, replay
+// against a golden file (tests/src/engine/golden/simulation_frames.txt; ECS_UPDATE_GOLDEN=1 rewrites it) and rewind. Each
+// case names the behaviour it fixes; the private headers give the counters and column versions.
 
 #include "SceneGraphGenerator.h"
 
 #include <donut/core/log.h>
 #include <donut/core/query_cast.h>
+#include <donut/engine/EcsQuery.h>
 #include <donut/engine/EcsScheduler.h>
 #include <donut/engine/EcsSimulation.h>
 #include <donut/engine/EcsWorld.h>
@@ -55,12 +59,15 @@ using namespace donut::math;
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
 #include <new>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -77,10 +84,16 @@ using namespace donut::math;
 namespace
 {
     std::atomic<uint64_t> g_NewCount{ 0 };
+    std::atomic<bool> g_FailNextNew{ false };   // one allocation fails
+    std::atomic<int32_t> g_FailAfterNew{ 0 };   // a countdown: the allocation that reaches it fails
 
     void* CountedAllocate(size_t size) noexcept
     {
         g_NewCount.fetch_add(1, std::memory_order_relaxed);
+        if (g_FailNextNew.load(std::memory_order_relaxed) && g_FailNextNew.exchange(false))
+            return nullptr;
+        if (g_FailAfterNew.load(std::memory_order_relaxed) > 0 && g_FailAfterNew.fetch_sub(1) == 1)
+            return nullptr;
         return std::malloc(size ? size : 1);
     }
 
@@ -329,8 +342,47 @@ namespace
 
     // ------------------------------------------------------------------------------------------ a toy engine
 
+    class MemoryWriter final : public nvrhi::ObjectImpl<IStateWriter>
+    {
+    public:
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(MemoryWriter)
+        NVRHI_IMPLEMENTS_INTERFACE(IStateWriter)
+        NVRHI_END_INTERFACE_TABLE()
+
+        std::vector<uint8_t> bytes;
+
+        nvrhi::FRESULT Write(const void* data, uint64_t size) noexcept override
+        {
+            const uint8_t* begin = static_cast<const uint8_t*>(data);
+            bytes.insert(bytes.end(), begin, begin + size);
+            return nvrhi::FS_OK;
+        }
+    };
+
+    class MemoryReader final : public nvrhi::ObjectImpl<IStateReader>
+    {
+    public:
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(MemoryReader)
+        NVRHI_IMPLEMENTS_INTERFACE(IStateReader)
+        NVRHI_END_INTERFACE_TABLE()
+
+        std::vector<uint8_t> bytes;
+        size_t at = 0;
+
+        explicit MemoryReader(const std::vector<uint8_t>& content) : bytes(content) { }
+        nvrhi::FRESULT Read(uint64_t size, void* data) noexcept override
+        {
+            if (size > bytes.size() - at)
+                return nvrhi::FE_INVALID_ARGS;
+            std::memcpy(data, bytes.data() + at, size_t(size));
+            at += size_t(size);
+            return nvrhi::FS_OK;
+        }
+    };
+
     // Balls under gravity that spin, in dense arrays addressed by the index that OnEntitiesAdded stores in SimBodyRef:
-    // what an engine behind a domain looks like, with the previous pose kept in engine order (the scatter contract).
+    // what an engine behind a domain looks like, with the previous pose kept in engine order (the scatter contract), and
+    // teleports consumed as SimTeleport's contract says. A teleport keeps the velocity and the spin.
     class BallDomain final : public nvrhi::ObjectImpl<ISimulationDomain>
     {
     public:
@@ -346,11 +398,29 @@ namespace
             dm::dquat spin;        // per step
             Entity entity;         // Null: free
         };
+        static Ball FreeBall()
+        {
+            Ball ball;
+            std::memset(static_cast<void*>(&ball), 0, sizeof(ball));   // dm's vectors start undefined
+            return ball;
+        }
+        // A request that the engine took.
+        struct Taken
+        {
+            Entity entity;
+            SimTeleport request;
+        };
 
         std::string name;
-        ComponentId pose, previous, scale, body, driven, filter;
+        ComponentId pose, previous, scale, body, driven, filter, teleport;
+        std::vector<ComponentAccess> inputs;
         std::vector<ComponentAccess> outputs;
         std::vector<QueryTerm> terms;
+        Query<Read<SimBodyRef>, Write<SimPose>, Write<SimPosePrevious>, Write<SimScale>, Enabled<SimTeleport>> requests;
+        std::vector<Taken> taken;
+        std::function<void(ISimulationContext*)> onGather;
+        std::function<nvrhi::FRESULT(ISimulationContext*)> onStep;
+        uint32_t parentSpaceSeen = 0;          // requests left alone, because they were not resolved
         std::vector<Ball> balls;
         std::vector<uint32_t> freeIndices;
         std::vector<std::pair<Entity, bool>> events;    // in order; true: added
@@ -360,6 +430,8 @@ namespace
         bool keepEvents = true;
         bool clearsBodyRefs = true;
         bool scattersWithoutSteps = false;     // a domain that breaks the contract
+        bool keepTaken = true;
+        uint32_t teleportsTaken = 0;
         uint32_t steps = 0;
         uint32_t scatters = 0;                 // that wrote
 
@@ -372,6 +444,10 @@ namespace
             scale = FindComponent<SimScale>(world);
             body = FindComponent<SimBodyRef>(world);
             driven = FindComponent<SimulationDriven>(world);
+            teleport = FindComponent<SimTeleport>(world);
+            CHECK(requests.Create(world, "requests") == nvrhi::FS_OK);
+            inputs = { { teleport, Access::Write, {} }, { scale, Access::Write, {} }, { pose, Access::Write, {} },
+                       { previous, Access::Write, {} }, { body, Access::Read, {} } };
             outputs = { { pose, Access::Write, {} }, { previous, Access::Write, {} }, { body, Access::Read, {} } };
             terms = { { driven, TermOp::All, Access::Filter, {} }, { body, TermOp::All, Access::Write, {} },
                       { pose, TermOp::All, Access::Read, {} } };
@@ -383,6 +459,8 @@ namespace
         {
             retVal = SimulationDomainDesc{};
             retVal.name = name.c_str();
+            retVal.inputs = inputs.data();
+            retVal.inputCount = uint32_t(inputs.size());
             retVal.outputs = outputs.data();
             retVal.outputCount = uint32_t(outputs.size());
             retVal.lifetime.terms = terms.data();
@@ -406,7 +484,7 @@ namespace
                     freeIndices.pop_back();
                 }
                 else
-                    balls.emplace_back();
+                    balls.push_back(FreeBall());
                 Ball& ball = balls[index];
                 ball.pose = poses[i];
                 ball.previous = SimPosePrevious{ poses[i].translation, poses[i].rotation };
@@ -433,7 +511,7 @@ namespace
                 EXPECT(index < balls.size() && balls[index].entity == batch.entities[i]);
                 if (index < balls.size())
                 {
-                    balls[index] = Ball{};
+                    balls[index] = FreeBall();
                     freeIndices.push_back(index);
                 }
                 if (clearsBodyRefs)
@@ -443,9 +521,47 @@ namespace
             }
             return nvrhi::FS_OK;
         }
-        nvrhi::FRESULT GatherInputs(ISimulationContext*) noexcept override { return nvrhi::FS_OK; }
-        nvrhi::FRESULT Step(double step, ISimulationContext*) noexcept override
+        nvrhi::FRESULT GatherInputs(ISimulationContext* context) noexcept override
         {
+            if (onGather)
+                onGather(context);
+            if (context->GetStepsThisFrame() == 0)
+                return nvrhi::FS_OK;   // they stay pending
+            requests.ForEachChunk(context->GetSystemContext(),
+                [&](const ChunkView& view, const SimBodyRef* bodies, SimPose* poses, SimPosePrevious* previousPoses,
+                    SimScale* scales, const SimTeleport* teleports)
+            {
+                for (uint32_t row = 0; row < view.count; ++row)
+                {
+                    if (!view.IsRowEnabled(4, row) || bodies[row].domain != uint32_t(context->GetDomainId()))
+                        continue;
+                    const SimTeleport& request = teleports[row];
+                    if (request.space != SimTeleportSpace::World)
+                    {
+                        ++parentSpaceSeen;
+                        continue;
+                    }
+                    Ball& ball = balls[bodies[row].index];
+                    EXPECT(ball.entity == view.entities[row]);
+                    ball.pose = poses[row] = SimPose{ request.translation, request.rotation };
+                    ball.previous = previousPoses[row] = SimPosePrevious{ request.translation, request.rotation };
+                    scales[row].scaling = request.scaling;
+                    EXPECT(context->GetWorld()->SetEnabled(view.entities[row], teleport, false) == nvrhi::FS_OK);
+                    ++teleportsTaken;
+                    if (keepTaken)
+                        taken.push_back(Taken{ view.entities[row], request });
+                }
+            });
+            return nvrhi::FS_OK;
+        }
+        nvrhi::FRESULT Step(double step, ISimulationContext* context) noexcept override
+        {
+            if (onStep)
+            {
+                const nvrhi::FRESULT result = onStep(context);
+                if (NVRHI_FAILED(result))
+                    return result;
+            }
             ++steps;
             for (Ball& ball : balls)
             {
@@ -492,8 +608,22 @@ namespace
             }
             return nvrhi::FS_OK;
         }
-        nvrhi::FRESULT CaptureState(IStateWriter*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
-        nvrhi::FRESULT RestoreState(IStateReader*) noexcept override { return nvrhi::FE_UNSUPPORTED; }
+        nvrhi::FRESULT CaptureState(IStateWriter* writer) noexcept override
+        {
+            const uint64_t count = balls.size();
+            nvrhi::FRESULT result = writer->Write(&count, sizeof(count));
+            if (NVRHI_SUCCEEDED(result))
+                result = writer->Write(balls.data(), count * sizeof(Ball));
+            return result;
+        }
+        nvrhi::FRESULT RestoreState(IStateReader* reader) noexcept override
+        {
+            uint64_t count = 0;
+            nvrhi::FRESULT result = reader->Read(sizeof(count), &count);
+            if (NVRHI_FAILED(result) || count != balls.size())
+                return nvrhi::FE_INVALID_ARGS;
+            return reader->Read(count * sizeof(Ball), balls.data());
+        }
 
         const Ball* Find(Entity entity) const
         {
@@ -565,6 +695,52 @@ namespace
             Simulate(delta);
             Refresh();
         }
+        // SceneGraph::Simulate, and a frame with it.
+        nvrhi::FRESULT TrySimulate(double delta)
+        {
+            time += delta;
+            return graph->Simulate(FrameTime{ time, delta, frame++ });
+        }
+        void SimulateGraph(double delta) { CHECK(TrySimulate(delta) == nvrhi::FS_OK); }
+        void GraphFrame(double delta)
+        {
+            SimulateGraph(delta);
+            Refresh();
+        }
+        bool IsPending(const SceneGraphNode* node)
+        {
+            return world->IsEnabled(EntityOf(node), FindComponent<SimTeleport>(world));
+        }
+        uint64_t Resolved() { return Store().GetCounters().resolvedTeleports; }
+        uint64_t RunsOf(Phase phase)
+        {
+            SystemId id = SystemId::Invalid;
+            CHECK(ecs::GetScheduleOrder(graph->GetScheduler(), phase, &id, 1) >= 1);
+            SystemStats stats{};
+            CHECK(graph->GetScheduler()->GetSystemStats(id, stats) == nvrhi::FS_OK);
+            return stats.runCount;
+        }
+        SystemId AddSystem(const char* name, Phase phase, const std::vector<ComponentAccess>& accesses,
+                           const std::function<nvrhi::FRESULT(ISystemContext*)>& update,
+                           SystemFlags flags = SystemFlags::MainThread, const char* runBefore = nullptr)
+        {
+            SystemDesc desc{};
+            desc.name = name;
+            desc.phase = phase;
+            desc.flags = flags;
+            desc.accesses = accesses.data();
+            desc.accessCount = uint32_t(accesses.size());
+            desc.runBefore = &runBefore;
+            desc.runBeforeCount = runBefore ? 1 : 0;
+            nvrhi::AutoPtr<ISystem> system;
+            CHECK(CreateLambdaSystem(desc, [update](ISystemContext* context) noexcept { return update(context); },
+                                     &system) == nvrhi::FS_OK);
+            SystemId id = SystemId::Invalid;
+            CHECK(graph->GetScheduler()->AddSystem(system, id) == nvrhi::FS_OK);
+            return id;
+        }
+        ComponentAccess Reads(ComponentId id) { return ComponentAccess{ id, Access::Read, {} }; }
+        ComponentAccess Writes(ComponentId id) { return ComponentAccess{ id, Access::Write, {} }; }
         void Bind(SceneGraphNode* node) { CHECK(graph->SetSimulationDriven(node, true) == nvrhi::FS_OK); }
         void Unbind(SceneGraphNode* node) { CHECK(graph->SetSimulationDriven(node, false) == nvrhi::FS_OK); }
         Entity EntityOf(const SceneGraphNode* node) { return graph->GetEntity(node); }
@@ -1457,14 +1633,26 @@ void test_driver_unbind()
     CHECK(TakeWarnings() == 1);
     sheared.graph->Detach(second);
     CHECK(TakeWarnings() == 1);
-    // a scale of 0 (a teleport may give one): no rotation
+    // a scale of 0 (a teleport may give one): the parts as they are, the rotation too, and no warning (the matrix is
+    // the pose)
     SceneGraphNode* point = sheared.AddAt(sheared.Root(), 1.0, 2.0, 3.0);
     sheared.Bind(point);
-    sheared.world->AdvanceVersion();
+    sheared.SetPose(point, dm::double3(1.0, 2.0, 3.0), c_Turn);
     sheared.Edit<SimScale>(point)->scaling = dm::double3(0.0);
     sheared.Unbind(point);
-    CHECK(TakeWarnings() == 1 && Near(point->GetTranslation(), dm::double3(1.0, 2.0, 3.0), 0.0));
-    CHECK(Near(point->GetScaling(), dm::double3(0.0), 0.0) && Near(point->GetRotation(), dm::dquat::identity(), 0.0));
+    CHECK(TakeWarnings() == 0 && Near(point->GetTranslation(), dm::double3(1.0, 2.0, 3.0), 0.0));
+    CHECK(Near(point->GetScaling(), dm::double3(0.0), 0.0) && Near(point->GetRotation(), c_Turn, 0.0));
+    // a pose that is no number: a warning, also of a root
+    for (bool root : { false, true })
+    {
+        Rig nan;
+        SceneGraphNode* lost = root ? nan.Root() : nan.AddAt(nan.Root(), 1.0, 2.0, 3.0);
+        nan.Bind(lost);
+        nan.world->AdvanceVersion();
+        nan.Edit<SimPose>(lost)->translation.y = std::numeric_limits<double>::quiet_NaN();
+        nan.Unbind(lost);
+        CHECK(TakeWarnings() == 1);
+    }
 
     // out of memory for the authored row: nothing changed, the flags included
     Rig full;
@@ -1591,9 +1779,9 @@ void test_driver_copy()
     rig.Refresh();
     rig.Bind(upper);
     rig.Bind(lower);
-    CHECK(rig.world->SetEnabled(rig.EntityOf(upper), FindComponent<SimTeleport>(rig.world), true) == nvrhi::FS_OK);
     for (int i = 0; i < 4; ++i)
         rig.Frame(0.25 * 1.3);
+    upper->SetTranslation(dm::double3(50.0));   // a pending request is not copied
     const dm::daffine3 posedUpper = rig.Posed(upper), posedLower = rig.Posed(lower);
     CHECK(!Near(posedUpper, upper->GetLocalToWorldTransform(), 1e-3));
     domain->events.clear();
@@ -1852,6 +2040,7 @@ void test_driver_getters()
     rig.Refresh();
     CHECK(SameBits(node->GetLocalToParentTransform(), node->GetLocalToWorldTransform()));
     CHECK(node->GetTranslation().x == 1e305);
+    CHECK(Near(node->GetScaling(), rig.Get<SimScale>(node)->scaling, 0.0));
     // or that of the axes
     Place(parent, Placement{ dm::double3(0.0), dm::dquat::identity(), dm::double3(1e-10) });
     rig.SetPose(node, dm::double3(0.0), dm::dquat::identity());
@@ -1860,6 +2049,7 @@ void test_driver_getters()
     rig.Simulate(0.0);
     rig.Refresh();
     CHECK(SameBits(node->GetLocalToParentTransform(), node->GetLocalToWorldTransform()));
+    CHECK(node->GetScaling().x == 1e300);
     CHECK(TakeWarnings() == 0);   // the getters are silent
 
     // an authored node without a transform has the identity, also while the driven node above it has moved on
@@ -2057,7 +2247,7 @@ void test_driver_refusals()
     CHECK(Near(bulky->GetTranslation(), dm::double3(2.0, 0.0, 0.0), 0.0));
     rig.graph->Detach(bulky);
 
-    // the setters of a driven node change nothing (until E6.2b makes them requests), and neither does an animation
+    // the setters of a driven node change neither its pose nor its local transform (they are requests, teleport_*)
     rig.Refresh();
     rig.Refresh();
     const LocalTransform kept = *rig.Get<LocalTransform>(second);
@@ -2067,7 +2257,6 @@ void test_driver_refusals()
     second->SetTranslation(dm::double3(5.0));
     second->SetRotation(c_Turn);
     second->SetScaling(dm::double3(2.0));
-    CHECK(TakeWarnings() == 3);
     CHECK(SameBits(&kept, rig.Get<LocalTransform>(second), sizeof(kept)) && kept.translation.z == 1.0);
     CHECK(SameBits(&pose, rig.Get<SimPose>(second), sizeof(pose)));
     CHECK(rig.ColumnVersion(second, FindComponent<LocalTransform>(rig.world)) == localVersion);
@@ -2075,7 +2264,7 @@ void test_driver_refusals()
     SceneGraphNode* bare = rig.Add(rig.Root());
     rig.Bind(bare);
     bare->SetTranslation(dm::double3(5.0));
-    CHECK(TakeWarnings() == 1 && !rig.Get<LocalTransform>(bare) && rig.IsDriven(bare));
+    CHECK(!rig.Get<LocalTransform>(bare) && rig.IsDriven(bare));
 
     // inside a render-read scope: a warning in Debug builds, and the call applies
     rig.graph->BeginRenderRead();
@@ -2111,10 +2300,8 @@ void test_driver_stale_flag()
     CHECK(!rig.graph->HasStaleWorldTransforms() && !rig.graph->HasPendingTransformChanges());
     rig.Refresh();
     CHECK(!rig.graph->HasPendingTransformChanges());   // a move of the simulation is no edit
-    node->SetTranslation(dm::double3(0.0));
-    CHECK(TakeWarnings() == 1 && !rig.graph->HasStaleWorldTransforms());
-    CHECK(rig.world->SetEnabled(rig.EntityOf(node), FindComponent<SimTeleport>(rig.world), true) == nvrhi::FS_OK);
-    CHECK(!rig.graph->HasStaleWorldTransforms());      // a request is none either
+    node->SetTranslation(dm::double3(0.0));            // a request is none either
+    CHECK(!rig.graph->HasStaleWorldTransforms() && !rig.graph->HasPendingTransformChanges());
     rig.Unbind(node);
     CHECK(rig.graph->HasStaleWorldTransforms() && rig.graph->HasPendingTransformChanges() &&
           !rig.graph->HasPendingStructureChanges());
@@ -2194,15 +2381,19 @@ void test_driver_job_system()
     {
         rig.jobs = MakeJobs(workers);
         nvrhi::AutoPtr<IScheduler> old = rig.graph->GetScheduler();
+        CHECK(old->RemoveSimulationDomain(SimulationDomainId(0)) == nvrhi::FS_OK);   // refused with one (E6.2b)
         rig.graph->SetJobSystem(rig.jobs);
         IScheduler* scheduler = rig.graph->GetScheduler();
         CHECK(scheduler != old.Get());
         const Phase phase = rig.Store().GetInterpolationPhase();
         CHECK(uint32_t(phase) == uint32_t(Phase::Count));   // the scheduler's first named phase
+        CHECK(rig.Store().GetTeleportPhase() == Phase(uint32_t(Phase::Count) + 1));
+        CHECK(ecs::GetScheduleOrder(scheduler, rig.Store().GetTeleportPhase(), nullptr, 0) == 1);
         CHECK(scheduler->Build() == nvrhi::FS_OK && ecs::GetScheduleOrder(scheduler, phase, nullptr, 0) == 1);
         Phase again = Phase::Count;
         CHECK(NVRHI_FAILED(scheduler->AddPhase("SimulationInterpolation", Phase::PostSimulation, again)));
-        CHECK(TakeWarnings() == 1);   // its name is taken: the phase is there, once
+        CHECK(NVRHI_FAILED(scheduler->AddPhase("SimulationTeleports", Phase::BeginFrame, again)));
+        CHECK(TakeWarnings() == 2);   // their names are taken: the phases are there, once
         // the new scheduler knows no domain: the nodes rest at their last poses, also those it never wrote
         rig.Frame(0.0);
         for (SceneGraphNode* node : nodes)
@@ -2463,8 +2654,9 @@ void test_interpolation_changes()
     const SimulationDomainId lightId = rig.AddDomain(lightDomain);
     CHECK(heavyDomain->events.size() == heavies.size() && lightDomain->events.size() == lights.size());
     CHECK(written([&]() { rig.Simulate(0.0); }) == heavyChunks + lightChunks + freeChunks);   // the first run
-    // both scatters write SimPose, of disjoint rows: the scheduler does not know, and says so (6.4; open point 11)
-    CHECK(rig.graph->GetScheduler()->GetAmbiguityCount() == 1);
+    // both scatters write SimPose, and both gathers do (teleports), of disjoint rows: the scheduler does not know, and
+    // says so (6.4; open point 11)
+    CHECK(rig.graph->GetScheduler()->GetAmbiguityCount() == 2);
     (void)TakeWarnings();   // in Debug builds
     CHECK(written([&]() { rig.Simulate(0.0); }) == 0);
 
@@ -2853,6 +3045,9 @@ namespace
         SimScale scale{};
         bool shown = false;              // an interpolation ran since it was bound
         dm::daffine3 boundWorld;         // its world until then
+        bool pending = false;            // a teleport request: in the parent's space, or resolved to the world
+        bool resolved = false;
+        dm::daffine3 request;
         uint64_t serial = 0;
         bool hasLeaf = false;
         dm::box3 box = dm::box3::empty();
@@ -2891,7 +3086,8 @@ namespace
         {
             uint32_t binds = 0, unbinds = 0, moves = 0, reparents = 0, leaves = 0, detaches = 0, attaches = 0, drops = 0,
                      copies = 0, roots = 0, drivenDetached = 0, deepDriven = 0, simulated = 0, stillFrames = 0,
-                     between = 0;
+                     between = 0, byGraph = 0, teleports = 0, taken = 0, waited = 0, mergedResolved = 0, same = 0,
+                     pendingDropped = 0;
         };
         const Counts& GetCounts() const { return m_Counts; }
         uint64_t GetHash() const { return m_Hash; }
@@ -2907,7 +3103,20 @@ namespace
             if (m_Rng.Percent(70))
             {
                 const double factors[] = { 0.0, 0.3, 1.0, 1.7, 8.0 };
-                m_Rig.Simulate(m_Domain->dt * factors[m_Rng.Below(std::size(factors))]);
+                const double delta = m_Domain->dt * factors[m_Rng.Below(std::size(factors))];
+                BeforeSimulation();
+                const bool stale = m_Rig.graph->HasStaleWorldTransforms();
+                if (m_Rng.Percent(70))   // else the phases by hand
+                {
+                    m_Rig.SimulateGraph(delta);
+                    CHECK(!m_Rig.graph->HasStaleWorldTransforms());
+                    ++m_Counts.byGraph;
+                }
+                else
+                {
+                    m_Rig.Simulate(delta);
+                    CHECK(m_Rig.graph->HasStaleWorldTransforms() == stale);
+                }
                 ++m_Counts.simulated;
                 AfterSimulation();
                 // edits between the interpolation and the Refresh, with driven nodes that moved and children that did not
@@ -3054,6 +3263,8 @@ namespace
         void BecomesAuthored(ModelNode* node, const dm::daffine3& simulatedWorld, const dm::daffine3& simulatedParent)
         {
             node->driven = false;
+            m_Counts.pendingDropped += node->pending ? 1 : 0;
+            node->pending = false;
             node->hasLocal = true;
             node->local = { node->node->GetTranslation(), node->node->GetRotation(), node->node->GetScaling() };
             const dm::daffine3 local =
@@ -3090,8 +3301,10 @@ namespace
 
         void EditOnce()
         {
-            const uint32_t pick = m_Rng.Below(100);
-            if (pick < 22)
+            const uint32_t pick = m_Rng.Below(125);
+            if (pick >= 100)
+                Teleport();
+            else if (pick < 22)
             {
                 ModelNode* node = Pick();
                 for (int i = 0; i < 8 && (node->driven || (m_Rng.Percent(50) && Depth(node) < 60)); ++i)
@@ -3259,9 +3472,111 @@ namespace
             }
         }
 
+        // A request through the setters, some parts or all: the model works on matrices (the scales are uniform, so a
+        // row is a scaled axis), the graph on parts.
+        void Teleport()
+        {
+            ModelNode* node = Pick();
+            for (int i = 0; i < 8 && !node->driven; ++i)
+                node = Pick();
+            if (m_Rng.Percent(40))   // one that is asked for again
+            {
+                for (ModelNode* other : m_Attached)
+                    node = other->driven && other->pending ? other : node;
+            }
+            if (!node->driven)
+                return;
+            const SimPose pose = *m_Rig.Get<SimPose>(node->node);
+            const dm::daffine3 toParent = inverse(node->parent ? World(node->parent, true) : dm::daffine3::identity());
+            const bool same = m_Rng.Percent(25);   // what the getters return: where the simulation has it
+            uint32_t mask = 1 + m_Rng.Below(7);
+            if (mask != 7 && !same && node->pending && node->resolved)
+                ++m_Counts.mergedResolved;
+            dm::daffine3 local = node->pending && !same ? (node->resolved ? node->request * toParent : node->request)
+                                                        : World(node, true) * toParent;
+            Placement given = RandomPlacement(m_Rng);
+            if (same)
+            {
+                mask = 7;
+                given = { node->node->GetTranslation(), node->node->GetRotation(), node->node->GetScaling() };
+                ++m_Counts.same;
+            }
+            else
+            {
+                dm::double3* rows[3] = { &local.m_linear.row0, &local.m_linear.row1, &local.m_linear.row2 };
+                const dm::double3x3 rotation = given.rotation.toMatrix();
+                const dm::double3 axes[3] = { rotation.row0, rotation.row1, rotation.row2 };
+                for (int i = 0; i < 3; ++i)
+                {
+                    const double length = std::sqrt(dm::dot(*rows[i], *rows[i]));
+                    *rows[i] = (mask & 2 ? axes[i] : *rows[i] / length) * (mask & 4 ? given.scaling[i] : length);
+                }
+                if (mask & 1)
+                    local.m_translation = given.translation;
+            }
+            if (mask == 1)
+                node->node->SetTranslation(given.translation);
+            else if (mask == 2)
+                node->node->SetRotation(given.rotation);
+            else if (mask == 4)
+                node->node->SetScaling(given.scaling);
+            else
+                node->node->SetTransform(mask & 1 ? &given.translation : nullptr, mask & 2 ? &given.rotation : nullptr,
+                                         mask & 4 ? &given.scaling : nullptr);
+            node->pending = true;
+            node->resolved = false;
+            node->request = local;
+            const SimTeleport& request = *m_Rig.Get<SimTeleport>(node->node);
+            CHECK(m_Rig.IsPending(node->node) && request.space == SimTeleportSpace::Parent);
+            CHECK(Near(ComposeTransform(request.translation, request.rotation, request.scaling), local, 1e-8));
+            CHECK(SameBits(&pose, m_Rig.Get<SimPose>(node->node), sizeof(pose)));
+            ++m_Counts.teleports;
+        }
+
+        // The requests are resolved over the poses as they are when the simulation starts.
+        void BeforeSimulation()
+        {
+            m_Domain->taken.clear();
+            for (ModelNode* node : m_Attached)
+            {
+                if (!node->driven || !node->pending || node->resolved)
+                    continue;
+                if (node->parent)
+                    node->request = node->request * World(node->parent, true);
+                node->resolved = true;
+            }
+        }
+
         void AfterSimulation()
         {
             m_Alpha = m_Rig.Alpha(m_Id);
+            // the engine took every request when it stepped, and none when it did not
+            std::map<Entity, const SimTeleport*> taken;
+            for (const BallDomain::Taken& t : m_Domain->taken)
+                taken[t.entity] = &t.request;
+            CHECK(taken.size() == m_Domain->taken.size());
+            const bool stepped = GetResource<FixedStepState>(m_Rig.world)->domains[uint32_t(m_Id)].stepsTaken != 0;
+            size_t expected = 0;
+            for (ModelNode* node : m_Attached)
+            {
+                if (!node->driven || !node->pending)
+                    continue;
+                const auto it = taken.find(m_Rig.EntityOf(node->node));
+                CHECK((it != taken.end()) == stepped && m_Rig.IsPending(node->node) == !stepped);
+                const SimTeleport& request = stepped ? *it->second : *m_Rig.Get<SimTeleport>(node->node);
+                CHECK(request.space == SimTeleportSpace::World);
+                CHECK(Near(ComposeTransform(request.translation, request.rotation, request.scaling), node->request,
+                           1e-8));
+                m_Counts.waited += stepped ? 0 : 1;
+                if (!stepped)
+                    continue;
+                ++expected;
+                node->pending = false;
+                node->scale.scaling = request.scaling;
+                CHECK(SameBits(m_Rig.Get<SimScale>(node->node), &node->scale, sizeof(node->scale)));
+            }
+            CHECK(taken.size() == expected);
+            m_Counts.taken += uint32_t(expected);
             for (ModelNode* node : m_Attached)
             {
                 if (!node->driven)
@@ -3312,8 +3627,15 @@ namespace
             }
             else
             {
-                const dm::daffine3 parent = node->parent ? node->parent->world : dm::daffine3::identity();
-                CHECK(Near(node->node->GetLocalToParentTransform() * parent, node->world, 1e-7));
+                // the getters are over the simulated poses, whatever is shown, and silent about requests
+                const dm::daffine3 parent = node->parent ? World(node->parent, true) : dm::daffine3::identity();
+                const dm::daffine3 world = World(node, true);
+                CHECK(Near(node->node->GetLocalToParentTransform() * parent, world, 1e-7));
+                CHECK(Near(ComposeTransform(node->node->GetTranslation(), node->node->GetRotation(),
+                                            node->node->GetScaling()) * parent, world, 1e-7));
+                CHECK(m_Rig.IsPending(node->node) == node->pending);
+                if (node->pending)
+                    Mix(m_Rig.Get<SimTeleport>(node->node), sizeof(SimTeleport));
             }
         }
 
@@ -3352,15 +3674,16 @@ namespace
     };
 }
 
-// Random binds, unbinds, moves, reparents, SetLeaf, detaches, re-attaches, destructions, copies and new roots, between
-// frames with and without simulation: after every frame each world transform (bit for bit), box and subtree content
-// equals what the model computes from scratch, the engine holds exactly the driven nodes, and the GPU scene follows.
+// Random binds, unbinds, moves, teleports, reparents, SetLeaf, detaches, re-attaches, destructions, copies and new
+// roots, between frames with Simulate, with the phases by hand and without simulation: after every frame each world
+// transform (bit for bit), box and subtree content equals what the model computes from scratch, the engine holds exactly
+// the driven nodes, it took exactly the requests the model has, at their targets, and the GPU scene follows.
 void test_driver_random()
 {
 #ifdef NDEBUG
     constexpr uint32_t c_Frames = 220;
 #else
-    constexpr uint32_t c_Frames = 60;
+    constexpr uint32_t c_Frames = 120;
 #endif
     Script::Counts total;
     for (uint64_t seed : { 1ull, 2ull, 3ull, 4ull })
@@ -3371,11 +3694,17 @@ void test_driver_random()
         const Script::Counts& c = script.GetCounts();
         std::printf("random %llu: %u binds (%u deep), %u unbinds, %u moves, %u reparents, %u SetLeaf, %u detaches, %u "
                     "attaches, %u dropped, %u copies, %u roots, %u driven nodes detached, %u frames simulated, %u not, "
-                    "%u "
-                    "edits between\n",
+                    "%u edits between; %u by Simulate, %u teleports (%u of the same place, %u merged with resolved "
+                    "ones), %u taken, %u waited, %u dropped\n",
                     (unsigned long long)seed, c.binds, c.deepDriven, c.unbinds, c.moves, c.reparents, c.leaves,
                     c.detaches, c.attaches, c.drops, c.copies, c.roots, c.drivenDetached, c.simulated, c.stillFrames,
-                    c.between);
+                    c.between, c.byGraph, c.teleports, c.same, c.mergedResolved, c.taken, c.waited, c.pendingDropped);
+        total.byGraph += c.byGraph;
+        total.teleports += c.teleports;
+        total.mergedResolved += c.mergedResolved;
+        total.taken += c.taken;
+        total.waited += c.waited;
+        total.pendingDropped += c.pendingDropped;
         total.binds += c.binds;
         total.deepDriven += c.deepDriven;
         total.unbinds += c.unbinds;
@@ -3386,6 +3715,8 @@ void test_driver_random()
     }
     CHECK(total.binds > 200 && total.deepDriven > 20 && total.unbinds > 50 && total.drivenDetached > 50 &&
           total.copies > 10 && total.roots > 4 && total.drops > 10);
+    CHECK(total.byGraph > 60 && total.teleports > 100 && total.taken > 70 && total.waited > 40 &&
+          total.mergedResolved > 5 && total.pendingDropped > 5);
 }
 
 // The same script at 1, 2 and 8 workers: the same transforms, poses and engine indices in every frame.
@@ -3452,6 +3783,2381 @@ void test_driver_allocations()
     }
 }
 
+// ------------------------------------------------------------------------------------------------- Simulate
+
+// The frame of SceneGraph::Simulate: propagation first when edits are pending (and only then), so that a gather sees this
+// frame's kinematic inputs; the time; BeginFrame to PostSimulation and the interpolation, once each, and nothing after.
+void test_simulate_frame()
+{
+    Rig rig;
+    auto domain = rig.NewDomain("balls", 0.25, 4);
+    const SimulationDomainId id = rig.AddDomain(domain);
+    SceneGraphNode* kinematic = rig.AddAt(rig.Root(), 1.0, 2.0, 3.0);
+    SceneGraphNode* hand = rig.AddAt(kinematic, 0.0, 1.0, 0.0, true);
+    SceneGraphNode* ball = rig.AddAt(rig.Root(), 0.0, 40.0, 0.0, true);
+    SceneGraphNode* onBall = rig.AddAt(ball, 1.0, 0.0, 0.0);
+    rig.Bind(ball);
+    rig.Refresh();
+    rig.Refresh();
+    std::vector<int> order;
+    auto mark = [&](const char* name, Phase phase, int number)
+    {
+        rig.AddSystem(name, phase, {}, [&order, number](ISystemContext*)
+        {
+            order.push_back(number);
+            return nvrhi::FS_OK;
+        });
+    };
+    mark("test.begin", Phase::BeginFrame, 1);
+    mark("test.teleports", rig.Store().GetTeleportPhase(), 2);
+    mark("test.pre", Phase::PreSimulation, 3);
+    mark("test.fixed", Phase::FixedSimulation, 4);
+    mark("test.post", Phase::PostSimulation, 5);
+    mark("test.interpolation", rig.Store().GetInterpolationPhase(), 6);
+    mark("test.propagation", Phase::TransformPropagation, 7);
+    mark("test.bounds", Phase::Bounds, 8);
+    mark("test.extract", Phase::RenderExtract, 9);
+    mark("test.end", Phase::EndFrame, 10);
+    dm::double3 handSeen(0.0);
+    bool staleSeen = true;
+    uint32_t stepsSeen = 99;
+    FrameTime timeSeen{};
+    domain->onGather = [&](ISimulationContext* context)
+    {
+        handSeen = hand->GetLocalToWorldTransform().m_translation;
+        staleSeen = rig.graph->HasStaleWorldTransforms();
+        stepsSeen = context->GetStepsThisFrame();
+        timeSeen = context->GetSystemContext()->GetFrameTime();
+    };
+
+    // nothing pending: no propagation
+    const uint64_t propagations = rig.RunsOf(Phase::TransformPropagation);
+    rig.SimulateGraph(0.25 * 1.5);
+    CHECK(order == std::vector<int>({ 1, 2, 3, 4, 5, 6 }));
+    CHECK(rig.RunsOf(Phase::TransformPropagation) == propagations);
+    CHECK(Near(handSeen, dm::double3(1.0, 3.0, 3.0), 0.0) && !staleSeen && stepsSeen == 1 && domain->steps == 1);
+    CHECK(timeSeen.time == 0.375 && timeSeen.deltaTime == 0.375 && timeSeen.frameIndex == 0);
+    CHECK(rig.Alpha(id) == 0.5);
+    CHECK(SameBits(ball->GetLocalToWorldTransform(), DirectWorld(*rig.Get<SimPosePrevious>(ball), *rig.Get<SimPose>(ball),
+                                                                 *rig.Get<SimScale>(ball), 0.5)));
+    // what hangs below follows at the next Refresh, which runs although no edit is pending
+    const uint64_t skipped = rig.Store().GetCounters().skippedRefreshes;
+    const dm::daffine3 below = onBall->GetLocalToWorldTransform();
+    CHECK(!Near(below.m_translation - ball->GetLocalToWorldTransform().m_translation, dm::double3(1.0, 0.0, 0.0), 1e-6));
+    order.clear();
+    rig.Refresh();
+    CHECK(order == std::vector<int>({ 7, 8 }) && rig.Store().GetCounters().skippedRefreshes == skipped);
+    CHECK(!SameBits(onBall->GetLocalToWorldTransform(), below));
+    CheckChildrenFollow(rig);
+
+    // an edit: propagated first, so that the gather sees it; the flags stay pending for Refresh
+    order.clear();
+    kinematic->SetTranslation(dm::double3(10.0, 2.0, 3.0));
+    CHECK(rig.graph->HasStaleWorldTransforms() && rig.graph->HasPendingTransformChanges());
+    rig.SimulateGraph(0.25);
+    CHECK(order == std::vector<int>({ 7, 1, 2, 3, 4, 5, 6 }));
+    CHECK(Near(handSeen, dm::double3(10.0, 3.0, 3.0), 0.0) && !staleSeen);
+    CHECK(timeSeen.time == 0.625 && timeSeen.deltaTime == 0.25 && timeSeen.frameIndex == 1);
+    CHECK(!rig.graph->HasStaleWorldTransforms() && rig.graph->HasPendingTransformChanges() &&
+          !rig.graph->HasPendingStructureChanges());
+    const auto boxOf = [&](const SceneGraphNode* node)
+    {
+        return rig.mesh->objectSpaceBounds * dm::affine3(node->GetLocalToWorldTransform());
+    };
+    CHECK(!all(rig.Get<WorldBounds>(hand)->bounds.m_mins == boxOf(hand).m_mins));   // Bounds is Refresh's
+    rig.Refresh();
+    CHECK(all(rig.Get<WorldBounds>(hand)->bounds.m_mins == boxOf(hand).m_mins));
+    CHECK(all(rig.Get<WorldBounds>(ball)->bounds.m_mins == boxOf(ball).m_mins));
+    CHECK(rig.graph->HasPendingTransformChanges());    // of this frame's move, for one more
+    rig.SimulateGraph(0.0);
+    rig.Refresh();
+    CHECK(!rig.graph->HasPendingTransformChanges());
+
+    // structure: a node attached below a moved one, before Simulate
+    rig.graph->Detach(hand);
+    CHECK(rig.graph->HasPendingStructureChanges());
+    hand = rig.AddAt(kinematic, 0.0, 7.0, 0.0, true);
+    rig.SimulateGraph(0.25);
+    CHECK(Near(handSeen, dm::double3(10.0, 9.0, 3.0), 0.0) && rig.graph->HasPendingStructureChanges());
+    rig.Refresh();
+    CHECK(!rig.graph->HasPendingStructureChanges());
+
+    // two in a row, and a Refresh before one, as GVDBApp does
+    const uint32_t steps = domain->steps;
+    kinematic->SetTranslation(dm::double3(20.0, 2.0, 3.0));
+    rig.Refresh();
+    order.clear();
+    rig.SimulateGraph(0.25);
+    rig.SimulateGraph(0.25);
+    CHECK(order == std::vector<int>({ 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6 }) && domain->steps == steps + 2);
+    CHECK(Near(handSeen, dm::double3(20.0, 9.0, 3.0), 0.0));
+    rig.Refresh();
+    CheckChildrenFollow(rig);
+
+    // time that is none does not advance the simulation; the call is a frame all the same
+    for (double delta : { 0.0, -1.0, std::numeric_limits<double>::quiet_NaN() })
+    {
+        const uint64_t index = GetResource<FixedStepState>(rig.world)->domains[uint32_t(id)].stepIndex;
+        CHECK(rig.graph->Simulate(FrameTime{ rig.time, delta, rig.frame++ }) == nvrhi::FS_OK);
+        CHECK(GetResource<FixedStepState>(rig.world)->domains[uint32_t(id)].stepIndex == index);
+    }
+}
+
+// Simulate and Refresh give what the phases by hand and Refresh give, bit for bit and row for row.
+void test_simulate_by_hand()
+{
+    std::vector<uint64_t> hashes[2];
+    for (int byGraph = 0; byGraph < 2; ++byGraph)
+    {
+        Rig rig;
+        auto domain = rig.NewDomain("balls", 1.0 / 32.0, 3);
+        rig.AddDomain(domain);
+        Rng rng(5);
+        std::vector<SceneGraphNode*> nodes = { rig.Root() };
+        for (int i = 0; i < 150; ++i)
+        {
+            const Placement p = RandomPlacement(rng);
+            nodes.push_back(rig.Add(nodes[rng.Below(nodes.size())], &p, i % 3 == 0));
+        }
+        for (int i = 1; i < 150; i += 4)
+            rig.Bind(nodes[size_t(i)]);
+        rig.Refresh();
+        for (int frame = 0; frame < 40; ++frame)
+        {
+            for (int k = rng.Below(5); k > 0; --k)
+                nodes[1 + rng.Below(nodes.size() - 1)]->SetTranslation(RandomVector(rng, -3.0, 3.0));   // some of driven
+            const double delta = domain->dt * rng.Range(0.0, 2.5);
+            if (byGraph)
+                rig.SimulateGraph(delta);
+            else
+            {
+                // as documented
+                if (rig.graph->HasStaleWorldTransforms())
+                    CHECK(rig.graph->GetScheduler()->RunPhase(Phase::TransformPropagation) == nvrhi::FS_OK);
+                rig.Simulate(delta);
+            }
+            rig.Refresh();
+            hashes[byGraph].push_back(rig.world->ComputeHash());
+            hashes[byGraph].push_back(rig.PropagatedRows());
+        }
+        CHECK(domain->teleportsTaken > 10);
+    }
+    CHECK(hashes[0] == hashes[1]);
+    for (size_t i = 2; i < hashes[0].size(); i += 2)
+        CHECK(hashes[0][i] != hashes[0][i - 2]);
+}
+
+// Where Simulate may not run it changes nothing, the time included; failures leave a graph that works.
+void test_simulate_refused()
+{
+    Rig rig;
+    auto domain = rig.NewDomain("balls", 0.25, 4);
+    const SimulationDomainId id = rig.AddDomain(domain);
+    SceneGraphNode* ball = rig.AddAt(rig.Root(), 0.0, 40.0, 0.0);
+    SceneGraphNode* authored = rig.AddAt(rig.Root(), 1.0, 0.0, 0.0);
+    rig.Bind(ball);
+    rig.Refresh();
+    rig.GraphFrame(0.25 * 1.25);
+    IScheduler* scheduler = rig.graph->GetScheduler();
+    auto entry = [&]() { return GetResource<FixedStepState>(rig.world)->domains[uint32_t(id)]; };
+    const FixedStepEntry before = entry();
+    const FrameTime timeBefore = *GetResource<FrameTime>(rig.world);
+    auto unchanged = [&]()
+    {
+        const FixedStepEntry now = entry();
+        return SameBits(&now, &before, sizeof(now)) &&
+               SameBits(GetResource<FrameTime>(rig.world), &timeBefore, sizeof(timeBefore));
+    };
+
+    // inside a phase, stale or not
+    for (bool stale : { false, true })
+    {
+        if (stale)
+            authored->SetTranslation(dm::double3(2.0, 0.0, 0.0));
+        nvrhi::FRESULT result = nvrhi::FS_OK;
+        bool unchangedInside = false;
+        const SystemId inPhase = rig.AddSystem("test.inside", Phase::EndFrame, {}, [&](ISystemContext*)
+        {
+            result = rig.graph->Simulate(FrameTime{ 99.0, 99.0, 99 });
+            unchangedInside = unchanged();
+            return nvrhi::FS_OK;
+        });
+        CHECK(scheduler->RunPhase(Phase::EndFrame) == nvrhi::FS_OK);
+        CHECK(result == nvrhi::FE_INVALID_ARGS && unchangedInside && unchanged() && TakeWarnings() == 1);
+        CHECK(rig.graph->HasStaleWorldTransforms() == stale);
+        CHECK(scheduler->RemoveSystem(inPhase) == nvrhi::FS_OK);
+    }
+    // in a callback of the domain (an observer), and in its capture, where the scheduler is busy
+    nvrhi::FRESULT inCallback = nvrhi::FS_OK;
+    domain->onAdded = [&](const EntityBatch&, ISimulationContext*)
+    {
+        inCallback = rig.graph->Simulate(FrameTime{ 99.0, 99.0, 99 });
+    };
+    SceneGraphNode* second = rig.AddAt(rig.Root(), 5.0, 40.0, 0.0);
+    rig.Refresh();   // no edit pending: nothing else keeps it from taking the time
+    rig.Bind(second);
+    domain->onAdded = nullptr;
+    CHECK(inCallback == nvrhi::FE_INVALID_ARGS && unchanged() && TakeWarnings() == 1);
+    rig.Refresh();
+    struct Busy final : public nvrhi::ObjectImpl<IStateWriter>
+    {
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(Busy)
+        NVRHI_IMPLEMENTS_INTERFACE(IStateWriter)
+        NVRHI_END_INTERFACE_TABLE()
+        SceneGraph* graph = nullptr;
+        nvrhi::FRESULT result = nvrhi::FS_OK;
+        nvrhi::FRESULT Write(const void*, uint64_t) noexcept override
+        {
+            result = graph->Simulate(FrameTime{ 99.0, 99.0, 99 });
+            return nvrhi::FE_GENERIC_ERROR;
+        }
+    };
+    auto busy = MAKE_RC_OBJ_PTR(Busy);
+    busy->graph = rig.graph;
+    CHECK(NVRHI_FAILED(scheduler->SaveSimulationState(busy)));
+    CHECK(busy->result == nvrhi::FE_INVALID_ARGS && unchanged() && TakeWarnings() >= 1);
+
+    // an ordering cycle in a simulation phase: nothing runs, the time is taken; the next frame takes the steps
+    const SystemId first = rig.AddSystem("test.first", Phase::PreSimulation, {}, [](ISystemContext*)
+        { return nvrhi::FS_OK; }, SystemFlags::MainThread, "test.second");
+    const SystemId cycle = rig.AddSystem("test.second", Phase::PreSimulation, {}, [](ISystemContext*)
+        { return nvrhi::FS_OK; }, SystemFlags::MainThread, "test.first");
+    const SimPose poseBefore = *rig.Get<SimPose>(ball);
+    const uint32_t steps = domain->steps;
+    authored->SetTranslation(dm::double3(3.0, 0.0, 0.0));
+    CHECK(rig.TrySimulate(0.25) == nvrhi::FE_INVALID_ARGS);
+    (void)TakeWarnings();   // the cycle's, in Debug builds
+    CHECK(domain->steps == steps && SameBits(&poseBefore, rig.Get<SimPose>(ball), sizeof(poseBefore)));
+    CHECK(entry().stepsPlanned == 1 && !rig.graph->HasStaleWorldTransforms());   // propagation ran before
+    CHECK(authored->GetLocalToWorldTransform().m_translation.x == 3.0);
+    rig.Refresh();          // usable: edits and structure go on
+    rig.AddAt(authored, 1.0, 1.0, 1.0);
+    rig.Refresh();
+    CHECK(scheduler->RemoveSystem(first) == nvrhi::FS_OK && scheduler->RemoveSystem(cycle) == nvrhi::FS_OK);
+    rig.GraphFrame(0.25);
+    CHECK(domain->steps == steps + 2);
+    // one in TransformPropagation: with a stale edit nothing at all, without one the simulation runs
+    const SystemId third = rig.AddSystem("test.third", Phase::TransformPropagation, {}, [](ISystemContext*)
+        { return nvrhi::FS_OK; }, SystemFlags::MainThread, "test.fourth");
+    const SystemId fourth = rig.AddSystem("test.fourth", Phase::TransformPropagation, {}, [](ISystemContext*)
+        { return nvrhi::FS_OK; }, SystemFlags::MainThread, "test.third");
+    const FixedStepEntry atCycle = entry();
+    authored->SetTranslation(dm::double3(4.0, 0.0, 0.0));
+    CHECK(rig.TrySimulate(0.25) == nvrhi::FE_INVALID_ARGS);
+    const FixedStepEntry afterCycle = entry();
+    CHECK(SameBits(&atCycle, &afterCycle, sizeof(atCycle)) && domain->steps == steps + 2);
+    CHECK(rig.graph->HasStaleWorldTransforms());
+    (void)TakeWarnings();
+    CHECK(scheduler->RemoveSystem(third) == nvrhi::FS_OK);
+    rig.SimulateGraph(0.25);
+    CHECK(domain->steps == steps + 3 && authored->GetLocalToWorldTransform().m_translation.x == 4.0);
+    CHECK(scheduler->RemoveSystem(fourth) == nvrhi::FS_OK);
+    rig.Refresh();
+
+    // a failing system and a failing step: the frame goes on, the diagnostics have them, and the next frame steps
+    bool failing = true;
+    const SystemId failed = rig.AddSystem("test.failing", Phase::BeginFrame, {}, [&](ISystemContext*)
+        { return failing ? nvrhi::FE_GENERIC_ERROR : nvrhi::FS_OK; });
+    domain->onStep = [&](ISimulationContext*) { return failing ? nvrhi::FE_GENERIC_ERROR : nvrhi::FS_OK; };
+    ball->SetTranslation(dm::double3(0.0, 77.0, 0.0));
+    rig.GraphFrame(0.25 * 2.0);
+    (void)TakeWarnings();   // the first failures are logged
+    CHECK(domain->steps == steps + 3 && entry().stepsDropped == 2 && entry().stepsTaken == 0);
+    CHECK(!rig.IsPending(ball) && rig.Get<SimPose>(ball)->translation.y == 77.0);   // taken by the gather
+    CHECK(ball->GetLocalToWorldTransform().m_translation.y == 77.0);
+    nvrhi::string text;
+    scheduler->GetDiagnostics(text);
+    CHECK(std::strstr(text.c_str(), "test.failing") && std::strstr(text.c_str(), "balls.step"));
+    failing = false;
+    rig.GraphFrame(0.25);
+    CHECK(domain->steps == steps + 4 && rig.Get<SimPose>(ball)->translation.y != 77.0);
+    CHECK(scheduler->RemoveSystem(failed) == nvrhi::FS_OK);
+    domain->onStep = nullptr;
+
+    // out of memory while the requests are gathered: none is resolved, the domain leaves them alone, the next frame has
+    // them all
+    {
+        Rig full;
+        auto balls = full.NewDomain();
+        full.AddDomain(balls);
+        std::vector<SceneGraphNode*> nodes;
+        for (int i = 0; i < 400; ++i)   // in several chunks; no propagation has seen them
+        {
+            nodes.push_back(full.AddAt(full.Root(), double(i), 30.0, 0.0));
+            full.Bind(nodes.back());
+            nodes.back()->SetTranslation(dm::double3(double(i), 50.0, 0.0));
+        }
+        Phase before = Phase::Count;
+        CHECK(full.graph->GetScheduler()->AddPhase("test.before", Phase::BeginFrame, before) == nvrhi::FS_OK);
+        bool arm = true;
+        full.AddSystem("test.arm", before, {}, [&](ISystemContext*)
+        {
+            g_FailNextNew.store(arm);
+            return nvrhi::FS_OK;
+        });
+        full.SimulateGraph(0.25);
+        CHECK(!g_FailNextNew.load() && TakeWarnings() == 1);   // the scheduler's, for the failure
+        CHECK(full.Resolved() == 0 && balls->teleportsTaken == 0 && balls->parentSpaceSeen == nodes.size());
+        arm = false;
+        full.GraphFrame(0.25);
+        CHECK(full.Resolved() == nodes.size() && balls->teleportsTaken == nodes.size());
+        CHECK(full.graph->GetScheduler()->GetAmbiguityCount() == 0);
+    }
+
+    // inside a render-read scope it warns like every write, in Debug builds, and runs
+    rig.graph->BeginRenderRead();
+    rig.SimulateGraph(0.25);
+    rig.graph->EndRenderRead();
+#ifdef NDEBUG
+    CHECK(TakeWarnings() == 0);
+#else
+    CHECK(TakeWarnings() == 1);
+#endif
+    CHECK(domain->steps == steps + 5);
+    // a graph without domains and driven nodes: a frame without work
+    Rig empty;
+    SceneGraphNode* child = empty.AddAt(empty.Root(), 1.0, 0.0, 0.0);
+    empty.GraphFrame(1.0);
+    child->SetTranslation(dm::double3(2.0, 0.0, 0.0));
+    empty.GraphFrame(1.0);
+    CHECK(child->GetLocalToWorldTransform().m_translation.x == 2.0 && empty.Resolved() == 0);
+}
+
+// Systems of the application around the simulation: one in FixedSimulation that reads the time, one in PreSimulation that
+// writes a kinematic input, one in BeginFrame that moves a parent: a request below it is resolved where it put it, and
+// the scheduler has nothing to report.
+void test_simulate_application()
+{
+    Rig rig;
+    auto domain = rig.NewDomain("balls", 0.25, 4);
+    const SimulationDomainId id = rig.AddDomain(domain);
+    SceneGraphNode* parent = rig.AddAt(rig.Root(), 1.0, 0.0, 0.0);
+    SceneGraphNode* ball = rig.AddAt(parent, 0.0, 40.0, 0.0);
+    rig.Bind(ball);
+    rig.Refresh();
+    uint32_t planned = 0, taken = 0, runs = 0;
+    rig.AddSystem("test.fixed", Phase::FixedSimulation, { rig.Reads(FindComponent<FixedStepState>(rig.world)) },
+        [&](ISystemContext* context)
+    {
+        planned = GetResource<FixedStepState>(context->GetWorld())->domains[uint32_t(id)].stepsPlanned;
+        ++runs;
+        return nvrhi::FS_OK;
+    }, SystemFlags::None);
+    rig.AddSystem("test.move", Phase::BeginFrame, { rig.Writes(FindComponent<LocalTransform>(rig.world)) },
+        [&](ISystemContext* context)
+    {
+        LocalTransform* local =
+            GetComponentForWrite<LocalTransform>(context->GetWorld(), rig.EntityOf(parent), context->GetVersion());
+        EXPECT(local);
+        local->translation.x += 100.0;
+        return nvrhi::FS_OK;
+    }, SystemFlags::None);
+    CHECK(rig.graph->GetScheduler()->Build() == nvrhi::FS_OK && rig.graph->GetScheduler()->GetAmbiguityCount() == 0);
+    ball->SetTransform(nullptr, nullptr, nullptr);   // nothing asked
+    CHECK(!rig.IsPending(ball));
+    ball->SetTranslation(dm::double3(0.0, 50.0, 0.0));
+    rig.GraphFrame(0.25 * 2.0);
+    taken = GetResource<FixedStepState>(rig.world)->domains[uint32_t(id)].stepsTaken;
+    CHECK(planned == 2 && taken == 2 && runs == 1);
+    CHECK(domain->taken.size() == 1 && Near(domain->taken[0].request.translation, dm::double3(101.0, 50.0, 0.0), 1e-14));
+    CHECK(parent->GetLocalToWorldTransform().m_translation.x == 101.0);
+    rig.GraphFrame(0.1);
+    CHECK(planned == 0 && runs == 2 && parent->GetLocalToWorldTransform().m_translation.x == 201.0);
+}
+
+// SetJobSystem would drop the domains: refused with a warning while there are some. Inside a phase or a callback it is
+// refused too, and the graph keeps the scheduler it has.
+void test_simulate_job_system()
+{
+    Rig rig;
+    auto domain = rig.NewDomain("balls", 0.25, 4);
+    SimulationDomainId id = rig.AddDomain(domain);
+    SceneGraphNode* ball = rig.AddAt(rig.Root(), 0.0, 40.0, 0.0);
+    rig.Bind(ball);
+    rig.Refresh();
+    rig.GraphFrame(0.25);
+    IScheduler* scheduler = rig.graph->GetScheduler();
+    const uint64_t generation = rig.graph->GetSchedulerGeneration();
+    auto jobs = MakeJobs(1);
+    auto kept = [&]()
+    {
+        return rig.graph->GetScheduler() == scheduler && scheduler->GetJobSystem() == rig.jobs.Get() &&
+               rig.graph->GetSchedulerGeneration() == generation;
+    };
+    for (IJobSystem* other : { jobs.Get(), static_cast<IJobSystem*>(nullptr) })
+    {
+        rig.graph->SetJobSystem(other);
+        CHECK(TakeWarnings() == 1 && kept());
+    }
+    rig.graph->SetJobSystem(rig.jobs);   // the one it has: nothing to do
+    CHECK(TakeWarnings() == 0 && kept());
+    const uint32_t steps = domain->steps;
+    rig.GraphFrame(0.25);
+    CHECK(domain->steps == steps + 1);   // the domain is still there
+    // a second domain, and the first one removed: still refused; both removed: accepted
+    auto second = rig.NewDomain("second", 0.5, 1, RegisterComponent<HeavyBall>(rig.world));
+    const SimulationDomainId secondId = rig.AddDomain(second);
+    CHECK(scheduler->RemoveSimulationDomain(id) == nvrhi::FS_OK);
+    (void)TakeWarnings();   // the two domains' ambiguity, in Debug builds
+    rig.graph->SetJobSystem(jobs);
+    CHECK(TakeWarnings() == 1 && kept());
+    CHECK(scheduler->RemoveSimulationDomain(secondId) == nvrhi::FS_OK);
+
+    // no domain: inside a phase and in an observer refused first, with the scheduler alive
+    uint32_t inside = 0;
+    const SystemId system = rig.AddSystem("test.inside", Phase::BeginFrame, {}, [&](ISystemContext*)
+    {
+        rig.graph->SetJobSystem(jobs);
+        inside += kept() ? 1 : 0;
+        return nvrhi::FS_OK;
+    });
+    const SystemId alone = rig.AddSystem("test.alone", Phase::EndFrame, {}, [&](ISystemContext*)
+    {
+        rig.graph->SetJobSystem(jobs);
+        inside += kept() ? 1 : 0;
+        return nvrhi::FS_OK;
+    }, SystemFlags::Exclusive);
+    rig.SimulateGraph(0.25);
+    CHECK(inside == 1 && kept() && TakeWarnings() == 1);
+    CHECK(scheduler->RunPhase(Phase::EndFrame) == nvrhi::FS_OK && inside == 2 && kept() && TakeWarnings() == 1);
+    CHECK(scheduler->RemoveSystem(system) == nvrhi::FS_OK && scheduler->RemoveSystem(alone) == nvrhi::FS_OK);
+    struct InObserver final : public nvrhi::ObjectImpl<IObserver>
+    {
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(InObserver)
+        NVRHI_IMPLEMENTS_INTERFACE(IObserver)
+        NVRHI_END_INTERFACE_TABLE()
+        std::function<void()> call;
+        nvrhi::FRESULT OnEntities(ObserverEvent, const EntityBatch&, ICommandBuffer*) noexcept override
+        {
+            call();
+            return nvrhi::FS_OK;
+        }
+    };
+    auto observer = MAKE_RC_OBJ_PTR(InObserver);
+    uint32_t calls = 0;
+    observer->call = [&]()
+    {
+        rig.graph->SetJobSystem(jobs);
+        calls += kept() ? 1 : 0;
+    };
+    ObserverDesc desc{};
+    desc.component = FindComponent<LeafObject>(rig.world);
+    desc.event = ObserverEvent::OnAdd;
+    desc.access = Access::Read;
+    ObserverId observerId = ObserverId::Invalid;
+    CHECK(rig.world->AddObserver(desc, observer, observerId) == nvrhi::FS_OK);
+    rig.AddAt(rig.Root(), 0.0, 0.0, 0.0, true);
+    CHECK(calls == 1 && kept() && TakeWarnings() == 1);
+    CHECK(rig.world->RemoveObserver(observerId) == nvrhi::FS_OK);
+
+    // outside: accepted, and the simulation goes on with the domain added again
+    rig.graph->SetJobSystem(jobs);
+    CHECK(TakeWarnings() == 0 && rig.graph->GetScheduler() != scheduler);
+    CHECK(rig.graph->GetScheduler()->GetJobSystem() == jobs.Get() &&
+          rig.graph->GetSchedulerGeneration() == generation + 1);
+    auto third = rig.NewDomain("balls", 0.25, 4);
+    id = rig.AddDomain(third);
+    ball->SetTranslation(dm::double3(3.0, 50.0, 0.0));
+    rig.GraphFrame(0.25);
+    CHECK(third->steps == 1 && third->teleportsTaken == 1);
+}
+
+// Skinned instances: the frame that their joints' edits mark is that of the Refresh, whatever propagated them before:
+// GetLastUpdateFrameIndex and what the consumers select equal those of the same script without Simulate, frame by frame.
+void test_simulate_skinned()
+{
+    struct Result
+    {
+        std::vector<uint32_t> marks;
+        std::vector<bool> selected;
+    };
+    enum Mode { Plain, WithSimulate, ByHand, ModeCount };
+    Result results[ModeCount];
+    uint32_t edited = 0, quiet = 0;
+    for (int mode = 0; mode < ModeCount; ++mode)
+    {
+        Rig rig;
+        nvrhi::AutoPtr<SkinnedMeshInstance> skinned[2];
+        std::vector<SceneGraphNode*> joints;
+        for (auto& instance : skinned)
+        {
+            instance = rig.factory->CreateSkinnedMeshInstance(rig.factory, rig.mesh);
+            rig.graph->AttachLeafNode(rig.Root(), instance);
+        }
+        for (int i = 0; i < 4; ++i)
+        {
+            // a group node above each: its moves are no moves of the joint's own
+            auto node = MakeNode("joint");
+            node->SetTranslation(dm::double3(1.0));
+            node->SetLeaf(MAKE_RC_OBJ_PTR(SkinnedMeshReference, skinned[i / 2].Get()));
+            // the joints of the two instances are in different chunks (joint versions are per chunk)
+            SceneGraphNode* group = rig.AddAt(i / 2 ? rig.AddAt(rig.Root(), 0.0, 0.0, 0.0) : rig.Root(), 1.0, 0.0, 0.0);
+            joints.push_back(rig.graph->Attach(group, node));
+        }
+        SceneGraphNode* other = rig.AddAt(rig.Root(), 0.0, 0.0, 0.0);
+        Rng rng(77);
+        for (uint32_t frame = 1; frame <= 120; ++frame)
+        {
+            // 0, 1: a joint before Simulate; 2, 3: one between; 4: both; 5: another node; 6, 7: none; 8: a new leaf on a
+            // joint's node; 9: another scheduler
+            const uint32_t what = rng.Below(frame < 12 ? 9 : 10);
+            const uint32_t which = rng.Below(4);
+            auto edit = [&](double at) { joints[which]->SetTranslation(dm::double3(at, 0.0, double(frame))); };
+            if (what <= 1 || what == 4)
+                edit(1.0);
+            if (what == 5)
+                other->SetTranslation(dm::double3(double(frame)));
+            if (what == 8)
+                joints[which]->SetLeaf(MAKE_RC_OBJ_PTR(SkinnedMeshReference, skinned[which / 2].Get()));
+            if (what == 9 && frame % 3 == 0)
+            {
+                rig.jobs = MakeJobs(1 + frame % 2);
+                rig.graph->SetJobSystem(rig.jobs);
+                other->SetTranslation(dm::double3(double(frame)));   // so that the next Refresh runs without Simulate
+            }
+            if (mode == WithSimulate)
+                rig.SimulateGraph(1.0 / 60.0);
+            if (mode == ByHand)
+                CHECK(rig.graph->GetScheduler()->RunPhase(Phase::TransformPropagation) == nvrhi::FS_OK);
+            if (what >= 2 && what <= 4)
+                edit(2.0);
+            if (mode == WithSimulate && frame % 7 == 0)
+                rig.SimulateGraph(1.0 / 60.0);   // a second one, after the edit between
+            rig.graph->Refresh(frame);
+            if (mode == Plain)
+                (what <= 4 || what == 8 ? edited : quiet) += 1;
+            for (const auto& instance : skinned)
+            {
+                results[mode].marks.push_back(instance->GetLastUpdateFrameIndex());
+                results[mode].selected.push_back(!(instance->GetLastUpdateFrameIndex() + 1 < frame));
+            }
+            // spelled out for the plain frame: the edited instance is marked with this frame, and no later one marks it
+            if (what <= 4)
+                CHECK(skinned[which / 2]->GetLastUpdateFrameIndex() == frame);
+            if (what >= 5 && what <= 7)
+                CHECK(skinned[0]->GetLastUpdateFrameIndex() < frame && skinned[1]->GetLastUpdateFrameIndex() < frame);
+            // a new scheduler's first propagation counts every joint as moved, as it always did
+            if (what == 9 && frame % 3 == 0)
+                CHECK(skinned[0]->GetLastUpdateFrameIndex() == frame && skinned[1]->GetLastUpdateFrameIndex() == frame);
+        }
+    }
+    CHECK(edited > 40 && quiet > 20);
+    for (int mode = 1; mode < ModeCount; ++mode)
+    {
+        CHECK(results[mode].marks == results[Plain].marks);
+        CHECK(results[mode].selected == results[Plain].selected);
+    }
+
+    // a refused Refresh marks nothing and loses nothing
+    Rig rig;
+    auto instance = rig.factory->CreateSkinnedMeshInstance(rig.factory, rig.mesh);
+    rig.graph->AttachLeafNode(rig.Root(), instance);
+    auto node = MakeNode("joint");
+    node->SetTranslation(dm::double3(1.0));
+    node->SetLeaf(MAKE_RC_OBJ_PTR(SkinnedMeshReference, instance.Get()));
+    rig.graph->Attach(rig.Root(), node);
+    rig.graph->Refresh(5);
+    CHECK(instance->GetLastUpdateFrameIndex() == 5);
+    node->SetTranslation(dm::double3(2.0));
+    rig.SimulateGraph(0.0);
+    rig.AddSystem("test.refresh", Phase::EndFrame, {}, [&](ISystemContext*)
+    {
+        rig.graph->Refresh(6);
+        return nvrhi::FS_OK;
+    });
+    CHECK(rig.graph->GetScheduler()->RunPhase(Phase::EndFrame) == nvrhi::FS_OK);
+    CHECK(TakeWarnings() >= 1 && instance->GetLastUpdateFrameIndex() == 5);
+    rig.SimulateGraph(0.0);   // not the refused Refresh's propagation either
+    CHECK(instance->GetLastUpdateFrameIndex() == 5);
+    rig.graph->Refresh(7);
+    CHECK(instance->GetLastUpdateFrameIndex() == 7);
+}
+
+// Steady frames: Simulate with two steps and an edit to propagate, 10 teleports, Refresh, of 1,000 driven nodes with
+// children, leaves and a chain into the last bucket, allocate nothing.
+void test_simulate_allocations()
+{
+    for (uint32_t workers : { 1u, 8u })
+    {
+        Rig rig(workers);
+        auto domain = rig.NewDomain("balls", 0.25, 4);
+        domain->keepTaken = false;
+        rig.AddDomain(domain);
+        Rng rng(13);
+        std::vector<SceneGraphNode*> nodes, groups;
+        for (int i = 0; i < 10; ++i)
+        {
+            const Placement p = RandomPlacement(rng);
+            groups.push_back(rig.Add(rig.Root(), &p));
+        }
+        for (int i = 0; i < 1000; ++i)
+        {
+            const Placement p = RandomPlacement(rng);
+            nodes.push_back(rig.Add(groups[size_t(i) % groups.size()], &p, i % 2 == 0));
+            rig.Add(nodes.back(), &p, i % 3 == 0);
+            rig.Bind(nodes.back());
+        }
+        SceneGraphNode* deep = nodes[0];
+        for (int i = 0; i < 80; ++i)
+            deep = rig.AddAt(deep, 0.0, 0.01, 0.0);
+        rig.Bind(deep);   // its requests are resolved over the 79 nodes between
+        auto frame = [&](int index)
+        {
+            groups[size_t(index) % groups.size()]->SetTranslation(dm::double3(double(index), 1.0, 0.0));
+            for (int i = 0; i < 10; ++i)
+            {
+                SceneGraphNode* node = i == 0 ? deep : nodes[rng.Below(nodes.size())];
+                const Placement p = RandomPlacement(rng);
+                if (i % 4 == 0)
+                    Place(node, p);
+                else if (i % 4 == 1)
+                    node->SetTranslation(p.translation);
+                else if (i % 4 == 2)
+                    node->SetRotation(p.rotation);
+                else
+                    node->SetTransform(&p.translation, nullptr, &p.scaling);
+            }
+            rig.SimulateGraph(index % 3 == 2 ? 0.125 : 0.25 * 2.125);   // every third one step, or none
+            rig.Refresh();
+            return float(nodes[rng.Below(nodes.size())]->GetTranslation().x) +
+                   rig.Root()->GetGlobalBoundingBox().m_mins.x;
+        };
+        for (int i = 0; i < 12; ++i)
+            (void)frame(i);
+        const uint32_t steps = domain->steps, taken = domain->teleportsTaken;
+        const uint64_t newBefore = g_NewCount.load();
+        const uint64_t heapBefore = ecs::GetHeapAllocationCount();
+        float sum = 0.f;
+        for (int i = 12; i < 32; ++i)
+            sum += frame(i);
+        const uint64_t newCalls = g_NewCount.load() - newBefore;
+        const uint64_t heapBlocks = ecs::GetHeapAllocationCount() - heapBefore;
+        std::printf("steady Simulate frames, %u workers: %llu operator new, %llu storage blocks, %u steps, %u teleports "
+                    "(checksum %g)\n", workers, (unsigned long long)newCalls, (unsigned long long)heapBlocks,
+                    domain->steps - steps, domain->teleportsTaken - taken, double(sum));
+        CHECK(domain->steps - steps >= 28 && domain->teleportsTaken - taken > 150 && newCalls == 0 && heapBlocks == 0);
+        std::vector<int> probe(1000);   // the counter sees an allocation
+        CHECK(g_NewCount.load() > newBefore && probe.size() == 1000);
+    }
+}
+
+// ------------------------------------------------------------------------------------------------- teleports
+
+namespace
+{
+    // The last request that the domain took for a node; the case fails when it took none.
+    SimTeleport TakenOf(Rig& rig, const BallDomain* domain, const SceneGraphNode* node)
+    {
+        for (size_t i = domain->taken.size(); i-- > 0;)
+        {
+            if (domain->taken[i].entity == rig.EntityOf(node))
+                return domain->taken[i].request;
+        }
+        CHECK(false);
+        return {};
+    }
+    dm::daffine3 MatrixOf(const SimTeleport& request)
+    {
+        return ComposeTransform(request.translation, request.rotation, request.scaling);
+    }
+    // A simulation step without motion: no gravity reaches it, so poses change by teleports alone.
+    void Freeze(BallDomain* domain)
+    {
+        for (BallDomain::Ball& ball : domain->balls)
+        {
+            ball.velocity = dm::double3(0.0);
+            ball.spin = dm::dquat::identity();
+        }
+        domain->onStep = [domain](ISimulationContext*)
+        {
+            for (BallDomain::Ball& ball : domain->balls)
+                ball.velocity.y = 9.0 * domain->dt;   // what the step takes away
+            return nvrhi::FS_OK;
+        };
+    }
+}
+
+// Every setter on a driven node is a request: filled and enabled, with the parts that were not given where the simulation
+// has them; the pose, the kept LocalTransform, the getters, the world transform and the pending flags stay. The next step
+// takes it: the pose is the target, the engine goes on from there, and the interpolation does not smear.
+void test_teleport_setters()
+{
+    const Placement target{ dm::double3(100.0, 50.0, -30.0), c_OtherTurn, dm::double3(2.0, 2.0, 2.0) };
+    struct Setter
+    {
+        const char* name;
+        uint32_t parts;   // 1 translation, 2 rotation, 4 scaling
+        std::function<void(SceneGraphNode*)> set;
+    };
+    const Setter setters[] = {
+        { "SetTranslation", 1, [&](SceneGraphNode* node) { node->SetTranslation(target.translation); } },
+        { "SetRotation", 2, [&](SceneGraphNode* node) { node->SetRotation(target.rotation); } },
+        { "SetScaling", 4, [&](SceneGraphNode* node) { node->SetScaling(target.scaling); } },
+        { "SetTransform", 7, [&](SceneGraphNode* node) { Place(node, target); } },
+        { "SetTransform(t, r)", 3,
+          [&](SceneGraphNode* node) { node->SetTransform(&target.translation, &target.rotation, nullptr); } },
+        { "SetTransform(r, s)", 6,
+          [&](SceneGraphNode* node) { node->SetTransform(nullptr, &target.rotation, &target.scaling); } },
+        { "SetTransform(t, s)", 5,
+          [&](SceneGraphNode* node) { node->SetTransform(&target.translation, nullptr, &target.scaling); } },
+    };
+    for (bool root : { false, true })   // a driven root has no parent
+    {
+        for (const Setter& setter : setters)
+        {
+            Rig rig;
+            auto domain = rig.NewDomain("balls", 0.25, 4);
+            rig.AddDomain(domain);
+            Placement place{ dm::double3(1.0, 40.0, 2.0), c_Turn, dm::double3(1.5) };
+            SceneGraphNode* node = root ? rig.Root() : rig.Add(rig.Root(), &place, true);
+            SceneGraphNode* child = rig.AddAt(node, 1.0, 0.0, 0.0);
+            if (root)
+                Place(node, place);
+            rig.Bind(node);
+            rig.Refresh();
+            for (int i = 0; i < 3; ++i)
+                rig.GraphFrame(0.25 * 1.1);
+            rig.Refresh();
+            const ComponentId local = FindComponent<LocalTransform>(rig.world);
+            const LocalTransform kept = *rig.Get<LocalTransform>(node);
+            const uint64_t localVersion = rig.ColumnVersion(node, local);
+            const SimPose pose = *rig.Get<SimPose>(node);
+            const SimPosePrevious previous = *rig.Get<SimPosePrevious>(node);
+            const SimScale scale = *rig.Get<SimScale>(node);
+            const dm::daffine3 shown = node->GetLocalToWorldTransform();
+            const Placement got{ node->GetTranslation(), node->GetRotation(), node->GetScaling() };
+            const uint64_t structural = rig.world->GetStructuralVersion();
+            CHECK(!rig.IsPending(node) && !rig.graph->HasPendingTransformChanges());
+
+            rig.world->AdvanceVersion();
+            setter.set(node);
+            CHECK(rig.IsPending(node));
+            const SimTeleport request = *rig.Get<SimTeleport>(node);
+            CHECK(request.space == SimTeleportSpace::Parent && request.reserved == 0);
+            CHECK(Near(request.translation, setter.parts & 1 ? target.translation : pose.translation, 1e-14));
+            CHECK(Near(request.rotation, setter.parts & 2 ? target.rotation : pose.rotation, 1e-14));
+            CHECK(Near(request.scaling, setter.parts & 4 ? target.scaling : scale.scaling, 1e-14));
+            CHECK(rig.ColumnVersion(node, FindComponent<SimTeleport>(rig.world)) == rig.world->GetVersion());
+            auto untouched = [&]()
+            {
+                const Placement now{ node->GetTranslation(), node->GetRotation(), node->GetScaling() };
+                CHECK(SameBits(&kept, rig.Get<LocalTransform>(node), sizeof(kept)));
+                CHECK(rig.ColumnVersion(node, local) == localVersion);
+                CHECK(SameBits(&pose, rig.Get<SimPose>(node), sizeof(pose)) &&
+                      SameBits(&previous, rig.Get<SimPosePrevious>(node), sizeof(previous)) &&
+                      SameBits(&scale, rig.Get<SimScale>(node), sizeof(scale)));
+                CHECK(SameBits(&got, &now, sizeof(got)) && SameBits(node->GetLocalToWorldTransform(), shown));
+                CHECK(!rig.graph->HasStaleWorldTransforms() && !rig.graph->HasPendingTransformChanges() &&
+                      !rig.graph->HasPendingStructureChanges() && rig.world->GetStructuralVersion() == structural);
+            };
+            untouched();
+            rig.Refresh();   // without a simulation it stays as it is
+            untouched();
+            CHECK(rig.IsPending(node) && rig.Get<SimTeleport>(node)->space == SimTeleportSpace::Parent);
+
+            // one step, halfway: the target, and from there; nothing between the old place and the new one
+            const double alphaBefore = rig.Alpha(SimulationDomainId(0));
+            rig.GraphFrame(0.25 * (1.5 - alphaBefore));
+            CHECK(!rig.IsPending(node) && domain->taken.size() == 1);
+            const SimTeleport taken = TakenOf(rig, domain, node);
+            CHECK(taken.space == SimTeleportSpace::World && Near(MatrixOf(taken), MatrixOf(request), 1e-13));
+            CHECK(SameBits(&rig.Get<SimPosePrevious>(node)->translation, &taken.translation, sizeof(dm::double3)));
+            CHECK(SameBits(&rig.Get<SimPosePrevious>(node)->rotation, &taken.rotation, sizeof(dm::dquat)));
+            CHECK(SameBits(&rig.Get<SimScale>(node)->scaling, &taken.scaling, sizeof(dm::double3)));
+            const double moved = length(node->GetLocalToWorldTransform().m_translation - taken.translation);
+            CHECK(moved > 0.0 && moved < 4.0 * 0.25 * 10.0);
+            CHECK(!SameBits(rig.Get<SimPose>(node), &taken.translation, sizeof(dm::double3)));   // it goes on
+            CHECK(rig.Alpha(SimulationDomainId(0)) == 0.5);
+            CHECK(SameBits(node->GetLocalToWorldTransform(), DirectWorld(*rig.Get<SimPosePrevious>(node),
+                  *rig.Get<SimPose>(node), *rig.Get<SimScale>(node), 0.5)));
+            CheckChildrenFollow(rig);
+            CHECK(SameBits(&kept, rig.Get<LocalTransform>(node), sizeof(kept)));
+            // taken once
+            rig.GraphFrame(0.25);
+            CHECK(domain->taken.size() == 1 && child->GetParent() == node);
+        }
+    }
+}
+
+// Requests merge by part: two setters keep both parts, the later one of the same part wins; also across frames without a
+// step, in which a resolved request is taken back into the parent's space, wherever the parent went meanwhile.
+void test_teleport_parts()
+{
+    Rig rig;
+    auto domain = rig.NewDomain("balls", 0.25, 4);
+    rig.AddDomain(domain);
+    Placement parentPlace{ dm::double3(3.0, -2.0, 7.5), c_Turn, dm::double3(2.0) };
+    SceneGraphNode* parent = rig.Add(rig.Root(), &parentPlace);
+    SceneGraphNode* node = rig.AddAt(parent, 1.0, 2.0, 3.0);
+    rig.Bind(node);
+    Freeze(domain);
+    rig.Refresh();
+    auto parentWorld = [&]() { return ExpectedWorld(rig, parent, [](SceneGraphNode*) { return dm::daffine3(); }); };
+    auto step = [&]()
+    {
+        domain->taken.clear();
+        rig.GraphFrame(0.25);
+        CHECK(domain->taken.size() == 1 && !rig.IsPending(node));
+        return TakenOf(rig, domain, node);
+    };
+    const dm::double3 t(5.0, 6.0, 7.0), t2(-1.0, 0.5, 2.0), s(0.5);
+    const dm::dquat r = c_OtherTurn, r2 = Unit(0.3, 0.1, -0.2, 0.9);
+
+    // two setters, one frame, in either order; a third part; the last of a part wins
+    node->SetTranslation(t);
+    node->SetRotation(r);
+    CHECK(Near(MatrixOf(step()), ComposeTransform(t, r, dm::double3(1.0)) * parentWorld(), 1e-13));
+    node->SetRotation(r2);
+    node->SetTranslation(t2);
+    CHECK(Near(MatrixOf(step()), ComposeTransform(t2, r2, dm::double3(1.0)) * parentWorld(), 1e-13));
+    node->SetScaling(s);
+    node->SetTranslation(t);
+    node->SetTranslation(t2);
+    node->SetRotation(r);
+    CHECK(Near(MatrixOf(step()), ComposeTransform(t2, r, s) * parentWorld(), 1e-13));
+    Place(node, Placement{ t, r2, dm::double3(1.0) });
+    node->SetRotation(r);
+    CHECK(Near(MatrixOf(step()), ComposeTransform(t, r, dm::double3(1.0)) * parentWorld(), 1e-13));
+
+    // across a frame without a step
+    node->SetTranslation(t2);
+    rig.GraphFrame(0.0);
+    CHECK(rig.IsPending(node) && rig.Get<SimTeleport>(node)->space == SimTeleportSpace::World);
+    const SimTeleport resolved = *rig.Get<SimTeleport>(node);
+    rig.GraphFrame(0.0);   // resolved once
+    CHECK(SameBits(&resolved, rig.Get<SimTeleport>(node), sizeof(resolved)));
+    node->SetRotation(r2);
+    CHECK(rig.Get<SimTeleport>(node)->space == SimTeleportSpace::Parent);
+    CHECK(Near(rig.Get<SimTeleport>(node)->translation, t2, 1e-13));
+    rig.GraphFrame(0.0);
+    node->SetScaling(s);
+    CHECK(Near(rig.Get<SimTeleport>(node)->rotation, r2, 1e-13));
+    CHECK(Near(MatrixOf(step()), ComposeTransform(t2, r2, s) * parentWorld(), 1e-13));
+
+    // the parent moves between: a resolved target stays where it is in the world, also when another part is set then
+    node->SetTranslation(t);
+    rig.GraphFrame(0.0);
+    const dm::daffine3 target = MatrixOf(*rig.Get<SimTeleport>(node));
+    Place(parent, Placement{ dm::double3(-9.0, 1.0, 1.0), c_OtherTurn, dm::double3(0.5) });
+    rig.GraphFrame(0.0);
+    CHECK(SameBits(MatrixOf(*rig.Get<SimTeleport>(node)), target));
+    node->SetScaling(dm::double3(3.0));
+    const SimTeleport merged = step();
+    CHECK(Near(merged.translation, target.m_translation, 1e-12));
+    CHECK(Near(MatrixOf(merged).m_linear.row0 / 1.5, normalize(target.m_linear.row0), 1e-12));   // 3 * 0.5
+    // one that is not resolved yet follows it
+    node->SetTranslation(t);
+    Place(parent, Placement{ dm::double3(20.0, 0.0, 0.0), dm::dquat::identity(), dm::double3(1.0) });
+    CHECK(Near(step().translation, dm::double3(25.0, 6.0, 7.0), 1e-13));
+
+    // a part that is not given is where the simulation has it, not where the last request put it
+    rig.SetPose(node, dm::double3(1.0, 1.0, 1.0), r2);
+    domain->balls[0].pose = *rig.Get<SimPose>(node);
+    node->SetScaling(dm::double3(1.0));
+    const SimTeleport here = step();
+    CHECK(Near(here.translation, dm::double3(1.0), 1e-13) && Near(here.rotation, r2, 1e-13));
+}
+
+// The space of a request: the parent's as the simulation has it. Setting what the getters return moves nothing, at every
+// point of a frame, below an authored, a moved, a driven and lagging, a stretched, a mirrored and a flat parent, below a
+// long chain and in the last bucket; a pending request of the parent does not count.
+void test_teleport_parent()
+{
+    Rig rig;
+    const ComponentId heavy = RegisterComponent<HeavyBall>(rig.world);
+    auto trains = rig.NewDomain("trains", 0.25, 4, heavy);
+    auto crates = rig.NewDomain("crates", 0.25, 4, RegisterComponent<LightBall>(rig.world));
+    rig.AddDomain(trains);
+    rig.AddDomain(crates);
+    CHECK(rig.graph->GetScheduler()->Build() == nvrhi::FS_OK);
+    (void)TakeWarnings();   // the domains are ambiguous with each other, in Debug builds
+    SceneGraphNode* train = rig.AddAt(rig.Root(), 0.0, 10.0, 0.0);
+    CHECK(rig.world->AddComponent(rig.EntityOf(train), heavy, nullptr) == nvrhi::FS_OK);
+    struct Crate
+    {
+        SceneGraphNode* parent;
+        SceneGraphNode* node;
+        bool rescaled;   // its parent has its scale only once it is bound
+        bool shears;
+    };
+    std::vector<Crate> list;
+    auto addCrate = [&](SceneGraphNode* parent, bool rescaled = false, bool shears = false)
+    {
+        Placement p{ dm::double3(1.0, 0.5, -2.0), dm::dquat::identity(), dm::double3(0.75) };
+        SceneGraphNode* node = rig.Add(parent, &p);
+        CHECK(rig.world->AddComponent(rig.EntityOf(node), FindComponent<LightBall>(rig.world), nullptr) == nvrhi::FS_OK);
+        list.push_back({ parent, node, rescaled, shears });
+    };
+    Placement joint{ dm::double3(0.0, 2.0, 0.0), c_Turn, dm::double3(1.5) };
+    Placement stretched{ dm::double3(1.0, 0.0, 0.0), c_Turn, dm::double3(1.0, 3.0, 0.5) };
+    Placement mirrored{ dm::double3(1.0, 0.0, 0.0), c_OtherTurn, dm::double3(1.0, -1.0, 1.0) };
+    Placement both{ dm::double3(1.0, 0.0, 0.0), c_OtherTurn, dm::double3(-2.0, 1.0, 0.25) };
+    addCrate(rig.Root());                                       // authored, at rest
+    addCrate(train);                                            // driven
+    addCrate(rig.Add(train, &joint));                           // authored below driven: stale between the two calls
+    addCrate(rig.Add(train));                                   // without a transform
+    addCrate(rig.Add(rig.Add(train, &joint), &stretched), true, true);
+    addCrate(rig.Add(rig.Add(train, &joint), &mirrored), true);
+    addCrate(rig.Add(train, &both), true, true);
+    SceneGraphNode* deep = train;
+    for (int i = 0; i < 200; ++i)   // longer than the stack of ComposeWorld, twice; the last bucket
+    {
+        const Placement p{ dm::double3(0.01, 0.0, 0.0), Unit(1.0, 0.001, 0.002, -0.001), dm::double3(1.0) };
+        deep = i % 5 == 4 ? rig.Add(deep) : rig.Add(deep, &p);
+    }
+    addCrate(deep);
+    rig.Refresh();
+    rig.Bind(train);
+    // bound while their parents neither shear nor mirror; then they tumble, so that nothing is special about their
+    // rotations
+    for (Crate& crate : list)
+    {
+        const dm::double3 scaling = crate.parent->GetScaling();
+        if (crate.rescaled)
+            crate.parent->SetScaling(dm::double3(1.0));
+        rig.Bind(crate.node);
+        if (crate.rescaled)
+            crate.parent->SetScaling(scaling);
+    }
+    CHECK(TakeWarnings() == 0);
+    rig.Refresh();
+    Rng rng(3);
+    uint32_t checked = 0;
+    auto expectKept = [&](Crate& crate, uint32_t parts)
+    {
+        // what the getters return, or a part of it, set again
+        const dm::double3 t = crate.node->GetTranslation();
+        const dm::dquat r = crate.node->GetRotation();
+        const dm::double3 s = crate.node->GetScaling();
+        crate.node->SetTransform(parts & 1 ? &t : nullptr, parts & 2 ? &r : nullptr, parts & 4 ? &s : nullptr);
+        // where the simulation has it: what the resolved request must be
+        const LocalTransform sim{ rig.Get<SimPose>(crate.node)->translation, rig.Get<SimPose>(crate.node)->rotation,
+                                  rig.Get<SimScale>(crate.node)->scaling };
+        return sim;
+    };
+    for (int frame = 0; frame < 60; ++frame)
+    {
+        // the shown train is behind the simulated one
+        const double delta = 0.25 * (frame % 3 == 0 ? 1.3 : frame % 3 == 1 ? 0.9 : 1.1);
+        for (int point = 0; point < 3; ++point)
+        {
+            std::vector<std::pair<SceneGraphNode*, LocalTransform>> expected;
+            if (frame % 3 == point)
+            {
+                for (Crate& crate : list)
+                {
+                    const uint32_t parts = 1 + rng.Below(7);
+                    expected.emplace_back(crate.node, expectKept(crate, parts));
+                }
+            }
+            if (point == 0)
+            {
+                crates->taken.clear();
+                rig.SimulateGraph(delta);
+            }
+            else if (point == 1)
+            {
+                CHECK(!Near(train->GetLocalToWorldTransform(), rig.Posed(train), 1e-6));
+                rig.Refresh();
+            }
+            if (!expected.empty())
+            {
+                if (point != 0)   // requested between Simulate and Refresh, or after it: the next frame takes them
+                {
+                    crates->taken.clear();
+                    rig.SimulateGraph(0.25 * 1.0);
+                    rig.Refresh();
+                }
+                CHECK(crates->taken.size() == expected.size());
+                for (const auto& [node, sim] : expected)
+                {
+                    const SimTeleport taken = TakenOf(rig, crates, node);
+                    CHECK(Near(taken.translation, sim.translation, 1e-10) && Near(taken.rotation, sim.rotation, 1e-10) &&
+                          Near(taken.scaling, sim.scaling, 1e-10));
+                    ++checked;
+                }
+            }
+        }
+        // the train's rotation and the joints move too
+        list[2].parent->SetRotation(Unit(1.0, 0.01 * frame, 0.2, 0.0));
+        rig.Refresh();
+    }
+    CHECK(checked == 60 * list.size() && TakeWarnings() == 0);
+
+    // the matrices: where a translation, a rotation and a scaling can say it, a request is its matrix times the parent's
+    auto parentOf = [&](const Crate& crate)
+    {
+        return ExpectedWorld(rig, crate.parent, [&](SceneGraphNode* node) { return rig.Posed(node); });
+    };
+    for (Crate& crate : list)
+    {
+        if (crate.shears)
+            continue;
+        const Placement p = RandomPlacement(rng);
+        Place(crate.node, p);
+        const dm::daffine3 expected = ComposeTransform(p.translation, p.rotation, p.scaling) * parentOf(crate);
+        crates->taken.clear();
+        rig.GraphFrame(0.25);
+        CHECK(Near(MatrixOf(TakenOf(rig, crates, crate.node)), expected, 1e-11));
+    }
+    // without rotation the axes of a stretched parent are the node's: a stretch that the parts can say, in the parent's
+    // own frame
+    Rig plain;
+    auto balls = plain.NewDomain();
+    plain.AddDomain(balls);
+    Placement box{ dm::double3(1.0, 2.0, 3.0), c_Turn, dm::double3(1.0, 3.0, 0.5) };
+    SceneGraphNode* boxNode = plain.Add(plain.Root(), &box);
+    SceneGraphNode* inBox = plain.AddAt(boxNode, 1.0, 0.0, 0.0);
+    plain.Bind(inBox);
+    const dm::daffine3 boxWorld = ComposeTransform(box.translation, box.rotation, box.scaling);
+    const dm::dquat quarters[] = { dm::dquat::identity(), Unit(1.0, 1.0, 0.0, 0.0), Unit(1.0, 0.0, 0.0, -1.0),
+                                   Unit(1.0, 1.0, 1.0, 1.0) };
+    for (const dm::dquat& quarter : quarters)   // turns that take axes to axes
+    {
+        const Placement p{ dm::double3(0.5, -1.0, 2.0), quarter, dm::double3(2.0, 4.0, 0.25) };
+        Place(inBox, p);
+        plain.GraphFrame(0.25);
+        CHECK(Near(MatrixOf(TakenOf(plain, balls, inBox)),
+                   ComposeTransform(p.translation, p.rotation, p.scaling) * boxWorld, 1e-13));
+    }
+    // and one that they cannot say: the place is exact, the rotation that of the two rotations, the axes as long as the
+    // matrices make them
+    {
+        const Placement p{ dm::double3(0.5, -1.0, 2.0), c_OtherTurn, dm::double3(2.0, 4.0, 0.25) };
+        Place(inBox, p);
+        plain.GraphFrame(0.25);
+        const SimTeleport taken = TakenOf(plain, balls, inBox);
+        const dm::daffine3 product = ComposeTransform(p.translation, p.rotation, p.scaling) * boxWorld;
+        CHECK(Near(taken.translation, product.m_translation, 1e-13));
+        CHECK(Near(taken.scaling, dm::double3(length(product.m_linear.row0), length(product.m_linear.row1),
+                                              length(product.m_linear.row2)), 1e-13));
+        const dm::daffine3 turned = ComposeTransform(dm::double3(0.0), p.rotation, dm::double3(1.0)) *
+                                    ComposeTransform(dm::double3(0.0), box.rotation, dm::double3(1.0));
+        CHECK(Near(ComposeTransform(dm::double3(0.0), taken.rotation, dm::double3(1.0)), turned, 1e-13));
+        // a request for one part leaves the others, though no local transform can say where they are
+        const SimPose pose = *plain.Get<SimPose>(inBox);
+        const SimScale scale = *plain.Get<SimScale>(inBox);
+        inBox->SetTranslation(dm::double3(9.0, 9.0, 9.0));
+        plain.GraphFrame(0.25);
+        const SimTeleport moved = TakenOf(plain, balls, inBox);
+        CHECK(Near(moved.rotation, pose.rotation, 1e-13) && Near(moved.scaling, scale.scaling, 1e-13));
+        CHECK(Near(moved.translation, boxWorld.transformPoint(dm::double3(9.0)), 1e-13));
+    }
+    // a parent without an inverse counts as none, as for the getters; so does one that overflows
+    boxNode->SetScaling(dm::double3(1.0, 0.0, 1.0));
+    Place(inBox, Placement{ dm::double3(4.0, 5.0, 6.0), c_Turn, dm::double3(2.0) });
+    plain.GraphFrame(0.25);
+    CHECK(Near(MatrixOf(TakenOf(plain, balls, inBox)),
+               ComposeTransform(dm::double3(4.0, 5.0, 6.0), c_Turn, dm::double3(2.0)), 1e-14));
+    Rig oblique;   // no axis of the parent is 0, but they lie in a plane
+    auto obliqueBalls = oblique.NewDomain();
+    oblique.AddDomain(obliqueBalls);
+    SceneGraphNode* pressed = oblique.AddAt(oblique.Root(), 1.0, 0.0, 0.0);
+    Placement turned{ dm::double3(2.0, 0.0, 0.0), c_Turn, dm::double3(1.0) };
+    SceneGraphNode* inPressed = oblique.AddAt(oblique.Add(pressed, &turned), 0.0, 1.0, 0.0);
+    oblique.Bind(inPressed);
+    Freeze(obliqueBalls);
+    pressed->SetScaling(dm::double3(1.0, 0.0, 1.0));
+    oblique.Refresh();
+    const SimPose obliquePose = *oblique.Get<SimPose>(inPressed);
+    CHECK(Near(inPressed->GetTranslation(), obliquePose.translation, 0.0));
+    inPressed->SetTranslation(inPressed->GetTranslation());
+    oblique.GraphFrame(0.25);
+    CHECK(Near(TakenOf(oblique, obliqueBalls, inPressed).translation, obliquePose.translation, 0.0));
+    CHECK(Near(TakenOf(oblique, obliqueBalls, inPressed).rotation, obliquePose.rotation, 0.0));
+    Place(boxNode, Placement{ dm::double3(0.0), dm::dquat::identity(), dm::double3(1e10) });
+    Place(inBox, Placement{ dm::double3(1e300, 0.0, 0.0), dm::dquat::identity(), dm::double3(1.0) });
+    plain.GraphFrame(0.25);
+    CHECK(TakenOf(plain, balls, inBox).translation.x == 1e300 && TakenOf(plain, balls, inBox).scaling.x == 1.0);
+    CHECK(TakeWarnings() == 0);
+    // a scale that mirrors and one of 0 are as good as another: the bodies do not know them
+    Place(boxNode, Placement{});
+    Place(inBox, Placement{ dm::double3(1.0), c_Turn, dm::double3(-1.0, 0.0, 2.0) });
+    plain.GraphFrame(0.25);
+    CHECK(Near(plain.Get<SimScale>(inBox)->scaling, dm::double3(-1.0, 0.0, 2.0), 1e-14));
+    CHECK(Near(inBox->GetScaling(), dm::double3(-1.0, 0.0, 2.0), 1e-14));
+
+    // two requests in a frame, of a parent and of a child: the child's is over where the simulation has the parent now,
+    // whatever order they were made in
+    for (bool parentFirst : { false, true })
+    {
+        Rig pair;
+        auto domain = pair.NewDomain();
+        pair.AddDomain(domain);
+        SceneGraphNode* upper = pair.AddAt(pair.Root(), 10.0, 0.0, 0.0);
+        SceneGraphNode* lower = pair.AddAt(upper, 1.0, 0.0, 0.0);
+        pair.Bind(upper);
+        pair.Bind(lower);
+        pair.Refresh();
+        for (int i = 0; i < 2; ++i)
+        {
+            if ((i == 0) == parentFirst)
+                upper->SetTranslation(dm::double3(500.0, 0.0, 0.0));
+            else
+                lower->SetTranslation(dm::double3(2.0, 3.0, 0.0));
+        }
+        pair.GraphFrame(0.25);
+        CHECK(Near(TakenOf(pair, domain, upper).translation, dm::double3(500.0, 0.0, 0.0), 0.0));
+        CHECK(Near(TakenOf(pair, domain, lower).translation, dm::double3(12.0, 3.0, 0.0), 1e-14));
+        CHECK(Near(upper->GetLocalToWorldTransform().m_translation, dm::double3(500.0, 0.0, 0.0), 1.0));
+    }
+}
+
+// A request waits for a step: while none is taken it stays pending and nothing moves. A domain does not take one that was
+// not resolved. Rows of no domain keep theirs until a domain takes them.
+void test_teleport_pending()
+{
+    Rig rig;
+    auto domain = rig.NewDomain("balls", 0.25, 4);
+    const SimulationDomainId id = rig.AddDomain(domain);
+    SceneGraphNode* node = rig.AddAt(rig.Root(), 1.0, 30.0, 0.0);
+    rig.Bind(node);
+    rig.Refresh();
+    rig.GraphFrame(0.25 * 1.2);
+    const SimPose pose = *rig.Get<SimPose>(node);
+    node->SetTranslation(dm::double3(50.0, 60.0, 70.0));
+    for (int i = 0; i < 4; ++i)
+    {
+        const uint64_t version = rig.ColumnVersion(node, FindComponent<SimTeleport>(rig.world));
+        rig.GraphFrame(0.25 * 0.15);   // less than a step
+        CHECK(rig.IsPending(node) && domain->taken.empty());
+        CHECK(SameBits(&pose, rig.Get<SimPose>(node), sizeof(pose)));
+        CHECK(Near(node->GetTranslation(), pose.translation, 1e-14));
+        CHECK(node->GetLocalToWorldTransform().m_translation.x < 20.0);
+        CHECK((rig.ColumnVersion(node, FindComponent<SimTeleport>(rig.world)) != version) == (i == 0));
+    }
+    // two before the step: the last one wins
+    node->SetTranslation(dm::double3(51.0, 61.0, 71.0));
+    node->SetTranslation(dm::double3(52.0, 62.0, 72.0));
+    const double rest = 0.25 * (1.0 - rig.Alpha(id));
+    rig.GraphFrame(rest + 1e-9);
+    CHECK(domain->taken.size() == 1 && Near(TakenOf(rig, domain, node).translation, dm::double3(52.0, 62.0, 72.0), 0.0));
+    CHECK(!rig.IsPending(node) && node->GetLocalToWorldTransform().m_translation.x > 40.0);
+    // several steps in one frame: the target is what the first of them starts from
+    const dm::double3 velocity = domain->Find(rig.EntityOf(node))->velocity;
+    node->SetTranslation(dm::double3(0.0, 100.0, 0.0));
+    rig.GraphFrame(0.25 * 3.0);
+    CHECK(Near(rig.Get<SimPose>(node)->translation.x, 3.0 * 0.25 * velocity.x, 1e-12));
+    CHECK(Near(rig.Get<SimPosePrevious>(node)->translation.x, 2.0 * 0.25 * velocity.x, 1e-12));
+    // a hitch beyond the limit: the same, with the steps that are taken
+    node->SetTranslation(dm::double3(0.0, 100.0, 0.0));
+    rig.GraphFrame(0.25 * 50.0);
+    CHECK(Near(rig.Get<SimPose>(node)->translation.x, 4.0 * 0.25 * velocity.x, 1e-12));
+
+    // phases by hand that skip the resolving: the domain leaves it alone, and the next frame has it
+    domain->taken.clear();
+    node->SetTranslation(dm::double3(7.0, 8.0, 9.0));
+    rig.SetTime(0.25);
+    CHECK(rig.graph->GetScheduler()->RunPhases(Phase::PreSimulation, rig.Store().GetInterpolationPhase()) ==
+          nvrhi::FS_OK);
+    CHECK(rig.IsPending(node) && domain->taken.empty() && domain->parentSpaceSeen == 1);
+    rig.GraphFrame(0.25);
+    CHECK(domain->taken.size() == 1 && domain->parentSpaceSeen == 1);
+    // BeginFrame alone does not resolve, its named phase does, once
+    node->SetTranslation(dm::double3(7.0, 8.0, 9.0));
+    const uint64_t resolved = rig.Resolved();
+    CHECK(rig.graph->GetScheduler()->RunPhase(Phase::BeginFrame) == nvrhi::FS_OK && rig.Resolved() == resolved);
+    CHECK(rig.graph->GetScheduler()->RunPhase(rig.Store().GetTeleportPhase()) == nvrhi::FS_OK);
+    CHECK(rig.Resolved() == resolved + 1 && rig.Get<SimTeleport>(node)->space == SimTeleportSpace::World);
+    CHECK(rig.graph->GetScheduler()->RunPhase(rig.Store().GetTeleportPhase()) == nvrhi::FS_OK);
+    CHECK(rig.Resolved() == resolved + 1);
+    rig.GraphFrame(0.25);
+
+    // bound, asked and simulated with nothing in between: the row's archetype is new to the systems
+    SceneGraphNode* fresh = rig.AddAt(rig.Root(), 2.0, 30.0, 0.0);
+    CHECK(rig.world->AddComponent(rig.EntityOf(fresh), RegisterComponent<HeavyBall>(rig.world), nullptr) == nvrhi::FS_OK);
+    rig.Refresh();
+    rig.Bind(fresh);
+    fresh->SetTranslation(dm::double3(4.0, 5.0, 6.0));
+    domain->taken.clear();
+    CHECK(!rig.graph->HasStaleWorldTransforms());
+    rig.SimulateGraph(0.25);
+    CHECK(domain->taken.size() == 1 && domain->parentSpaceSeen == 1);
+
+    // no domain: it waits, and is resolved meanwhile; a domain that comes takes it
+    Rig alone;
+    SceneGraphNode* body = alone.AddAt(alone.Root(), 1.0, 2.0, 3.0);
+    alone.Bind(body);
+    body->SetTranslation(dm::double3(5.0, 5.0, 5.0));
+    for (int i = 0; i < 3; ++i)
+        alone.GraphFrame(1.0);
+    CHECK(alone.IsPending(body) && Near(body->GetLocalToWorldTransform().m_translation, dm::double3(1.0, 2.0, 3.0), 0.0));
+    auto late = alone.NewDomain();
+    alone.AddDomain(late);
+    alone.GraphFrame(0.25);
+    CHECK(!alone.IsPending(body) && late->teleportsTaken == 1);
+    // and one that goes leaves them
+    body->SetTranslation(dm::double3(6.0, 6.0, 6.0));
+    CHECK(alone.graph->GetScheduler()->RemoveSimulationDomain(SimulationDomainId(0)) == nvrhi::FS_OK);
+    alone.GraphFrame(1.0);
+    CHECK(alone.IsPending(body) && late->teleportsTaken == 1);
+}
+
+// What happens to a pending request when its node changes: unbinding and Detach drop it (and the node is where the
+// simulation has it), copies do not get it, SetLeaf and other components keep it with its bit, binding starts without.
+void test_teleport_lifecycle()
+{
+    Rig rig;
+    auto domain = rig.NewDomain("balls", 0.25, 4);
+    rig.AddDomain(domain);
+    std::vector<SceneGraphNode*> nodes;
+    for (int i = 0; i < 200; ++i)   // more than a chunk's mask word
+    {
+        nodes.push_back(rig.AddAt(rig.Root(), double(i), 30.0, 0.0, true));
+        rig.Bind(nodes.back());
+    }
+    rig.Refresh();
+    rig.GraphFrame(0.25 * 1.5);
+
+    SceneGraphNode* node = nodes[150];
+    const dm::daffine3 posed = rig.Posed(node);
+    node->SetTranslation(dm::double3(500.0));
+    rig.Unbind(node);
+    CHECK(Near(node->GetLocalToParentTransform(), posed, 1e-13));
+    rig.Bind(node);
+    CHECK(!rig.IsPending(node));
+    node->SetRotation(c_Turn);   // the rest from now, nothing of the dropped request
+    CHECK(Near(rig.Get<SimTeleport>(node)->translation, posed.m_translation, 1e-13));
+
+    SceneGraphNode* kept = nodes[151];
+    kept->SetTranslation(dm::double3(600.0, 0.0, 0.0));
+    const SimTeleport request = *rig.Get<SimTeleport>(kept);
+    nvrhi::AutoPtr<SceneGraphNode> copy = rig.graph->Attach(rig.Root(), kept);
+    CHECK(copy != kept && !rig.IsDriven(copy) && Near(copy->GetLocalToParentTransform(), rig.Posed(kept), 1e-13));
+    CHECK(rig.IsPending(kept));
+    kept->SetLeaf(MAKE_RC_OBJ_PTR(PointLight));          // the row moves to other archetypes
+    CHECK(rig.IsPending(kept) && SameBits(&request, rig.Get<SimTeleport>(kept), sizeof(request)));
+    kept->SetLeaf(nullptr);
+    CHECK(rig.world->AddComponent(rig.EntityOf(kept), RegisterComponent<HeavyBall>(rig.world), nullptr) == nvrhi::FS_OK);
+    CHECK(rig.IsPending(kept) && SameBits(&request, rig.Get<SimTeleport>(kept), sizeof(request)));
+    // rows around it go: the last row of the chunk takes the place, with its bit
+    rig.graph->Detach(nodes[10]);
+    rig.graph->Detach(nodes[199]);
+    uint32_t pending = 0;
+    for (int i = 0; i < 199; ++i)
+        pending += i != 10 && rig.IsPending(nodes[size_t(i)]) ? 1 : 0;
+    CHECK(pending == 2 && rig.IsPending(kept) && rig.IsPending(node));
+
+    SceneGraphNode* gone = nodes[20];
+    const dm::daffine3 gonePosed = rig.Posed(gone);
+    gone->SetTranslation(dm::double3(700.0));
+    nvrhi::AutoPtr<SceneGraphNode> detached = rig.graph->Detach(gone);
+    CHECK(Near(detached->GetLocalToParentTransform(), gonePosed, 1e-13));
+    rig.graph->Attach(rig.Root(), detached);
+    rig.Bind(gone);
+    CHECK(!rig.IsPending(gone));
+    domain->taken.clear();
+    rig.GraphFrame(0.25);
+    CHECK(domain->taken.size() == 2 && Near(TakenOf(rig, domain, kept).translation, dm::double3(600.0, 0.0, 0.0), 0.0));
+    CHECK(TakenOf(rig, domain, node).space == SimTeleportSpace::World);
+    // a request in a frame whose node is destroyed before it is taken
+    nodes[30]->SetTranslation(dm::double3(1.0));
+    rig.graph->Detach(nodes[30]);
+    rig.GraphFrame(0.25);
+    CHECK(domain->taken.size() == 2);
+}
+
+// What no request is made of: numbers that are not finite, a rotation of 0, a driven row without the component. The
+// rotation is normalised; setters that give nothing ask nothing.
+void test_teleport_refused()
+{
+    Rig rig;
+    auto domain = rig.NewDomain();
+    rig.AddDomain(domain);
+    SceneGraphNode* node = rig.AddAt(rig.Root(), 1.0, 30.0, 0.0);
+    rig.Bind(node);
+    rig.Refresh();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double infinity = std::numeric_limits<double>::infinity();
+    const std::function<void()> bad[] = {
+        [&]() { node->SetTranslation(dm::double3(0.0, nan, 0.0)); },
+        [&]() { node->SetTranslation(dm::double3(infinity, 0.0, 0.0)); },
+        [&]() { node->SetTranslation(dm::double3(0.0, 0.0, -infinity)); },
+        [&]() { node->SetRotation(dm::dquat(0.0, 0.0, 0.0, 0.0)); },
+        [&]() { node->SetRotation(dm::dquat(nan, 0.0, 0.0, 1.0)); },
+        [&]() { node->SetRotation(dm::dquat(1.0, 0.0, infinity, 1.0)); },
+        [&]() { node->SetRotation(dm::dquat(1e200, 0.0, 0.0, 0.0)); },    // its square is not finite
+        [&]() { node->SetRotation(dm::dquat(1e-200, 0.0, 0.0, 0.0)); },   // its square is 0
+        [&]() { node->SetScaling(dm::double3(1.0, 1.0, nan)); },
+        [&]() { node->SetScaling(dm::double3(infinity, 1.0, 1.0)); },
+        [&]() { Place(node, Placement{ dm::double3(1.0), c_Turn, dm::double3(1.0, nan, 1.0) }); },
+    };
+    for (bool pending : { false, true })
+    {
+        if (pending)
+            node->SetTranslation(dm::double3(5.0, 6.0, 7.0));
+        const SimTeleport request = *rig.Get<SimTeleport>(node);
+        const uint64_t version = rig.ColumnVersion(node, FindComponent<SimTeleport>(rig.world));
+        rig.world->AdvanceVersion();
+        for (const auto& set : bad)
+        {
+            set();
+            CHECK(TakeWarnings() == 1 && rig.IsPending(node) == pending);
+            CHECK(SameBits(&request, rig.Get<SimTeleport>(node), sizeof(request)));
+            CHECK(rig.ColumnVersion(node, FindComponent<SimTeleport>(rig.world)) == version);
+        }
+        node->SetTransform(nullptr, nullptr, nullptr);
+        CHECK(TakeWarnings() == 0 && rig.IsPending(node) == pending);
+        CHECK(rig.ColumnVersion(node, FindComponent<SimTeleport>(rig.world)) == version);
+    }
+    node->SetRotation(dm::dquat(0.0, 0.0, 10.0, 0.0));
+    CHECK(Near(rig.Get<SimTeleport>(node)->rotation, dm::dquat(0.0, 0.0, 1.0, 0.0), 0.0));
+    CHECK(Near(rig.Get<SimTeleport>(node)->translation, dm::double3(5.0, 6.0, 7.0), 0.0));
+    rig.GraphFrame(0.25);
+    CHECK(domain->taken.size() == 1 && rig.Get<SimPosePrevious>(node)->rotation.y == 1.0);
+
+    // driven by the tag alone: no request, no transform, a warning; no structural change
+    SceneGraphNode* tagged = rig.AddAt(rig.Root(), 1.0, 2.0, 3.0);
+    CHECK(rig.world->AddComponent(rig.EntityOf(tagged), FindComponent<SimulationDriven>(rig.world), nullptr) ==
+          nvrhi::FS_OK);
+    const uint64_t structural = rig.world->GetStructuralVersion();
+    tagged->SetTranslation(dm::double3(9.0));
+    CHECK(TakeWarnings() == 1 && rig.world->GetStructuralVersion() == structural);
+    CHECK(rig.Get<LocalTransform>(tagged)->translation.x == 1.0);
+    // without a pose of its own (tag and request): the rest of a request is its world transform, as for the getters
+    SceneGraphNode* posed = rig.AddAt(rig.Root(), 1.0, 2.0, 3.0);
+    rig.Refresh();
+    for (ComponentId component : { FindComponent<SimulationDriven>(rig.world), FindComponent<SimTeleport>(rig.world) })
+        CHECK(rig.world->AddComponent(rig.EntityOf(posed), component, nullptr) == nvrhi::FS_OK);
+    CHECK(rig.world->SetEnabled(rig.EntityOf(posed), FindComponent<SimTeleport>(rig.world), false) == nvrhi::FS_OK);
+    posed->SetScaling(dm::double3(4.0));
+    CHECK(TakeWarnings() == 0 && Near(rig.Get<SimTeleport>(posed)->translation, dm::double3(1.0, 2.0, 3.0), 1e-14));
+}
+
+// Many requests in many chunks: exactly the enabled ones of space Parent are resolved, the others keep their bytes, only
+// chunks with one are stamped; the same bits at 1, 2 and 8 workers, also of requests whose parents have requests.
+void test_teleport_rows()
+{
+    std::vector<std::vector<SimTeleport>> results;
+    for (uint32_t workers : { 1u, 2u, 8u, 8u })
+    {
+        Rig rig(workers);
+        Rng rng(31);
+        std::vector<SceneGraphNode*> nodes;
+        std::vector<SceneGraphNode*> parents = { rig.Root() };
+        for (int i = 0; i < 3000; ++i)
+        {
+            const Placement p = RandomPlacement(rng);
+            SceneGraphNode* node = rig.Add(parents[rng.Below(parents.size())], &p, i % 3 == 0);
+            if (i % 40 == 0)
+                parents.push_back(node);   // driven ones among them
+            nodes.push_back(node);
+        }
+        for (SceneGraphNode* node : nodes)
+            rig.Bind(node);
+        rig.Refresh();
+        std::set<SceneGraphNode*> asked;
+        std::set<ChunkKey> chunks;
+        for (int i = 0; i < 700; ++i)
+        {
+            SceneGraphNode* node = nodes[rng.Below(nodes.size())];
+            const Placement p = RandomPlacement(rng);
+            Place(node, p);
+            asked.insert(node);
+        }
+        // chunks without any
+        for (int i = 2900; i < 3000; ++i)
+        {
+            asked.erase(nodes[size_t(i)]);
+            CHECK(rig.world->SetEnabled(rig.EntityOf(nodes[size_t(i)]), FindComponent<SimTeleport>(rig.world), false) ==
+                  nvrhi::FS_OK);
+        }
+        for (SceneGraphNode* node : asked)
+            chunks.insert(ChunkOf(rig, node));
+        std::vector<SimTeleport> before;
+        std::vector<uint64_t> versions;
+        for (SceneGraphNode* node : nodes)
+        {
+            before.push_back(*rig.Get<SimTeleport>(node));
+            versions.push_back(rig.ColumnVersion(node, FindComponent<SimTeleport>(rig.world)));
+        }
+        rig.SimulateGraph(0.0);
+        CHECK(rig.Resolved() == asked.size());
+        std::vector<SimTeleport> after;
+        uint32_t stampedChunks = 0;
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
+            const SimTeleport request = *rig.Get<SimTeleport>(nodes[i]);
+            after.push_back(request);
+            const bool isAsked = asked.count(nodes[i]) != 0;
+            CHECK(rig.IsPending(nodes[i]) == isAsked);
+            const bool stamped = rig.ColumnVersion(nodes[i], FindComponent<SimTeleport>(rig.world)) != versions[i];
+            CHECK(stamped == (chunks.count(ChunkOf(rig, nodes[i])) != 0));
+            stampedChunks += stamped ? 1 : 0;
+            if (!isAsked)
+            {
+                CHECK(SameBits(&request, &before[i], sizeof(request)));
+                continue;
+            }
+            CHECK(request.space == SimTeleportSpace::World && request.reserved == 0);
+            // over the poses, which no request changes
+            SceneGraphNode* parent = nodes[i]->GetParent();
+            const dm::daffine3 parentWorld =
+                ExpectedWorld(rig, parent, [&](SceneGraphNode* node) { return rig.Posed(node); });
+            CHECK(Near(MatrixOf(request), MatrixOf(before[i]) * parentWorld, 1e-10));
+        }
+        CHECK(stampedChunks > 1000 && stampedChunks < nodes.size() && chunks.size() > 8);
+        results.push_back(after);
+    }
+    for (const auto& result : results)
+        CHECK(SameBits(result.data(), results[0].data(), result.size() * sizeof(SimTeleport)));
+
+    // rows beyond the first word of their chunk's mask, and only those
+    Rig rig;
+    std::vector<SceneGraphNode*> nodes, asked;
+    for (int i = 0; i < 260; ++i)
+        nodes.push_back(rig.AddAt(rig.Root(), double(i), 0.0, 0.0));
+    for (SceneGraphNode* node : nodes)
+        rig.Bind(node);
+    rig.Refresh();
+    for (SceneGraphNode* node : nodes)
+    {
+        if (rig.Impl().FindAlive(rig.EntityOf(node))->row >= 64)
+            asked.push_back(node);
+    }
+    CHECK(asked.size() > 5 && asked.size() < nodes.size() / 2);
+    for (SceneGraphNode* node : asked)
+        node->SetScaling(dm::double3(2.0));
+    rig.SimulateGraph(0.0);
+    CHECK(rig.Resolved() == asked.size());
+}
+
+// The phase that resolves: right after BeginFrame and before PreSimulation; its accesses are declared, and no system of a
+// domain or of BeginFrame is ambiguous with it.
+void test_teleport_phase()
+{
+    Rig rig;
+    auto domain = rig.NewDomain();
+    rig.AddDomain(domain);
+    SceneGraphNode* node = rig.AddAt(rig.Root(), 0.0, 30.0, 0.0);
+    rig.Bind(node);
+    rig.Refresh();
+    IScheduler* scheduler = rig.graph->GetScheduler();
+    const Phase phase = rig.Store().GetTeleportPhase();
+    rig.AddSystem("test.mover", Phase::BeginFrame,
+                  { rig.Writes(FindComponent<LocalTransform>(rig.world)), rig.Writes(FindComponent<Parent>(rig.world)),
+                    rig.Writes(FindComponent<SimTeleport>(rig.world)) },
+                  [](ISystemContext*) { return nvrhi::FS_OK; });
+    CHECK(scheduler->Build() == nvrhi::FS_OK && scheduler->GetAmbiguityCount() == 0);
+    nvrhi::string text;
+    scheduler->GetDiagnostics(text);
+    CHECK(std::strstr(text.c_str(), "phase 'SimulationTeleports': 'SceneGraph.SimulationTeleports'"));
+    const std::pair<ComponentId, Access> conflicts[] = {
+        { FindComponent<SimTeleport>(rig.world), Access::Read },
+        { FindComponent<SimTeleport>(rig.world), Access::Write },
+        { FindComponent<SimPose>(rig.world), Access::Write },
+        { FindComponent<SimScale>(rig.world), Access::Write },
+        { FindComponent<LocalTransform>(rig.world), Access::Write },
+        { FindComponent<WorldTransform>(rig.world), Access::Write },
+        { FindComponent<Parent>(rig.world), Access::Write },
+    };
+    for (const auto& [component, access] : conflicts)
+    {
+        const SystemId id = rig.AddSystem("test.conflict", phase, { ComponentAccess{ component, access, {} } },
+                                          [](ISystemContext*) { return nvrhi::FS_OK; });
+        CHECK(scheduler->Build() == nvrhi::FS_OK && scheduler->GetAmbiguityCount() == 1);
+        CHECK(scheduler->RemoveSystem(id) == nvrhi::FS_OK && scheduler->Build() == nvrhi::FS_OK);
+        (void)TakeWarnings();   // in Debug builds
+    }
+    const SystemId reader = rig.AddSystem("test.reader", phase, { rig.Reads(FindComponent<SimPose>(rig.world)),
+                                          rig.Reads(FindComponent<SimPosePrevious>(rig.world)) },
+                                          [](ISystemContext*) { return nvrhi::FS_OK; });
+    CHECK(scheduler->Build() == nvrhi::FS_OK && scheduler->GetAmbiguityCount() == 0);
+    CHECK(scheduler->RemoveSystem(reader) == nvrhi::FS_OK);
+    // a named phase of the application after BeginFrame comes before it
+    Phase own = Phase::Count;
+    CHECK(scheduler->AddPhase("test.own", Phase::BeginFrame, own) == nvrhi::FS_OK);
+    SimTeleportSpace seen[2] = {};
+    rig.AddSystem("test.own.system", own, { rig.Reads(FindComponent<SimTeleport>(rig.world)) }, [&](ISystemContext*)
+    {
+        seen[0] = rig.Get<SimTeleport>(node)->space;
+        return nvrhi::FS_OK;
+    });
+    domain->onGather = [&](ISimulationContext*) { seen[1] = rig.Get<SimTeleport>(node)->space; };
+    node->SetTranslation(dm::double3(3.0));
+    rig.GraphFrame(0.25);
+    CHECK(seen[0] == SimTeleportSpace::Parent && seen[1] == SimTeleportSpace::World);
+    // the world's checks of writes (Debug builds) find nothing: the bits and the rows are the system's
+    CHECK(TakeWarnings() == 0);
+}
+
+// A pending request survives SaveSimulationState and LoadSimulationState with its bit, resolved or not; one that was made
+// after the save is gone after the load.
+void test_teleport_save_load()
+{
+    for (bool resolved : { false, true })
+    {
+        Rig rig;
+        auto domain = rig.NewDomain("balls", 0.25, 4);
+        rig.AddDomain(domain);
+        SceneGraphNode* parent = rig.AddAt(rig.Root(), 10.0, 0.0, 0.0);
+        SceneGraphNode* asked = rig.AddAt(parent, 1.0, 30.0, 0.0);
+        SceneGraphNode* other = rig.AddAt(parent, 2.0, 30.0, 0.0);
+        rig.Bind(asked);
+        rig.Bind(other);
+        rig.Refresh();
+        rig.GraphFrame(0.25 * 1.5);
+        asked->SetTranslation(dm::double3(5.0, 6.0, 7.0));
+        if (resolved)
+            rig.GraphFrame(0.0);
+        const SimTeleport request = *rig.Get<SimTeleport>(asked);
+        CHECK((request.space == SimTeleportSpace::World) == resolved);
+        auto writer = MAKE_RC_OBJ_PTR(MemoryWriter);
+        CHECK(rig.graph->GetScheduler()->SaveSimulationState(writer) == nvrhi::FS_OK);
+        // taken, and others asked
+        rig.GraphFrame(0.25);
+        CHECK(!rig.IsPending(asked) && domain->taken.size() == 1);
+        other->SetTranslation(dm::double3(-5.0));
+        asked->SetTranslation(dm::double3(99.0));
+        auto reader = MAKE_RC_OBJ_PTR(MemoryReader, writer->bytes);
+        CHECK(rig.graph->GetScheduler()->LoadSimulationState(reader) == nvrhi::FS_OK);
+        CHECK(rig.IsPending(asked) && !rig.IsPending(other));
+        CHECK(SameBits(&request, rig.Get<SimTeleport>(asked), sizeof(request)));
+        domain->taken.clear();
+        rig.GraphFrame(0.25);
+        CHECK(domain->taken.size() == 1 && !rig.IsPending(asked));
+        CHECK(Near(TakenOf(rig, domain, asked).translation, dm::double3(15.0, 6.0, 7.0), 1e-14));
+    }
+}
+
+// ------------------------------------------------------------------------------------------ replay and rewind
+
+namespace
+{
+    struct Fnv
+    {
+        uint64_t value = 0xcbf29ce484222325ull;
+        void Bytes(const void* data, size_t size)
+        {
+            const uint8_t* bytes = static_cast<const uint8_t*>(data);
+            for (size_t i = 0; i < size; ++i)
+                value = (value ^ bytes[i]) * 0x100000001b3ull;
+        }
+        template <typename T> void Value(const T& v) { Bytes(&v, sizeof(v)); }
+    };
+
+    // What a frame of a replay shows and holds.
+    struct FrameHashes
+    {
+        uint64_t shown;        // every node's world transform and box, in walk order
+        uint64_t simulated;    // the poses, scales, body references and requests of the driven rows
+        uint64_t engine;       // the engine's bytes and the domain's time
+        uint64_t events;       // lifetime events and requests taken so far
+        bool operator==(const FrameHashes& o) const
+        {
+            return shown == o.shown && simulated == o.simulated && engine == o.engine && events == o.events;
+        }
+        bool operator!=(const FrameHashes& o) const { return !(*this == o); }
+    };
+    FrameHashes HashFrame(Rig& rig, const BallDomain* domain, SimulationDomainId id)
+    {
+        Fnv shown, simulated, engine;
+        for (SceneGraphWalker walker(rig.Root()); walker; walker.Next(true))
+        {
+            shown.Value(walker->GetLocalToWorldTransform());
+            const dm::box3 box = walker->GetGlobalBoundingBox();
+            shown.Value(box);
+            if (!rig.IsDriven(walker.Get()))
+                continue;
+            simulated.Value(*rig.Get<SimPose>(walker.Get()));
+            simulated.Value(*rig.Get<SimPosePrevious>(walker.Get()));
+            simulated.Value(*rig.Get<SimScale>(walker.Get()));
+            simulated.Value(*rig.Get<SimBodyRef>(walker.Get()));
+            const bool pending = rig.IsPending(walker.Get());
+            simulated.Value(pending);
+            if (pending)
+                simulated.Value(*rig.Get<SimTeleport>(walker.Get()));
+        }
+        engine.Bytes(domain->balls.data(), domain->balls.size() * sizeof(BallDomain::Ball));
+        engine.Value(GetResource<FixedStepState>(rig.world)->domains[uint32_t(id)]);
+        return { shown.value, simulated.value, engine.value,
+                 (uint64_t(domain->events.size()) << 32) | domain->teleportsTaken };
+    }
+
+    // 300 frames of a recorded script: deltas, edits, teleports, attaches, detaches, binds, all from one generator.
+    constexpr uint32_t c_ReplayFrames = 300;
+    std::vector<FrameHashes> RunReplay(uint32_t workers)
+    {
+        Rig rig(workers);
+        auto domain = rig.NewDomain("balls", 1.0 / 60.0, 3);
+        const SimulationDomainId id = rig.AddDomain(domain);
+        Rng rng(0x62b);
+        std::vector<nvrhi::AutoPtr<SceneGraphNode>> nodes;
+        std::vector<nvrhi::AutoPtr<SceneGraphNode>> detached;
+        // nodes with few children at the top, chains below: stable names by position in the vector
+        auto grow = [&](uint32_t count)
+        {
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                SceneGraphNode* parent = rig.Root();
+                for (int k = 0; k < 4 && !nodes.empty(); ++k)
+                {
+                    SceneGraphNode* candidate = nodes[rng.Below(nodes.size())];
+                    if (candidate->GetGraph() == rig.graph.Get())
+                    {
+                        parent = candidate;
+                        break;
+                    }
+                }
+                const Placement p = RandomPlacement(rng);
+                nodes.push_back(rig.Add(parent, &p, rng.Percent(50)));
+                if (rng.Percent(40))
+                    rig.Bind(nodes.back());
+            }
+        };
+        grow(120);
+        rig.Refresh();
+        std::vector<FrameHashes> hashes;
+        const double factors[] = { 0.0, 0.3, 1.0, 1.0, 1.7, 2.2, 9.0 };
+        uint32_t binds = 0;
+        for (uint32_t frame = 0; frame < c_ReplayFrames; ++frame)
+        {
+            auto pick = [&]() -> SceneGraphNode*
+            {
+                for (int k = 0; k < 16; ++k)
+                {
+                    SceneGraphNode* node = nodes[rng.Below(nodes.size())];
+                    if (node->GetGraph() == rig.graph.Get() && node->GetParent())
+                        return node;
+                }
+                return nullptr;
+            };
+            auto edits = [&](uint32_t count)
+            {
+                for (uint32_t e = 0; e < count; ++e)
+                {
+                    SceneGraphNode* node = pick();
+                    const uint32_t what = rng.Below(100);
+                    const Placement p = RandomPlacement(rng);
+                    if (!node)
+                        continue;
+                    if (what < 25)
+                        node->SetTranslation(p.translation);   // an edit, or a teleport of a driven node
+                    else if (what < 40)
+                        node->SetRotation(p.rotation);
+                    else if (what < 55)
+                        Place(node, p);
+                    else if (what < 60)
+                        node->SetScaling(p.scaling);
+                    else if (what < 80)
+                    {
+                        const bool drive = !rig.IsDriven(node);
+                        CHECK(rig.graph->SetSimulationDriven(node, drive) == nvrhi::FS_OK);
+                        ++binds;
+                    }
+                    else if (what < 88 && detached.size() < 4)
+                        detached.push_back(rig.graph->Detach(node));
+                    else if (what < 96 && !detached.empty())
+                    {
+                        rig.graph->Attach(node, detached.back());
+                        detached.pop_back();
+                    }
+                    else if (nodes.size() < 220)
+                        grow(1);
+                }
+            };
+            edits(rng.Below(6));
+            rig.SimulateGraph(domain->dt * factors[rng.Below(std::size(factors))]);
+            edits(rng.Below(3));
+            rig.Refresh();
+            hashes.push_back(HashFrame(rig, domain, id));
+        }
+        CHECK(domain->teleportsTaken > 100 && binds > 60 && domain->events.size() > 150);
+        return hashes;
+    }
+
+    // The frames against tests/src/engine/golden/simulation_frames.txt: Release and Debug, and every machine, agree.
+    void CheckReplayGolden(const std::vector<FrameHashes>& frames)
+    {
+        std::string actual = "# the replayed simulation script (test_scene_graph_simulation.cpp; ECS_UPDATE_GOLDEN=1 "
+                             "rewrites it)\n"
+                             "# frame shown simulated engine lifetime-events requests-taken\n";
+        for (size_t f = 0; f < frames.size(); ++f)
+        {
+            char line[128];
+            std::snprintf(line, sizeof(line), "%u %016llx %016llx %016llx %u %u\n", uint32_t(f),
+                          (unsigned long long)frames[f].shown, (unsigned long long)frames[f].simulated,
+                          (unsigned long long)frames[f].engine, uint32_t(frames[f].events >> 32),
+                          uint32_t(frames[f].events));
+            actual += line;
+        }
+        const std::filesystem::path path = std::filesystem::path(DONUT_TEST_GOLDEN_DIR) / "simulation_frames.txt";
+        const char* update = std::getenv("ECS_UPDATE_GOLDEN");
+        if (update && std::strcmp(update, "1") == 0)
+        {
+            std::ofstream file(path, std::ios::binary);
+            file << actual;
+            CHECK(file.good());
+            std::printf("wrote %s\n", path.generic_string().c_str());
+            return;
+        }
+        std::ifstream file(path, std::ios::binary);
+        std::stringstream expected;
+        expected << file.rdbuf();
+        if (expected.str() != actual)
+        {
+            std::istringstream a(actual), e(expected.str());
+            std::string lineA, lineE;
+            while (std::getline(a, lineA))
+            {
+                if (!std::getline(e, lineE) || lineA != lineE)
+                    break;
+            }
+            std::printf("the frames differ from %s, first:\n  expected %s\n  actual   %s\n",
+                        path.generic_string().c_str(), lineE.c_str(), lineA.c_str());
+            CHECK(false);
+        }
+    }
+}
+
+// The recorded script gives the same frames on every run, at 1, 2 and 8 workers, and those of the golden file.
+void test_replay_script()
+{
+    const std::vector<FrameHashes> first = RunReplay(2);
+    uint32_t moved = 0;
+    for (uint32_t f = 1; f < c_ReplayFrames; ++f)
+        moved += first[f] != first[f - 1] ? 1 : 0;
+    CHECK(moved > c_ReplayFrames * 9 / 10);
+    for (uint32_t workers : { 2u, 1u, 8u, 8u })
+    {
+        const std::vector<FrameHashes> again = RunReplay(workers);
+        for (uint32_t f = 0; f < c_ReplayFrames; ++f)
+        {
+            if (again[f] == first[f])
+                continue;
+            std::printf("%u workers, frame %u: shown %d simulated %d engine %d events %d\n", workers, f,
+                        int(again[f].shown == first[f].shown), int(again[f].simulated == first[f].simulated),
+                        int(again[f].engine == first[f].engine), int(again[f].events == first[f].events));
+            CHECK(false);
+        }
+    }
+    CheckReplayGolden(first);
+}
+
+namespace
+{
+    // A script without structural edits: kinematic parents that some frames move, teleports in some, of driven nodes
+    // below them, and authored nodes below driven ones.
+    struct RewindScript
+    {
+        Rig rig;
+        nvrhi::AutoPtr<BallDomain> domain;
+        SimulationDomainId id;
+        std::vector<SceneGraphNode*> kinematic, driven;
+        SceneGraphNode* onKinematic = nullptr;
+
+        explicit RewindScript(uint32_t workers) : rig(workers)
+        {
+            domain = rig.NewDomain("balls", 1.0 / 60.0, 4);
+            id = rig.AddDomain(domain);
+            for (int i = 0; i < 6; ++i)
+            {
+                kinematic.push_back(rig.AddAt(rig.Root(), double(i), 0.0, 0.0));
+                for (int k = 0; k < 5; ++k)
+                {
+                    driven.push_back(rig.AddAt(kinematic.back(), double(k), 10.0, 1.0));
+                    rig.AddAt(driven.back(), 0.0, 1.0, 0.0, true);
+                    rig.Bind(driven.back());
+                }
+            }
+            onKinematic = rig.AddAt(kinematic[1], 0.0, 0.0, 2.0);
+            rig.Refresh();
+        }
+        // The authored values after frame `frame`: each is that of the last frame that set it.
+        static Placement Authored(uint32_t frame, size_t index)
+        {
+            const uint32_t last = frame - (frame + 3 - uint32_t(index % 3)) % 3;
+            Placement p;
+            p.translation = dm::double3(double(index) + 0.01 * double(last), 0.02 * double(last % 50), 0.0);
+            p.rotation = Unit(1.0, 0.001 * double(last), 0.0, 0.01);
+            return p;
+        }
+        // The whole authored state of a frame: what a replay applies again, because a load does not (8.5, recorded gap).
+        void ApplyAuthored(uint32_t frame)
+        {
+            for (size_t i = 0; i < kinematic.size(); ++i)
+                Place(kinematic[i], Authored(frame, i));
+        }
+        FrameHashes Frame(uint32_t frame)
+        {
+            for (size_t i = 0; i < kinematic.size(); ++i)
+            {
+                if (frame % 3 == i % 3)
+                    Place(kinematic[i], Authored(frame, i));
+            }
+            if (frame % 4 == 1)
+                driven[(frame * 7) % driven.size()]->SetTranslation(dm::double3(0.1 * double(frame % 10), 12.0, 0.0));
+            if (frame % 5 == 2)
+                driven[(frame * 11) % driven.size()]->SetRotation(Unit(1.0, 0.0, 0.01 * double(frame), 0.3));
+            const double factors[] = { 1.0, 0.4, 1.7, 0.0, 2.3 };
+            rig.SimulateGraph(domain->dt * factors[frame % 5]);
+            rig.Refresh();
+            return HashFrame(rig, domain, id);
+        }
+    };
+}
+
+// Rewind: a save, 100 frames with edits and teleports, a load, and the same 100 frames with the same authored values
+// applied again give the same hashes, frame by frame. A structural edit in between makes the load answer FE_OUT_OF_DATE
+// with nothing changed. With the authored values not applied again a kinematic child differs while the simulation does
+// not: the recorded gap against design 8.5.
+void test_replay_rewind()
+{
+    constexpr uint32_t c_Save = 150, c_Frames = 100;
+    for (uint32_t workers : { 2u, 8u })
+    {
+        RewindScript script(workers);
+        Rig& rig = script.rig;
+        IScheduler* scheduler = rig.graph->GetScheduler();
+        for (uint32_t f = 0; f < c_Save; ++f)
+            script.Frame(f);
+        // a request pending over the save, too
+        script.driven[3]->SetTranslation(dm::double3(1.0, 33.0, 0.0));
+        auto writer = MAKE_RC_OBJ_PTR(MemoryWriter);
+        CHECK(scheduler->SaveSimulationState(writer) == nvrhi::FS_OK);
+        const double time = rig.time;
+        const uint64_t frame = rig.frame;
+        std::vector<FrameHashes> first;
+        std::vector<dm::daffine3> childOf;
+        const uint32_t takenBefore = script.domain->teleportsTaken;
+        for (uint32_t f = 0; f < c_Frames; ++f)
+        {
+            first.push_back(script.Frame(c_Save + f));
+            childOf.push_back(script.onKinematic->GetLocalToWorldTransform());
+        }
+        CHECK(script.domain->teleportsTaken > takenBefore + 20 && first.front() != first.back());
+        auto load = [&]()
+        {
+            auto reader = MAKE_RC_OBJ_PTR(MemoryReader, writer->bytes);
+            const nvrhi::FRESULT result = scheduler->LoadSimulationState(reader);
+            if (NVRHI_SUCCEEDED(result))
+            {
+                rig.time = time;
+                rig.frame = frame;
+                script.domain->teleportsTaken = takenBefore;
+            }
+            return result;
+        };
+
+        CHECK(load() == nvrhi::FS_OK);
+        script.ApplyAuthored(c_Save - 1);
+        for (uint32_t f = 0; f < c_Frames; ++f)
+            CHECK(script.Frame(c_Save + f) == first[f]);
+
+        // the gap: the kinematic parents stay where the last frame put them until the script sets them again
+        CHECK(load() == nvrhi::FS_OK);
+        static_assert(c_Save % 3 != 1, "the first frame does not set kinematic[1]");
+        const FrameHashes gap = script.Frame(c_Save);
+        CHECK(gap.engine == first[0].engine && gap.simulated == first[0].simulated);
+        CHECK(!Near(script.onKinematic->GetLocalToWorldTransform(), childOf[0], 1e-3) && gap.shown != first[0].shown);
+
+        // a structural edit: out of date, and nothing changed
+        const FrameHashes before = HashFrame(rig, script.domain, script.id);
+        SceneGraphNode* more = rig.AddAt(rig.Root(), 0.0, 50.0, 0.0);
+        rig.Bind(more);
+        rig.Refresh();
+        const FrameHashes edited = HashFrame(rig, script.domain, script.id);
+        CHECK(edited != before);
+        CHECK(load() == nvrhi::FE_OUT_OF_DATE);
+        CHECK(HashFrame(rig, script.domain, script.id) == edited);
+        // taken back: the same entities again, so it loads
+        rig.graph->Detach(more);
+        rig.Refresh();
+        (void)TakeWarnings();
+        script.domain->balls.resize(script.driven.size());   // the engine's free slot goes with it
+        script.domain->freeIndices.clear();
+        CHECK(load() == nvrhi::FS_OK);
+        script.ApplyAuthored(c_Save - 1);
+        const FrameHashes again = script.Frame(c_Save);
+        CHECK(again.shown == first[0].shown && again.engine == first[0].engine);
+    }
+}
+
+// ------------------------------------------------------------------------------------------------- review fixes
+
+// The local getters of a driven node give its last simulated pose, not the place that is shown: with a domain whose
+// interpolation is between two poses, after Refresh, below an unmoved authored root.
+void test_simulate_getters()
+{
+    Rig rig;
+    auto domain = rig.NewDomain("balls", 0.25, 4);
+    const SimulationDomainId id = rig.AddDomain(domain);
+    SceneGraphNode* ball = rig.AddAt(rig.Root(), 0.0, 40.0, 0.0);
+    rig.Bind(ball);
+    rig.Refresh();
+    uint32_t between = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        rig.GraphFrame(0.25 * 1.3);
+        const SimPose pose = *rig.Get<SimPose>(ball);
+        const dm::double3 translation = ball->GetTranslation();
+        CHECK(SameBits(&pose.translation, &translation, sizeof(translation)));
+        CHECK(Near(ball->GetRotation(), pose.rotation, 0.0));
+        CHECK(Near(ball->GetLocalToParentTransform(), rig.Posed(ball), 1e-15));
+        if (rig.Alpha(id) < 1.0)
+        {
+            ++between;
+            CHECK(!Near(ball->GetLocalToWorldTransform(), ball->GetLocalToParentTransform(), 1e-6));
+        }
+    }
+    CHECK(between >= 3);
+}
+
+namespace
+{
+    // The countdown of g_FailAfterNew: the allocation that it reaches fails.
+    struct FailingNew
+    {
+        explicit FailingNew(int32_t nth) { g_FailAfterNew.store(nth); }
+        ~FailingNew() { g_FailAfterNew.store(0); }
+        bool Fired() const { return g_FailAfterNew.load() <= 0; }
+    };
+}
+
+// SetJobSystem is all or nothing: whichever allocation of the new scheduler and its phases and systems fails, the graph
+// keeps its scheduler, job system, generation and marks, and goes on propagating, simulating and resolving teleports.
+// A graph made with one of them failing warns, has what could be made, and Simulate refuses without a scheduler or a
+// phase of its own.
+void test_simulate_scheduler_failures()
+{
+    uint32_t refusals = 0;
+    for (int32_t nth = 1;; ++nth)
+    {
+        Rig rig;
+        auto instance = rig.factory->CreateSkinnedMeshInstance(rig.factory, rig.mesh);
+        rig.graph->AttachLeafNode(rig.Root(), instance);
+        auto joint = MakeNode("joint");
+        joint->SetTranslation(dm::double3(1.0));
+        joint->SetLeaf(MAKE_RC_OBJ_PTR(SkinnedMeshReference, instance.Get()));
+        rig.graph->Attach(rig.Root(), joint);
+        SceneGraphNode* node = rig.AddAt(rig.Root(), 0.0, 0.0, 0.0);
+        SceneGraphNode* other = rig.AddAt(rig.Root(), 0.0, 0.0, 0.0);
+        rig.Bind(node);
+        rig.GraphFrame(0.25);
+        joint->SetTranslation(dm::double3(1.5));
+        rig.graph->Refresh(100);
+        CHECK(instance->GetLastUpdateFrameIndex() == 100);
+        auto jobs = MakeJobs(1);
+        IScheduler* before = rig.graph->GetScheduler();
+        IJobSystem* jobsBefore = before->GetJobSystem();
+        const uint64_t generation = rig.graph->GetSchedulerGeneration();
+        bool fired = false;
+        {
+            FailingNew failing(nth);
+            rig.graph->SetJobSystem(jobs);
+            fired = failing.Fired();
+        }
+        const uint32_t warnings = TakeWarnings();
+        if (!fired)
+        {
+            CHECK(warnings == 0 && rig.graph->GetScheduler() != before &&
+                  rig.graph->GetSchedulerGeneration() == generation + 1);
+            CHECK(rig.graph->GetScheduler()->GetJobSystem() == jobs.Get());
+            break;
+        }
+        ++refusals;
+        CHECK(warnings >= 1 && rig.graph->GetScheduler() == before && before->GetJobSystem() == jobsBefore);
+        CHECK(rig.graph->GetSchedulerGeneration() == generation);
+        CHECK(rig.Store().GetTeleportPhase() != SceneGraphStore::c_NoPhase &&
+              rig.Store().GetInterpolationPhase() != SceneGraphStore::c_NoPhase);
+        // the marks go on from where they were: an edit elsewhere marks no joint
+        other->SetTranslation(dm::double3(2.0));
+        rig.graph->Refresh(101);
+        CHECK(instance->GetLastUpdateFrameIndex() == 100);
+        // propagation, the simulation and the requests go on
+        node->SetTranslation(dm::double3(3.0, 0.0, 0.0));
+        other->SetTranslation(dm::double3(4.0));
+        const uint64_t resolved = rig.Resolved();
+        rig.GraphFrame(0.25);
+        CHECK(rig.Resolved() == resolved + 1 && other->GetLocalToWorldTransform().m_translation.x == 4.0);
+        // the graph's job system is still the old one: the new one is taken when it is given again
+        rig.graph->SetJobSystem(jobs);
+        CHECK(TakeWarnings() == 0 && rig.graph->GetScheduler() != before);
+        CHECK(rig.graph->GetScheduler()->GetJobSystem() == jobs.Get());
+    }
+    std::printf("SetJobSystem refused at %u allocations\n", refusals);
+    CHECK(refusals >= 10);
+
+    // a graph whose scheduler, phases or systems could not all be made
+    uint64_t allocations = 0;
+    for (int i = 0; i < 2; ++i)   // the second one: without what is made once per thread
+    {
+        const uint64_t before = g_NewCount.load();
+        auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+        allocations = g_NewCount.load() - before;
+    }
+    uint32_t withoutScheduler = 0, withoutPhase = 0, incomplete = 0;
+    for (uint64_t last = 0; last < uint64_t(refusals); ++last)   // the scheduler's are the last ones
+    {
+        nvrhi::AutoPtr<SceneGraph> graph;
+        {
+            FailingNew failing(int32_t(allocations - last));
+            graph = MAKE_RC_OBJ_PTR(SceneGraph);
+            CHECK(failing.Fired());
+        }
+        const uint32_t warnings = TakeWarnings();
+        CHECK(warnings >= 1);
+        graph->SetRootNode(MakeNode("root"));
+        SceneGraphStore& store = StoreOf(graph);
+        const bool scheduler = graph->GetScheduler() != nullptr;
+        const bool phases = store.GetTeleportPhase() != SceneGraphStore::c_NoPhase &&
+                            store.GetInterpolationPhase() != SceneGraphStore::c_NoPhase;
+        const nvrhi::FRESULT simulated = graph->Simulate(FrameTime{ 0.25, 0.25, 0 });
+        (void)TakeWarnings();
+        CHECK((simulated == nvrhi::FS_OK) == (scheduler && phases));
+        withoutScheduler += scheduler ? 0 : 1;
+        withoutPhase += scheduler && !phases ? 1 : 0;
+        incomplete += scheduler && phases ? 1 : 0;
+        graph->Refresh(1);
+        (void)TakeWarnings();
+    }
+    std::printf("graphs made with a failure: %u without a scheduler, %u without a phase, %u with the phases\n",
+                withoutScheduler, withoutPhase, incomplete);
+    CHECK(withoutScheduler >= 1 && withoutPhase >= 1);
+}
+
+// SetJobSystem asks the graph's own scheduler for domains: another scheduler of the world, with or without domains, does
+// not decide. The 16th domain counts.
+void test_simulate_jobs_domains()
+{
+    {
+        Rig rig;
+        auto domain = rig.NewDomain();
+        rig.AddDomain(domain);
+        SceneGraphNode* node = rig.AddAt(rig.Root(), 1.0, 2.0, 3.0);
+        rig.Bind(node);
+        rig.GraphFrame(0.25);
+        IScheduler* before = rig.graph->GetScheduler();
+        {
+            nvrhi::AutoPtr<IScheduler> tool;   // it publishes a FixedStepState without domains
+            CHECK(CreateScheduler(rig.world, rig.jobs, &tool) == nvrhi::FS_OK);
+        }
+        auto jobs = MakeJobs(1);
+        rig.graph->SetJobSystem(jobs);
+        CHECK(TakeWarnings() == 1 && rig.graph->GetScheduler() == before);
+    }
+    {
+        Rig rig;
+        IScheduler* before = rig.graph->GetScheduler();
+        nvrhi::AutoPtr<IScheduler> tool;
+        CHECK(CreateScheduler(rig.world, rig.jobs, &tool) == nvrhi::FS_OK);
+        auto domain = rig.NewDomain();
+        SimulationDomainId id;
+        CHECK(tool->AddSimulationDomain(domain, id) == nvrhi::FS_OK);   // not the graph's
+        auto jobs = MakeJobs(1);
+        rig.graph->SetJobSystem(jobs);
+        CHECK(TakeWarnings() == 0 && rig.graph->GetScheduler() != before);
+        CHECK(tool->RemoveSimulationDomain(id) == nvrhi::FS_OK);
+    }
+    {
+        Rig rig;
+        IScheduler* scheduler = rig.graph->GetScheduler();
+        std::vector<nvrhi::AutoPtr<BallDomain>> domains;
+        std::vector<SimulationDomainId> ids;
+        for (uint32_t i = 0; i < c_MaxSimulationDomains; ++i)
+        {
+            domains.push_back(rig.NewDomain(("d" + std::to_string(i)).c_str()));
+            ids.push_back(rig.AddDomain(domains.back()));
+        }
+        CHECK(uint32_t(ids.back()) == c_MaxSimulationDomains - 1);
+        for (uint32_t i = 0; i + 1 < c_MaxSimulationDomains; ++i)
+            CHECK(scheduler->RemoveSimulationDomain(ids[i]) == nvrhi::FS_OK);
+        (void)TakeWarnings();
+        auto jobs = MakeJobs(1);
+        rig.graph->SetJobSystem(jobs);
+        CHECK(TakeWarnings() == 1 && rig.graph->GetScheduler() == scheduler);
+        CHECK(scheduler->RemoveSimulationDomain(ids.back()) == nvrhi::FS_OK);
+        rig.graph->SetJobSystem(jobs);
+        CHECK(TakeWarnings() == 0 && rig.graph->GetScheduler() != scheduler);
+    }
+}
+
+// A Refresh that a system of another Refresh's phases calls is refused, and leaves that one's marks and frame alone.
+void test_simulate_nested_refresh()
+{
+    Rig rig;
+    auto instance = rig.factory->CreateSkinnedMeshInstance(rig.factory, rig.mesh);
+    rig.graph->AttachLeafNode(rig.Root(), instance);
+    auto node = MakeNode("joint");
+    node->SetTranslation(dm::double3(1.0));
+    node->SetLeaf(MAKE_RC_OBJ_PTR(SkinnedMeshReference, instance.Get()));
+    rig.graph->Attach(rig.Root(), node);
+    rig.graph->Refresh(5);
+    rig.AddSystem("test.nested", Phase::TransformPropagation, {}, [&](ISystemContext*)
+    {
+        rig.graph->Refresh(9);
+        return nvrhi::FS_OK;
+    }, SystemFlags::MainThread, "SceneGraph.TransformPropagation");
+    node->SetTranslation(dm::double3(2.0));
+    rig.graph->Refresh(6);
+    CHECK(TakeWarnings() >= 1 && instance->GetLastUpdateFrameIndex() == 6);
+    rig.graph->Refresh(7);
+    CHECK(instance->GetLastUpdateFrameIndex() == 6);
+    node->SetTranslation(dm::double3(3.0));
+    rig.graph->Refresh(8);
+    CHECK(TakeWarnings() >= 1 && instance->GetLastUpdateFrameIndex() == 8);
+}
+
+// Chains far longer than the stack of local transforms: binding takes the world that propagation gives, bit for bit;
+// the getters, a request, its resolving, unbinding, Detach and a copy work at the depth of 200,000.
+void test_simulate_long_chain()
+{
+    // the pieces of ComposeWorld: around one block, and several of them
+    for (int length : { 63, 64, 65, 66, 130, 4095, 4097, 64 * 64 + 1 })
+    {
+        Rig rig;
+        SceneGraphNode* last = rig.Root();
+        for (int i = 0; i < length; ++i)
+        {
+            const Placement p{ dm::double3(0.01, 0.0, 0.0), Unit(1.0, 0.001, 0.0, 0.0), dm::double3(1.0) };
+            last = i % 7 == 3 ? rig.Add(last) : rig.Add(last, &p);
+        }
+        rig.Refresh();
+        const dm::daffine3 propagated = last->GetLocalToWorldTransform();
+        rig.Bind(last);
+        CHECK(SameBits(last->GetLocalToWorldTransform(), propagated));
+    }
+    {   // below a driven node: from its pose on
+        Rig rig;
+        SceneGraphNode* top = rig.AddAt(rig.Root(), 1.0, 2.0, 3.0);
+        SceneGraphNode* last = top;
+        for (int i = 0; i < 200; ++i)
+            last = rig.AddAt(last, 0.01, 0.0, 0.0);
+        rig.Bind(top);
+        rig.SetPose(top, dm::double3(50.0, 0.0, 0.0), c_Turn);
+        rig.Simulate(0.0);
+        rig.Refresh();
+        const dm::daffine3 propagated = last->GetLocalToWorldTransform();
+        CHECK(Near(propagated.m_translation, rig.Posed(top).transformPoint(dm::double3(2.0, 0.0, 0.0)), 1e-12));
+        rig.Bind(last);
+        CHECK(SameBits(last->GetLocalToWorldTransform(), propagated));
+    }
+    constexpr int c_Depth = 200000;
+    Rig rig;
+    auto domain = rig.NewDomain();
+    rig.AddDomain(domain);
+    Freeze(domain);
+    std::vector<SceneGraphNode*> chain;
+    SceneGraphNode* last = rig.Root();
+    for (int i = 0; i < c_Depth; ++i)
+    {
+        const Placement p{ dm::double3(1e-4, 0.0, 0.0), Unit(1.0, 1e-5, 0.0, 0.0), dm::double3(1.0) };
+        last = i % 5 == 4 ? rig.Add(last) : rig.Add(last, &p);
+        chain.push_back(last);
+    }
+    rig.Refresh();
+    const dm::daffine3 propagated = last->GetLocalToWorldTransform();
+    const dm::daffine3 parentWorld = last->GetParent()->GetLocalToWorldTransform();
+    rig.Bind(last);
+    CHECK(SameBits(last->GetLocalToWorldTransform(), propagated));
+    CHECK(Near(rig.Posed(last), propagated, 1e-12));
+    // the getters, set again: the pose is the target
+    CHECK(Near(last->GetLocalToParentTransform() * parentWorld, rig.Posed(last), 1e-9));
+    const dm::double3 t = last->GetTranslation();
+    const dm::dquat r = last->GetRotation();
+    const dm::double3 s = last->GetScaling();
+    const SimPose pose = *rig.Get<SimPose>(last);
+    last->SetTransform(&t, &r, &s);
+    domain->taken.clear();
+    rig.GraphFrame(0.25);
+    CHECK(Near(TakenOf(rig, domain, last).translation, pose.translation, 1e-9));
+    last->SetTranslation(dm::double3(1.0, 2.0, 3.0));
+    rig.GraphFrame(0.25);
+    CHECK(Near(TakenOf(rig, domain, last).translation, parentWorld.transformPoint(dm::double3(1.0, 2.0, 3.0)), 1e-9));
+    // a copy, Detach and unbinding: the same local transform
+    const dm::daffine3 local = last->GetLocalToParentTransform();
+    nvrhi::AutoPtr<SceneGraphNode> copy = rig.graph->Attach(chain[c_Depth / 2], last);
+    CHECK(copy && Near(copy->GetLocalToParentTransform(), local, 1e-12));
+    nvrhi::AutoPtr<SceneGraphNode> detached = rig.graph->Detach(last);
+    CHECK(Near(detached->GetLocalToParentTransform(), local, 1e-12));
+    last = rig.graph->Attach(chain[c_Depth - 2], detached);
+    rig.Bind(last);
+    rig.Unbind(last);
+    CHECK(Near(last->GetLocalToParentTransform(), local, 1e-9));
+    rig.Refresh();
+    CHECK(TakeWarnings() == 0);
+}
+
+// Unbinding, Detach and copies take what the getters give: also of a scale of 0 (its rotation stays), of a mirrored one
+// (as it is), and below a parent that shears (with a warning, as the matrix cannot be the pose).
+void test_simulate_unbind_parts()
+{
+    struct Case { dm::double3 scale; Placement parent; bool warns; dm::dquat rotation = Unit(1.0, 0.3, 0.2, 0.1); };
+    const Case cases[] = {
+        { dm::double3(1.0, 0.0, 2.0), Placement{}, false },
+        { dm::double3(0.0), Placement{ dm::double3(1.0), c_OtherTurn, dm::double3(2.0) }, false },
+        { dm::double3(1.0, -2.0, 1.0), Placement{}, false },
+        { dm::double3(1.0, -2.0, 1.0), Placement{ dm::double3(1.0), c_OtherTurn, dm::double3(2.0, -2.0, 2.0) }, false },
+        { dm::double3(1.0), Placement{ dm::double3(1.0), c_OtherTurn, dm::double3(1.0, 3.0, 1.0) }, true },
+        // a turn about x below a stretch along y: the first axis stays, the other two shear
+        { dm::double3(1.0), Placement{ dm::double3(1.0), dm::dquat::identity(), dm::double3(1.0, 3.0, 1.0) }, true,
+          Unit(1.0, 0.4, 0.0, 0.0) },
+        // a quarter turn below it: axes to axes, the parts are the matrix's
+        { dm::double3(1.0), Placement{ dm::double3(1.0), dm::dquat::identity(), dm::double3(1.0, 3.0, 1.0) }, false,
+          Unit(1.0, 1.0, 0.0, 0.0) },
+    };
+    for (const Case& c : cases)
+    {
+        for (int how = 0; how < 3; ++how)   // unbind, Detach, copy
+        {
+            Rig rig;
+            auto domain = rig.NewDomain();
+            rig.AddDomain(domain);
+            SceneGraphNode* parent = rig.Add(rig.Root());
+            SceneGraphNode* node = rig.AddAt(parent, 1.0, 2.0, 3.0);
+            rig.Bind(node);
+            Place(parent, c.parent);
+            rig.Refresh();
+            rig.SetPose(node, dm::double3(1.0, 2.0, 3.0), c.rotation);
+            rig.Edit<SimScale>(node)->scaling = c.scale;
+            const Placement got{ node->GetTranslation(), node->GetRotation(), node->GetScaling() };
+            SceneGraphNode* result = node;
+            nvrhi::AutoPtr<SceneGraphNode> kept;
+            if (how == 0)
+                rig.Unbind(node);
+            else if (how == 1)
+                kept = rig.graph->Detach(node), result = kept;
+            else
+                kept = rig.graph->Attach(parent, node), result = kept;
+            CHECK(TakeWarnings() == (c.warns ? 1u : 0u));
+            CHECK(Near(result->GetTranslation(), got.translation, 1e-13) &&
+                  Near(result->GetRotation(), got.rotation, 1e-13) && Near(result->GetScaling(), got.scaling, 1e-13));
+        }
+    }
+}
+
+// Light::SetPosition and SetDirection on a driven light below a driven parent that the interpolation shows behind its
+// pose: the target is where they were told, over the simulated world of the parent.
+void test_simulate_light()
+{
+    Rig rig;
+    auto domain = rig.NewDomain();
+    rig.AddDomain(domain);
+    SceneGraphNode* train = rig.AddAt(rig.Root(), 0.0, 10.0, 0.0);
+    auto lampNode = MakeNode("lamp");
+    auto lamp = MAKE_RC_OBJ_PTR(SpotLight);
+    lampNode->SetLeaf(lamp);
+    SceneGraphNode* lampAt = rig.graph->Attach(train, lampNode);
+    rig.Bind(train);
+    rig.Bind(lampAt);
+    rig.Refresh();
+    rig.GraphFrame(0.25 * 1.3);
+    rig.GraphFrame(0.25);
+    CHECK(!Near(train->GetLocalToWorldTransform(), rig.Posed(train), 1e-3));
+    const dm::double3 position(5.0, 6.0, 7.0);
+    lamp->SetPosition(position);
+    domain->taken.clear();
+    rig.GraphFrame(0.25);
+    CHECK(Near(TakenOf(rig, domain, lampAt).translation, position, 1e-12));
+    const dm::double3 direction = normalize(dm::double3(1.0, -2.0, 0.5));
+    rig.Edit<SimScale>(lampAt)->scaling = dm::double3(2.0);   // the direction comes with a scale of 1
+    lamp->SetDirection(direction);
+    domain->taken.clear();
+    rig.GraphFrame(0.25);
+    const SimTeleport taken = TakenOf(rig, domain, lampAt);
+    const dm::daffine3 world = MatrixOf(taken);
+    CHECK(Near(-normalize(dm::double3(world.m_linear.row2)), direction, 1e-12));
+    CHECK(Near(taken.scaling, dm::double3(1.0), 1e-12));
+    // an authored light below it is placed over what is shown, as ever
+    auto authored = MAKE_RC_OBJ_PTR(PointLight);
+    auto authoredNode = MakeNode("authored");
+    authoredNode->SetLeaf(authored);
+    rig.graph->Attach(train, authoredNode);
+    rig.Refresh();
+    authored->SetPosition(position);
+    rig.Refresh();
+    CHECK(Near(authored->GetPosition(), position, 1e-12));
+    CHECK(TakeWarnings() == 0);
+}
+
+// A setter in a lifetime callback of the domain (a world observer): the request is made, and taken at the next step.
+// The column's stamp is the resolving system's own version.
+void test_teleport_callbacks()
+{
+    Rig rig;
+    auto domain = rig.NewDomain();
+    rig.AddDomain(domain);
+    SceneGraphNode* node = rig.AddAt(rig.Root(), 1.0, 2.0, 3.0);
+    domain->onAdded = [&](const EntityBatch&, ISimulationContext*) { node->SetTranslation(dm::double3(50.0)); };
+    rig.Bind(node);
+    domain->onAdded = nullptr;
+    CHECK(rig.IsPending(node) && TakeWarnings() == 0);
+    Freeze(domain);
+    rig.GraphFrame(0.25);
+    CHECK(domain->teleportsTaken == 1 && Near(rig.Get<SimPose>(node)->translation, dm::double3(50.0), 1e-12));
+
+    uint64_t later = 0;
+    rig.AddSystem("test.later", rig.Store().GetTeleportPhase(), {}, [&](ISystemContext* context)
+    {
+        later = context->GetVersion();
+        return nvrhi::FS_OK;
+    });
+    node->SetTranslation(dm::double3(60.0));
+    rig.SimulateGraph(0.0);   // resolved, not taken
+    CHECK(rig.IsPending(node) && rig.Get<SimTeleport>(node)->space == SimTeleportSpace::World);
+    CHECK(later != 0 && rig.ColumnVersion(node, FindComponent<SimTeleport>(rig.world)) == later - 1);
+}
+
+// Requests below parents whose worlds shear and mirror: what the getters give, set again, is the pose, all parts or
+// some; and a request is the parts of the matrix product where they exist (the translation always, the lengths of the
+// axes always, the axes near those of the product).
+void test_teleport_sheared_parents()
+{
+    Rig rig;
+    auto domain = rig.NewDomain();
+    rig.AddDomain(domain);
+    Rng rng(9);
+    for (int round = 0; round < 300; ++round)
+    {
+        Placement a{ RandomVector(rng, -3.0, 3.0), RandomRotation(rng), RandomVector(rng, 0.8, 1.25) };
+        Placement b{ RandomVector(rng, -3.0, 3.0), RandomRotation(rng), RandomVector(rng, 0.8, 1.25) };
+        if (round % 2)
+            b.scaling.y = -b.scaling.y;
+        if (round % 3 == 0)
+            a.scaling.z = -a.scaling.z;
+        SceneGraphNode* upper = rig.AddAt(rig.Root(), 0.0, 0.0, 0.0);
+        SceneGraphNode* lower = rig.AddAt(upper, 0.0, 0.0, 0.0);
+        SceneGraphNode* node = rig.AddAt(lower, 1.0, 2.0, 3.0);
+        rig.Bind(node);
+        Place(upper, a);
+        Place(lower, b);
+        rig.Refresh();
+        Freeze(domain);
+        const dm::daffine3 parent = lower->GetLocalToWorldTransform();
+        if (round % 5 == 0)
+            rig.Edit<SimScale>(node)->scaling = dm::double3(1.0, -2.0, 0.5);
+        const SimPose pose = *rig.Get<SimPose>(node);
+        const SimScale scale = *rig.Get<SimScale>(node);
+        const dm::double3 t = node->GetTranslation(), s = node->GetScaling();
+        const dm::dquat r = node->GetRotation();
+        const int parts = 1 + round % 7;
+        node->SetTransform(parts & 1 ? &t : nullptr, parts & 2 ? &r : nullptr, parts & 4 ? &s : nullptr);
+        domain->taken.clear();
+        rig.GraphFrame(0.25);
+        const SimTeleport same = TakenOf(rig, domain, node);
+        CHECK(Near(same.translation, pose.translation, 1e-9) && Near(same.rotation, pose.rotation, 1e-9) &&
+              Near(same.scaling, scale.scaling, 1e-9));
+
+        const Placement local = RandomPlacement(rng);
+        Place(node, local);
+        domain->taken.clear();
+        rig.GraphFrame(0.25);
+        const SimTeleport taken = TakenOf(rig, domain, node);
+        const dm::daffine3 product = ComposeTransform(local.translation, local.rotation, local.scaling) * parent;
+        CHECK(Near(taken.translation, product.m_translation, 1e-9));
+        const dm::daffine3 axes = ComposeTransform(dm::double3(0.0), taken.rotation, dm::double3(1.0));
+        for (int i = 0; i < 3; ++i)
+        {
+            const dm::double3 row = product.m_linear[i];
+            CHECK(Near(std::abs(taken.scaling[i]), length(row), 1e-9));
+            const double sign = taken.scaling[i] < 0.0 ? -1.0 : 1.0;
+            CHECK(dm::dot(sign * dm::double3(axes.m_linear[i]), row / length(row)) > 0.9);
+        }
+        rig.graph->Detach(upper);
+    }
+    (void)TakeWarnings();   // Detach below sheared parents
+}
+
 int main(int argc, char** argv)
 {
     struct Case { const char* name; void (*run)(); };
@@ -3482,6 +6188,33 @@ int main(int argc, char** argv)
         { "interpolation_poses", test_interpolation_poses },
         { "interpolation_changes", test_interpolation_changes },
         { "interpolation_phase", test_interpolation_phase },
+        { "simulate_frame", test_simulate_frame },
+        { "simulate_by_hand", test_simulate_by_hand },
+        { "simulate_refused", test_simulate_refused },
+        { "simulate_application", test_simulate_application },
+        { "simulate_job_system", test_simulate_job_system },
+        { "simulate_skinned", test_simulate_skinned },
+        { "simulate_allocations", test_simulate_allocations },
+        { "teleport_setters", test_teleport_setters },
+        { "teleport_parts", test_teleport_parts },
+        { "teleport_parent", test_teleport_parent },
+        { "teleport_pending", test_teleport_pending },
+        { "teleport_lifecycle", test_teleport_lifecycle },
+        { "teleport_refused", test_teleport_refused },
+        { "teleport_rows", test_teleport_rows },
+        { "teleport_phase", test_teleport_phase },
+        { "teleport_save_load", test_teleport_save_load },
+        { "replay_script", test_replay_script },
+        { "replay_rewind", test_replay_rewind },
+        { "simulate_getters", test_simulate_getters },
+        { "simulate_scheduler_failures", test_simulate_scheduler_failures },
+        { "simulate_jobs_domains", test_simulate_jobs_domains },
+        { "simulate_nested_refresh", test_simulate_nested_refresh },
+        { "simulate_long_chain", test_simulate_long_chain },
+        { "simulate_unbind_parts", test_simulate_unbind_parts },
+        { "simulate_light", test_simulate_light },
+        { "teleport_callbacks", test_teleport_callbacks },
+        { "teleport_sheared_parents", test_teleport_sheared_parents },
     };
     log::SetCallback([](log::Severity severity, const char* message)
     {

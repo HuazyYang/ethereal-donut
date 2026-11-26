@@ -25,6 +25,8 @@
 #include <donut/core/json.h>
 #include <json/json-forwards.h>
 
+#include "SceneGraphStore.h"
+
 using namespace donut::math;
 #include <donut/shaders/light_cb.h>
 #include <donut/shaders/bindless.h>
@@ -105,6 +107,14 @@ void Light::SetPosition(const dm::double3& position) const
         return;
     }
 
+    // A node that a simulation drives is placed over the simulated world of its parent, not over the shown one.
+    LocalTransform driven;
+    if (SceneGraphStore::ToDrivenLocal(node, dm::translation(position), driven))
+    {
+        node->SetTranslation(driven.translation);
+        return;
+    }
+
     SceneGraphNode* parent = node->GetParent();
     dm::daffine3 parentToWorld = dm::daffine3::identity();
     if (parent)
@@ -120,6 +130,13 @@ void Light::SetDirection(const dm::double3& direction) const
     if (!node)
     {
         assert(!"Lights must be attached in order to set their direction");
+        return;
+    }
+
+    LocalTransform driven;   // as in SetPosition
+    if (SceneGraphStore::ToDrivenLocal(node, inverse(lookatZ(direction)), driven))
+    {
+        node->SetTransform(nullptr, &driven.rotation, &driven.scaling);
         return;
     }
 

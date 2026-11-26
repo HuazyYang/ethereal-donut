@@ -1,5 +1,5 @@
-// bench_simulation: what simulation-driven nodes cost (aggregate docs/plans/2026-11-21-donut-ecs-e6.md, item E6.2a and
-// its performance table).
+// bench_simulation: what simulation-driven nodes cost (aggregate docs/plans/2026-11-21-donut-ecs-e6.md, items E6.2a and
+// E6.2b and its performance table).
 //
 //     bench_simulation [--smoke] [--rounds N] [--workers N]
 //
@@ -15,6 +15,11 @@
 //     <n>_refresh           the Refresh after them (propagation, bounds, subgraphs)
 //     <n>_setters           for comparison, without a simulation: SetTransform of the same nodes in the same scene
 //     <n>_setters_refresh   ... and the Refresh after it
+//     <n>_simulate_refresh  a frame as an application has it: SceneGraph::Simulate with one step, and Refresh
+//     teleports_set         the setters of 1k of 100k driven nodes: teleport requests, all parts but one or two
+//     teleports_gather      BeginFrame to PreSimulation with them: resolving, and the domain's GatherInputs
+//     teleports_gather_none the same without a request
+//     teleports_frame       Simulate with one step, and Refresh, with them
 //     bind                  SetSimulationDriven(true) of 10k nodes of 100k, with the domain's OnEntitiesAdded
 //     unbind                SetSimulationDriven(false) of them, with OnEntitiesRemoved
 //     detach                Detach of a subgraph of 10k driven nodes
@@ -22,6 +27,7 @@
 // Protocol as in bench_scene_graph: every round runs every case once; a run keeps the median of its iterations, the
 // table shows the median of the run medians and their range. Meaningful in Release builds only.
 
+#include <donut/engine/EcsQuery.h>
 #include <donut/engine/EcsScheduler.h>
 #include <donut/engine/EcsSimulation.h>
 #include <donut/engine/EcsWorld.h>
@@ -58,7 +64,7 @@ namespace
         return samples[samples.size() / 2];
     }
 
-    // The graph's scheduler has one named phase, the interpolation; named phases get their values from Count up.
+    // The graph's scheduler makes the phase of the interpolation first; named phases get their values from Count up.
     constexpr Phase c_Interpolation = Phase(uint32_t(Phase::Count));
 
     // The job system of --workers, or null for the shared one.
@@ -77,8 +83,11 @@ namespace
         };
 
         static constexpr double c_TimeStep = 1.0 / 64.0;
-        ComponentId pose, previous, body, driven;
+        ComponentId pose, previous, body, driven, scale, teleport;
+        std::vector<ComponentAccess> inputs;
         std::vector<ComponentAccess> outputs;
+        Query<Read<SimBodyRef>, Write<SimPose>, Write<SimPosePrevious>, Write<SimScale>, Enabled<SimTeleport>> requests;
+        uint64_t teleports = 0;                 // taken
         std::vector<QueryTerm> terms;
         std::vector<SimPose> poses[2];          // [current], and the poses before the last step
         std::vector<dm::double3> velocities;
@@ -89,8 +98,12 @@ namespace
 
         explicit FallDomain(IWorld* world)
             : pose(FindComponent<SimPose>(world)), previous(FindComponent<SimPosePrevious>(world)),
-              body(FindComponent<SimBodyRef>(world)), driven(FindComponent<SimulationDriven>(world))
+              body(FindComponent<SimBodyRef>(world)), driven(FindComponent<SimulationDriven>(world)),
+              scale(FindComponent<SimScale>(world)), teleport(FindComponent<SimTeleport>(world)),
+              requests(world, "requests")
         {
+            inputs = { { teleport, Access::Write, {} }, { scale, Access::Write, {} }, { pose, Access::Write, {} },
+                       { previous, Access::Write, {} }, { body, Access::Read, {} } };
             outputs = { { pose, Access::Write, {} }, { previous, Access::Write, {} }, { body, Access::Read, {} } };
             terms = { { driven, TermOp::All, Access::Filter, {} }, { body, TermOp::All, Access::Write, {} },
                       { pose, TermOp::All, Access::Read, {} } };
@@ -100,6 +113,8 @@ namespace
         {
             retVal = SimulationDomainDesc{};
             retVal.name = "fall";
+            retVal.inputs = inputs.data();
+            retVal.inputCount = uint32_t(inputs.size());
             retVal.outputs = outputs.data();
             retVal.outputCount = uint32_t(outputs.size());
             retVal.lifetime.terms = terms.data();
@@ -144,7 +159,28 @@ namespace
             }
             return nvrhi::FS_OK;
         }
-        nvrhi::FRESULT GatherInputs(ISimulationContext*) noexcept override { return nvrhi::FS_OK; }
+        nvrhi::FRESULT GatherInputs(ISimulationContext* context) noexcept override
+        {
+            if (context->GetStepsThisFrame() == 0)
+                return nvrhi::FS_OK;
+            requests.ForEachChunk(context->GetSystemContext(),
+                [&](const ChunkView& view, const SimBodyRef* refs, SimPose* rowPoses, SimPosePrevious* rowPrevious,
+                    SimScale* rowScales, const SimTeleport* targets)
+            {
+                for (uint32_t row = 0; row < view.count; ++row)
+                {
+                    if (!view.IsRowEnabled(4, row))
+                        continue;
+                    poses[current][refs[row].index] = rowPoses[row] =
+                        SimPose{ targets[row].translation, targets[row].rotation };
+                    rowPrevious[row] = SimPosePrevious{ targets[row].translation, targets[row].rotation };
+                    rowScales[row].scaling = targets[row].scaling;
+                    context->GetWorld()->SetEnabled(view.entities[row], teleport, false);
+                    ++teleports;
+                }
+            });
+            return nvrhi::FS_OK;
+        }
         nvrhi::FRESULT Step(double dt, ISimulationContext* context) noexcept override
         {
             struct Call { const SimPose* from; SimPose* to; dm::double3* velocities; double dt; };
@@ -261,6 +297,14 @@ namespace
             time += delta;
             graph->GetScheduler()->SetFrameTime(FrameTime{ time, delta, frame });
         }
+        // SceneGraph::Simulate and Refresh.
+        void Frame(double delta)
+        {
+            time += delta;
+            if (NVRHI_FAILED(graph->Simulate(FrameTime{ time, delta, frame })))
+                std::abort();
+            graph->Refresh(frame++);
+        }
         void Run(Phase first, Phase last)
         {
             if (NVRHI_FAILED(graph->GetScheduler()->RunPhases(first, last)))
@@ -273,6 +317,7 @@ namespace
         size_t nodes = 100000;
         size_t few = 10000;
         size_t events = 10000;
+        size_t teleports = 1000;
         int iterations = 40;
         int eventIterations = 3;
     };
@@ -391,6 +436,16 @@ namespace
             Record(name + "setters", count, n, Median(set));
             Record(name + "setters_refresh", count, n, Median(setRefresh));
 
+            // the frame as an application has it: one Simulate with a step, one Refresh
+            std::vector<double> whole;
+            for (int it = 0; it < m_Sizes.iterations; ++it)
+            {
+                const auto start = Clock::now();
+                scene.Frame(FallDomain::c_TimeStep);
+                whole.push_back(Milliseconds(start, Clock::now()));
+            }
+            Record(name + "simulate_refresh", count, n, Median(whole));
+
             if (count == m_Sizes.nodes)
             {
                 std::vector<double> still;
@@ -403,7 +458,58 @@ namespace
                     still.push_back(Milliseconds(start, Clock::now()));
                 }
                 Record("still", count, n, Median(still));
+                Teleports(scene);
             }
+        }
+
+        // Requests of some of the driven nodes: the setters; what resolving them and the domain's gather cost, and what
+        // the two cost without any; the frame of Simulate and Refresh with them.
+        void Teleports(Scene& scene)
+        {
+            const auto chosen = scene.Every(m_Sizes.nodes / m_Sizes.teleports);
+            auto request = [&](int it)
+            {
+                for (size_t i = 0; i < chosen.size(); ++i)
+                {
+                    const dm::double3 translation(double(it), double(i % 53), double(i / 317));
+                    const dm::dquat rotation(0.6, 0.0, 0.8, 0.0);
+                    if (i % 2)
+                        chosen[i]->SetTransform(&translation, &rotation, nullptr);
+                    else
+                        chosen[i]->SetTranslation(translation);
+                }
+            };
+            std::vector<double> set, gather, noGather, whole;
+            const uint64_t before = scene.domain->teleports;
+            for (int it = 0; it < m_Sizes.iterations; ++it)
+            {
+                for (bool asked : { false, true })
+                {
+                    const auto t0 = Clock::now();
+                    if (asked)
+                        request(it);
+                    const auto t1 = Clock::now();
+                    scene.SetTime(FallDomain::c_TimeStep);
+                    scene.Run(Phase::BeginFrame, Phase::PreSimulation);
+                    const auto t2 = Clock::now();
+                    scene.Run(Phase::FixedSimulation, c_Interpolation);
+                    scene.graph->Refresh(scene.frame++);
+                    if (asked)
+                        set.push_back(Milliseconds(t0, t1));
+                    (asked ? gather : noGather).push_back(Milliseconds(t1, t2));
+                }
+                request(it);
+                const auto start = Clock::now();
+                scene.Frame(FallDomain::c_TimeStep);
+                whole.push_back(Milliseconds(start, Clock::now()));
+            }
+            if (scene.domain->teleports - before != uint64_t(m_Sizes.iterations) * 2 * chosen.size())
+                std::abort();
+            const int n = m_Sizes.iterations;
+            Record("teleports_set", chosen.size(), n, Median(set));
+            Record("teleports_gather", chosen.size(), n, Median(gather));
+            Record("teleports_gather_none", 0, n, Median(noGather));
+            Record("teleports_frame", chosen.size(), n, Median(whole));
         }
 
         void Events()
@@ -475,6 +581,7 @@ int main(int argc, char** argv)
         sizes.nodes /= 100;
         sizes.few /= 100;
         sizes.events /= 100;
+        sizes.teleports /= 100;
         sizes.iterations = 2;
         sizes.eventIterations = 1;
         rounds = 1;

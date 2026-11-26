@@ -276,13 +276,18 @@ namespace donut::engine
     DONUT_ECS_COMPONENT(SimBodyRef, "d4219345-9610-4d64-9578-e516c589e5d1", DONUT_ECS_FIELDS(domain, index))
 
     // A pending request to move a driven entity (5.2): enabled while it is pending, and the request's only home. The
-    // node's transform setters fill and enable it; the domain applies it before its next step, sets both poses to the
-    // target (nothing smears) and disables it. In a frame without a step it stays pending, and its column has not
-    // changed at the next gather: a domain finds requests by the enabled bit, not by the column's version.
+    // node's transform setters fill and enable it, with all its parts. A domain declares it, SimScale and both poses as
+    // inputs that it consumes (Write). In a GatherInputs with GetStepsThisFrame() > 0 it applies the enabled ones of
+    // space World to its engine, sets both poses to the target (nothing smears) and SimScale to the scale, and disables
+    // them (IWorld::SetEnabled). In a frame without a step they stay pending, and their column has not changed at the
+    // next gather: a domain finds requests by the enabled bit (Enabled<SimTeleport> in a query of its own), not by the
+    // column's version. One that is still of space Parent was not resolved this frame (it was made after the resolving
+    // phase, or that phase did not run, or could not): it is left alone, for the next frame.
     enum class SimTeleportSpace : uint32_t
     {
         Parent,   // as the setter wrote it
-        World,    // resolved through the parent's WorldTransform, before GatherInputs: what a domain sees
+        World,    // resolved before GatherInputs, over the parent's simulated world (the SimPose of driven ancestors, not
+                  // their WorldTransform, which lags): what a domain sees
     };
     struct SimTeleport
     {

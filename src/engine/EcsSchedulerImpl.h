@@ -85,6 +85,9 @@ namespace donut::engine::ecs
     // Whether an enabled system of the phase declares a Write access or is Exclusive (SceneGraph::RunReadOnlyPhase);
     // true for a scheduler of another module.
     bool PhaseDeclaresWrites(IScheduler* scheduler, Phase phase) noexcept;
+    // The simulation domains that the scheduler has now (FixedStepState is a copy of the world's, which another scheduler
+    // may have written); 0 for null and for a scheduler of another module.
+    uint32_t GetSimulationDomainCount(IScheduler* scheduler) noexcept;
     // A system's command buffers (not AddRef'd): one per worker index of the job system, then the home buffer of the
     // thread that runs its Update. Writes up to `capacity`, returns how many there are. A buffer takes its first arena
     // page when it first records, so which of them a system has warmed depends on which workers ran it; tests warm

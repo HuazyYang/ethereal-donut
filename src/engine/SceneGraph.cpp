@@ -1393,10 +1393,10 @@ void SceneGraph::Refresh(uint32_t frameIndex)
         m_Store->ReconcileMeshes();
 }
 
-// Stub: item E6.2b of the E6 sub-plan implements it.
-nvrhi::FRESULT SceneGraph::Simulate(const FrameTime&) noexcept
+nvrhi::FRESULT SceneGraph::Simulate(const FrameTime& time) noexcept
 {
-    return nvrhi::FE_UNSUPPORTED;
+    DONUT_SCENE_GRAPH_WARN_RENDER_READ(m_Store, "Simulate");
+    return m_Store->Simulate(time);
 }
 
 nvrhi::FRESULT SceneGraph::SetSimulationDriven(SceneGraphNode* node, bool driven) noexcept
@@ -1410,7 +1410,7 @@ nvrhi::FRESULT SceneGraph::SetSimulationDriven(SceneGraphNode* node, bool driven
     }
     catch (...)
     {
-        return nvrhi::FE_OUT_OF_MEMORY;   // the walk up to the root, before anything changed
+        return nvrhi::FE_OUT_OF_MEMORY;
     }
 }
 
