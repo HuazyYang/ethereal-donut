@@ -42,8 +42,10 @@
 // (its load-time upload: the first frame is no resend), with item E5.1's device-only checks. Then the skinning pass of
 // item E5.5 against Scene::UpdateSkinnedMeshes (RunSkinning): skinned vertex buffers and joint buffers byte-identical
 // to the CPU path's after every executed frame, the first frame, a skinned instance attached at runtime, a detach and
-// re-attach, and a dropped frame that keeps a first frame for the next one. Then, on a second device without the nvrhi
-// validation layer, the steady-state heap allocations of extraction, upload, skinning and recording (RunSteadyState).
+// re-attach, and a dropped frame that keeps a first frame for the next one. Then runtime-only mesh instances (plan step
+// E7, item E7.2; RunRuntimeRows): a population of them and one of nodes of the same quads drawn into images that are
+// equal. Then, on a second device without the nvrhi validation layer, the steady-state heap allocations of extraction,
+// upload, skinning and recording (RunSteadyState).
 // A GPU program: one at a time.
 
 #include <donut/app/ApplicationBase.h>
@@ -1947,6 +1949,353 @@ namespace
         device->runGarbageCollection();
     }
 
+    // ------------------------------------------------------------------------------- runtime-only rows (E7, E7.2)
+
+    // Plan step E7, item E7.2 on a device: a population of runtime-only mesh instances (SceneComponents.h,
+    // RuntimeMeshInstance) and one of nodes of the same quads (meshes, transforms, creation order), in two scenes on
+    // the graph path with a render service each and their own copies of the meshes and materials, built alike and taken
+    // in one order (SceneGraph::AcquireRuntimeMesh), so that the tables and slots are alike. Each frame both are
+    // extracted and uploaded, and a GBufferFillPass draws the opaque then the transparent packets into four colour
+    // targets and a depth target for a composite view of two children, through InstancedOpaqueDrawStrategy and
+    // TransparentDrawStrategy bound to each snapshot (the items carry the slot; a runtime row's item has no leaf); the
+    // node scene once more through the same kinds walking its graph (items with the default slot, which RenderView
+    // takes from the leaf, as for items made by hand). 180 quads of four meshes of 1-3 geometries (opaque,
+    // alpha-tested, double-sided, blended), a third turned away, at distinct depths. Frames: 1 (load), 2 (a fifth moved:
+    // nodes through the setter, rows through the world), 3 (a tenth removed and made again elsewhere: slots freed and
+    // reused), 4 (idle). Per frame: VerifyPlan and no diagnostics; the snapshots' instances alike (slots, meshes, bounds;
+    // no leaf for the rows); the three images equal byte for byte and not empty (but the emissive target; D3D11: the
+    // colour targets); the runtime population's draws equal the node population's, draw for draw; no warning.
+    void RunRuntimeRows(app::DeviceManager* deviceManager, nvrhi::GraphicsAPI api, bool bindless)
+    {
+        nvrhi::IDevice* device = deviceManager->GetDevice();
+        const std::string tag = std::string(app::GetShaderTypeName(api)) + (bindless ? ", bindless" : "") +
+                                ", runtime-only rows";
+        const uint32_t warningsBefore = g_Warnings.load();
+        // one fixture per scene: each scene's descriptors in a table of its own, at the same indices
+        Fixture fixtures[2] = { Fixture(device, api, bindless), Fixture(device, api, bindless) };
+        nvrhi::AutoPtr<Scene> scenes[2] = { fixtures[0].MakeScene(true), fixtures[1].MakeScene(true) };   // nodes, rows
+        SceneGraph* graphs[2] = { scenes[0]->GetSceneGraph(), scenes[1]->GetSceneGraph() };
+
+        auto material = [](const char* name, MaterialDomain domain, bool doubleSided, float3 color)
+        {
+            auto m = MAKE_RC_OBJ_PTR(Material);
+            m->name = name;
+            m->domain = domain;
+            m->doubleSided = doubleSided;
+            m->baseOrDiffuseColor = color;
+            m->opacity = domain == MaterialDomain::AlphaBlended ? 0.5f : 1.f;
+            return m;
+        };
+        std::vector<nvrhi::AutoPtr<MeshInfo>> meshes[2];
+        std::vector<MeshId> meshIds[2];
+        for (uint32_t g = 0; g < 2; ++g)
+        {
+            nvrhi::AutoPtr<Material> red = material("red", MaterialDomain::Opaque, false, float3(1.f, 0.f, 0.f));
+            nvrhi::AutoPtr<Material> green = material("green", MaterialDomain::AlphaTested, false, float3(0.f, 1.f, 0.f));
+            nvrhi::AutoPtr<Material> blue = material("blue", MaterialDomain::Opaque, true, float3(0.f, 0.f, 1.f));
+            nvrhi::AutoPtr<Material> yellow =
+                material("yellow", MaterialDomain::AlphaBlended, false, float3(1.f, 1.f, 0.f));
+            nvrhi::AutoPtr<Material> cyan = material("cyan", MaterialDomain::AlphaBlended, true, float3(0.f, 1.f, 1.f));
+            meshes[g] = { MakeQuadMesh("quad", { red }, MAKE_RC_OBJ_PTR(BufferGroup)),
+                          MakeQuadMesh("pair", { green, blue }, MAKE_RC_OBJ_PTR(BufferGroup)),
+                          MakeQuadMesh("triple", { red, yellow, cyan }, MAKE_RC_OBJ_PTR(BufferGroup)),
+                          MakeQuadMesh("glass", { cyan }, MAKE_RC_OBJ_PTR(BufferGroup)) };
+            for (const auto& mesh : meshes[g])
+            {
+                meshIds[g].push_back(graphs[g]->AcquireRuntimeMesh(mesh));
+                check(meshIds[g].back() != MeshId::Invalid, tag + ": AcquireRuntimeMesh");
+            }
+        }
+        check(meshIds[0] == meshIds[1], tag + ": the mesh tables alike");
+
+        // the quads: node i or row i of each population
+        struct Quad
+        {
+            LocalTransform local;
+            uint32_t mesh;
+            SceneGraphNode* node = nullptr;
+            Entity row = Entity::Null;
+        };
+        std::vector<Quad> quads(180);
+        auto place = [](Quad& quad, uint32_t i, double shift)
+        {
+            quad.local.translation = double3(-6.0 + 0.9 * double(i % 14), -3.8 + 0.85 * double((i / 14) % 9),
+                                             4.0 + 0.31 * double((i * 37) % 61) + 0.001 * double(i) + shift);
+            quad.local.rotation = i % 3 == 0 ? rotationQuat(double3(0.0, 1.0, 0.0), dm::PI_d) : dquat::identity();
+            quad.local.scaling = double3(1.0);
+        };
+        IWorld* world = graphs[1]->GetWorld();
+        std::vector<ComponentId> components(graphs[1]->GetRuntimeMeshInstanceComponents(nullptr, 0));
+        graphs[1]->GetRuntimeMeshInstanceComponents(components.data(), uint32_t(components.size()));
+        // nodes attached in order; rows made in one batch in the same order (the observer takes slots in row order)
+        auto make = [&](const std::vector<uint32_t>& which)
+        {
+            std::vector<LocalTransform> locals;
+            std::vector<MeshRef> refs;
+            for (uint32_t i : which)
+            {
+                Quad& quad = quads[i];
+                auto node = MAKE_RC_OBJ_PTR(SceneGraphNode);
+                node->SetName("quad" + std::to_string(i));
+                node->SetTransform(&quad.local.translation, &quad.local.rotation, &quad.local.scaling);
+                node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, meshes[0][quad.mesh].Get()));
+                quad.node = graphs[0]->Attach(graphs[0]->GetRootNode(), node);
+                locals.push_back(quad.local);
+                refs.push_back(MeshRef{ meshIds[1][quad.mesh] });
+            }
+            std::vector<const void*> values(components.size(), nullptr);
+            for (size_t c = 0; c < components.size(); ++c)
+            {
+                if (components[c] == FindComponent<LocalTransform>(world))
+                    values[c] = locals.data();
+                else if (components[c] == FindComponent<MeshRef>(world))
+                    values[c] = refs.data();
+            }
+            EntityCreateDesc desc{};
+            desc.components = components.data();
+            desc.values = values.data();
+            desc.componentCount = uint32_t(components.size());
+            desc.entityCount = uint32_t(which.size());
+            std::vector<Entity> rows(which.size(), Entity::Null);
+            check(world->CreateEntities(desc, rows.data()) == nvrhi::FS_OK, tag + ": CreateEntities");
+            for (size_t k = 0; k < which.size(); ++k)
+                quads[which[k]].row = rows[k];
+        };
+        std::vector<uint32_t> all;
+        for (uint32_t i = 0; i < uint32_t(quads.size()); ++i)
+        {
+            place(quads[i], i, 0.0);
+            quads[i].mesh = (i / 45) % 4;   // runs of consecutive slots
+            all.push_back(i);
+        }
+        make(all);
+
+        auto view = MAKE_RC_OBJ_PTR(CompositeView);
+        nvrhi::AutoPtr<PlanarView> children[2];
+        for (uint32_t c = 0; c < 2; ++c)
+        {
+            children[c] = MAKE_RC_OBJ_PTR(PlanarView);
+            children[c]->SetViewport(nvrhi::Viewport(96.f * float(c), 96.f * float(c + 1), 0.f, 128.f, 0.f, 1.f));
+            children[c]->SetMatrices(inverse(translation(float3(c ? 0.15f : -0.15f, 0.f, 0.f))),
+                                     perspProjD3DStyleReverse(radians(70.f), 0.75f, 0.1f));
+            children[c]->UpdateCache();
+            view->AddView(children[c]);
+        }
+        const IView* views[] = { children[0].Get(), children[1].Get() };
+
+        nvrhi::AutoPtr<CommonRenderPasses> commonPasses =
+            MAKE_RC_OBJ_PTR(CommonRenderPasses, device, fixtures[0].shaderFactory);
+        auto gbuffer = MAKE_RC_OBJ_PTR(RecordingGBufferPass, device, commonPasses);
+        gbuffer->Init(*fixtures[0].shaderFactory, GBufferFillPass::CreateParameters());
+        // [bound nodes, bound rows, walked nodes]
+        nvrhi::AutoPtr<InstancedOpaqueDrawStrategy> opaque[3] = { MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy),
+                                                                  MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy),
+                                                                  MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy) };
+        nvrhi::AutoPtr<TransparentDrawStrategy> transparent[3] = { MAKE_RC_OBJ_PTR(TransparentDrawStrategy),
+                                                                   MAKE_RC_OBJ_PTR(TransparentDrawStrategy),
+                                                                   MAKE_RC_OBJ_PTR(TransparentDrawStrategy) };
+        const nvrhi::Format formats[5] = { nvrhi::Format::SRGBA8_UNORM, nvrhi::Format::SRGBA8_UNORM,
+                                           nvrhi::Format::RGBA16_SNORM, nvrhi::Format::RGBA16_FLOAT, nvrhi::Format::D32 };
+        const char* sideNames[3] = { "BoundNodes", "BoundRows", "WalkedNodes" };
+        nvrhi::TextureHandle targets[3][5];
+        for (uint32_t side = 0; side < 3; ++side)
+            for (uint32_t t = 0; t < 5; ++t)
+                targets[side][t] = MakeTarget(device, formats[t], sideNames[side]);
+
+        nvrhi::AutoPtr<IResourceRegistry> registries[2];
+        nvrhi::AutoPtr<IRenderGraph> renderGraphs[2];
+        nvrhi::AutoPtr<RenderService> services[2];
+        BackendProfile profile;
+        check(ComputeBackendProfile(device, &profile) == nvrhi::FS_OK, "profile");
+        for (uint32_t g = 0; g < 2; ++g)
+        {
+            check(CreateResourceRegistry(device, &registries[g]) == nvrhi::FS_OK, "registry");
+            check(CreateRenderGraph(registries[g], &renderGraphs[g]) == nvrhi::FS_OK, "render graph");
+            RenderServiceDesc serviceDesc;
+            serviceDesc.scene = scenes[g];
+            serviceDesc.shaderFactory = fixtures[g].shaderFactory;
+            services[g] = MAKE_RC_OBJ_PTR(RenderService, device, serviceDesc);
+            scenes[g]->FinishedLoading(0);
+        }
+        device->waitForIdle();
+
+        uint64_t runtimeDraws = 0;
+        for (uint32_t frame = 1; frame <= 4; ++frame)
+        {
+            const std::string where = tag + ", frame " + std::to_string(frame);
+            if (frame == 2)
+            {
+                world->AdvanceVersion();   // as a phase would: a new version for the writes
+                for (size_t i = 0; i < quads.size(); i += 5)
+                {
+                    quads[i].local.translation += double3(0.05, 0.02, 0.5003);
+                    quads[i].node->SetTranslation(quads[i].local.translation);
+                    GetComponentForWrite<LocalTransform>(world, quads[i].row)->translation = quads[i].local.translation;
+                }
+            }
+            if (frame == 3)
+            {
+                std::vector<uint32_t> again;
+                for (uint32_t i = 3; i < uint32_t(quads.size()); i += 10)
+                {
+                    graphs[0]->Detach(quads[i].node);
+                    check(world->DestroyEntities(&quads[i].row, 1) == nvrhi::FS_OK, where + ": DestroyEntities");
+                    place(quads[i], i, 0.1501);
+                    again.push_back(i);
+                }
+                make(again);
+            }
+            const SceneFrame* sceneFrames[2] = {};
+            RecordingContext contexts[3][2];   // [side][opaque, transparent]
+            for (uint32_t g = 0; g < 2; ++g)
+            {
+                IRenderGraph* renderGraph = renderGraphs[g];
+                scenes[g]->RefreshSceneGraph(frame);
+                renderGraph->Reset();
+                SceneFrame* sceneFrame = nullptr;
+                ExtractDesc extractDesc;
+                extractDesc.views = views;
+                extractDesc.viewCount = 2;
+                extractDesc.frameIndex = frame;
+                check(services[g]->Extract(renderGraph, nullptr, extractDesc, &sceneFrame) == nvrhi::FS_OK && sceneFrame,
+                      where + ": Extract");
+                check(services[g]->AddUploadPasses(renderGraph, sceneFrame) == nvrhi::FS_OK, where + ": AddUploadPasses");
+                sceneFrames[g] = sceneFrame;
+                // the node scene: bound (side 0) and walked (side 2); the rows: bound (side 1)
+                const uint32_t sides[2][2] = { { 0, 2 }, { 1, 1 } };
+                for (uint32_t k = 0; k < (g == 0 ? 2u : 1u); ++k)
+                {
+                    const uint32_t side = sides[g][k];
+                    const bool walk = side == 2;
+                    opaque[side]->SetPackets(walk ? nullptr : sceneFrame->snapshot);
+                    transparent[side]->SetPackets(walk ? nullptr : sceneFrame->snapshot);
+                    GeometryGraphInputs inputs;
+                    inputs.name = sideNames[side];
+                    inputs.view = view;
+                    inputs.viewPrev = view;
+                    inputs.rootNode = walk ? graphs[0]->GetRootNode() : nullptr;
+                    inputs.colorTargetCount = 4;
+                    for (uint32_t t = 0; t < 4; ++t)
+                        inputs.colorTargets[t] = renderGraph->ImportTexture(targets[side][t], TargetState(formats[t]),
+                                                                            TargetState(formats[t]));
+                    inputs.depth = renderGraph->ImportTexture(targets[side][4], TargetState(formats[4]),
+                                                              TargetState(formats[4]));
+                    inputs.clearTargets = true;
+                    inputs.bufferReads = sceneFrame->bufferReads;
+                    inputs.bufferReadCount = sceneFrame->bufferReadCount;
+                    inputs.drawStrategy = opaque[side];
+                    inputs.passContext = &contexts[side][0];
+                    const GeometryGraphOutputs opaqueOut = gbuffer->AddToGraph(renderGraph, inputs);
+                    for (uint32_t t = 0; t < 4; ++t)
+                        inputs.colorTargets[t] = opaqueOut.colorTargets[t];
+                    inputs.depth = opaqueOut.depth;
+                    inputs.clearTargets = false;
+                    inputs.drawStrategy = transparent[side];
+                    inputs.passContext = &contexts[side][1];
+                    gbuffer->AddToGraph(renderGraph, inputs);
+                }
+
+                nvrhi::AutoPtr<ICompiledRenderGraph> plan;
+                const nvrhi::FRESULT compiled = renderGraph->Compile(profile, CompileOptions(), &plan);
+                nvrhi::string diagnostics;
+                renderGraph->GetDiagnostics(diagnostics);
+                check(compiled == nvrhi::FS_OK, where + ": Compile: " + std::string(diagnostics.c_str()));
+                check(diagnostics.empty(), where + ": diagnostics: " + std::string(diagnostics.c_str()));
+                nvrhi::string report;
+                check(VerifyPlan(plan, renderGraph, nullptr, &report) == nvrhi::FS_OK,
+                      where + ": VerifyPlan: " + std::string(report.c_str()));
+                check(renderGraph->Execute(plan, ExecuteDesc()) == nvrhi::FS_OK, where + ": Execute");
+            }
+
+            // the snapshots: the same instances in each view, the rows without a leaf
+            const RenderSnapshot& nodeSnapshot = *sceneFrames[0]->snapshot;
+            const RenderSnapshot& rowSnapshot = *sceneFrames[1]->snapshot;
+            check(nodeSnapshot.instances.count == rowSnapshot.instances.count && rowSnapshot.instances.count > 0,
+                  where + ": the visible instances");
+            for (uint32_t v = 0; v < 2; ++v)
+            {
+                const SnapshotRange a = nodeSnapshot.views[v].instances;
+                const SnapshotRange b = rowSnapshot.views[v].instances;
+                std::vector<std::pair<uint32_t, uint32_t>> slotsA, slotsB;   // (slot, index)
+                for (uint32_t i = a.first; i < a.first + a.count; ++i)
+                    slotsA.emplace_back(nodeSnapshot.instances.instanceSlots[i], i);
+                for (uint32_t i = b.first; i < b.first + b.count; ++i)
+                    slotsB.emplace_back(rowSnapshot.instances.instanceSlots[i], i);
+                std::sort(slotsA.begin(), slotsA.end());
+                std::sort(slotsB.begin(), slotsB.end());
+                check(slotsA.size() == slotsB.size(), where + ": a view's visible instances");
+                for (size_t k = 0; k < slotsA.size(); ++k)
+                {
+                    const uint32_t i = slotsA[k].second, j = slotsB[k].second;
+                    check(slotsA[k].first == slotsB[k].first && rowSnapshot.instances.leaves[j] == nullptr &&
+                          nodeSnapshot.instances.leaves[i] != nullptr &&
+                          nodeSnapshot.instances.meshes[i] == rowSnapshot.instances.meshes[j] &&
+                          std::memcmp(&nodeSnapshot.instances.worldBounds[i], &rowSnapshot.instances.worldBounds[j],
+                                      sizeof(box3)) == 0, where + ": an instance of both populations");
+                }
+            }
+            for (uint32_t g = 0; g < 2; ++g)
+                services[g]->EndFrame(true);
+            device->waitForIdle();
+
+            // the images
+            const uint32_t readTargets = api == nvrhi::GraphicsAPI::D3D11 ? 4 : 5;
+            for (uint32_t t = 0; t < readTargets; ++t)
+            {
+                const std::vector<uint8_t> nodes = ReadTexture(device, targets[0][t]);
+                for (uint32_t side = 1; side < 3; ++side)
+                {
+                    const std::vector<uint8_t> other = ReadTexture(device, targets[side][t]);
+                    size_t differing = 0;
+                    const size_t texel = nvrhi::getFormatInfo(formats[t]).bytesPerBlock;
+                    for (size_t i = 0; i + texel <= nodes.size(); i += texel)
+                        differing += std::memcmp(nodes.data() + i, other.data() + i, texel) != 0 ? 1 : 0;
+                    check(nodes.size() == other.size() && differing == 0,
+                          where + ": target " + std::to_string(t) + ": " + std::to_string(differing) + " texels of " +
+                              sideNames[side] + " differ from BoundNodes");
+                }
+                if (t != 3)   // no material is emissive
+                    check(std::any_of(nodes.begin(), nodes.end(), [](uint8_t b) { return b != 0; }),
+                          where + ": target " + std::to_string(t) + " has content");
+            }
+
+            // the draws: the rows' equal the nodes', draw for draw, in each child view and pass
+            for (uint32_t pass = 0; pass < 2; ++pass)
+            {
+                check(contexts[0][pass].views.size() == 2 && contexts[1][pass].views.size() == 2,
+                      where + ": two uses of each geometry pass");
+                for (uint32_t v = 0; v < 2; ++v)
+                {
+                    const std::vector<DrawRecord>& a = contexts[0][pass].views[v];
+                    const std::vector<DrawRecord>& b = contexts[1][pass].views[v];
+                    bool same = a.size() == b.size() && !a.empty();
+                    for (size_t k = 0; same && k < a.size(); ++k)
+                        same = a[k].startIndex == b[k].startIndex && a[k].startVertex == b[k].startVertex &&
+                               a[k].startInstance == b[k].startInstance && a[k].instanceCount == b[k].instanceCount;
+                    check(same, where + ": the rows' draws equal the nodes' (pass " + std::to_string(pass) + ", view " +
+                                    std::to_string(v) + ")");
+                    runtimeDraws += b.size();
+                }
+            }
+            std::printf("ok: %s: images equal (rows bound, nodes bound, nodes walked); %u visible instances\n",
+                        where.c_str(), rowSnapshot.instances.count);
+            device->runGarbageCollection();
+        }
+        check(runtimeDraws > 0, tag + ": draws");
+        check(g_Warnings.load() == warningsBefore, tag + ": no warning");
+
+        for (uint32_t g = 0; g < 2; ++g)
+        {
+            services[g] = nullptr;
+            renderGraphs[g] = nullptr;
+            registries[g] = nullptr;
+            for (MeshId id : meshIds[g])
+                graphs[g]->ReleaseRuntimeMesh(id);
+        }
+        device->waitForIdle();
+        device->runGarbageCollection();
+    }
+
     // ---------------------------------------------------------------------- steady-state allocations (E5's target)
 
 #ifdef _WIN32
@@ -2830,6 +3179,7 @@ int main(int argc, char** argv)
                 RunSkinning(deviceManager, api, true);
             for (bool inputAssembler : { false, true })
                 RunGeometry(deviceManager, api, api != nvrhi::GraphicsAPI::D3D11, inputAssembler);
+            RunRuntimeRows(deviceManager, api, api != nvrhi::GraphicsAPI::D3D11);
         }
 
         deviceManager->Shutdown();

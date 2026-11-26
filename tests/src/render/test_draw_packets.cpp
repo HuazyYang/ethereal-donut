@@ -55,6 +55,13 @@
 //   small_extraction     a scene below the limits of the serial extraction hands nothing to the job system (so no worker
 //                        wakes) and allocates nothing; the same frames in parallel give the same bytes
 //   parallel_sort_workers  a segment sorted in parallel inside the segments' parallel loop: equal at 1, 2, 8 workers
+//   runtime_rows         runtime-only mesh instances (plan step E7, item E7.2): two graphs of the same instances
+//                        (meshes, transforms, creation order), one of nodes, one where all instances, or about half of
+//                        them, are runtime-only rows; 12 frames of moves and respawns, five views, extracted serially
+//                        and in parallel at 1 and 8 workers (equal bytes per graph): each view's visible instances and
+//                        each pass's packets equal the node graph's after slot remapping (keys rebuilt with the mapped
+//                        slot; fields, order, mesh, bounds); runtime rows have no leaf
+//   runtime_steady_state 10 frames of moving runtime rows beside nodes after warm-up: no operator new, no ECS heap block
 //
 //     test_draw_packets [case]
 
@@ -73,6 +80,7 @@
 #include "CountingJobSystem.h"
 #include "EcsWorldImpl.h"       // ecs::GetHeapAllocationCount
 #include "RenderVisibility.h"   // the radix sort's own cases, the limits of the serial extraction
+#include "RuntimeTwins.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1398,6 +1406,285 @@ namespace
         CHECK(largest >= visibility::RadixSorter::c_ParallelThreshold);
     }
 
+    // ------------------------------------------------------------------------------------------ runtime-only rows
+
+    bool SameBits(const dm::box3& x, const dm::box3& y)
+    {
+        return std::memcmp(&x, &y, sizeof(x)) == 0;
+    }
+
+    struct TwinTally
+    {
+        uint64_t instances = 0;
+        uint64_t runtimeInstances = 0;
+        uint64_t packets[c_DrawPacketPassCount] = {};
+        uint64_t runtimePackets[c_DrawPacketPassCount] = {};
+        uint64_t subgraphPackets = 0;   // transparent packets of node instances with a child
+        uint64_t remapped = 0;          // visible instances whose slot differs between the graphs
+    };
+
+    // One packet of a view and pass: its instance by id, its key built with a given instance slot.
+    struct TwinPacket
+    {
+        uint64_t key;
+        uint32_t id;
+        uint32_t geometryIndex;
+        uint32_t geometrySlot;
+        uint32_t materialSlot;
+        uint8_t cullMode;
+        uint8_t flags;
+
+        bool operator==(const TwinPacket& o) const
+        {
+            return key == o.key && id == o.id && geometryIndex == o.geometryIndex && geometrySlot == o.geometrySlot &&
+                   materialSlot == o.materialSlot && cullMode == o.cullMode && flags == o.flags;
+        }
+    };
+
+    // The key of packet i of `s` with `slot` for its instance's slot.
+    uint64_t KeyWithSlot(const RenderSnapshot& s, uint32_t i, uint32_t slot)
+    {
+        const DrawPackets& p = s.packets;
+        const MeshInfo* mesh = s.instances.meshInfos[p.visibleInstances[i]];
+        const Material* material = mesh->geometries[p.geometryIndices[i]]->material;
+        if (p.flags[i] & c_DrawPacketFlagTransparentPass)
+            return MakeTransparentDrawKey(GetTransparentDrawKeyDistance(p.keys[i]), slot, p.cullModes[i]);
+        return MakeOpaqueDrawKey(uint32_t(material->domain), p.cullModes[i], p.materialSlots[i], p.geometrySlots[i],
+                                 slot);
+    }
+
+    // Graph 1's snapshot `b` against graph 0's `a` (RuntimeTwins): each view's visible instances, matched by id, have
+    // the same mesh, bounds, geometry count and remapped slots; each pass's packets, in order, equal graph 0's with
+    // their keys rebuilt with the remapped slots (sorted again, stably). Graph 1's runtime rows have no leaf.
+    void CompareTwins(const tests::RuntimeTwins& twins, const RenderSnapshot& a, const RenderSnapshot& b,
+                      TwinTally& tally)
+    {
+        CHECK(a.viewCount == b.viewCount);
+        const VisibleInstances& ia = a.instances;
+        const VisibleInstances& ib = b.instances;
+        std::vector<uint32_t> idsA(ia.count), idsB(ib.count);
+        std::map<uint32_t, std::pair<uint32_t, uint32_t>> slotsOf[2];   // id -> (instance slot, first geometry slot)
+        for (uint32_t g = 0; g < 2; ++g)
+        {
+            const VisibleInstances& in = g ? ib : ia;
+            std::vector<uint32_t>& ids = g ? idsB : idsA;
+            for (uint32_t i = 0; i < in.count; ++i)
+            {
+                ids[i] = twins.Id(g, in, i);
+                CHECK(ids[i] != tests::RuntimeTwins::c_NoId);
+                const auto slots = std::make_pair(in.instanceSlots[i], in.firstGeometryInstanceSlots[i]);
+                CHECK(slotsOf[g].emplace(ids[i], slots).first->second == slots);   // one slot per instance
+            }
+        }
+        std::map<uint32_t, uint32_t> slotMap;   // graph 0's instance slot -> graph 1's
+        for (const auto& [id, slots] : slotsOf[0])
+        {
+            const auto it = slotsOf[1].find(id);
+            CHECK(it != slotsOf[1].end());
+            CHECK(slotMap.emplace(slots.first, it->second.first).first->second == it->second.first);
+        }
+
+        for (uint32_t v = 0; v < a.viewCount; ++v)
+        {
+            // the visible instances, by id
+            const SnapshotRange ra = a.views[v].instances;
+            const SnapshotRange rb = b.views[v].instances;
+            CHECK(ra.count == rb.count);
+            std::vector<std::pair<uint32_t, uint32_t>> byIdA, byIdB;
+            for (uint32_t i = ra.first; i < ra.first + ra.count; ++i)
+                byIdA.emplace_back(idsA[i], i);
+            for (uint32_t i = rb.first; i < rb.first + rb.count; ++i)
+                byIdB.emplace_back(idsB[i], i);
+            std::sort(byIdA.begin(), byIdA.end());
+            std::sort(byIdB.begin(), byIdB.end());
+            for (size_t k = 0; k < byIdA.size(); ++k)
+            {
+                const auto [id, i] = byIdA[k];
+                const uint32_t j = byIdB[k].second;
+                CHECK(byIdB[k].first == id);
+                const tests::RuntimeTwins::Instance& instance = twins.instances[id / 2];
+                const bool runtime = id % 2 == 0 && instance.runtime;
+                CHECK((ib.leaves[j] == nullptr) == runtime && ia.leaves[i] != nullptr);
+                CHECK(ib.instanceSlots[j] == slotMap.at(ia.instanceSlots[i]));
+                CHECK(ib.firstGeometryInstanceSlots[j] == slotsOf[1].at(id).second);
+                CHECK(ib.geometryCounts[j] == ia.geometryCounts[i]);
+                CHECK(ib.meshes[j] == ia.meshes[i] && ib.meshInfos[j] == ia.meshInfos[i]);
+                CHECK(SameBits(ib.worldBounds[j], ia.worldBounds[i]));
+                tally.instances += 1;
+                tally.runtimeInstances += runtime ? 1 : 0;
+                tally.remapped += ib.instanceSlots[j] != ia.instanceSlots[i] ? 1 : 0;
+            }
+
+            // the packets: graph 0's rebuilt with graph 1's slots, in key order, against graph 1's
+            for (uint32_t p = 0; p < c_DrawPacketPassCount; ++p)
+            {
+                const SnapshotRange pa = a.views[v].packets[p];
+                const SnapshotRange pb = b.views[v].packets[p];
+                std::vector<TwinPacket> expected, actual;
+                for (uint32_t i = pa.first; i < pa.first + pa.count; ++i)
+                {
+                    const uint32_t vi = a.packets.visibleInstances[i];
+                    CHECK(KeyWithSlot(a, i, ia.instanceSlots[vi]) == a.packets.keys[i]);
+                    expected.push_back(TwinPacket{ KeyWithSlot(a, i, slotMap.at(ia.instanceSlots[vi])), idsA[vi],
+                                                   a.packets.geometryIndices[i], a.packets.geometrySlots[i],
+                                                   a.packets.materialSlots[i], a.packets.cullModes[i],
+                                                   a.packets.flags[i] });
+                }
+                std::stable_sort(expected.begin(), expected.end(),
+                                 [](const TwinPacket& x, const TwinPacket& y) { return x.key < y.key; });
+                for (uint32_t i = pb.first; i < pb.first + pb.count; ++i)
+                {
+                    const uint32_t vi = b.packets.visibleInstances[i];
+                    actual.push_back(TwinPacket{ b.packets.keys[i], idsB[vi], b.packets.geometryIndices[i],
+                                                 b.packets.geometrySlots[i], b.packets.materialSlots[i],
+                                                 b.packets.cullModes[i], b.packets.flags[i] });
+                    const bool runtime = idsB[vi] % 2 == 0 && twins.instances[idsB[vi] / 2].runtime;
+                    tally.runtimePackets[p] += runtime ? 1 : 0;
+                    const bool parent = idsB[vi] % 2 == 0 && !runtime &&
+                                        twins.instances[idsB[vi] / 2].childMesh != tests::RuntimeTwins::c_NoChild;
+                    tally.subgraphPackets += parent && p == uint32_t(DrawPacketPass::Transparent) ? 1 : 0;
+                }
+                CHECK(expected == actual);
+                tally.packets[p] += actual.size();
+            }
+        }
+    }
+
+    // Runtime-only rows against nodes of the same instances: all of them, then about half beside nodes (some with a
+    // child); 12 frames of moves (none in every fifth) and two respawns of 40 instances; every frame extracted
+    // serially, in parallel at 1 worker and at 8 workers, with equal bytes per graph.
+    void test_runtime_rows()
+    {
+        nvrhi::AutoPtr<CountingJobSystem> jobs[2];
+        const uint32_t workerCounts[2] = { 1, 8 };
+        for (uint32_t k = 0; k < 2; ++k)
+        {
+            JobSystemDesc desc;
+            desc.debugName = "test_draw_packets.runtime";
+            desc.workerThreadCount = workerCounts[k];
+            nvrhi::AutoPtr<IJobSystem> inner;
+            CHECK(CreateJobSystem(desc, &inner) == nvrhi::FS_OK);
+            jobs[k] = MAKE_RC_OBJ_PTR(CountingJobSystem, inner.Get());
+        }
+        constexpr uint32_t c_Runs = 3;
+        const struct
+        {
+            uint32_t jobs;
+            ExtractionMode mode;
+        } runs[c_Runs] = { { 0, { false, false } }, { 0, { true, true } }, { 1, { true, true } } };
+
+        TestViews views;
+        PacketScene assets(0x7e2);
+        assets.MakeAssets();
+        std::vector<MeshInfo*> meshes;
+        for (const auto& mesh : assets.meshes)
+            meshes.push_back(mesh);
+        for (double share : { 1.0, 0.5 })
+        {
+            tests::RuntimeTwins twins(share == 1.0 ? 31 : 37);
+            twins.Build(meshes, 600, share, 40.0, 6);
+            RenderFrame frames[2];
+            nvrhi::AutoPtr<RenderService> services[2] = { MakeService(twins.graphs[0]), MakeService(twins.graphs[1]) };
+            TwinTally tally;
+            for (uint32_t f = 1; f <= 12; ++f)
+            {
+                if (f > 1 && f % 5 != 0)
+                    twins.Move();
+                if (f == 4 || f == 8)
+                    twins.Respawn(40);
+                twins.Refresh(f);
+                const ExtractDesc desc = views.Desc(f);
+                uint64_t hashes[2][c_Runs] = {};
+                for (uint32_t k = 0; k < c_Runs; ++k)
+                {
+                    CountingJobSystem* runJobs = jobs[runs[k].jobs];
+                    runs[k].mode.Set();
+                    const RenderSnapshot* snapshots[2] = {};
+                    for (uint32_t g = 0; g < 2; ++g)
+                    {
+                        twins.graphs[g]->SetJobSystem(runJobs);
+                        const uint32_t calls = runJobs->calls.load();
+                        snapshots[g] = &ExtractFrame(services[g], frames[g], desc);
+                        const uint32_t made = runJobs->calls.load() - calls;
+                        CHECK(runs[k].mode.parallelRanges ? made > 0
+                                                          : made == (snapshots[g]->packets.count > 8192 ? 1u : 0u));
+                        hashes[g][k] = HashPackets(*snapshots[g]);
+                    }
+                    if (k == 0)
+                        CompareTwins(twins, *snapshots[0], *snapshots[1], tally);
+                    services[0]->EndFrame(true);
+                    services[1]->EndFrame(true);
+                }
+                for (uint32_t g = 0; g < 2; ++g)
+                    for (uint32_t k = 1; k < c_Runs; ++k)
+                        CHECK(hashes[g][k] == hashes[g][0]);
+            }
+            ExtractionMode::Reset();
+            twins.graphs[0]->SetJobSystem(nullptr);
+            twins.graphs[1]->SetJobSystem(nullptr);
+            std::printf("  %u of 600 runtime rows: %llu visible instances (%llu runtime rows, %llu with another slot), "
+                        "%llu opaque and %llu transparent packets (%llu and %llu of runtime rows, %llu transparent of "
+                        "nodes with a child)\n", twins.RuntimeCount(), (unsigned long long)tally.instances,
+                        (unsigned long long)tally.runtimeInstances, (unsigned long long)tally.remapped,
+                        (unsigned long long)tally.packets[0], (unsigned long long)tally.packets[1],
+                        (unsigned long long)tally.runtimePackets[0], (unsigned long long)tally.runtimePackets[1],
+                        (unsigned long long)tally.subgraphPackets);
+            CHECK(tally.runtimeInstances > 0 && tally.runtimePackets[0] > 100 && tally.runtimePackets[1] > 100);
+            CHECK(share == 1.0 ? tally.runtimeInstances == tally.instances
+                               : tally.runtimeInstances < tally.instances && tally.subgraphPackets > 0);
+        }
+    }
+
+    // Ten frames of runtime rows moving beside nodes after warm-up, five views: no operator new, no ECS heap block. A
+    // tenth of the rows swing between two places every frame through the world, so that the views' sets change.
+    void test_runtime_steady_state()
+    {
+        TestViews views;
+        PacketScene assets(0x5002);
+        assets.MakeAssets();
+        std::vector<MeshInfo*> meshes;
+        for (const auto& mesh : assets.meshes)
+            meshes.push_back(mesh);
+        tests::RuntimeTwins twins(41);
+        twins.Build(meshes, 1500, 0.8, 40.0, 0);
+        SceneGraph* graph = twins.graphs[1];
+        IWorld* world = graph->GetWorld();
+        RenderFrame frame;
+        auto service = MakeService(graph);
+        std::vector<std::pair<Entity, dm::double3>> movers;
+        for (size_t i = 0; i < twins.instances.size(); i += 10)
+            if (twins.instances[i].runtime)
+                movers.emplace_back(twins.instances[i].row, twins.instances[i].local.translation);
+        uint32_t f = 0;
+        uint32_t visible[2] = {};
+        auto run = [&]()
+        {
+            const dm::double3 swing = (f & 1) ? dm::double3(12.0, 0.0, 9.0) : dm::double3(0.0);
+            world->AdvanceVersion();
+            for (const auto& [row, home] : movers)
+                GetComponentForWrite<LocalTransform>(world, row)->translation = home + swing;
+            graph->Refresh(++f);
+            const RenderSnapshot& snapshot = ExtractFrame(service, frame, views.Desc(f));
+            CHECK(snapshot.packets.count > 0);
+            visible[f & 1] = snapshot.instances.count;
+            service->EndFrame(true);
+        };
+        for (int i = 0; i < 6; ++i)
+            run();
+        const uint64_t newBefore = g_NewCount.load();
+        const uint64_t heapBefore = ecs::GetHeapAllocationCount();
+        for (int i = 0; i < 10; ++i)
+            run();
+        const uint64_t newCalls = g_NewCount.load() - newBefore;
+        const uint64_t heapBlocks = ecs::GetHeapAllocationCount() - heapBefore;
+        std::printf("  %u runtime rows (%zu moving) and %u nodes: %u and %u visible instances; %llu operator new, %llu "
+                    "storage blocks over 10 frames\n", twins.RuntimeCount(), movers.size(),
+                    uint32_t(twins.instances.size()) - twins.RuntimeCount(), visible[0], visible[1],
+                    (unsigned long long)newCalls, (unsigned long long)heapBlocks);
+        CHECK(visible[0] != visible[1]);
+        CHECK(newCalls == 0 && heapBlocks == 0);
+    }
+
     struct Case
     {
         const char* name;
@@ -1434,6 +1721,8 @@ int main(int argc, char** argv)
         { "review_cases", test_review_cases },
         { "small_extraction", test_small_extraction },
         { "parallel_sort_workers", test_parallel_sort_workers },
+        { "runtime_rows", test_runtime_rows },
+        { "runtime_steady_state", test_runtime_steady_state },
     };
     try
     {

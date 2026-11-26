@@ -49,6 +49,13 @@
 //                        one warning (the arena is filled with a pattern at Reset)
 //   use_check            Debug: a strategy prepared on two threads and drained on the first gives one warning; prepared
 //                        and drained on one thread, then on another, none
+//   runtime_rows         runtime-only mesh instances (plan step E7, item E7.2; RuntimeTwins.h): a graph of runtime rows
+//                        and one where about half of the instances are, each against a graph of nodes of the same
+//                        instances, 8 frames of moves and respawns: every bound strategy's items carry the packets'
+//                        slots (and no leaf for a runtime row), and RenderView's batching of them gives the node graph's
+//                        draws exactly; the walking strategies do not see runtime rows and leave the slot at its default
+//   default_slot         a DrawItem made by hand keeps c_DrawItemSlotFromInstance, and RenderView's batching of such
+//                        items (the slot from the leaf) equals that of the same items with the slot set
 //
 //     test_draw_strategy_adapters [case]
 
@@ -62,6 +69,8 @@
 #include <donut/core/log.h>
 #include <donut/core/query_cast.h>
 #include <donut/tests/utils.h>
+
+#include "RuntimeTwins.h"
 
 #include <algorithm>
 #include <atomic>
@@ -538,7 +547,8 @@ namespace
             lastMaterial = item.material;
             lastCull = uint32_t(item.cullMode);
             const uint32_t startIndex = item.mesh->indexOffset + item.geometry->indexOffsetInMesh;
-            const int instance = item.instance->GetInstanceIndex();
+            const int instance = item.instanceSlot != c_DrawItemSlotFromInstance ? int(item.instanceSlot)
+                                                                                 : item.instance->GetInstanceIndex();
             if (current.instanceCount > 0 && current.startIndex == startIndex &&
                 current.startInstance + int(current.instanceCount) == instance)
             {
@@ -581,6 +591,7 @@ namespace
             const MeshInfo* mesh = in.meshInfos[vi];
             const DrawItem& item = items[k];
             CHECK(item.instance == in.leaves[vi]);
+            CHECK(item.instanceSlot == in.instanceSlots[vi]);
             CHECK(item.mesh == mesh);
             CHECK(item.geometry == mesh->geometries[packets.geometryIndices[i]].Get());
             CHECK(item.material == item.geometry->material.Get());
@@ -993,6 +1004,138 @@ namespace
 #endif
     }
 
+    // Runtime-only rows (RuntimeTwins.h): graph 1's bound items are its packets (CheckAgainstPackets: the slot, no leaf
+    // for a runtime row), and RenderView's batching of them equals the batching of graph 0's bound items, draw for draw
+    // (the graphs' slots and tables are alike, and their meshes, materials and buffer groups shared); the walking
+    // strategies see graph 1's nodes only and leave every slot at its default.
+    void test_runtime_rows()
+    {
+        TestViews views;
+        PacketScene assets(0x7e3);
+        assets.MakeAssets();
+        std::vector<MeshInfo*> meshes;
+        for (const auto& mesh : assets.meshes)
+            meshes.push_back(mesh);
+        for (double share : { 1.0, 0.5 })
+        {
+            donut::tests::RuntimeTwins twins(share == 1.0 ? 43 : 47);
+            twins.Build(meshes, 500, share, 40.0, 6);
+            RenderFrame frames[2];
+            nvrhi::AutoPtr<RenderService> services[2] = { MakeService(twins.graphs[0]), MakeService(twins.graphs[1]) };
+            Strategies strategies[2];
+            uint64_t items = 0, runtimeItems = 0, draws = 0, walked = 0;
+            for (uint32_t f = 1; f <= 8; ++f)
+            {
+                if (f > 1)
+                    twins.Move();
+                if (f == 4)
+                    twins.Respawn(30);
+                twins.Refresh(f);
+                const RenderSnapshot* snapshots[2] = { &ExtractFrame(services[0], frames[0], views.Desc(f)),
+                                                       &ExtractFrame(services[1], frames[1], views.Desc(f)) };
+                for (uint32_t g = 0; g < 2; ++g)
+                    strategies[g].Bind(snapshots[g]);
+                for (uint32_t v = 0; v < snapshots[1]->viewCount; ++v)
+                {
+                    for (uint32_t p = 0; p < c_DrawPacketPassCount; ++p)
+                    {
+                        std::vector<DrawItem> bound[2];
+                        for (uint32_t g = 0; g < 2; ++g)
+                        {
+                            bound[g] = Drain(strategies[g].Legacy(p), nullptr, *snapshots[g]->views[v].view);
+                            CheckAgainstPackets(*snapshots[g], v, DrawPacketPass(p), bound[g]);
+                            const std::vector<DrawItem> direct =
+                                Drain(strategies[g].packets[p], nullptr, *snapshots[g]->views[v].view);
+                            CHECK(direct.size() == bound[g].size());
+                            for (size_t i = 0; i < direct.size(); ++i)
+                                CHECK(direct[i].instanceSlot == bound[g][i].instanceSlot &&
+                                      ItemOf(direct[i]) == ItemOf(bound[g][i]));
+                        }
+                        const std::vector<ModelDraw> nodeDraws = Batch(bound[0]);
+                        CHECK(Batch(bound[1]) == nodeDraws);
+                        items += bound[1].size();
+                        draws += nodeDraws.size();
+                        for (const DrawItem& item : bound[1])
+                        {
+                            CHECK(item.instanceSlot != c_DrawItemSlotFromInstance);
+                            runtimeItems += item.instance ? 0 : 1;
+                        }
+
+                        // the walk: graph 1's nodes only, the slot from the leaf
+                        IDrawStrategy* walk = p == 0 ? static_cast<IDrawStrategy*>(strategies[1].opaque.Get())
+                                                     : static_cast<IDrawStrategy*>(strategies[1].transparent.Get());
+                        strategies[1].opaque->SetPackets(nullptr);
+                        strategies[1].transparent->SetPackets(nullptr);
+                        for (const DrawItem& item : Drain(walk, twins.graphs[1]->GetRootNode(),
+                                                          *snapshots[1]->views[v].view))
+                        {
+                            CHECK(item.instance && item.instanceSlot == c_DrawItemSlotFromInstance);
+                            ++walked;
+                        }
+                        strategies[1].Bind(snapshots[1]);
+                    }
+                }
+                services[0]->EndFrame(true);
+                services[1]->EndFrame(true);
+            }
+            std::printf("  %u of 500 runtime rows: %llu bound items (%llu of runtime rows), %llu draws equal to the "
+                        "node graph's; %llu walked items of nodes\n", twins.RuntimeCount(),
+                        (unsigned long long)items, (unsigned long long)runtimeItems, (unsigned long long)draws,
+                        (unsigned long long)walked);
+            CHECK(runtimeItems > 1000 && draws > 0);
+            CHECK(share == 1.0 ? runtimeItems == items && walked == 0 : runtimeItems < items && walked > 0);
+        }
+    }
+
+    // A DrawItem made by hand keeps the default slot; RenderView takes it from the leaf then, so that such items batch as
+    // the same items with the slot set (the packet adapters' items).
+    void test_default_slot()
+    {
+        const DrawItem made{};
+        CHECK(made.instanceSlot == c_DrawItemSlotFromInstance);
+        DrawItem assigned;
+        assigned.instance = nullptr;
+        CHECK(assigned.instanceSlot == c_DrawItemSlotFromInstance);
+
+        TestViews views;
+        PacketScene scene(0x99);
+        scene.Build(80);
+        scene.graph->Refresh(1);
+        uint64_t compared = 0;
+        for (uint32_t v = 0; v < TestViews::c_Count; ++v)
+        {
+            for (uint32_t p = 0; p < c_DrawPacketPassCount; ++p)
+            {
+                // hand-made copies of the walk's items, as deferred_shading_rdg and VXGI make theirs
+                auto opaque = MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy);
+                auto transparent = MAKE_RC_OBJ_PTR(TransparentDrawStrategy);
+                IDrawStrategy* strategy = p == 0 ? static_cast<IDrawStrategy*>(opaque.Get())
+                                                 : static_cast<IDrawStrategy*>(transparent.Get());
+                std::vector<DrawItem> byHand, withSlot;
+                for (const DrawItem& item : Drain(strategy, scene.graph->GetRootNode(), *views.list[v]))
+                {
+                    DrawItem copy;
+                    copy.instance = item.instance;
+                    copy.mesh = item.mesh;
+                    copy.geometry = item.geometry;
+                    copy.material = item.material;
+                    copy.buffers = item.buffers;
+                    copy.distanceToCamera = item.distanceToCamera;
+                    copy.cullMode = item.cullMode;
+                    copy.userData = nullptr;
+                    CHECK(copy.instanceSlot == c_DrawItemSlotFromInstance);
+                    byHand.push_back(copy);
+                    copy.instanceSlot = uint32_t(item.instance->GetInstanceIndex());
+                    withSlot.push_back(copy);
+                }
+                CHECK(Batch(byHand) == Batch(withSlot));
+                compared += byHand.size();
+            }
+        }
+        std::printf("  %llu hand-made items batch as with their slots set\n", (unsigned long long)compared);
+        CHECK(compared > 100);
+    }
+
     // Debug: the in-use check of the strategies (DrawStrategyUseCheck).
     void test_use_check()
     {
@@ -1066,6 +1209,8 @@ int main(int argc, char** argv)
         { "steady_state", test_steady_state },
         { "stale_snapshot", test_stale_snapshot },
         { "use_check", test_use_check },
+        { "runtime_rows", test_runtime_rows },
+        { "default_slot", test_default_slot },
     };
     try
     {

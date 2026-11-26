@@ -70,12 +70,13 @@ namespace donut::render
     // order (plan step E5, sub-plan item E5.3; design 7.3: the strategies become adapters over packets). The view is
     // found by its address among the snapshot's ExtractedView::view, so the child views of a composite view, which
     // IGeometryPass::AddToGraph prepares in turn on one strategy object, each get their own packets. `instance` is the
-    // packet's leaf, `mesh` the instance's MeshInfo from the snapshot (VisibleInstances::meshInfos), `geometry` and
-    // `material` by index into the mesh's geometries (read when the item is made), `buffers` the mesh's,
-    // `distanceToCamera` from a transparent key. Recording reads the snapshot and the objects it points to; RenderView
-    // also calls the leaf's GetInstanceIndex() (design 7.5: pipelining must keep those objects unchanged until the
-    // frame has recorded). Each item is made when Next returns it, into one item of this object: its pointer is valid
-    // until the next call.
+    // packet's leaf (null for a runtime-only mesh instance), `instanceSlot` its slot from the snapshot
+    // (VisibleInstances::instanceSlots), `mesh` the instance's MeshInfo from the snapshot (VisibleInstances::meshInfos),
+    // `geometry` and `material` by index into the mesh's geometries (read when the item is made), `buffers` the mesh's,
+    // `distanceToCamera` from a transparent key. Recording reads the snapshot and the objects it points to, not the
+    // leaf: RenderView draws with the slot (design 7.5: pipelining must keep the mesh objects unchanged until the frame
+    // has recorded). Each item is made when Next returns it, into one item of this object: its pointer is valid until
+    // the next call.
     //
     // The snapshot lives in the render graph's frame arena and dies at the next IRenderGraph::Reset: bind again every
     // frame, after RenderService::Extract. Debug builds fill the arena with a pattern at Reset, and Prepare refuses a

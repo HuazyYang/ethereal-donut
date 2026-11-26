@@ -30,7 +30,10 @@
 // in steady state; one service per graph; EndFrame idempotent, with first-frame skinning flags set only for executed
 // frames; an extraction does not make the next Refresh run (SceneGraph::RunReadOnlyPhase); the service's
 // shadow table; the review fixes (exclusive and command-recording systems in the read-only phase, arena failures,
-// destroyed joints, a shadow map replaced mid-frame, the old scheduler released, repeated calls in one frame).
+// destroyed joints, a shadow map replaced mid-frame, the old scheduler released, repeated calls in one frame); plan step
+// E7, item E7.2: runtime-only mesh instances (SceneComponents.h, RuntimeMeshInstance) beside nodes, taken by the
+// brute force from the world (no leaf; the mesh's box under the row's world transform), with the Debug leaf check
+// passing over their chunks.
 //
 //     test_render_extract [case]      runs every case, or the one named; `measure` (by name only) prints timings
 
@@ -38,6 +41,7 @@
 #include <donut/render/LightShadows.h>
 #include <donut/render/RenderGraph.h>
 #include <donut/render/RenderGraphFrameData.h>
+#include <donut/engine/EcsQuery.h>
 #include <donut/engine/EcsScheduler.h>
 #include <donut/engine/KeyframeAnimation.h>
 #include <donut/engine/SceneGraph.h>
@@ -1126,6 +1130,35 @@ namespace
             row.bounds = local.isempty() ? dm::box3::empty() : local * node->GetLocalToWorldTransformFloat();
             all.push_back(row);
         }
+        // and every runtime-only row of the graph's world with a slot (plan step E7, item E7.2): no leaf, the mesh's
+        // box under the row's world transform in float, as the node's
+        {
+            Query<Read<GpuInstanceSlot>, Read<MeshRef>, Read<WorldTransform>, With<RuntimeMeshInstance>,
+                  Without<SceneNode>> rows(graph->GetWorld(), "CheckSnapshot.RuntimeRows");
+            rows.ForEachChunk(ChunkRequest{}, [&](const ChunkView& view, const GpuInstanceSlot* slots,
+                                                  const MeshRef* refs, const WorldTransform* worlds)
+            {
+                for (uint32_t r = 0; r < view.count; ++r)
+                {
+                    if (slots[r].instance == c_NoInstanceSlot)
+                        continue;
+                    const MeshInfo* mesh = graph->GetMeshes().Get(refs[r].mesh);
+                    CHECK(mesh != nullptr);
+                    const dm::box3 local = mesh->objectSpaceBounds;
+                    InstanceRow row;
+                    row.entity = view.entities[r];
+                    row.slot = slots[r].instance;
+                    row.mesh = refs[r].mesh;
+                    row.firstGeometryInstance = slots[r].firstGeometryInstance;
+                    row.geometryCount = uint32_t(mesh->geometries.size());
+                    CHECK(slots[r].geometryCount == row.geometryCount);
+                    row.leaf = nullptr;
+                    row.meshInfo = mesh;
+                    row.bounds = local.isempty() ? dm::box3::empty() : local * dm::affine3(worlds[r].transform);
+                    all.push_back(row);
+                }
+            });
+        }
         auto byEntity = [](const InstanceRow& a, const InstanceRow& b) { return a.entity < b.entity; };
         const VisibleInstances& in = s.instances;
         for (uint32_t v = 0; v < s.viewCount; ++v)
@@ -1490,6 +1523,168 @@ namespace
         s.graph->SetJobSystem(nullptr);
         service = nullptr;
         CHECK(g_Warnings.load() == 0);
+    }
+
+    // Runtime-only rows beside nodes (plan step E7, item E7.2): rows of every mesh (the one without geometry and the one
+    // with a geometry without a material included), made before the nodes so that their chunks come first in the query,
+    // and a row whose mesh id names no mesh of the graph (no slot: never visible; one warning when it is made); then
+    // the instances, characters, lights and cameras of BuildInstances. 70 frames of moves of nodes and rows; every
+    // frame CheckSnapshot (it takes the rows from the world) and equal snapshots serially and in parallel at 1 and 8
+    // workers. In Debug the sampled leaf check (every 64th extraction, the query's first chunks first) passes over the
+    // rows' chunks without a warning.
+    void test_runtime_rows()
+    {
+        constexpr uint32_t c_Runs = 3;
+        const uint32_t workerCounts[2] = { 1, 8 };
+        nvrhi::AutoPtr<CountingJobSystem> jobs[2];
+        for (uint32_t k = 0; k < 2; ++k)
+        {
+            JobSystemDesc desc;
+            desc.debugName = "test_render_extract.runtime";
+            desc.workerThreadCount = workerCounts[k];
+            nvrhi::AutoPtr<IJobSystem> inner;
+            CHECK(CreateJobSystem(desc, &inner) == nvrhi::FS_OK);
+            jobs[k] = MAKE_RC_OBJ_PTR(CountingJobSystem, inner.Get());
+        }
+        const struct
+        {
+            uint32_t jobs;
+            ExtractionMode mode;
+        } runs[c_Runs] = { { 0, { false, false } }, { 0, { true, true } }, { 1, { true, true } } };
+
+        TestViews views;
+        TraceScene s(0x7002, c_LargeProfile);
+        CreateAssets(s);
+        s.graph->SetRootNode(NewNode(s));
+        SceneGraphNode* root = s.graph->GetRootNode();
+        IWorld* world = s.graph->GetWorld();
+        std::vector<MeshId> meshIds;
+        for (const auto& mesh : s.meshes)
+            meshIds.push_back(s.graph->AcquireRuntimeMesh(mesh));
+        std::vector<ComponentId> components(s.graph->GetRuntimeMeshInstanceComponents(nullptr, 0));
+        s.graph->GetRuntimeMeshInstanceComponents(components.data(), uint32_t(components.size()));
+        auto spawn = [&](const std::vector<MeshRef>& refs, std::vector<LocalTransform>& locals)
+        {
+            std::vector<const void*> values(components.size(), nullptr);
+            for (size_t c = 0; c < components.size(); ++c)
+            {
+                if (components[c] == FindComponent<LocalTransform>(world))
+                    values[c] = locals.data();
+                else if (components[c] == FindComponent<MeshRef>(world))
+                    values[c] = refs.data();
+            }
+            EntityCreateDesc desc{};
+            desc.components = components.data();
+            desc.values = values.data();
+            desc.componentCount = uint32_t(components.size());
+            desc.entityCount = uint32_t(refs.size());
+            std::vector<Entity> rows(refs.size(), Entity::Null);
+            CHECK(world->CreateEntities(desc, rows.data()) == nvrhi::FS_OK);
+            return rows;
+        };
+        std::vector<MeshRef> refs;
+        std::vector<LocalTransform> locals;
+        for (uint32_t i = 0; i < 400; ++i)
+        {
+            refs.push_back(MeshRef{ meshIds[i % meshIds.size()] });
+            locals.push_back(LocalTransform{ RandomVector(s.rng, -30.0, 30.0), RandomRotation(s.rng),
+                                             RandomVector(s.rng, 0.5, 1.5) });
+        }
+        std::vector<Entity> rows = spawn(refs, locals);
+        std::vector<MeshRef> unknown = { MeshRef{ MeshId((9u << 24) | 5u) } };
+        std::vector<LocalTransform> unknownLocal = { locals[0] };
+        const Entity stray = spawn(unknown, unknownLocal)[0];
+        CHECK(g_Warnings.load() == 1);   // the row whose id names no mesh: no slot
+        g_Warnings.fetch_sub(1);
+        CHECK(GetComponent<GpuInstanceSlot>(world, stray)->instance == c_NoInstanceSlot);
+        for (uint32_t i = 0; i < 200; i++)
+        {
+            auto node = NewNode(s);
+            Move(s, node);
+            node->SetLeaf(NewLeaf(s, LeafKind::Mesh));
+            s.graph->Attach(root, node);
+            Track(s, node);
+        }
+        auto character = NewCharacter(s, 5);
+        s.graph->Attach(root, character);
+        Track(s, character);
+        AddLightsAndCameras(s, root);
+
+        RenderFrame frame;
+        auto service = MakeService(s.graph);
+        uint64_t runtimeVisible = 0, nodeVisible = 0;
+        for (uint32_t f = 0; f < 70; ++f)
+        {
+            if (f > 0)
+            {
+                for (const auto& node : s.movers)
+                    Move(s, node);
+                world->AdvanceVersion();
+                for (size_t i = f % 10; i < rows.size(); i += 10)
+                    GetComponentForWrite<LocalTransform>(world, rows[i])->translation = RandomVector(s.rng, -30.0, 30.0);
+            }
+            s.graph->Refresh(f);
+            uint64_t hashes[c_Runs] = {};
+            for (uint32_t k = 0; k < c_Runs; ++k)
+            {
+                CountingJobSystem* runJobs = jobs[runs[k].jobs];
+                s.graph->SetJobSystem(runJobs);
+                runs[k].mode.Set();
+                const ExtractDesc desc = views.Desc(f);
+                const uint32_t calls = runJobs->calls.load();
+                const RenderSnapshot& snapshot = ExtractFrame(service, frame, desc);
+                const uint32_t made = runJobs->calls.load() - calls;
+                CHECK(runs[k].mode.parallelRanges ? made > 0 : made == runs[k].mode.Calls(snapshot.packets.count));
+                hashes[k] = HashSnapshot(snapshot, false);
+                if (k == 0)
+                {
+                    CheckSnapshot(s.graph, snapshot, desc);
+                    for (uint32_t i = 0; i < snapshot.instances.count; ++i)
+                    {
+                        CHECK(snapshot.instances.entities[i] != stray);
+                        runtimeVisible += snapshot.instances.leaves[i] ? 0 : 1;
+                        nodeVisible += snapshot.instances.leaves[i] ? 1 : 0;
+                    }
+                }
+                service->EndFrame(k == c_Runs - 1);
+            }
+            for (uint32_t k = 1; k < c_Runs; ++k)
+                CHECK(hashes[k] == hashes[0]);
+        }
+        ExtractionMode::Reset();
+        s.graph->SetJobSystem(nullptr);
+        std::printf("  %zu runtime rows and %zu nodes, 70 frames: %llu visible runtime rows, %llu visible node "
+                    "instances\n", rows.size(), CollectNodes(s.graph).size(), (unsigned long long)runtimeVisible,
+                    (unsigned long long)nodeVisible);
+        CHECK(runtimeVisible > 1000 && nodeVisible > 1000);
+        service = nullptr;
+        for (MeshId id : meshIds)
+            s.graph->ReleaseRuntimeMesh(id);
+        CHECK(g_Warnings.load() == 0);
+    }
+
+    // The service registers the leaf tags its queries named before E7.2, in that order, although its instance query no
+    // longer names MeshInstanceLeaf (plan step E7, decision 8): at its first extraction on a world without mesh leaves
+    // yet, MeshInstanceLeaf then SkinnedMeshInstanceLeaf, consecutive, so that the world's component ids are those it
+    // had.
+    void test_component_ids()
+    {
+        auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+        graph->SetRootNode(MAKE_RC_OBJ_PTR(SceneGraphNode));
+        IWorld* world = graph->GetWorld();
+        CHECK(FindComponent<MeshInstanceLeaf>(world) == ComponentId::Invalid);
+        CHECK(FindComponent<SkinnedMeshInstanceLeaf>(world) == ComponentId::Invalid);
+        auto service = MakeService(graph);
+        TestViews views;
+        RenderFrame frame;
+        graph->Refresh(1);
+        (void)ExtractFrame(service, frame, views.Desc(1));   // the service claims the graph at its first Extract
+        service->EndFrame(true);
+        const ComponentId mesh = FindComponent<MeshInstanceLeaf>(world);
+        const ComponentId skinned = FindComponent<SkinnedMeshInstanceLeaf>(world);
+        CHECK(mesh != ComponentId::Invalid && skinned != ComponentId::Invalid);
+        CHECK(uint32_t(mesh) + 1 == uint32_t(skinned));
+        std::printf("  MeshInstanceLeaf %u, SkinnedMeshInstanceLeaf %u\n", uint32_t(mesh), uint32_t(skinned));
     }
 
     // The snapshot lives in the graph's frame arena: Reset rewinds it, so the next frame's snapshot takes the same
@@ -2421,6 +2616,8 @@ int main(int argc, char** argv)
         { "isolation", test_isolation },
         { "refresh_skip", test_refresh_skip },
         { "workers", test_workers },
+        { "runtime_rows", test_runtime_rows },
+        { "component_ids", test_component_ids },
         { "arena_reset", test_arena_reset },
         { "steady_state", test_steady_state },
         { "second_service", test_second_service },

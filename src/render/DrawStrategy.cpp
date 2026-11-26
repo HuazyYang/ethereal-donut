@@ -146,7 +146,10 @@ const DrawItem* PacketDrawItems::Next() noexcept
             continue;
         const MeshGeometry* geometry = mesh->geometries[geometryIndex].Get();
 
+        // The leaf (null for a runtime-only row) and the slot from the snapshot: RenderView draws with the slot and
+        // reads no leaf (plan step E7, item E7.2).
         m_Item.instance = instances.leaves[visible];
+        m_Item.instanceSlot = instances.instanceSlots[visible];
         m_Item.mesh = mesh;
         m_Item.geometry = geometry;
         m_Item.material = geometry->material.Get();

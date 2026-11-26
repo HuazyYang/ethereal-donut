@@ -469,12 +469,15 @@ namespace donut::render::visibility
 
     // ------------------------------------------------------------------------------------------ visibility
 
-    // The instance query of the service (RenderService.Instances). Its data terms, in ChunkView::columns order:
-    using InstanceQuery = engine::Query<engine::With<engine::MeshInstanceLeaf>, engine::Read<engine::GpuInstanceSlot>,
+    // The instance query of the service (RenderService.Instances). Only mesh-instance rows carry MeshRef and
+    // GpuInstanceSlot, so the Read terms select the rows of both kinds (plan step E7, decision 8): a node's mesh
+    // instance and a runtime-only one (SceneComponents.h, RuntimeMeshInstance), which has no SceneLinks, SceneNode
+    // and LeafObject: those columns are Optional, null in such a chunk. Its data terms, in ChunkView::columns order:
+    using InstanceQuery = engine::Query<engine::Read<engine::GpuInstanceSlot>,
                                         engine::Read<engine::MeshRef>, engine::Read<engine::RenderFlags>,
                                         engine::Read<engine::WorldBounds>, engine::Read<engine::WorldTransform>,
-                                        engine::Read<engine::SceneLinks>, engine::Read<engine::SceneNode>,
-                                        engine::Read<engine::LeafObject>, engine::Read<engine::LocalBounds>,
+                                        engine::Optional<engine::SceneLinks>, engine::Optional<engine::SceneNode>,
+                                        engine::Optional<engine::LeafObject>, engine::Read<engine::LocalBounds>,
                                         engine::ReadChunk<engine::ChunkWorldBounds>>;
     enum InstanceColumn : uint32_t
     {
@@ -734,7 +737,7 @@ namespace donut::render::visibility
         {
             dm::box3 bounds;
             engine::Entity entity;
-            const engine::MeshInstance* leaf;
+            const engine::MeshInstance* leaf;   // null for a runtime-only row
             const engine::MeshInfo* mesh;
             uint32_t instanceSlot;
             uint32_t firstGeometryInstance;
@@ -934,7 +937,10 @@ namespace donut::render::visibility
                 using namespace engine;
                 const GpuInstanceSlot& slot = ColumnOf<GpuInstanceSlot>(chunk, ColumnSlot)[row];
                 const MeshRef& meshRef = ColumnOf<MeshRef>(chunk, ColumnMeshRef)[row];
-                const SceneGraphLeaf* leafObject = ColumnOf<LeafObject>(chunk, ColumnLeaf)[row].object;
+                // A node's row has its leaf object, a MeshInstance (its LeafTypeDesc gives it MeshRef and the slot); a
+                // runtime-only row has none: its record's leaf is null.
+                const LeafObject* leaves = ColumnOf<LeafObject>(chunk, ColumnLeaf);
+                const SceneGraphLeaf* leafObject = leaves ? leaves[row].object : nullptr;
                 const auto* leaf = static_cast<const MeshInstance*>(leafObject);
                 // The mesh from the graph's table (MeshRef names the leaf's mesh while it is attached), so that the
                 // leaf object is not read.
@@ -982,12 +988,15 @@ namespace donut::render::visibility
                     if (!haveInstanceBox)
                     {
                         // The legacy walker's GetGlobalBoundingBox: the subgraph's box. A node without children has
-                        // its own box, the row's WorldBounds.
+                        // its own box, the row's WorldBounds, and so has a runtime-only row (no node, no links, no
+                        // subgraph).
                         // After Refresh it is the value Refresh stored in the node; a structural change not yet
                         // refreshed computes it under the graph's lock, which can throw: then the own box.
-                        const SceneGraphNode* node = ColumnOf<SceneNode>(chunk, ColumnNode)[row].object;
+                        const SceneNode* nodes = ColumnOf<SceneNode>(chunk, ColumnNode);
+                        const SceneLinks* links = ColumnOf<SceneLinks>(chunk, ColumnLinks);
+                        const SceneGraphNode* node = nodes ? nodes[row].object : nullptr;
                         instanceBox = record.bounds;
-                        if (ColumnOf<SceneLinks>(chunk, ColumnLinks)[row].firstChild != Entity::Null && node)
+                        if (node && links && links[row].firstChild != Entity::Null)
                         {
                             try
                             {
@@ -1212,7 +1221,10 @@ namespace donut::render::visibility
                 engine::ChunkView chunk;
                 if (iquery->GetChunks(index, request, 1, &chunk) != 1)
                     continue;
+                // Runtime-only rows have no leaf: the store writes their columns from the mesh when they join.
                 const auto* leaves = static_cast<const engine::LeafObject*>(chunk.columns[ColumnLeaf]);
+                if (!leaves)
+                    continue;
                 const auto* locals = static_cast<const engine::LocalBounds*>(chunk.columns[ColumnLocalBounds]);
                 const auto* flags = static_cast<const engine::RenderFlags*>(chunk.columns[ColumnRenderFlags]);
                 const auto* nodes = static_cast<const engine::SceneNode*>(chunk.columns[ColumnNode]);
@@ -1226,7 +1238,7 @@ namespace donut::render::visibility
                     const bool staleFlags = uint32_t(leaf->GetContentFlags()) != flags[row].contentFlags;
                     if (!staleBox && !staleFlags)
                         continue;
-                    const engine::SceneGraphNode* node = nodes[row].object;
+                    const engine::SceneGraphNode* node = nodes ? nodes[row].object : nullptr;
                     log::warning("RenderService: the %s of the leaf of node '%s' changed without "
                                  "SceneGraphNode::InvalidateContent; it is culled and sorted with the old one",
                                  staleBox ? "bounding box" : "content (material domains)",

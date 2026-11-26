@@ -132,7 +132,10 @@ void donut::render::RenderView(
             args.instanceCount = 1;
             args.startVertexLocation = item->mesh->vertexOffset + item->geometry->vertexOffsetInMesh;
             args.startIndexLocation = item->mesh->indexOffset + item->geometry->indexOffsetInMesh;
-            args.startInstanceLocation = item->instance->GetInstanceIndex();
+            // The packet adapters give the slot (and no leaf for a runtime-only row); hand-made and walked items
+            // keep c_DrawItemSlotFromInstance and take it from their leaf.
+            args.startInstanceLocation = item->instanceSlot != c_DrawItemSlotFromInstance
+                ? item->instanceSlot : uint32_t(item->instance->GetInstanceIndex());
 
             if (currentDraw.instanceCount > 0 && 
                 currentDraw.startIndexLocation == args.startIndexLocation && 

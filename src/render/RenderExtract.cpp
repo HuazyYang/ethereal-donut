@@ -293,7 +293,13 @@ namespace donut::render
             }
 
             IWorld* world = target->GetWorld();
-            nvrhi::FRESULT result = instanceQuery.Create(world, "RenderService.Instances");
+            // The instance query no longer names MeshInstanceLeaf (plan step E7, decision 8); the tag is registered
+            // first, as the query's first term did, so that a world whose service comes before its first mesh leaf
+            // keeps the component ids it had.
+            nvrhi::FRESULT result = RegisterComponent<MeshInstanceLeaf>(world) != ComponentId::Invalid
+                                        ? nvrhi::FS_OK : nvrhi::FE_INVALID_ARGS;
+            if (NVRHI_SUCCEEDED(result))
+                result = instanceQuery.Create(world, "RenderService.Instances");
             if (NVRHI_SUCCEEDED(result))
                 result = skinnedQuery.Create(world, "RenderService.SkinnedInstances");
             if (NVRHI_FAILED(result))
