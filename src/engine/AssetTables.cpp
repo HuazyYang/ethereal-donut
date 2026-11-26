@@ -23,6 +23,7 @@
 // Asset tables and stable slots (plan step E4); see AssetTables.h.
 
 #include <donut/engine/AssetTables.h>
+#include <donut/core/log.h>
 
 #include <algorithm>
 
@@ -210,6 +211,38 @@ namespace donut::engine
         row.prototype = MeshId::Invalid;
         row.materials.clear();
         Release(prototype, materials, changes);
+    }
+
+    bool MeshTable::AddReferences(MeshId id, uint32_t count)
+    {
+        if (!Get(id))
+            return false;
+        Row& row = m_Rows[SlotOf(id)];
+        if (count > ~0u - row.references)
+            return false;
+        row.references += count;
+        return true;
+    }
+
+    void MeshTable::ReleaseReferences(MeshId id, uint32_t count, MaterialTable& materials, Changes& changes)
+    {
+        if (count == 0)
+            return;
+        if (!Get(id))
+        {
+            log::warning("MeshTable::ReleaseReferences: the mesh id is not in the table; nothing released");
+            return;
+        }
+        Row& row = m_Rows[SlotOf(id)];
+        if (count > row.references)
+        {
+            log::warning("MeshTable::ReleaseReferences: %u references released, the row has %u; clamped", count,
+                         row.references);
+            count = row.references;
+        }
+        // all but the last one here; the last one through Release, which frees the row when it was the row's last
+        row.references -= count - 1;
+        Release(id, materials, changes);
     }
 
     bool MeshTable::Reconcile(uint32_t slot, MaterialTable& materials, Changes& changes)

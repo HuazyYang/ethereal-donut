@@ -60,6 +60,22 @@
 //   GpuInstanceSlot columns (table references, stable slots) before it calls RegisterLeaf, and releases them before it
 //   calls UnregisterLeaf. Every structural operation and InvalidateContent first advances the world's version, so that
 //   what they stamp is newer than any version a reader (GpuScene) took before them.
+// - Runtime-only mesh instances (design 5.8; plan step E7, item E7.1): rows with RuntimeMeshInstance and no node or
+//   leaf. Observers registered after the leaf observer do per batch what AcquireInstance and ReleaseInstance do per
+//   leaf, from the row's MeshRef, on the membership {RuntimeMeshInstance, GpuInstanceSlot, MeshRef, no SceneNode}
+//   (OnMatch, OnUnmatch): one bulk table reference per run of rows with one mesh, the slots, RenderFlags and
+//   LocalBounds from the mesh. A row holds a reference exactly while it holds an instance slot
+//   (GpuInstanceSlot::instance != c_NoInstanceSlot), which it can only while it is a member. A row that arrives with
+//   the tag and without
+//   GpuInstanceSlot (a snapshot's: the column is NoSerialize) gets the column through the observer's commands, and its
+//   slots when that makes it a member. Propagation takes member archetypes (the tag, no SceneNode) as depth-0 roots
+//   whatever Parent or HierarchyDepth they carry (LevelArchetype::runtime), and the subgraph passes skip them: they
+//   belong to no node's subgraph. The passes that read SceneNode (row hints, teardown) skip archetypes without it.
+//   MeshRef is read when a row joins and when it leaves: it must not change in between. RenderFlags and LocalBounds
+//   are taken when it joins: nothing refreshes them after the mesh is edited in place (there is no InvalidateContent
+//   for runtime rows), and a mesh with a skin prototype is taken as it is (runtime skinned rows are open point 11).
+// - Asset callbacks may call back into the graph (AcquireRuntimeMesh, destroying runtime rows) while the changes they
+//   report are being raised: each nesting level collects its changes in its own MeshTable::Changes (ChangesScope).
 
 #pragma once
 
@@ -109,6 +125,10 @@ namespace donut::engine
     // Whether a leaf column is one value per row, which a record can hold and Get and Edit hand out: no tag, buffer,
     // Shared, Chunk or Sparse component.
     bool IsPlainColumn(const ComponentTypeDesc& desc) noexcept;
+
+    // The material domains of a mesh's geometries as content flags: MeshInstance::GetContentFlags, and the content of a
+    // runtime-only mesh instance (RenderFlags::contentFlags). None for a null mesh.
+    SceneContentFlags GetMeshContentFlags(const MeshInfo* mesh) noexcept;
 
     // The column values of a leaf that is in no graph (LeafTypeDesc::leafRecord, E6.3): one block, this header and then
     // the values of the class's plain columns in the order of LeafTypeDesc::columns, found by GUID. All of them are
@@ -343,6 +363,20 @@ namespace donut::engine
         // SceneGraph::Simulate.
         nvrhi::FRESULT Simulate(const FrameTime& time) noexcept;
 
+        // ------------------------------------------------------ runtime-only mesh instances (5.8; E7.1)
+        // SceneGraph's calls of the same names (SceneGraph.h).
+        MeshId AcquireRuntimeMesh(MeshInfo* mesh) noexcept;
+        void ReleaseRuntimeMesh(MeshId mesh) noexcept;
+        uint32_t GetRuntimeMeshInstanceComponents(ComponentId* out, uint32_t capacity,
+                                                  bool simulationDriven) const noexcept;
+        uint32_t GetRuntimeMeshInstanceCount() const noexcept { return m_RuntimeRows; }
+        // The references the application holds through AcquireRuntimeMesh (test seam).
+        uint32_t GetRuntimeMeshHolds(MeshId mesh) const noexcept;
+        // The observer's work for a batch of rows that became members (`added`, OnMatch) or stop being ones (OnUnmatch).
+        void OnRuntimeRows(const EntityBatch& batch, bool added) noexcept;
+        // The observer's work for rows that got the tag without the slot column: records its addition in `commands`.
+        void AddRuntimeSlotColumn(const EntityBatch& batch, ICommandBuffer* commands) noexcept;
+
         // ------------------------------------------------------------------------------ refresh (5.4, 5.7)
         // Runs the phases when anything changed; returns whether structure changed since the last refresh.
         bool Refresh(uint32_t frameIndex);
@@ -551,6 +585,7 @@ namespace donut::engine
             uint8_t parent;
             uint8_t world;
             bool driven;               // the interpolation writes its rows' worlds, not propagation
+            bool runtime;              // runtime-only mesh instances: roots (parent c_Absent), in no node's subgraph
         };
 
         // Rows that the interpolation writes: driven, with the columns that SetSimulationDriven adds.
@@ -659,6 +694,21 @@ namespace donut::engine
         bool CreateSystems(IJobSystem* jobs, Systems& out) noexcept;
         // Makes them the graph's, in place of the ones it has.
         void TakeSystems(const Systems& systems) noexcept;
+        // The changes of the asset tables that one call collects and raises (RaiseAssetCallbacks): a level of their own
+        // per nesting, since a callback may call back into the graph while its level is being raised. The levels are
+        // kept for their capacity; Get is null when a new level cannot be made (out of memory).
+        class ChangesScope
+        {
+        public:
+            explicit ChangesScope(SceneGraphStore& store) noexcept;
+            ~ChangesScope();
+            ChangesScope(const ChangesScope&) = delete;
+            ChangesScope& operator=(const ChangesScope&) = delete;
+            MeshTable::Changes* Get() const noexcept { return m_Changes; }
+        private:
+            SceneGraphStore& m_Store;
+            MeshTable::Changes* m_Changes = nullptr;
+        };
         // The leaf observer's work per leaf (OnAdd, OnRemove), and the mesh-instance columns it fills and releases.
         void OnLeaf(Entity entity, SceneGraphLeaf* leaf, bool added);
         void AcquireInstance(const RowRef& row, MeshInstance* instance, MeshTable::Changes& changes);
@@ -756,6 +806,10 @@ namespace donut::engine
         nvrhi::AutoPtr<IJobSystem> m_Jobs;
         nvrhi::AutoPtr<IScheduler> m_Scheduler;
         nvrhi::AutoPtr<IObserver> m_LeafObserver;
+        nvrhi::AutoPtr<IObserver> m_RuntimeObserver;   // on RuntimeMeshInstance, after the leaf observer
+        ComponentId m_RuntimeTag = ComponentId::Invalid;
+        uint32_t m_RuntimeRows = 0;                     // rows that hold slots (GetRuntimeMeshInstanceCount)
+        std::vector<uint32_t> m_RuntimeMeshHolds;       // per mesh slot: the application's AcquireRuntimeMesh references
         ComponentId m_Ids[SlotCount] = {};
         ComponentId m_SimPreviousId = ComponentId::Invalid;
         ComponentId m_SimBodyId = ComponentId::Invalid;
@@ -776,7 +830,8 @@ namespace donut::engine
         // Stable slots of the mesh instances (step E4): instance-buffer rows and geometry-instance ranges.
         SlotAllocator m_InstanceSlots;
         SlotAllocator m_GeometryInstanceSlots;
-        MeshTable::Changes m_Changes;      // the leaf observer's, kept for its capacity
+        std::vector<std::unique_ptr<MeshTable::Changes>> m_ChangesLevels;   // ChangesScope's, by nesting depth
+        uint32_t m_ChangesDepth = 0;
         uint64_t m_RefreshCalls = 0;
         uint64_t m_LayoutSerial = 0;
         uint64_t m_Serial = 0;

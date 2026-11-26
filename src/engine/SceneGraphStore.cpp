@@ -454,10 +454,11 @@ namespace donut::engine
         // A process-wide serial per store (SceneGraphStore::GetSerial).
         std::atomic<uint64_t> g_StoreSerial{ 0 };
 
-        RenderFlags MakeRenderFlags(MeshInstance* instance) noexcept
+        // The flags of an instance of `mesh` (null: none) whose content flags are `content`.
+        RenderFlags MakeRenderFlags(const MeshInfo* mesh, SceneContentFlags content) noexcept
         {
-            RenderFlags flags{ 0, uint32_t(instance->GetContentFlags()) };
-            if (const MeshInfo* mesh = instance->GetMesh())
+            RenderFlags flags{ 0, uint32_t(content) };
+            if (mesh)
             {
                 // as Scene::UpdateInstance set InstanceData::flags
                 if (mesh->type == MeshType::CurveDisjointOrthogonalTriangleStrips)
@@ -467,6 +468,70 @@ namespace donut::engine
             }
             return flags;
         }
+
+        // A leaf's: its content flags through the virtual call, which a subclass may override.
+        RenderFlags MakeRenderFlags(MeshInstance* instance) noexcept
+        {
+            return MakeRenderFlags(instance->GetMesh(), instance->GetContentFlags());
+        }
+
+        // The graph's observer of runtime-only mesh instances (E7.1), registered three times by SceneGraphStore's
+        // constructor: OnMatch and OnUnmatch of the membership {RuntimeMeshInstance, GpuInstanceSlot, no SceneNode}
+        // take and release the slots and table references (SceneGraphStore::OnRuntimeRows; the batch's columns are the
+        // filter's data terms), and OnAdd of the tag on rows without GpuInstanceSlot adds the column
+        // (SceneGraphStore::AddRuntimeSlotColumn), which makes them members.
+        class RuntimeObserver final : public nvrhi::ObjectImpl<IObserver>
+        {
+        public:
+            NVRHI_BEGIN_INTERFACE_TABLE_INLINE(RuntimeObserver)
+            NVRHI_IMPLEMENTS_INTERFACE(IObserver)
+            NVRHI_END_INTERFACE_TABLE()
+
+            explicit RuntimeObserver(SceneGraphStore* store) noexcept : m_Store(store) { }
+
+            // As LeafObserver's: the world may outlive the store, and this observer with it; it then does nothing.
+            void Disconnect() noexcept { m_Store = nullptr; }
+
+            nvrhi::FRESULT OnEntities(ObserverEvent event, const EntityBatch& batch,
+                                      ICommandBuffer* commands) noexcept override
+            {
+                if (!m_Store || batch.count == 0)
+                    return nvrhi::FS_OK;
+                if (event == ObserverEvent::OnAdd)
+                    m_Store->AddRuntimeSlotColumn(batch, commands);
+                else
+                    m_Store->OnRuntimeRows(batch, event == ObserverEvent::OnMatch);
+                return nvrhi::FS_OK;
+            }
+
+        private:
+            SceneGraphStore* m_Store;
+        };
+    }
+
+    SceneContentFlags GetMeshContentFlags(const MeshInfo* mesh) noexcept
+    {
+        if (!mesh)
+            return SceneContentFlags::None;
+        SceneContentFlags flags = SceneContentFlags::None;
+        for (const auto& geometry : mesh->geometries)
+        {
+            if (!geometry || !geometry->material)
+                continue;
+            switch (geometry->material->domain)   // NOLINT(clang-diagnostic-switch-enum)
+            {
+            case MaterialDomain::Opaque:
+                flags |= SceneContentFlags::OpaqueMeshes;
+                break;
+            case MaterialDomain::AlphaTested:
+                flags |= SceneContentFlags::AlphaTestedMeshes;
+                break;
+            default:
+                flags |= SceneContentFlags::BlendedMeshes;
+                break;
+            }
+        }
+        return flags;
     }
 
     OrphanRecord* OrphanRecord::Create()
@@ -865,6 +930,55 @@ namespace donut::engine
         Systems systems;
         CreateSystems(m_Jobs, systems);   // what cannot be made is warned about; the graph lives with the rest
         TakeSystems(systems);
+
+        // Runtime-only mesh instances (E7.1): the tag, registered after every type that the constructor registers
+        // (the store's and the scheduler's), so that those ids stay as they were; its observers after the leaf
+        // observer. Membership is {RuntimeMeshInstance, GpuInstanceSlot, MeshRef, no SceneNode} (a node's row with the
+        // tag is not one): a row holds slots and a reference exactly while it is a member, so whatever ends membership
+        // (destruction, the tag, the slot column or MeshRef removed, a SceneNode added) releases them while MeshRef is
+        // still readable, and a row that never became one (destroyed before the slot column was added) holds nothing.
+        // The batch's columns: GpuInstanceSlot, MeshRef, and at OnMatch RenderFlags, LocalBounds and Parent, each null
+        // where the row lacks it (Optional).
+        m_RuntimeTag = RegisterComponent<RuntimeMeshInstance>(m_World);
+        m_RuntimeObserver = MAKE_RC_OBJ_PTR(RuntimeObserver, this);
+        const QueryTerm memberTerms[] = {
+            { m_RuntimeTag, TermOp::All, Access::Filter, {} },
+            { m_Ids[SlotNode], TermOp::Without, Access::Filter, {} },
+            { m_Ids[SlotInstance], TermOp::All, Access::Write, {} },
+            { m_Ids[SlotMeshRef], TermOp::All, Access::Read, {} },
+            { m_Ids[SlotRenderFlags], TermOp::Optional, Access::Write, {} },
+            { m_Ids[SlotLocalBounds], TermOp::Optional, Access::Write, {} },
+            { m_Ids[SlotParent], TermOp::Optional, Access::Read, {} },
+        };
+        ObserverDesc runtime{};
+        runtime.debugName = "SceneGraph runtime-only mesh instances";
+        runtime.component = ComponentId::Invalid;
+        runtime.event = ObserverEvent::OnMatch;
+        runtime.filterTerms = memberTerms;
+        runtime.filterTermCount = uint32_t(std::size(memberTerms));
+        bool added = m_RuntimeTag != ComponentId::Invalid &&
+                     NVRHI_SUCCEEDED(m_World->AddObserver(runtime, m_RuntimeObserver, id));
+        runtime.event = ObserverEvent::OnUnmatch;
+        runtime.filterTermCount = 4;   // the same membership; GpuInstanceSlot and MeshRef
+        added = added && NVRHI_SUCCEEDED(m_World->AddObserver(runtime, m_RuntimeObserver, id));
+        // Rows that get the tag: without the slot column (a snapshot's: GpuInstanceSlot is NoSerialize) they get the
+        // column; without MeshRef they are reported (they never become members). The batch's columns: the tag's (null),
+        // GpuInstanceSlot and MeshRef, each null where the row lacks it.
+        const QueryTerm slotlessTerms[] = {
+            { m_Ids[SlotNode], TermOp::Without, Access::Filter, {} },
+            { m_Ids[SlotInstance], TermOp::Optional, Access::Read, {} },
+            { m_Ids[SlotMeshRef], TermOp::Optional, Access::Read, {} },
+        };
+        runtime.debugName = "SceneGraph runtime-only mesh instances added";
+        runtime.component = m_RuntimeTag;
+        runtime.access = Access::Filter;
+        runtime.event = ObserverEvent::OnAdd;
+        runtime.filterTerms = slotlessTerms;
+        runtime.filterTermCount = uint32_t(std::size(slotlessTerms));
+        added = added && NVRHI_SUCCEEDED(m_World->AddObserver(runtime, m_RuntimeObserver, id));
+        if (!added)
+            log::warning("SceneGraph: cannot add the observers of runtime-only mesh instances");
+        // ChangesScope makes its levels on first use (not here: the constructor's last allocations are reported ones)
     }
 
     void SceneGraphStore::TakeSystems(const Systems& systems) noexcept
@@ -1070,6 +1184,9 @@ namespace donut::engine
         m_Scheduler.Reset();
         static_cast<LeafObserver*>(m_LeafObserver.Get())->Disconnect();
         m_LeafObserver.Reset();
+        // Runtime-only rows (E7.1) keep their slots and MeshRef; the tables they name go with the graph, whole.
+        static_cast<RuntimeObserver*>(m_RuntimeObserver.Get())->Disconnect();
+        m_RuntimeObserver.Reset();
         // A world that someone else holds lives on with its rows: its nodes and leaves are in no graph all the same.
         const bool worldIsHeld = ReferenceCount(m_World.Get()) > 1;
         if (m_AnyLeafRecord)
@@ -2513,19 +2630,23 @@ namespace donut::engine
         // The asset tables and slots change first, and SceneGraph's callbacks run after them (they may throw), then
         // the virtual RegisterLeaf or UnregisterLeaf: as RegisterLeaf raised OnMeshAdded before it added the leaf to
         // its vectors.
-        m_Changes.Clear();
-        RowRef row;
-        if (Locate(entity, row) && ColumnIndex(*row.archetype, row.archetypeIndex, SlotMeshRef) != c_Absent)
         {
-            // Only MeshInstance classes declare these columns (MeshInstance::GetTypeDesc, inherited by subclasses).
-            assert(query_cast<MeshInstance>(leaf));
-            if (added)
-                AcquireInstance(row, static_cast<MeshInstance*>(leaf), m_Changes);
-            else
-                ReleaseInstance(row, m_Changes);
+            ChangesScope scope(*this);
+            if (!scope.Get())
+                throw std::bad_alloc();   // the leaf observer reports it
+            MeshTable::Changes& changes = *scope.Get();
+            RowRef row;
+            if (Locate(entity, row) && ColumnIndex(*row.archetype, row.archetypeIndex, SlotMeshRef) != c_Absent)
+            {
+                // Only MeshInstance classes declare these columns (MeshInstance::GetTypeDesc, inherited by subclasses).
+                assert(query_cast<MeshInstance>(leaf));
+                if (added)
+                    AcquireInstance(row, static_cast<MeshInstance*>(leaf), changes);
+                else
+                    ReleaseInstance(row, changes);
+            }
+            RaiseAssetCallbacks(changes);
         }
-        RaiseAssetCallbacks(m_Changes);
-        m_Changes.Clear();
         if (added)
             m_Graph->RegisterLeaf(leaf);
         else
@@ -2605,16 +2726,280 @@ namespace donut::engine
         }
     }
 
+    // ----------------------------------------------------------- runtime-only mesh instances (5.8; E7.1)
+
+    namespace
+    {
+        // A callback of the asset tables may throw; the runtime calls are noexcept, as the leaf observer is.
+        template <typename Raise>
+        void RaiseQuietly(const char* operation, Raise&& raise) noexcept
+        {
+            try
+            {
+                raise();
+            }
+            catch (const std::exception& error)
+            {
+                log::warning("SceneGraph: %s: an asset callback threw '%s'", operation, error.what());
+            }
+            catch (...)
+            {
+                log::warning("SceneGraph: %s: an asset callback threw", operation);
+            }
+        }
+    }
+
+    SceneGraphStore::ChangesScope::ChangesScope(SceneGraphStore& store) noexcept
+        : m_Store(store)
+    {
+        const uint32_t depth = store.m_ChangesDepth++;
+        if (depth >= store.m_ChangesLevels.size() || !store.m_ChangesLevels[depth])
+        {
+            try
+            {
+                if (depth >= store.m_ChangesLevels.size())
+                    store.m_ChangesLevels.resize(size_t(depth) + 1);
+                store.m_ChangesLevels[depth] = std::make_unique<MeshTable::Changes>();
+            }
+            catch (...)
+            {
+                return;   // Get() is null
+            }
+        }
+        m_Changes = store.m_ChangesLevels[depth].get();
+        m_Changes->Clear();
+    }
+
+    SceneGraphStore::ChangesScope::~ChangesScope()
+    {
+        if (m_Changes)
+            m_Changes->Clear();   // the events hold their objects: released here, after the callbacks
+        --m_Store.m_ChangesDepth;
+    }
+
+    MeshId SceneGraphStore::AcquireRuntimeMesh(MeshInfo* mesh) noexcept
+    {
+        if (!mesh)
+        {
+            log::warning("SceneGraph::AcquireRuntimeMesh: the mesh is null");
+            return MeshId::Invalid;
+        }
+        if (!CanChangeStructure("AcquireRuntimeMesh"))
+            return MeshId::Invalid;
+        SceneGraph& graph = *m_Graph;
+        MeshId id = MeshId::Invalid;
+        try
+        {
+            // The holds first: a new row takes the lowest free slot, at most the end, so nothing can fail after the
+            // reference is taken.
+            if (m_RuntimeMeshHolds.size() <= graph.m_Meshes.GetSlotEnd())
+                m_RuntimeMeshHolds.resize(size_t(graph.m_Meshes.GetSlotEnd()) + 1, 0);
+        }
+        catch (...)
+        {
+            log::warning("SceneGraph::AcquireRuntimeMesh: out of memory; no reference taken");
+            return MeshId::Invalid;
+        }
+        ChangesScope scope(*this);
+        MeshTable::Changes* changes = scope.Get();
+        try
+        {
+            if (!changes)
+                throw std::bad_alloc();
+            id = graph.m_Meshes.Acquire(mesh, graph.m_Materials, *changes);
+        }
+        catch (...)
+        {
+            log::warning("SceneGraph::AcquireRuntimeMesh: out of memory; no reference taken");
+            return MeshId::Invalid;
+        }
+        ++m_RuntimeMeshHolds[MeshTable::SlotOf(id)];
+        graph.m_MaxGeometryCountPerMesh = std::max(graph.m_MaxGeometryCountPerMesh, changes->geometriesAdded);
+        RaiseQuietly("AcquireRuntimeMesh", [&]() { RaiseAssetCallbacks(*changes); });
+        return id;
+    }
+
+    void SceneGraphStore::ReleaseRuntimeMesh(MeshId mesh) noexcept
+    {
+        if (!CanChangeStructure("ReleaseRuntimeMesh"))
+            return;
+        SceneGraph& graph = *m_Graph;
+        const uint32_t slot = MeshTable::SlotOf(mesh);
+        if (!graph.m_Meshes.Get(mesh) || slot >= m_RuntimeMeshHolds.size() || m_RuntimeMeshHolds[slot] == 0)
+        {
+            log::warning("SceneGraph::ReleaseRuntimeMesh: the caller holds no reference to this mesh id; nothing "
+                         "released");
+            return;
+        }
+        ChangesScope scope(*this);
+        if (!scope.Get())
+        {
+            log::warning("SceneGraph::ReleaseRuntimeMesh: out of memory; nothing released");
+            return;
+        }
+        --m_RuntimeMeshHolds[slot];
+        RaiseQuietly("ReleaseRuntimeMesh", [&]()
+        {
+            graph.m_Meshes.Release(mesh, graph.m_Materials, *scope.Get());
+            RaiseAssetCallbacks(*scope.Get());
+        });
+    }
+
+    uint32_t SceneGraphStore::GetRuntimeMeshHolds(MeshId mesh) const noexcept
+    {
+        const uint32_t slot = MeshTable::SlotOf(mesh);
+        return m_Graph->m_Meshes.Get(mesh) && slot < m_RuntimeMeshHolds.size() ? m_RuntimeMeshHolds[slot] : 0;
+    }
+
+    uint32_t SceneGraphStore::GetRuntimeMeshInstanceComponents(ComponentId* out, uint32_t capacity,
+                                                               bool simulationDriven) const noexcept
+    {
+        // The order of SceneComponents.h's row layout.
+        const ComponentId ids[SceneGraph::c_MaxRuntimeMeshInstanceComponents] = {
+            m_RuntimeTag, m_Ids[SlotLocal], m_Ids[SlotWorld], m_Ids[SlotLocalBounds], m_Ids[SlotWorldBounds],
+            m_Ids[SlotChunkBounds], m_Ids[SlotMeshRef], m_Ids[SlotRenderFlags], m_Ids[SlotInstance],
+            m_Ids[SlotDriven], m_Ids[SlotSimPose], m_SimPreviousId, m_Ids[SlotSimScale], m_SimBodyId,
+        };
+        const uint32_t count = simulationDriven ? SceneGraph::c_MaxRuntimeMeshInstanceComponents : 9;
+        if (out)
+        {
+            for (uint32_t i = 0; i < std::min(count, capacity); ++i)
+                out[i] = ids[i];
+        }
+        return count;
+    }
+
+    // Per batch (a run of rows of one chunk, in delivery order) of rows that became members: references in bulk per run
+    // of rows that name one mesh, then each row's slots, geometry-instance range first, as AcquireInstance allocates
+    // them. A row holds a reference exactly while it holds an instance slot; one that names no mesh of the table
+    // (Invalid, released, another graph's that is not one of this table) gets none, an empty LocalBounds, and is never
+    // drawn. Copies (Instantiate, another world's rows) arrive with their source's slot values, so every row starts
+    // without one. Of rows that stop being members: the slots and references of those that hold them. MeshRef is read
+    // at both: a row's MeshRef must not change in between (the inspector's read-only list has it).
+    void SceneGraphStore::OnRuntimeRows(const EntityBatch& batch, bool added) noexcept
+    {
+        GpuInstanceSlot* slots = static_cast<GpuInstanceSlot*>(batch.columns[0]);
+        const MeshRef* refs = static_cast<const MeshRef*>(batch.columns[1]);
+        SceneGraph& graph = *m_Graph;
+        MeshTable& meshes = graph.m_Meshes;
+        const uint32_t count = batch.count;
+        if (added)
+        {
+            for (uint32_t r = 0; r < count; ++r)
+                slots[r] = GpuInstanceSlot{};
+            RenderFlags* flags = static_cast<RenderFlags*>(batch.columns[2]);
+            LocalBounds* bounds = static_cast<LocalBounds*>(batch.columns[3]);
+            if (batch.columns[4])
+                log::warning("SceneGraph: %u runtime-only mesh instances have a Parent, which is not supported; they "
+                             "are roots", count);
+            uint32_t unknown = 0;
+            uint32_t overflowed = 0;
+            for (uint32_t first = 0; first < count;)
+            {
+                const MeshId id = refs[first].mesh;
+                uint32_t end = first + 1;
+                while (end < count && refs[end].mesh == id)
+                    ++end;
+                const MeshInfo* mesh = meshes.Get(id);
+                if (!mesh || !meshes.AddReferences(id, end - first))
+                {
+                    // no mesh, no box: such rows add nothing to their chunk's bounds
+                    for (uint32_t r = first; !mesh && bounds && r < end; ++r)
+                        bounds[r].bounds = dm::box3::empty();
+                    (mesh ? overflowed : unknown) += end - first;
+                    first = end;
+                    continue;
+                }
+                const uint32_t geometryCount = meshes.GetMeshRow(MeshTable::SlotOf(id)).geometryCount;
+                const RenderFlags meshFlags = MakeRenderFlags(mesh, GetMeshContentFlags(mesh));
+                for (uint32_t r = first; r < end; ++r)
+                {
+                    // Allocate takes no memory: nothing below can fail
+                    slots[r].firstGeometryInstance = m_GeometryInstanceSlots.Allocate(geometryCount);
+                    slots[r].instance = m_InstanceSlots.Allocate(1);
+                    slots[r].geometryCount = geometryCount;
+                    if (flags)
+                        flags[r] = meshFlags;
+                    if (bounds)
+                        bounds[r].bounds = mesh->objectSpaceBounds;
+                }
+                m_RuntimeRows += end - first;
+                first = end;
+            }
+            if (unknown)
+                log::warning("SceneGraph: %u runtime-only mesh instances name no mesh of the graph (not from "
+                             "AcquireRuntimeMesh, released, or of another graph); they get no slots and are not drawn",
+                             unknown);
+            if (overflowed)
+                log::warning("SceneGraph: %u runtime-only mesh instances would overflow their mesh's reference count; "
+                             "they get no slots and are not drawn", overflowed);
+            return;
+        }
+
+        ChangesScope scope(*this);
+        if (!scope.Get())
+        {
+            log::warning("SceneGraph: out of memory; the slots and references of %u runtime-only mesh instances are "
+                         "not released", count);
+            return;
+        }
+        MeshTable::Changes& changes = *scope.Get();
+        RaiseQuietly("runtime-only mesh instances removed", [&]()
+        {
+            // Runs of held rows with one mesh: one ReleaseReferences each.
+            MeshId run = MeshId::Invalid;
+            uint32_t runCount = 0;
+            for (uint32_t r = 0; r < count; ++r)
+            {
+                if (slots[r].instance == c_NoInstanceSlot)
+                    continue;
+                if (runCount != 0 && refs[r].mesh != run)
+                {
+                    meshes.ReleaseReferences(run, runCount, graph.m_Materials, changes);
+                    runCount = 0;
+                }
+                m_InstanceSlots.Free(slots[r].instance, 1);
+                m_GeometryInstanceSlots.Free(slots[r].firstGeometryInstance, slots[r].geometryCount);
+                slots[r] = GpuInstanceSlot{};
+                --m_RuntimeRows;
+                run = refs[r].mesh;
+                ++runCount;
+            }
+            if (runCount != 0)
+                meshes.ReleaseReferences(run, runCount, graph.m_Materials, changes);
+            RaiseAssetCallbacks(changes);
+        });
+    }
+
+    // Rows that got the tag: those without MeshRef are reported (they never become members). Those without
+    // GpuInstanceSlot (a snapshot's: it is NoSerialize; or made without it) get the column through the observer's
+    // commands, which play back before the structural call returns; the column makes them members, and OnRuntimeRows
+    // gives them their slots then. A row destroyed before that playback never became a member and holds nothing; the
+    // command finds it dead and fails (the structural call or the scheduler's run still succeeds; a world with
+    // validation logs a warning per row): the command buffer has no form that skips dead entities.
+    void SceneGraphStore::AddRuntimeSlotColumn(const EntityBatch& batch, ICommandBuffer* commands) noexcept
+    {
+        if (!batch.columns[2])
+            log::warning("SceneGraph: %u runtime-only mesh instances lack MeshRef "
+                         "(SceneGraph::GetRuntimeMeshInstanceComponents); they get no slots and are not drawn",
+                         batch.count);
+        if (!batch.columns[1] && commands)
+            commands->AddComponents(batch.entities, batch.count, m_Ids[SlotInstance], nullptr, 0);
+    }
+
     void SceneGraphStore::ReconcileMeshes()
     {
         SceneGraph& graph = *m_Graph;
         MeshTable& meshes = graph.m_Meshes;
-        m_Changes.Clear();
+        ChangesScope scope(*this);   // a callback may change the tables again (AcquireRuntimeMesh): a level of its own
+        if (!scope.Get())
+            throw std::bad_alloc();
+        MeshTable::Changes& changes = *scope.Get();
         std::vector<uint8_t> reranged;   // per mesh slot; empty while none was
         const uint32_t slotEnd = meshes.GetSlotEnd();
         for (uint32_t slot = 0; slot < slotEnd; ++slot)
         {
-            if (meshes.GetRow(slot).object && meshes.Reconcile(slot, graph.m_Materials, m_Changes))
+            if (meshes.GetRow(slot).object && meshes.Reconcile(slot, graph.m_Materials, changes))
             {
                 reranged.resize(slotEnd, 0);
                 reranged[slot] = 1;
@@ -2664,7 +3049,7 @@ namespace donut::engine
         // Callbacks after the tables are consistent; an exception from one is reported, as the leaf observer does.
         try
         {
-            RaiseAssetCallbacks(m_Changes);
+            RaiseAssetCallbacks(changes);
         }
         catch (const std::exception& error)
         {
@@ -2674,7 +3059,6 @@ namespace donut::engine
         {
             log::warning("SceneGraph::Refresh: an asset callback threw");
         }
-        m_Changes.Clear();
     }
 
     // ------------------------------------------------------------------------------------- refresh
@@ -2784,18 +3168,26 @@ namespace donut::engine
             const uint8_t world = column(m_Ids[SlotWorld]);
             const uint8_t local = column(m_Ids[SlotLocal]);
             const bool driven = column(m_Ids[SlotDriven]) != c_Absent;
+            // Runtime-only mesh instances are roots (E7.1, open point 3): a Parent or HierarchyDepth that such a row
+            // carries is not read (the observer warns about a Parent). A node's row is never one: the tag on it is
+            // ignored here and by the observers, with a warning per archetype.
+            const bool tagged = m_RuntimeTag != ComponentId::Invalid && column(m_RuntimeTag) != c_Absent;
+            const bool runtime = tagged && column(m_Ids[SlotNode]) == c_Absent;
+            if (tagged && !runtime)
+                log::warning("SceneGraph: RuntimeMeshInstance on a node's rows is not supported; it is ignored");
             uint8_t level = c_Absent;
             if (world != c_Absent && archetype.components.size() > 0)
             {
                 uint32_t depth = 0;
                 const uint8_t depthColumn = column(m_DepthId);
-                if (depthColumn != c_Absent)
+                if (depthColumn != c_Absent && !runtime)
                     std::memcpy(&depth, archetype.sharedValues + archetype.columns[depthColumn].offset, sizeof(depth));
                 level = uint8_t(std::min(depth, c_MaxHierarchyDepth));
                 m_ArchetypeLevelSlot.resize(a + 1, c_None);
                 m_ArchetypeLevelSlot[a] = uint32_t(m_Levels[level].size());
                 m_Levels[level].push_back(LevelArchetype{ a, local, column(m_Ids[SlotLocalMatrix]),
-                                                          column(m_Ids[SlotParent]), world, driven });
+                                                          runtime ? c_Absent : column(m_Ids[SlotParent]), world,
+                                                          driven, runtime });
 
                 const uint8_t localBounds = column(m_Ids[SlotLocalBounds]);
                 const uint8_t worldBounds = column(m_Ids[SlotWorldBounds]);
@@ -2815,7 +3207,7 @@ namespace donut::engine
 
             const DrivenArchetype poses{ a, column(m_Ids[SlotSimPose]), column(m_SimPreviousId),
                                          column(m_Ids[SlotSimScale]), column(m_SimBodyId), world,
-                                         column(m_SimTeleportId), column(m_Ids[SlotParent]) };
+                                         column(m_SimTeleportId), runtime ? c_Absent : column(m_Ids[SlotParent]) };
             if (driven && poses.pose != c_Absent && poses.previous != c_Absent && poses.scale != c_Absent &&
                 poses.body != c_Absent && poses.world != c_Absent)
                 m_DrivenArchetypes.push_back(poses);
@@ -4713,6 +5105,8 @@ namespace donut::engine
                 {
                     for (const LevelArchetype& level : m_Levels[d])
                     {
+                        if (level.runtime)
+                            continue;   // runtime-only rows (E7.1): in no node's subgraph
                         const Archetype& archetype = m_Impl->GetArchetypeStorage(level.archetype);
                         for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
                         {
@@ -4796,6 +5190,8 @@ namespace donut::engine
             {
                 for (const LevelArchetype& level : m_Levels[d])
                 {
+                    if (level.runtime)
+                        continue;   // as in step 1
                     const Archetype& archetype = m_Impl->GetArchetypeStorage(level.archetype);
                     for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
                     {

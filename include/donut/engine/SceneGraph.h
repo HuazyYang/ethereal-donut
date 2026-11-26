@@ -1042,7 +1042,9 @@ namespace donut::engine
         // simulate like a node's rows, and are invisible to SceneGraphWalker, GetMeshInstances, GetNode (null) and
         // the root's subgraph bounds. Only rows made in this graph's world: rows copied from another world
         // (IWorld::CopyEntitiesFrom) carry ids of another table. A Parent on such a row is not supported (a warning;
-        // the row stays a root).
+        // the row stays a root). A row made without GpuInstanceSlot (as a snapshot's are: it is not saved) gets it
+        // through the graph's observer commands; one that the same playback destroys first makes that command fail:
+        // nothing is held or leaked, the call still succeeds, and a world with validation (Debug) logs a warning per row.
         //
         // A reference to `mesh` in the graph's mesh table, held for the caller until ReleaseRuntimeMesh; raises
         // OnMeshAdded for a mesh new to the graph. Its id is what MeshRef of the caller's rows names: the graph's

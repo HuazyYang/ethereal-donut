@@ -149,31 +149,8 @@ nvrhi::AutoPtr<SceneGraphLeaf> MeshInstance::Clone()
 
 SceneContentFlags MeshInstance::GetContentFlags() const
 {
-    if (!m_Mesh)
-        return SceneContentFlags::None;
-
-    SceneContentFlags flags = SceneContentFlags::None;
-
-    for (const auto& geometry : m_Mesh->geometries)
-    {
-        if (!geometry->material)
-            continue;
-
-        switch(geometry->material->domain)  // NOLINT(clang-diagnostic-switch-enum)
-        {
-        case MaterialDomain::Opaque:
-            flags |= SceneContentFlags::OpaqueMeshes;
-            break;
-        case MaterialDomain::AlphaTested: 
-            flags |= SceneContentFlags::AlphaTestedMeshes;
-            break;
-        default:
-            flags |= SceneContentFlags::BlendedMeshes;
-            break;
-        }
-    }
-
-    return flags;
+    // one home for the rule: runtime-only mesh instances take their content flags from it too (SceneGraphStore.cpp)
+    return GetMeshContentFlags(m_Mesh);
 }
 
 bool MeshInstance::SetProperty(const std::string& name, const dm::float4& value)
@@ -1414,6 +1391,29 @@ nvrhi::FRESULT SceneGraph::SetSimulationDriven(SceneGraphNode* node, bool driven
     {
         return nvrhi::FE_OUT_OF_MEMORY;
     }
+}
+
+MeshId SceneGraph::AcquireRuntimeMesh(MeshInfo* mesh) noexcept
+{
+    DONUT_SCENE_GRAPH_WARN_RENDER_READ(m_Store, "AcquireRuntimeMesh");
+    return m_Store->AcquireRuntimeMesh(mesh);
+}
+
+void SceneGraph::ReleaseRuntimeMesh(MeshId mesh) noexcept
+{
+    DONUT_SCENE_GRAPH_WARN_RENDER_READ(m_Store, "ReleaseRuntimeMesh");
+    m_Store->ReleaseRuntimeMesh(mesh);
+}
+
+uint32_t SceneGraph::GetRuntimeMeshInstanceComponents(ComponentId* out, uint32_t capacity,
+                                                      bool simulationDriven) const noexcept
+{
+    return m_Store->GetRuntimeMeshInstanceComponents(out, capacity, simulationDriven);
+}
+
+uint32_t SceneGraph::GetRuntimeMeshInstanceCount() const noexcept
+{
+    return m_Store->GetRuntimeMeshInstanceCount();
 }
 
 const size_t SceneGraph::GetGeometryInstancesCount() const
