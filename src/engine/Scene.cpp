@@ -814,6 +814,7 @@ inline void AppendBufferRange(nvrhi::BufferRange& range, size_t size, uint64_t& 
 
 void Scene::CreateMeshBuffers(nvrhi::ICommandList* commandList)
 {
+    m_PipelinedRecording.Check("Scene::CreateMeshBuffers");
     // The objects first, then their data (plan step E5: the graph path makes them at extraction and writes the data in
     // the upload pass's Prepare). The objects and descriptors are made in the same order as before.
     ScanMeshBufferObjects();
@@ -843,6 +844,7 @@ namespace
 
 nvrhi::FRESULT Scene::CreateMeshBufferObjects() noexcept
 {
+    m_PipelinedRecording.Check("Scene::CreateMeshBufferObjects");
     if (!m_SceneGraph)
         return nvrhi::FE_INVALID_ARGS;
     try
@@ -1106,6 +1108,7 @@ bool Scene::ScanMeshBufferObjects()
 
 void Scene::WriteMeshBufferData(nvrhi::ICommandList* commandList)
 {
+    m_PipelinedRecording.Check("Scene::WriteMeshBufferData");
     // The graph path keeps the CPU data until the frame is acknowledged (CreateMeshBufferObjects).
     const bool keep = IsOnGraphPath();
     if (keep)
@@ -1202,6 +1205,7 @@ void Scene::WriteMeshBufferData(nvrhi::ICommandList* commandList)
 
 void Scene::ConfirmMeshBufferData() noexcept
 {
+    m_PipelinedRecording.Check("Scene::ConfirmMeshBufferData");
     for (const PendingMeshBufferData& entry : m_UnconfirmedMeshBufferData)
         FreeMeshCpuData(*entry.buffers, entry.indexData, entry.vertexData);
     m_UnconfirmedMeshBufferData.clear();
@@ -1209,6 +1213,7 @@ void Scene::ConfirmMeshBufferData() noexcept
 
 GpuScene* Scene::EnsureGpuScene() noexcept
 {
+    m_PipelinedRecording.Check("Scene::EnsureGpuScene");
     if (m_GpuScene || !m_Device)
         return m_GpuScene;
     GpuSceneDesc desc;
@@ -1230,8 +1235,23 @@ GpuScene* Scene::EnsureGpuScene() noexcept
     return m_GpuScene;
 }
 
+void Scene::BeginPipelinedRecording() noexcept
+{
+    m_PipelinedRecording.Begin();
+    if (m_GpuScene)
+        m_GpuScene->BeginPipelinedRecording();
+}
+
+void Scene::EndPipelinedRecording() noexcept
+{
+    if (m_GpuScene)
+        m_GpuScene->EndPipelinedRecording();
+    m_PipelinedRecording.End();
+}
+
 void Scene::BindMeshInstanceBuffers()
 {
+    m_PipelinedRecording.Check("Scene::BindMeshInstanceBuffers");
     nvrhi::IBuffer* instanceBuffer = m_GpuScene ? m_GpuScene->GetInstanceBuffer() : nullptr;
     for (const auto& mesh : m_SceneGraph->GetMeshes())
     {

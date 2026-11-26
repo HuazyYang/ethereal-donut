@@ -1197,9 +1197,7 @@ void SceneGraph::CompactLeafVectors()
 
 void SceneGraph::BeginRenderRead(RenderReadMode mode) noexcept
 {
-    if (mode == RenderReadMode::Defer)   // E7.8 implements deferred releases
-        log::warning("SceneGraph::BeginRenderRead: RenderReadMode::Defer is not implemented yet; the scope warns");
-    m_Store->BeginRenderRead();
+    m_Store->BeginRenderRead(mode);
 }
 
 void SceneGraph::EndRenderRead() noexcept
@@ -1210,6 +1208,11 @@ void SceneGraph::EndRenderRead() noexcept
 bool SceneGraph::IsInRenderRead() const noexcept
 {
     return m_Store->IsInRenderRead();
+}
+
+bool SceneGraph::IsRenderReadDeferring() const noexcept
+{
+    return m_Store->IsDeferring();
 }
 
 nvrhi::FRESULT SceneGraph::RunReadOnlyPhase(Phase phase) noexcept
@@ -1409,9 +1412,10 @@ void SceneGraph::Refresh(uint32_t frameIndex)
     const bool structureDirty = m_Store->Refresh(frameIndex);
 
     // Slots are stable (step E4): nothing is renumbered. After structural changes, as the old renumbering did, the mesh
-    // table follows meshes whose geometries were edited in place since they were added.
-    if (structureDirty)
-        m_Store->ReconcileMeshes();
+    // table follows meshes whose geometries were edited in place since they were added. While a Defer scope is open
+    // (E7.8) that waits for its last EndRenderRead; one that failed there runs here.
+    if (structureDirty || m_Store->IsReconcileDeferred())
+        m_Store->ReconcileOrDefer();
 }
 
 nvrhi::FRESULT SceneGraph::Simulate(const FrameTime& time) noexcept

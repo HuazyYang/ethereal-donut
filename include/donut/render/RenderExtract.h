@@ -399,7 +399,9 @@ namespace donut::render
         // Pipelined rendering (design 7.5; plan step E7, items E7.8 and E7.9): the graph records frame N on another
         // thread while the world runs frame N+1, and the service opens the graph's render-read scope in its deferring
         // mode (SceneGraph::RenderReadMode::Defer). Off by default, enabled only after the A/B steps of E7.9 pass;
-        // ignored (the frame stays serial) until E7.8 implements it.
+        // ignored (the frame stays serial) until E7.9 reads it: E7.8 built the library's side (the Defer scope and
+        // its retire list, the deferred mesh reconciliation, the owner-thread checks of Scene::BeginPipelinedRecording
+        // and the walking strategies' refusal).
         bool pipelined = false;
     };
 

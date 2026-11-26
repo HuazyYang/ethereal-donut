@@ -936,7 +936,13 @@ namespace donut::engine
         // leaf, node, mesh or material while a scope of this mode is open goes to a retire list that EndRenderRead
         // releases, on the thread that calls it. Mixed scopes: while any Defer scope is open the graph defers, and writes
         // do not warn, also inside a Warn scope nested in it; the EndRenderRead that closes the last open Defer scope
-        // releases the list. Until E7.8 implements it, Defer logs a warning and acts as Warn.
+        // releases the list. Scopes close in reverse order of opening. What is kept: a leaf that leaves the world (the
+        // leaf observer's OnRemove: Detach, SetLeaf, a row destroyed through the world), each node of a detached
+        // subgraph, and every mesh and material the asset tables remove; each one reference, released in that order.
+        // Refresh's reconciliation of meshes edited in place (their geometries' and materials' slot fields, the mesh
+        // table's ranges) waits for that EndRenderRead too, which runs it first and raises its asset callbacks. The
+        // application's own objects (views, its shadow maps) and its in-place edits of assets are its own: it keeps
+        // them, and orders such edits after the pipelined frame's join.
         enum class RenderReadMode : uint8_t
         {
             Warn,    // the serial frame's isolation guard, as above
@@ -945,6 +951,8 @@ namespace donut::engine
         void BeginRenderRead(RenderReadMode mode = RenderReadMode::Warn) noexcept;
         void EndRenderRead() noexcept;
         [[nodiscard]] bool IsInRenderRead() const noexcept;
+        // A Defer scope is open: a pipelined frame records. Any thread may ask (the walking draw strategies refuse then).
+        [[nodiscard]] bool IsRenderReadDeferring() const noexcept;
         // Runs a phase of GetScheduler() whose systems only read (the render service's RenderExtract, plan step E5.1),
         // and accounts for it: when nothing else ran on the world since the last Refresh, the version the phase took is
         // not a change, so the next Refresh still returns at once when nothing changed and the on-demand caches stay. A

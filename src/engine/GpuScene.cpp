@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <new>
 #include <thread>
@@ -1055,12 +1056,45 @@ namespace donut::engine
 
     void GpuScene::InvalidateAssets() noexcept
     {
+        m_Recording.Check("GpuScene::InvalidateAssets");
         if (m_Impl)
             m_Impl->assetsInvalid = true;
     }
 
+    // ------------------------------------------------------------------- pipelined recording (E7.8)
+
+    namespace
+    {
+        uint64_t CurrentThreadKey() noexcept
+        {
+            // never 0, the value of "no recording"
+            return uint64_t(std::hash<std::thread::id>()(std::this_thread::get_id())) | 1u;
+        }
+    }
+
+    void PipelinedRecordingCheck::Begin() noexcept
+    {
+        m_Warned.store(false, std::memory_order_relaxed);
+        m_MainThread.store(CurrentThreadKey(), std::memory_order_release);
+    }
+
+    void PipelinedRecordingCheck::End() noexcept
+    {
+        m_MainThread.store(0, std::memory_order_release);
+    }
+
+    void PipelinedRecordingCheck::OnCheck(const char* operation) const noexcept
+    {
+        const uint64_t main = m_MainThread.load(std::memory_order_acquire);
+        if (main == 0 || main != CurrentThreadKey() || m_Warned.exchange(true, std::memory_order_relaxed))
+            return;
+        log::warning("%s on the main thread while a pipelined frame records (between BeginPipelinedRecording and "
+                     "EndPipelinedRecording): the recording owns it until the join; the call runs", operation);
+    }
+
     nvrhi::FRESULT GpuScene::Update(SceneGraph* graph) noexcept
     {
+        m_Recording.Check("GpuScene::Update");
         if (!graph || !graph->m_Store)
             return nvrhi::FE_INVALID_ARGS;
         if (!EnsureImpl())
@@ -1139,6 +1173,7 @@ namespace donut::engine
 
     nvrhi::FRESULT GpuScene::UploadTo(IGpuSceneWriter* writer) noexcept
     {
+        m_Recording.Check("GpuScene::UploadTo");
         if (!writer)
             return nvrhi::FE_INVALID_ARGS;
         if (m_Desc.uploadMode == GpuSceneUploadMode::Scatter)
@@ -1161,6 +1196,7 @@ namespace donut::engine
 
     nvrhi::FRESULT GpuScene::Upload(nvrhi::ICommandList* commandList) noexcept
     {
+        m_Recording.Check("GpuScene::Upload");
         if (!commandList || !m_Device)
             return nvrhi::FE_INVALID_ARGS;
         if (!m_Impl)
@@ -1173,6 +1209,7 @@ namespace donut::engine
 
     nvrhi::FRESULT GpuScene::CreateBuffers() noexcept
     {
+        m_Recording.Check("GpuScene::CreateBuffers");
         if (!m_Impl)
             return nvrhi::FS_OK;   // nothing was updated yet
         Impl& impl = *m_Impl;
@@ -1242,6 +1279,7 @@ namespace donut::engine
 
     nvrhi::FRESULT GpuScene::UploadAssetsTo(IGpuSceneWriter* writer) noexcept
     {
+        m_Recording.Check("GpuScene::UploadAssetsTo");
         if (!writer)
             return nvrhi::FE_INVALID_ARGS;
         if (m_Desc.uploadMode != GpuSceneUploadMode::Scatter)
@@ -1296,6 +1334,7 @@ namespace donut::engine
 
     nvrhi::FRESULT GpuScene::UploadAssets(nvrhi::ICommandList* commandList) noexcept
     {
+        m_Recording.Check("GpuScene::UploadAssets");
         if (!commandList || !m_Device)
             return nvrhi::FE_INVALID_ARGS;
         if (!m_Impl)
@@ -1323,6 +1362,7 @@ namespace donut::engine
 
     bool GpuScene::HasPendingAssets() const noexcept
     {
+        m_Recording.Check("GpuScene::HasPendingAssets");
         if (!m_Impl)
             return false;
         const Impl& impl = *m_Impl;
@@ -1341,6 +1381,7 @@ namespace donut::engine
 
     void GpuScene::GetScatterRecords(GpuSceneScatterRecords& out) const noexcept
     {
+        m_Recording.Check("GpuScene::GetScatterRecords");
         out = GpuSceneScatterRecords();
         if (!m_Impl || m_Desc.uploadMode != GpuSceneUploadMode::Scatter)
             return;
@@ -1357,12 +1398,14 @@ namespace donut::engine
 
     void GpuScene::CommitScatter(uint64_t serial) noexcept
     {
+        m_Recording.Check("GpuScene::CommitScatter");
         if (m_Impl && serial == m_Impl->scatterSerial)
             m_Impl->ackedSerial = serial;
     }
 
     bool GpuScene::IsScatterPending() const noexcept
     {
+        m_Recording.Check("GpuScene::IsScatterPending");
         return m_Impl && m_Impl->scatterSerial != m_Impl->ackedSerial;
     }
 

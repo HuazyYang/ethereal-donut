@@ -120,6 +120,13 @@ namespace donut::render
         virtual ~IDrawStrategy() = default;
     };
 
+    // The legacy walking strategies (InstancedOpaqueDrawStrategy and TransparentDrawStrategy, unbound) read the scene
+    // graph live, from the root node a PrepareForView gets. While a pipelined frame records (plan step E7, item E7.8:
+    // the root node's graph has a SceneGraph::RenderReadMode::Defer scope open, SceneGraph::IsRenderReadDeferring),
+    // the main thread changes that graph, so they refuse: PrepareForView logs one warning per strategy object and the
+    // view gets no draw items. Only the packet adapters (bound strategies, PacketDrawStrategy) record a pipelined frame.
+    // The check reads the root node's graph on the recording thread: the root must not be detached while it records.
+
     class PassthroughDrawStrategy : public IDrawStrategy
     {
         NVRHI_INHERIT_INTERFACE_TABLE()
@@ -147,6 +154,7 @@ namespace donut::render
         std::vector<const DrawItem*> m_InstancePtrChunk;
         size_t m_ReadPtr = 0;
         size_t m_ChunkSize = 128;
+        bool m_WarnedPipelined = false;   // the refusal's one warning (E7.8)
 
         void FillChunk();
 
@@ -180,6 +188,7 @@ namespace donut::render
         size_t m_ReadPtr = 0;
         PacketDrawItems m_Packets;
         DrawStrategyUseCheck m_UseCheck;
+        bool m_WarnedPipelined = false;   // the refusal's one warning (E7.8)
 
     public:
         // Bound to packets, the setting is ExtractDesc::drawDoubleSidedMaterialsSeparately instead.

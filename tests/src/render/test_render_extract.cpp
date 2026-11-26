@@ -38,11 +38,13 @@
 //     test_render_extract [case]      runs every case, or the one named; `measure` (by name only) prints timings
 
 #include <donut/render/RenderExtract.h>
+#include <donut/render/DrawStrategy.h>
 #include <donut/render/LightShadows.h>
 #include <donut/render/RenderGraph.h>
 #include <donut/render/RenderGraphFrameData.h>
 #include <donut/engine/EcsQuery.h>
 #include <donut/engine/EcsScheduler.h>
+#include <donut/engine/GpuScene.h>
 #include <donut/engine/KeyframeAnimation.h>
 #include <donut/engine/SceneGraph.h>
 #include <donut/engine/ShadowMap.h>
@@ -69,6 +71,7 @@ using namespace donut::math;
 #include <initializer_list>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -2583,6 +2586,307 @@ namespace
         service = nullptr;
     }
 
+    // ------------------------------------------------- deferred releases and pipelining checks (E7 rev 2, part I6)
+
+    std::atomic<uint32_t> g_CountedMeshesDestroyed{ 0 };
+
+    // A mesh whose destruction is counted (MeshInfo has no weak references).
+    struct CountedMesh : MeshInfo
+    {
+        NVRHI_INHERIT_INTERFACE_TABLE()
+        ~CountedMesh() override { g_CountedMeshesDestroyed.fetch_add(1); }
+    };
+
+    nvrhi::AutoPtr<nvrhi::IWeakReference> WeakOf(nvrhi::IWeakReferenceSource* object)
+    {
+        nvrhi::AutoPtr<nvrhi::IWeakReference> weak;
+        object->GetWeakReference(weak.GetAddressOf());
+        CHECK(weak);
+        return weak;
+    }
+
+    bool Expired(nvrhi::IWeakReference* weak)
+    {
+        return weak->IsExpired() != 0;
+    }
+
+    nvrhi::AutoPtr<MeshInfo> NewCountedMesh(SceneTypeFactory* factory, Material* material, uint32_t geometries)
+    {
+        nvrhi::AutoPtr<MeshInfo> mesh = MAKE_RC_OBJ_PTR(CountedMesh);
+        mesh->objectSpaceBounds = dm::box3(dm::float3(-1.f), dm::float3(1.f));
+        for (uint32_t i = 0; i < geometries; ++i)
+        {
+            auto geometry = factory->CreateMeshGeometry();
+            geometry->material = material;
+            geometry->objectSpaceBounds = mesh->objectSpaceBounds;
+            mesh->geometries.push_back(geometry);
+        }
+        return mesh;
+    }
+
+    // The retire list of a Defer scope: what the graph, its world and its tables drop while the scope is open (a
+    // detached subgraph nobody keeps, a leaf replaced by SetLeaf, a mesh and its material whose last instance went, a
+    // runtime mesh released) lives until the EndRenderRead that closes the last Defer scope, not before (a Warn scope
+    // nested in it closes first), and goes then, on that thread. Refresh's mesh reconciliation waits for it too. In a
+    // Warn scope the same drop releases at once.
+    void test_defer_retire_list()
+    {
+        const uint32_t warningsBefore = g_Warnings.load();
+        const uint32_t destroyedBefore = g_CountedMeshesDestroyed.load();
+        auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+        auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+        auto root = MAKE_RC_OBJ_PTR(SceneGraphNode);
+        graph->SetRootNode(root);
+
+        auto material = factory->CreateMaterial();
+        material->domain = MaterialDomain::Opaque;
+        auto weakMaterial = WeakOf(material);
+        nvrhi::AutoPtr<MeshInfo> mesh = NewCountedMesh(factory, material, 2);
+        nvrhi::AutoPtr<MeshInfo> runtimeMesh = NewCountedMesh(factory, material, 1);
+        nvrhi::AutoPtr<MeshInfo> edited = factory->CreateMesh();   // kept by the test: edited in place below
+        edited->geometries.push_back(factory->CreateMeshGeometry());
+        edited->geometries[0]->material = material;
+        material = nullptr;
+
+        nvrhi::AutoPtr<SceneGraphLeaf> leafA = factory->CreateMeshInstance(mesh);
+        nvrhi::AutoPtr<SceneGraphNode> nodeA = graph->AttachLeafNode(root, leafA);
+        auto weakNodeA = WeakOf(nodeA);
+        auto weakLeafA = WeakOf(leafA);
+        nvrhi::AutoPtr<SceneGraphLeaf> light = MAKE_RC_OBJ_PTR(PointLight);
+        nvrhi::AutoPtr<SceneGraphNode> nodeB = graph->AttachLeafNode(root, light);
+        auto weakLight = WeakOf(light);
+        graph->AttachLeafNode(root, factory->CreateMeshInstance(edited));
+        const MeshId runtimeId = graph->AcquireRuntimeMesh(runtimeMesh);
+        CHECK(runtimeId != MeshId::Invalid);
+        const uint32_t editedSlot = MeshTable::SlotOf(graph->GetMeshes().Find(edited));
+        CHECK(graph->GetMeshes().GetMeshRow(editedSlot).geometryCount == 1);
+        graph->Refresh(0);
+        mesh = nullptr;
+        runtimeMesh = nullptr;
+        leafA = nullptr;
+        light = nullptr;
+        CHECK(!graph->IsInRenderRead() && !graph->IsRenderReadDeferring());
+
+        graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+        CHECK(graph->IsInRenderRead() && graph->IsRenderReadDeferring());
+        graph->BeginRenderRead();   // a Warn scope inside the Defer one: the graph still defers
+        CHECK(graph->IsRenderReadDeferring());
+        (void)graph->Detach(nodeA);   // nobody keeps the subgraph
+        nodeA = nullptr;
+        nodeB->SetLeaf(MAKE_RC_OBJ_PTR(SpotLight));
+        graph->ReleaseRuntimeMesh(runtimeId);
+        edited->geometries.push_back(factory->CreateMeshGeometry());   // an in-place edit, then a structural change
+        edited->geometries[1]->material = edited->geometries[0]->material;
+        graph->AttachLeafNode(root, MAKE_RC_OBJ_PTR(PointLight));
+        graph->Refresh(1);
+        CHECK(!Expired(weakNodeA) && !Expired(weakLeafA) && !Expired(weakLight) && !Expired(weakMaterial));
+        CHECK(g_CountedMeshesDestroyed.load() == destroyedBefore);
+        CHECK(graph->GetMeshes().GetMeshRow(editedSlot).geometryCount == 1);   // reconciled after the scope
+
+        graph->EndRenderRead();   // the Warn scope
+        CHECK(graph->IsInRenderRead() && graph->IsRenderReadDeferring());
+        CHECK(!Expired(weakNodeA) && !Expired(weakLeafA) && !Expired(weakLight) && !Expired(weakMaterial));
+        CHECK(g_CountedMeshesDestroyed.load() == destroyedBefore);
+        CHECK(graph->GetMeshes().GetMeshRow(editedSlot).geometryCount == 1);
+
+        graph->EndRenderRead();   // the last Defer scope: released here, on this thread
+        CHECK(!graph->IsInRenderRead() && !graph->IsRenderReadDeferring());
+        CHECK(Expired(weakNodeA) && Expired(weakLeafA) && Expired(weakLight));
+        CHECK(g_CountedMeshesDestroyed.load() == destroyedBefore + 2);
+        CHECK(!Expired(weakMaterial));   // the edited mesh still uses it
+        CHECK(graph->GetMeshes().GetMeshRow(editedSlot).geometryCount == 2);
+
+        // A Warn scope keeps nothing: a dropped subgraph goes at once (and Debug builds warn about the Detach).
+        nvrhi::AutoPtr<SceneGraphNode> nodeC = graph->AttachLeafNode(root, MAKE_RC_OBJ_PTR(PointLight));
+        auto weakNodeC = WeakOf(nodeC);
+        graph->Refresh(2);
+        graph->BeginRenderRead();
+        (void)graph->Detach(nodeC);
+        nodeC = nullptr;
+        CHECK(Expired(weakNodeC));
+        graph->EndRenderRead();
+        const uint32_t warnings = g_Warnings.load() - warningsBefore;
+#ifdef NDEBUG
+        CHECK(warnings == 0);
+#else
+        CHECK(warnings == 1);
+#endif
+        g_Warnings.store(warningsBefore);
+        std::printf("  two meshes, a node, two leaves kept until the last EndRenderRead; reconciliation deferred\n");
+    }
+
+    // Writes through the API: the forms the isolation case lists. Returns how many.
+    uint32_t WriteThroughApi(TraceScene& s)
+    {
+        uint32_t writes = 0;
+        for (uint32_t i = 0; i < 3; ++i, ++writes)
+            Move(s, s.movers[i]);
+        std::vector<SceneGraphNode*> nodes = CollectNodes(s.graph);
+        nvrhi::AutoPtr<SceneGraphNode> detached = s.graph->Detach(nodes[nodes.size() / 2]);
+        ++writes;
+        s.graph->Attach(s.graph->GetRootNode(), detached);
+        ++writes;
+        nodes = CollectNodes(s.graph);
+        nodes[3]->SetLeaf(s.factory->CreateMeshInstance(s.meshes[1]));
+        ++writes;
+        nodes[4]->InvalidateContent();
+        ++writes;
+        s.graph->AttachLeafNode(s.graph->GetRootNode(), MAKE_RC_OBJ_PTR(PointLight));
+        ++writes;
+        auto newRoot = NewNode(s);
+        auto oldRoot = s.graph->SetRootNode(newRoot);
+        ++writes;
+        s.graph->Attach(newRoot, oldRoot);
+        ++writes;
+        return writes;
+    }
+
+    // The writes that warn in a Warn scope (Debug builds) warn in no build inside a Defer scope, nor inside a Warn scope
+    // nested in one.
+    void test_defer_no_warning()
+    {
+        TraceScene s(0x4006, c_SmallProfile);
+        BuildMixed(s, 120);
+        s.graph->Refresh(0);
+        const uint32_t warningsBefore = g_Warnings.load();
+
+        s.graph->BeginRenderRead();
+        const uint32_t serialWrites = WriteThroughApi(s);
+        s.graph->EndRenderRead();
+        const uint32_t serialWarnings = g_Warnings.load() - warningsBefore;
+#ifdef NDEBUG
+        CHECK(serialWarnings == 0);
+#else
+        CHECK(serialWarnings == serialWrites);
+#endif
+        s.graph->Refresh(1);
+
+        const uint32_t deferBefore = g_Warnings.load();
+        s.graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+        const uint32_t deferWrites = WriteThroughApi(s);
+        CHECK(s.graph->Simulate(FrameTime{ 0.0, 1.0 / 60.0, 1 }) == nvrhi::FS_OK);   // warns in a Warn scope
+        s.graph->Refresh(2);
+        s.graph->BeginRenderRead();
+        const uint32_t nestedWrites = WriteThroughApi(s);
+        s.graph->EndRenderRead();
+        s.graph->EndRenderRead();
+        CHECK(g_Warnings.load() == deferBefore);
+        CHECK(!s.graph->IsInRenderRead());
+        s.graph->Refresh(3);
+        g_Warnings.store(warningsBefore);
+        std::printf("  Warn scope: %u writes, %u warnings; Defer scope: %u writes (and %u in a nested Warn scope), "
+                    "0 warnings\n", serialWrites, serialWarnings, deferWrites, nestedWrites);
+    }
+
+    uint32_t DrainItems(IDrawStrategy& strategy, SceneGraphNode* root, const IView& view)
+    {
+        strategy.PrepareForView(root, view);
+        uint32_t count = 0;
+        while (strategy.GetNextItem())
+            ++count;
+        return count;
+    }
+
+    // In a pipelined frame (a Defer scope open on the root's graph) a walking strategy refuses: no draw items and one
+    // warning per strategy object; a Warn scope does not refuse; a bound strategy (a packet adapter) records.
+    void test_walking_refused()
+    {
+        TestViews views;
+        TraceScene s(0x4007, c_SmallProfile);
+        BuildMixed(s, 200);
+        s.graph->Refresh(0);
+        const uint32_t warningsBefore = g_Warnings.load();
+        auto opaque = MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy);
+        auto transparent = MAKE_RC_OBJ_PTR(TransparentDrawStrategy);
+        const IView& view = *views.perspective;
+        const uint32_t opaqueItems = DrainItems(*opaque, s.graph->GetRootNode(), view);
+        const uint32_t transparentItems = DrainItems(*transparent, s.graph->GetRootNode(), view);
+        CHECK(opaqueItems > 0);
+
+        s.graph->BeginRenderRead();   // a serial frame's scope: the walk runs
+        CHECK(DrainItems(*opaque, s.graph->GetRootNode(), view) == opaqueItems);
+        CHECK(DrainItems(*transparent, s.graph->GetRootNode(), view) == transparentItems);
+        s.graph->EndRenderRead();
+        CHECK(g_Warnings.load() == warningsBefore);
+
+        s.graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            CHECK(DrainItems(*opaque, s.graph->GetRootNode(), view) == 0);
+            CHECK(DrainItems(*transparent, s.graph->GetRootNode(), view) == 0);
+        }
+        CHECK(g_Warnings.load() == warningsBefore + 2);   // one per strategy object, in every build
+        s.graph->EndRenderRead();
+
+        // A packet adapter records in a pipelined frame.
+        RenderFrame frame;
+        auto service = MakeService(s.graph);
+        const RenderSnapshot& snapshot = ExtractFrame(service, frame, views.Desc(1));
+        s.graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+        auto packets = MAKE_RC_OBJ_PTR(PacketDrawStrategy);
+        packets->SetPackets(&snapshot, DrawPacketPass::Opaque);
+        const uint32_t packetItems = DrainItems(*packets, s.graph->GetRootNode(), view);
+        CHECK(packetItems == snapshot.views[0].packets[uint32_t(DrawPacketPass::Opaque)].count);
+        CHECK(packetItems > 0);
+        opaque->SetPackets(&snapshot);   // bound: not a walk, so not refused
+        CHECK(DrainItems(*opaque, s.graph->GetRootNode(), view) == packetItems);
+        opaque->SetPackets(nullptr);
+        s.graph->EndRenderRead();
+        service->EndFrame(true);
+        CHECK(g_Warnings.load() == warningsBefore + 2);
+
+        // After the scope the walk runs again, without another warning.
+        CHECK(DrainItems(*opaque, s.graph->GetRootNode(), view) == opaqueItems);
+        CHECK(g_Warnings.load() == warningsBefore + 2);
+        g_Warnings.store(warningsBefore);
+        std::printf("  walked %u opaque and %u transparent items serially, none in a Defer scope; %u packet items\n",
+                    opaqueItems, transparentItems, packetItems);
+        service = nullptr;
+    }
+
+    // The owner-thread check of a pipelined recording (GpuScene; Scene forwards to it): calls on the thread that began
+    // the recording warn once per recording in Debug builds, calls on another thread do not, nothing is checked before
+    // Begin or after End.
+    void test_pipelined_owner_check()
+    {
+        GpuSceneDesc desc;
+        desc.uploadMode = GpuSceneUploadMode::Scatter;
+        auto gpuScene = MAKE_RC_OBJ_PTR(GpuScene, nullptr, desc);
+        const uint32_t warningsBefore = g_Warnings.load();
+        gpuScene->CommitScatter(0);
+        (void)gpuScene->IsScatterPending();
+        CHECK(!gpuScene->IsPipelinedRecording());
+        CHECK(g_Warnings.load() == warningsBefore);
+
+#ifdef NDEBUG
+        constexpr uint32_t c_PerRecording = 0;
+#else
+        constexpr uint32_t c_PerRecording = 1;   // one warning per recording
+#endif
+        for (uint32_t round = 0; round < 2; ++round)
+        {
+            gpuScene->BeginPipelinedRecording();
+            CHECK(gpuScene->IsPipelinedRecording());
+            std::thread recorder([&gpuScene]()
+            {
+                GpuSceneScatterRecords records;
+                gpuScene->GetScatterRecords(records);
+                (void)gpuScene->HasPendingAssets();
+                gpuScene->CommitScatter(records.serial);
+            });
+            recorder.join();
+            CHECK(g_Warnings.load() == warningsBefore + round * c_PerRecording);   // the recording thread's calls
+            gpuScene->CommitScatter(0);                           // the main thread's, before the join
+            (void)gpuScene->IsScatterPending();
+            CHECK(gpuScene->Update(nullptr) == nvrhi::FE_INVALID_ARGS);
+            gpuScene->EndPipelinedRecording();
+            CHECK(!gpuScene->IsPipelinedRecording());
+            gpuScene->CommitScatter(0);
+            CHECK(g_Warnings.load() == warningsBefore + (round + 1) * c_PerRecording);
+        }
+        g_Warnings.store(warningsBefore);
+    }
+
     struct Case
     {
         const char* name;
@@ -2632,6 +2936,10 @@ int main(int argc, char** argv)
         { "shadow_map_reassigned", test_shadow_map_reassigned },
         { "scheduler_release", test_scheduler_release },
         { "repeated_calls", test_repeated_calls },
+        { "defer_retire_list", test_defer_retire_list },
+        { "defer_no_warning", test_defer_no_warning },
+        { "walking_refused", test_walking_refused },
+        { "pipelined_owner_check", test_pipelined_owner_check },
         { "measure", measure_extraction },   // by name only
     };
     try

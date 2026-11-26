@@ -1158,6 +1158,10 @@ namespace donut::engine
         // outlives the graph as the root of its own subgraph, as a referenced child outlived its parent before. The
         // world holds one reference to each node; the graph has released its root already. One pre-order pass from
         // each root (a node without a Parent): a referenced node takes its subgraph along, so the walk skips it.
+        // A Defer scope still open (E7.8): what it kept goes first, without the deferred reconciliation.
+        m_DeferReads.store(0, std::memory_order_release);
+        m_ReconcileDeferred = false;
+        ReleaseDeferred();
         SyncArchetypes();
         {
             ScratchScope scope(*this);
@@ -1689,9 +1693,100 @@ namespace donut::engine
         // Open point 12 of the E5 sub-plan, beside the phase check of design 5.6: the render service's snapshot points
         // at this graph's leaves and assets until its EndFrame. A warning, not an error (log::error breaks into the
         // debugger); the write applies, so Debug and Release behave alike.
-        if (m_RenderReads != 0 && m_RenderReadQuiet == 0)
+        // A Defer scope (E7.8) allows writes: what they release goes to the retire list.
+        if (m_RenderReads != 0 && m_RenderReadQuiet == 0 && !IsDeferring())
             log::warning("SceneGraph::%s while a frame records (between RenderService::Extract and EndFrame): the "
                          "frame's snapshot may point at what this changes; the write applies", operation);
+    }
+
+    // ------------------------------------------------------------------- deferred releases (E7.8)
+
+    void SceneGraphStore::BeginRenderRead(SceneGraph::RenderReadMode mode) noexcept
+    {
+        const uint32_t depth = m_RenderReads++;
+        if (mode != SceneGraph::RenderReadMode::Defer)
+            return;
+        if (depth >= 64)
+        {
+            log::warning("SceneGraph::BeginRenderRead: a Defer scope nested %u deep acts as a Warn scope", depth + 1);
+            return;
+        }
+        m_RenderReadModes |= uint64_t(1) << depth;
+        m_DeferReads.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void SceneGraphStore::EndRenderRead() noexcept
+    {
+        if (m_RenderReads == 0)
+            return;
+        const uint32_t depth = --m_RenderReads;
+        if (depth >= 64 || !(m_RenderReadModes & (uint64_t(1) << depth)))
+            return;
+        m_RenderReadModes &= ~(uint64_t(1) << depth);
+        // The last Defer scope: what it deferred runs now, on this thread (after the pipelined frame's join).
+        if (m_DeferReads.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            ReleaseDeferred();
+    }
+
+    void SceneGraphStore::Retire(nvrhi::IObject* object) noexcept
+    {
+        if (!object || !IsDeferring())
+            return;
+        try
+        {
+            m_Retired.push_back(object);   // grows to its high-water mark, then allocates nothing
+        }
+        catch (...)
+        {
+            log::warning("SceneGraph: out of memory; an object released while a pipelined frame records is not kept "
+                         "until its EndRenderRead");
+            return;
+        }
+        object->AddRef();
+    }
+
+    void SceneGraphStore::ReconcileOrDefer()
+    {
+        if (IsDeferring())
+        {
+            m_ReconcileDeferred = true;
+            return;
+        }
+        ReconcileMeshes();
+        m_ReconcileDeferred = false;
+    }
+
+    void SceneGraphStore::ReleaseDeferred() noexcept
+    {
+        // The mesh table first: it may release materials and meshes, which go at once now (no Defer scope is open).
+        if (m_ReconcileDeferred)
+        {
+            try
+            {
+                ReconcileMeshes();
+                m_ReconcileDeferred = false;
+            }
+            catch (const std::exception& error)
+            {
+                log::warning("SceneGraph::EndRenderRead: the deferred mesh reconciliation failed ('%s'); the next "
+                             "Refresh runs it", error.what());
+            }
+            catch (...)
+            {
+                log::warning("SceneGraph::EndRenderRead: the deferred mesh reconciliation failed; the next Refresh "
+                             "runs it");
+            }
+        }
+        // In retirement order. A release may destroy an object whose destructor releases others (a node its record's
+        // children and leaf); none of them comes back here, since no Defer scope is open.
+        const size_t count = m_Retired.size();
+        for (size_t i = 0; i < count; ++i)
+        {
+            nvrhi::IObject* object = m_Retired[i];
+            m_Retired[i] = nullptr;
+            object->Release();
+        }
+        m_Retired.clear();   // capacity kept
     }
 
     // The leaf classes and local boxes of the gathered nodes. A separate pass, so that the leaves, which the walk does
@@ -2382,6 +2477,13 @@ namespace donut::engine
 
         GatherSubgraph(node->m_Entity);
         MoveToRecords(true);
+        // While a Defer scope is open (E7.8), the nodes that leave the world are kept until its end: the caller may drop
+        // the subgraph before the open frame has recorded (their leaves are kept by the leaf observer's OnRemove).
+        if (IsDeferring())
+        {
+            for (SceneGraphNode* gathered : m_S->nodes)
+                Retire(gathered);
+        }
 
         // The leaf observer unregisters the leaves in pre-order; the graph removes them from its vectors in one pass.
         m_Graph->m_DeferLeafRemoval = true;
@@ -2677,6 +2779,8 @@ namespace donut::engine
         // The asset tables and slots change first, and SceneGraph's callbacks run after them (they may throw), then
         // the virtual RegisterLeaf or UnregisterLeaf: as RegisterLeaf raised OnMeshAdded before it added the leaf to
         // its vectors.
+        if (!added)
+            Retire(leaf);   // while a Defer scope is open (E7.8): the open frame may name the leaf
         {
             ChangesScope scope(*this);
             if (!scope.Get())
@@ -2820,7 +2924,22 @@ namespace donut::engine
     SceneGraphStore::ChangesScope::~ChangesScope()
     {
         if (m_Changes)
+        {
+            // While a Defer scope is open (E7.8) the removed assets go to the retire list: the open frame may name them.
+            if (m_Store.IsDeferring())
+            {
+                for (const MeshTable::Change& change : m_Changes->events)
+                {
+                    if (change.added)
+                        continue;
+                    if (change.mesh)
+                        m_Store.Retire(change.mesh.Get());
+                    else if (change.material)
+                        m_Store.Retire(change.material.Get());
+                }
+            }
             m_Changes->Clear();   // the events hold their objects: released here, after the callbacks
+        }
         --m_Store.m_ChangesDepth;
     }
 

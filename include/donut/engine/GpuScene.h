@@ -78,6 +78,7 @@
 #include <nvrhi/core/foundation.h>
 #include <nvrhi/nvrhi.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -197,6 +198,35 @@ namespace donut::engine
         uint32_t rowRecords = 0;
     };
 
+    // Pipelined rendering (design 7.5; plan step E7, item E7.8): while a pipelined frame records on another thread, the
+    // objects its passes write on that thread (the GpuScene; the Scene's mesh-buffer data) belong to the recording, and
+    // the main thread touches them only after the join (model 3 of the E7 sub-plan: GpuScene::Update runs in the next
+    // Extract). Begin, called on the main thread when it hands the frame to the recording thread, names that thread;
+    // End, after the join, ends the recording. Check, at the guarded calls: in Debug builds a call made on the named
+    // thread in between logs one warning per recording (log::warning; the call still runs); Release builds check
+    // nothing. Never begun (serial frames), nothing is checked. Module-private.
+    class PipelinedRecordingCheck
+    {
+    public:
+        void Begin() noexcept;
+        void End() noexcept;
+        [[nodiscard]] bool IsRecording() const noexcept { return m_MainThread.load(std::memory_order_acquire) != 0; }
+        void Check(const char* operation) const noexcept
+        {
+#ifndef NDEBUG
+            if (m_MainThread.load(std::memory_order_relaxed) != 0)
+                OnCheck(operation);
+#else
+            (void)operation;
+#endif
+        }
+
+    private:
+        void OnCheck(const char* operation) const noexcept;
+        std::atomic<uint64_t> m_MainThread{ 0 };   // the thread that began the recording; 0 while none records
+        mutable std::atomic<bool> m_Warned{ false };
+    };
+
     class GpuScene : public nvrhi::ObjectImpl<nvrhi::IObject>
     {
     public:
@@ -267,11 +297,21 @@ namespace donut::engine
 
         [[nodiscard]] const GpuSceneStats& GetStats() const noexcept;
 
+        // Pipelined rendering (E7.8; PipelinedRecordingCheck): while a pipelined frame records, its upload pass owns
+        // this object (Prepare: UploadAssets; Execute: the records and CommitScatter). BeginPipelinedRecording on the
+        // main thread when it hands the frame over, EndPipelinedRecording after the join. In between, Debug builds warn
+        // once about a call of Update, InvalidateAssets, Upload, UploadTo, CreateBuffers, UploadAssets, UploadAssetsTo,
+        // HasPendingAssets, GetScatterRecords, CommitScatter or IsScatterPending made on the main thread.
+        void BeginPipelinedRecording() noexcept { m_Recording.Begin(); }
+        void EndPipelinedRecording() noexcept { m_Recording.End(); }
+        [[nodiscard]] bool IsPipelinedRecording() const noexcept { return m_Recording.IsRecording(); }
+
     private:
         struct Impl;
         bool EnsureImpl() noexcept;
         nvrhi::IDevice* m_Device;   // not a reference: the scene that owns this holds the device
         GpuSceneDesc m_Desc;
         std::unique_ptr<Impl> m_Impl;
+        PipelinedRecordingCheck m_Recording;
     };
 }

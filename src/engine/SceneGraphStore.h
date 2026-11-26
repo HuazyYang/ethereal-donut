@@ -485,16 +485,34 @@ namespace donut::engine
         // SceneGraph::BeginRenderRead and EndRenderRead: the scopes the render service keeps open while a frame's
         // snapshot points at this graph's leaves and assets (open point 12). The count is kept in every build; only
         // Debug builds check it, in the API's write entry points (SceneGraph.cpp), so Release writes cost nothing.
-        void BeginRenderRead() noexcept { ++m_RenderReads; }
-        void EndRenderRead() noexcept
-        {
-            if (m_RenderReads != 0)
-                --m_RenderReads;
-        }
+        // Scopes nest and close in reverse order; the mode of each of the first 64 is kept (m_RenderReadModes), a
+        // Defer scope deeper than that acts as Warn (a warning).
+        void BeginRenderRead(SceneGraph::RenderReadMode mode) noexcept;
+        void EndRenderRead() noexcept;
         bool IsInRenderRead() const noexcept { return m_RenderReads != 0; }
         // Logs one warning for a write through the API while a scope is open (and the write is not part of another
-        // one, RenderReadQuiet). The write still applies.
+        // one, RenderReadQuiet), unless a Defer scope is open. The write still applies.
         void WarnRenderRead(const char* operation) const noexcept;
+
+        // ------------------------------------------------ deferred releases (plan step E7, items E7.8 / I6)
+        // While a Defer scope is open (SceneGraph::RenderReadMode::Defer, the pipelined frame's), the references that
+        // the graph, its world and its tables drop to leaves, nodes, meshes and materials are kept: the leaf observer's
+        // OnRemove (Detach, SetLeaf, a row destroyed through the world), Detach for the nodes that leave the world, and
+        // the removed events of the asset tables (ChangesScope) each give one reference to the retire list. The
+        // EndRenderRead that closes the last Defer scope runs the deferred ReconcileMeshes, then releases the list in
+        // retirement order, on its thread. The list keeps its capacity: once it reached its high-water mark, retiring
+        // allocates nothing. Read by any thread (the walking draw strategies' refusal, on the recording thread).
+        bool IsDeferring() const noexcept { return m_DeferReads.load(std::memory_order_acquire) != 0; }
+        // Takes a reference to `object` for the retire list while deferring; nothing otherwise. Out of memory: the
+        // reference is not taken (a warning), the object may go before the frame ends.
+        void Retire(nvrhi::IObject* object) noexcept;
+        // SceneGraph::Refresh, after a refresh that saw structural changes: ReconcileMeshes, or, while deferring, a
+        // mark that the last EndRenderRead of the Defer scopes runs it (the open frame names the meshes it would edit
+        // in place: their geometries' and materials' slot fields).
+        void ReconcileOrDefer();
+        bool IsReconcileDeferred() const noexcept { return m_ReconcileDeferred; }
+        // Test seam: the references in the retire list.
+        size_t GetRetiredCount() const noexcept { return m_Retired.size(); }
         // SceneGraph::RunReadOnlyPhase: runs the phase; when it wrote nothing and nothing else ran on the world since the
         // last Refresh, moves m_RefreshedVersion past the phase's versions, so that the next Refresh may skip.
         nvrhi::FRESULT RunReadOnlyPhase(Phase phase) noexcept;
@@ -920,6 +938,11 @@ namespace donut::engine
         // Render-read scopes (BeginRenderRead) and the nesting of API calls that warn once (RenderReadQuiet).
         uint32_t m_RenderReads = 0;
         uint32_t m_RenderReadQuiet = 0;
+        uint64_t m_RenderReadModes = 0;            // bit d: the scope at depth d (< 64) is a Defer scope
+        std::atomic<uint32_t> m_DeferReads{ 0 };   // open Defer scopes
+        bool m_ReconcileDeferred = false;          // ReconcileMeshes is due when the last Defer scope closes
+        std::vector<nvrhi::IObject*> m_Retired;    // one reference each; capacity kept
+        void ReleaseDeferred() noexcept;
         std::atomic<bool> m_RenderServiceClaimed{ false };
         uint64_t m_SchedulerGeneration = 0;   // CreateSystems calls
         Phase m_InterpolationPhase = c_NoPhase;

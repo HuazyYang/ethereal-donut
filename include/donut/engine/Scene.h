@@ -106,6 +106,8 @@ namespace donut::engine
         const SceneGraph* m_MeshScanGraph = nullptr;
         uint64_t m_MeshScanSerial = ~uint64_t(0);
         size_t m_MeshScanSkinnedInstances = ~size_t(0);
+        // Pipelined rendering (E7.8): BeginPipelinedRecording to EndPipelinedRecording.
+        PipelinedRecordingCheck m_PipelinedRecording;
 
         nvrhi::DeviceHandle m_Device;
         nvrhi::ShaderHandle m_SkinningShader;
@@ -228,11 +230,26 @@ namespace donut::engine
         void ConfirmMeshBufferData() noexcept;
         // CreateMeshBufferObjects made buffers whose data WriteMeshBufferData has not written yet (the upload pass adds
         // a use for it).
-        [[nodiscard]] bool HasMeshBufferDataPending() const noexcept { return !m_PendingMeshBufferData.empty(); }
+        [[nodiscard]] bool HasMeshBufferDataPending() const noexcept
+        {
+            m_PipelinedRecording.Check("Scene::HasMeshBufferDataPending");
+            return !m_PendingMeshBufferData.empty();
+        }
         // Points every mesh's BufferGroup::instanceBuffer at the GpuScene's instance buffer (after it was made or
         // replaced, or after structural changes), before any recording reads it. A replaced buffer is reported to the
         // application (SceneFrame::sceneBuffersReplaced): passes that cache binding sets need ResetBindingCache.
         void BindMeshInstanceBuffers();
+        // Pipelined rendering (design 7.5; plan step E7, item E7.8; PipelinedRecordingCheck, GpuScene.h): while a
+        // pipelined frame records on another thread, the upload pass writes the mesh data there (WriteMeshBufferData in
+        // its Prepare, ConfirmMeshBufferData in its Execute) and the main thread touches neither the pending mesh writes
+        // nor the GpuScene until the join. BeginPipelinedRecording, on the main thread when it hands the frame over,
+        // also begins the GpuScene's; EndPipelinedRecording, after the join, ends both. In between, Debug builds warn
+        // once about a call of CreateMeshBufferObjects, CreateMeshBuffers, WriteMeshBufferData, ConfirmMeshBufferData,
+        // HasMeshBufferDataPending, BindMeshInstanceBuffers or EnsureGpuScene made on the main thread (and the GpuScene
+        // about its own). Never begun (serial frames), nothing is checked.
+        void BeginPipelinedRecording() noexcept;
+        void EndPipelinedRecording() noexcept;
+        [[nodiscard]] bool IsPipelinedRecording() const noexcept { return m_PipelinedRecording.IsRecording(); }
 
     };
 }
