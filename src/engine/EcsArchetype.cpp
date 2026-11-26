@@ -229,6 +229,7 @@ namespace donut::engine::ecs
         uint64_t sharedSize = 0;
         archetype.columns.clear();
         archetype.destructRows = false;
+        archetype.rowVersionSlots = 0;
         for (uint32_t i = 0; i < count; ++i)
         {
             const ComponentType& type = *m_Types[uint32_t(components[i])];
@@ -237,6 +238,7 @@ namespace donut::engine::ecs
             column.component = components[i];
             column.kind = type.kind;
             column.enableable = type.enableable;
+            column.rowVersionSlot = c_NoRowVersions;
             switch (type.kind)
             {
             case StorageKind::Data:
@@ -244,6 +246,9 @@ namespace donut::engine::ecs
                 rowSize += type.desc.size;
                 if (type.desc.destruct)
                     archetype.destructRows = true;
+                // Row versions outside the chunk (EcsWorldImpl.h): the row size and the layout stay as they are.
+                if (!!(type.desc.flags & ComponentFlags::RowTracked))
+                    column.rowVersionSlot = uint16_t(archetype.rowVersionSlots++);
                 break;
             case StorageKind::Buffer:
                 column.stride = sizeof(BufferHeader);
@@ -599,11 +604,38 @@ namespace donut::engine::ecs
         return chunkSize == m_SmallPages.GetPageSize() ? m_SmallPages : m_LargePages;
     }
 
+    bool WorldImpl::ReserveRowVersionBlocks(Archetype& archetype, uint32_t chunkCount) noexcept
+    {
+        if (archetype.rowVersionSlots == 0)
+            return true;
+        const size_t bytes = size_t(archetype.rowVersionSlots) * (size_t(archetype.rowsPerChunk) + 1) * sizeof(uint64_t);
+        while (archetype.rowVersionBlocks.size() < chunkCount)
+        {
+            uint64_t* block = static_cast<uint64_t*>(HeapAllocate(bytes, c_ColumnAlignment));
+            if (!block)
+                return false;
+            archetype.rowVersionBlocks.push_back(block);   // the list grows as the other containers (ecs::Allocator)
+        }
+        return true;
+    }
+
     bool WorldImpl::AppendChunk(Archetype& archetype, uint64_t version) noexcept
     {
+        const uint32_t index = archetype.GetChunkCount();
+        if (!ReserveRowVersionBlocks(archetype, index + 1))
+            return false;
         uint8_t* memory = static_cast<uint8_t*>(PoolFor(archetype.chunkSize).Allocate());
         if (!memory)
             return false;
+        if (archetype.rowVersionSlots != 0)
+        {
+            // The rows are stamped as they are placed; each column's newest row version starts at the chunk's.
+            const size_t stride = size_t(archetype.rowsPerChunk) + 1;
+            uint64_t* block = archetype.rowVersionBlocks[index];
+            std::memset(block, 0, size_t(archetype.rowVersionSlots) * stride * sizeof(uint64_t));
+            for (uint32_t s = 0; s < archetype.rowVersionSlots; ++s)
+                block[s * stride] = version;
+        }
         for (const ArchetypeColumn& column : archetype.columns)
         {
             if (column.enableable)
@@ -654,6 +686,65 @@ namespace donut::engine::ecs
             StampVersion(versions + i, version);
     }
 
+    void WorldImpl::StampPlacedRows(const Archetype& archetype, uint32_t chunk, uint32_t firstRow, uint32_t count,
+                                    uint64_t version) noexcept
+    {
+        for (uint32_t c = 0; c < archetype.columns.size(); ++c)
+        {
+            uint64_t* rows = archetype.RowVersions(chunk, c);
+            if (!rows)
+                continue;
+            SpreadChunkWrite(archetype, chunk, c);
+            for (uint32_t r = firstRow; r < firstRow + count; ++r)
+                rows[r] = version;   // structural changes run alone
+            StampVersion(rows - 1, version);
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------ row versions
+
+    void SpreadChunkWrite(const Archetype& archetype, uint32_t chunk, uint32_t column) noexcept
+    {
+        uint64_t* rows = archetype.RowVersions(chunk, column);
+        if (!rows)
+            return;
+        const uint64_t chunkVersion = LoadVersionWord(archetype.Versions(chunk) + column);
+        if (chunkVersion <= LoadVersionWord(rows - 1))
+            return;
+        const uint32_t count = archetype.chunks[chunk].count;
+        for (uint32_t r = 0; r < count; ++r)
+            StampVersion(rows + r, chunkVersion);
+        StampVersion(rows - 1, chunkVersion);
+    }
+
+    void StampChunkWrite(const Archetype& archetype, uint32_t chunk, uint32_t column, uint64_t version) noexcept
+    {
+        if (uint64_t* rows = archetype.RowVersions(chunk, column))
+        {
+            SpreadChunkWrite(archetype, chunk, column);
+            if (version <= LoadVersionWord(rows - 1))
+            {
+                const uint32_t count = archetype.chunks[chunk].count;
+                for (uint32_t r = 0; r < count; ++r)
+                    StampVersion(rows + r, version);
+            }
+        }
+        StampVersion(archetype.Versions(chunk) + column, version);
+    }
+
+    void StampRowWrites(const Archetype& archetype, uint32_t chunk, uint32_t column, uint32_t firstRow, uint32_t count,
+                        uint64_t version) noexcept
+    {
+        if (uint64_t* rows = archetype.RowVersions(chunk, column))
+        {
+            SpreadChunkWrite(archetype, chunk, column);
+            for (uint32_t r = firstRow; r < firstRow + count; ++r)
+                StampVersion(rows + r, version);
+            StampVersion(rows - 1, version);
+        }
+        StampVersion(archetype.Versions(chunk) + column, version);
+    }
+
     // ------------------------------------------------------------------------------------------------ rows
 
     void WorldImpl::RemoveRow(Archetype& archetype, uint32_t chunk, uint32_t row, uint64_t version) noexcept
@@ -665,6 +756,8 @@ namespace donut::engine::ecs
         if (chunk != lastChunk || row != lastRow)
         {
             MoveRowWithin(archetype, lastChunk, lastRow, chunk, row);
+            if (archetype.rowVersionSlots != 0)
+                StampPlacedRows(archetype, chunk, row, 1, version);
             StampChunk(archetype, chunk, version);
         }
         --archetype.chunks[lastChunk].count;

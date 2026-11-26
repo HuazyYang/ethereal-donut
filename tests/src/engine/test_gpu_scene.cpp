@@ -1805,6 +1805,56 @@ void test_scatter_lost_prepare()
     compare_with_cpu_mode(graph, cpuMirror, scatter, RowsCompared::Live, "lost prepare after");
 }
 
+// RowTracked scene columns (plan step E7, item E7.5) behind SceneGraph::SetRowTrackedTransforms, off by default: a
+// graph made while it is on registers LocalTransform and WorldTransform RowTracked; then a node's move stamps its row,
+// propagation writes and stamps only that row's WorldTransform, and GpuScene builds only that row of the chunk.
+void test_row_tracked_transforms()
+{
+    CHECK(!SceneGraph::GetRowTrackedTransforms());
+    auto material = make_material("m", MaterialDomain::Opaque);
+    auto mesh = make_mesh("mesh", { material });
+    for (const bool tracked : { false, true })
+    {
+        SceneGraph::SetRowTrackedTransforms(tracked);
+        auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+        SceneGraph::SetRowTrackedTransforms(false);   // the graph keeps what it was made with
+        IWorld* world = graph->GetWorld();
+        for (const ComponentId component : { FindComponent<LocalTransform>(world), FindComponent<WorldTransform>(world) })
+            CHECK(!!(world->GetComponentTypeDesc(component)->flags & ComponentFlags::RowTracked) == tracked);
+        CHECK(!(world->GetComponentTypeDesc(FindComponent<LocalMatrix>(world))->flags & ComponentFlags::RowTracked));
+
+        graph->SetRootNode(make_node("root"));
+        std::vector<nvrhi::AutoPtr<SceneGraphNode>> nodes;
+        for (int i = 0; i < 64; ++i)
+        {
+            auto node = make_node("n");
+            node->SetTranslation(dm::double3(double(i), 0.0, 0.0));
+            node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, mesh.Get()));
+            nodes.push_back(graph->Attach(graph->GetRootNode(), node));
+        }
+        GpuScene gpu(nullptr, test_desc());
+        Mirror mirror;
+        PrevModel model;
+        uint32_t frame = 0;
+        auto step = [&]()
+        {
+            graph->Refresh(++frame);
+            CHECK(NVRHI_SUCCEEDED(gpu.Update(graph)));
+            CHECK(NVRHI_SUCCEEDED(gpu.UploadTo(&mirror)));
+            verify_frame(graph, gpu, mirror, model, "row tracked");
+            return gpu.GetStats();
+        };
+        step();
+        step();
+        nodes[10]->SetTranslation(dm::double3(10.0, 1.0, 0.0));
+        GpuSceneStats stats = step();
+        CHECK(stats.chunksChanged == 1 && stats.rowsChanged == 1);
+        CHECK(tracked ? stats.rowsBuilt == 1 : stats.rowsBuilt == 64);   // one chunk of 64 rows
+        stats = step();   // its previous transform settles
+        CHECK(stats.rowsSettled == 1 && stats.rowsChanged == 0);
+    }
+}
+
 int main(int, char**)
 {
 #if defined(_MSC_VER)
@@ -1849,6 +1899,8 @@ int main(int, char**)
         test_scatter_steady_state_allocations();
         std::printf("%s\n", "test_scatter_lost_prepare");
         test_scatter_lost_prepare();
+        std::printf("%s\n", "test_row_tracked_transforms");
+        test_row_tracked_transforms();
     }
     catch (const std::runtime_error& err)
     {

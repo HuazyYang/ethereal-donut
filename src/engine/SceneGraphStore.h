@@ -285,12 +285,13 @@ namespace donut::engine
             node->m_HintMoves = row.archetype->rowMoves;
         }
         static void ForgetRow(SceneGraphNode* node) noexcept { node->m_HintMoves = ~uint64_t(0); }
-        // Stamps the row's chunk column with the world's version, as GetComponentForWrite outside phases does.
+        // Stamps the row's chunk column (and its row version, E7.5) with the world's version, as GetComponentForWrite
+        // outside phases does.
         void Stamp(const RowRef& row, Slot slot) const noexcept
         {
             const uint8_t column = ColumnIndex(*row.archetype, row.archetypeIndex, slot);
             if (column != c_Absent)
-                ecs::StampVersion(row.archetype->Versions(row.chunk) + column, m_Impl->GetStampVersion());
+                ecs::StampRowWrite(*row.archetype, row.chunk, column, row.row, m_Impl->GetStampVersion());
         }
         // The node of an attached entity: through the store's table by entity index (no entity-table lookup), else the
         // SceneNode column.
@@ -630,6 +631,8 @@ namespace donut::engine
             uint32_t archetype;        // index in the level or bounds list
             uint32_t chunk;
             bool whole;                // the chunk's own columns changed: every row
+            const uint64_t* localRows; // propagation, E7.5: a whole chunk that changed only in LocalTransform, whose
+                                       // row versions tell the rows to compose (LocalRowsChanged); null: every row
         };
 
         struct PropagationContext;
@@ -754,6 +757,10 @@ namespace donut::engine
         static bool DrivenWritten(const LevelArchetype& level, const ecs::Archetype& archetype, uint64_t since) noexcept;
         static bool DeepChunkDirty(const LevelArchetype& level, const ecs::Archetype& archetype, uint32_t chunk,
                                    uint64_t since) noexcept;
+        // E7.5: the row versions of LocalTransform when a chunk changed since `since` only there and they tell the
+        // changed rows apart (RowTracked, no chunk-only write); null otherwise (every row is composed).
+        static const uint64_t* LocalRowsChanged(const LevelArchetype& level, const ecs::Archetype& archetype,
+                                                uint32_t chunk, uint64_t since) noexcept;
         bool PropagateDeepRow(Entity entity, bool parentInBucket, uint64_t since, uint64_t version) noexcept;
         static void RunDeepTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
         void MarkSkinnedJoints(uint64_t since);

@@ -361,7 +361,6 @@ namespace donut::engine::ecs
     void ObserverRegistry::Call(const Observer& observer, const ObserverReport& report) noexcept
     {
         const Archetype& archetype = m_World.GetArchetypeStorage(report.archetype);
-        uint64_t* versions = archetype.Versions(report.chunk);
         const uint64_t version = m_World.GetVersion();
         size_t n = 0;
         if (!IsMatchEvent(observer.event))
@@ -378,8 +377,8 @@ namespace donut::engine::ecs
                 {
                     const uint32_t c = archetype.FindColumn(observer.component);
                     column = ColumnAt(archetype, c, report.chunk, report.firstRow);
-                    if (observer.access == Access::Write)
-                        StampVersion(versions + c, version);   // what the observer writes is a change (4.5)
+                    if (observer.access == Access::Write)   // what the observer writes is a change (4.5)
+                        StampRowWrites(archetype, report.chunk, c, report.firstRow, report.count, version);
                 }
             }
             m_Columns[n++] = column;
@@ -392,7 +391,7 @@ namespace donut::engine::ecs
             {
                 column = ColumnAt(archetype, c, report.chunk, report.firstRow);
                 if (term.access == Access::Write)
-                    StampVersion(versions + c, version);
+                    StampRowWrites(archetype, report.chunk, c, report.firstRow, report.count, version);
             }
             m_Columns[n++] = column;
         }

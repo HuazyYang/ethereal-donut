@@ -962,6 +962,16 @@ namespace donut::engine
         // caller that registered systems compares this instead of holding the scheduler.
         [[nodiscard]] uint64_t GetSchedulerGeneration() const noexcept;
 
+        // RowTracked scene columns (plan step E7, item E7.5; design D9): a process-wide switch, off by default, that
+        // stays off until measured (sub-plan revision 2, stage B). Graphs constructed while it is on register
+        // LocalTransform and WorldTransform with ComponentFlags::RowTracked: the node setters, transform propagation
+        // and the interpolation stamp the rows they write, propagation composes only the rows whose local transform
+        // or parent changed, and GpuScene takes only the changed rows of a chunk. A graph keeps what it was made
+        // with; the switch changes no output (snapshots, hashes, rows per chunk, uploaded rows), only the work. Set
+        // it between graphs, on any thread; an A/B run makes one graph with it off and one with it on.
+        static void SetRowTrackedTransforms(bool enabled) noexcept;
+        [[nodiscard]] static bool GetRowTrackedTransforms() noexcept;
+
         // Replaces the current root node of the graph with the new one.
         nvrhi::AutoPtr<SceneGraphNode> SetRootNode(SceneGraphNode *root);
         

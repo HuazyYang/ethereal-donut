@@ -180,6 +180,7 @@ namespace donut::engine::ecs
             }
         }
         m_NullMasks.resize(desc.termCount, nullptr);
+        m_NullRowVersions.resize(desc.termCount, nullptr);
         return nvrhi::FS_OK;
     }
 
@@ -282,6 +283,14 @@ namespace donut::engine::ecs
                 AddSlot(matched.firstWrite, columns[t]);
         matched.writeCount = uint32_t(m_Slots.size()) - matched.firstWrite;
 
+        // RowTracked columns of data terms (E7.5): views carry their row versions.
+        matched.firstTracked = uint32_t(m_Slots.size());
+        for (size_t t = 0; t < m_Terms.size(); ++t)
+            if (m_Terms[t].data && columns[t] != c_NoColumn &&
+                archetype.columns[columns[t]].rowVersionSlot != c_NoRowVersions)
+                AddSlot(matched.firstTracked, columns[t]);
+        matched.trackedCount = uint32_t(m_Slots.size()) - matched.firstTracked;
+
         m_Matched.push_back(matched);
     }
 
@@ -337,11 +346,13 @@ namespace donut::engine::ecs
 
         // Every non-empty chunk of the matched archetypes, in archetype-creation and chunk order.
         size_t chunkCount = 0;
+        m_HasRowVersions = false;
         for (const MatchedArchetype& matched : m_Matched)
         {
             const Archetype& archetype = world.GetArchetypeStorage(matched.archetype);
             for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
                 chunkCount += archetype.chunks[c].count != 0 ? 1 : 0;
+            m_HasRowVersions = m_HasRowVersions || matched.trackedCount != 0;
         }
         const size_t termCount = m_Terms.size();
         m_Chunks.clear();
@@ -349,6 +360,7 @@ namespace donut::engine::ecs
         m_Columns.resize(chunkCount * m_DataTermCount);
         m_EnabledMasks.resize(m_HasEnableable ? chunkCount * termCount : 0);
         m_PresenceMasks.resize(m_HasSparse ? chunkCount * termCount : 0);
+        m_RowVersions.resize(m_HasRowVersions ? chunkCount * termCount : 0);
         uint64_t entityCount = 0;
 
         for (uint32_t m = 0; m < m_Matched.size(); ++m)
@@ -362,12 +374,13 @@ namespace donut::engine::ecs
                 if (rows == 0)
                     continue;
                 const size_t index = m_Chunks.size();
-                m_Chunks.push_back(ChunkEntry{ archetype.Entities(c), archetype.Versions(c), rows, m });
+                m_Chunks.push_back(ChunkEntry{ archetype.Entities(c), archetype.Versions(c), rows, m, c, 0 });
                 entityCount += rows;
 
                 void** columns = m_Columns.data() + index * m_DataTermCount;
                 const uint64_t** enabled = m_HasEnableable ? m_EnabledMasks.data() + index * termCount : nullptr;
                 const uint64_t** presence = m_HasSparse ? m_PresenceMasks.data() + index * termCount : nullptr;
+                uint64_t** rowVersions = m_HasRowVersions ? m_RowVersions.data() + index * termCount : nullptr;
                 for (size_t t = 0; t < termCount; ++t)
                 {
                     const Term& term = m_Terms[t];
@@ -389,6 +402,8 @@ namespace donut::engine::ecs
                     if (presence)
                         presence[t] = term.sparse ? world.GetSparsePresence(*term.sparse, matched.archetype, c)
                                                   : nullptr;
+                    if (rowVersions)
+                        rowVersions[t] = term.data && column != c_NoColumn ? archetype.RowVersions(c, column) : nullptr;
                 }
             }
         }
@@ -521,9 +536,22 @@ namespace donut::engine::ecs
             if (!m_RowFilters.empty() && !AnyRowPasses(size_t(i), entry.count))
                 continue;
 
-            // Handing the chunk out stamps its Write columns (4.5).
-            for (uint32_t s = 0; s < matched.writeCount; ++s)
-                StampVersion(entry.versions + slots[matched.firstWrite + s], writeVersion);
+            // Handing the chunk out stamps its Write columns (4.5). With RowTracked data terms: a chunk-only write is
+            // spread onto the rows before the view shows them, and this hand-out's stamp is a chunk-only write itself
+            // until the writer stamps its rows (the chunk-only writer rule, EcsWorldImpl.h).
+            if (matched.trackedCount != 0)
+            {
+                const Archetype& archetype = m_World->GetArchetypeStorage(matched.archetype);
+                for (uint32_t s = 0; s < matched.trackedCount; ++s)
+                    SpreadChunkWrite(archetype, entry.chunk, slots[matched.firstTracked + s]);
+                for (uint32_t s = 0; s < matched.writeCount; ++s)
+                    StampChunkWrite(archetype, entry.chunk, slots[matched.firstWrite + s], writeVersion);
+            }
+            else
+            {
+                for (uint32_t s = 0; s < matched.writeCount; ++s)
+                    StampVersion(entry.versions + slots[matched.firstWrite + s], writeVersion);
+            }
 
             ChunkView& view = views[written++];
             view.entities = entry.entities;
@@ -532,6 +560,8 @@ namespace donut::engine::ecs
             view.presenceMasks = m_HasSparse ? m_PresenceMasks.data() + size_t(i) * termCount : m_NullMasks.data();
             view.count = entry.count;
             view.chunkIndex = uint32_t(i);
+            view.rowVersions = m_HasRowVersions ? m_RowVersions.data() + size_t(i) * termCount
+                                                : m_NullRowVersions.data();
         }
         return written;
     }

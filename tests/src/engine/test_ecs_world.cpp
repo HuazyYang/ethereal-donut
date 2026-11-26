@@ -2714,6 +2714,112 @@ void test_determinism()
            (unsigned long long)hash.hash);
 }
 
+// --------------------------------------------------------------------------- row versions (D9, plan step E7.5)
+
+namespace
+{
+    // T's descriptor with ComponentFlags::RowTracked, as the scene graph registers its transforms behind its switch.
+    template <typename T>
+    ComponentId RegisterRowTracked(IWorld* world)
+    {
+        ComponentTypeDesc desc = ComponentTraits<T>::Desc();
+        desc.flags |= ComponentFlags::RowTracked;
+        ComponentId id = ComponentId::Invalid;
+        CHECK(world->RegisterComponent(desc, id) == nvrhi::FS_OK);
+        return id;
+    }
+
+    uint64_t RowVersionOf(IWorld* world, Entity entity, ComponentId component)
+    {
+        const ecs::EntityRecord& record = Record(world, entity);
+        const ecs::Archetype& archetype = Impl(world).GetArchetypeStorage(record.archetype);
+        const uint64_t* rows = archetype.RowVersions(record.chunk, archetype.FindColumn(component));
+        CHECK(rows != nullptr);
+        return rows[record.row];
+    }
+}
+
+// A row's version on create, write, swap-remove and move; the flag's registration rules.
+void test_row_versions()
+{
+    auto world = MakeWorld(true);
+    ecs::WorldImpl& impl = Impl(world);
+    const ComponentId position = RegisterRowTracked<Position>(world);
+    const ComponentId id = RegisterComponent<Id>(world);
+    const ComponentId velocity = RegisterComponent<Velocity>(world);
+    // A storage option, not a layout: registering the GUID again without it gives the same id, and the flag stays.
+    CHECK(RegisterComponent<Position>(world) == position);
+    CHECK(!!(world->GetComponentTypeDesc(position)->flags & ComponentFlags::RowTracked));
+    // Only for a value per row.
+    const uint64_t errors = impl.GetValidationErrorCount();
+    for (ComponentTypeDesc desc : { ComponentTraits<Frozen>::Desc(), ComponentTraits<Layer>::Desc(),
+                                    ComponentTraits<ChunkBounds>::Desc(), ComponentTraits<Selected>::Desc(),
+                                    ComponentTraits<Joint>::Desc() })
+    {
+        desc.flags |= ComponentFlags::RowTracked;
+        ComponentId refused = ComponentId(0);
+        CHECK(world->RegisterComponent(desc, refused) == nvrhi::FE_INVALID_ARGS && refused == ComponentId::Invalid);
+    }
+    CHECK(impl.GetValidationErrorCount() == errors + 5);
+
+    // Create: every row at the creation's version; a column that is not RowTracked has no row versions.
+    Entity e[3];
+    for (Entity& entity : e)
+        entity = Create(world, { id, position });
+    for (const Entity entity : e)
+        CHECK(RowVersionOf(world, entity, position) == 1);
+    const ecs::Archetype& archetype = impl.GetArchetypeStorage(ArchetypeOf(world, e[0]));
+    CHECK(archetype.rowVersionSlots == 1 && archetype.RowVersions(0, ColumnOf(world, e[0], id)) == nullptr);
+    const uint32_t posColumn = ColumnOf(world, e[0], position);
+
+    // Write: GetComponentForWrite stamps its row and the chunk, not the other rows; nor does a write of another column.
+    const uint64_t v2 = world->AdvanceVersion();
+    CHECK(world->GetComponentForWrite(e[1], position, c_WorldVersion) != nullptr);
+    CHECK(world->GetComponentForWrite(e[0], id, c_WorldVersion) != nullptr);
+    CHECK(RowVersionOf(world, e[0], position) == 1 && RowVersionOf(world, e[1], position) == v2);
+    CHECK(RowVersionOf(world, e[2], position) == 1 && VersionsOf(world, e[1])[posColumn] == v2);
+    CHECK(archetype.RowVersions(0, posColumn)[-1] == v2);   // the newest row version
+
+    // Swap-remove: the last row moves into the hole and is stamped with the removal's version.
+    const uint64_t v3 = world->AdvanceVersion();
+    CHECK(world->DestroyEntities(&e[0], 1) == nvrhi::FS_OK);
+    CHECK(Record(world, e[2]).row == 0 && Record(world, e[1]).row == 1);
+    CHECK(RowVersionOf(world, e[2], position) == v3 && RowVersionOf(world, e[1], position) == v2);
+
+    // Move: a row that changes archetype is stamped in its new one; it was the old one's last row, so no row moved.
+    const uint64_t v4 = world->AdvanceVersion();
+    CHECK(world->AddComponent(e[1], velocity, nullptr) == nvrhi::FS_OK);
+    CHECK(ArchetypeOf(world, e[1]) != archetype.index);
+    CHECK(RowVersionOf(world, e[1], position) == v4 && RowVersionOf(world, e[2], position) == v3);
+    CHECK(impl.GetValidationErrorCount() == errors + 5);
+}
+
+// The row versions live outside the chunk: rows per chunk, chunk and row sizes and chunk counts are those of a world
+// without the flag, for a small row (16 KiB chunks) and a large one (64 KiB chunks).
+void test_row_versions_rows_per_chunk()
+{
+    auto plain = MakeWorld();
+    auto tracked = MakeWorld();
+    const ComponentId plainIds[] = { RegisterComponent<Position>(plain), RegisterComponent<Id>(plain),
+                                     RegisterComponent<Big>(plain) };
+    const ComponentId trackedIds[] = { RegisterRowTracked<Position>(tracked), RegisterComponent<Id>(tracked),
+                                       RegisterRowTracked<Big>(tracked) };
+    for (const bool large : { false, true })
+    {
+        const uint32_t second = large ? 2 : 1;
+        const CreateDesc plainDesc({ plainIds[0], plainIds[second] }, {}, 3000);
+        const CreateDesc trackedDesc({ trackedIds[0], trackedIds[second] }, {}, 3000);
+        std::vector<Entity> a(3000), b(3000);
+        CHECK(plain->CreateEntities(plainDesc, a.data()) == nvrhi::FS_OK);
+        CHECK(tracked->CreateEntities(trackedDesc, b.data()) == nvrhi::FS_OK);
+        const ArchetypeInfo x = InfoOf(plain, a[0]);
+        const ArchetypeInfo y = InfoOf(tracked, b[0]);
+        CHECK(Impl(tracked).GetArchetypeStorage(ArchetypeOf(tracked, b[0])).rowVersionSlots == (large ? 2u : 1u));
+        CHECK(x.rowsPerChunk == y.rowsPerChunk && x.chunkSize == y.chunkSize && x.rowSize == y.rowSize);
+        CHECK(x.chunkCount == y.chunkCount && x.chunkCount > 1 && x.chunkSize == (large ? 64u : 16u) * 1024);
+    }
+}
+
 // ------------------------------------------------------------------------------- steady-state allocations
 
 void test_steady_state_allocations()
@@ -2884,6 +2990,8 @@ int main(int, char**)
         { "unimplemented_seams", &test_unimplemented_seams },
         { "stats_and_leaks", &test_stats_and_leaks },
         { "determinism", &test_determinism },
+        { "row_versions", &test_row_versions },
+        { "row_versions_rows_per_chunk", &test_row_versions_rows_per_chunk },
         { "steady_state_allocations", &test_steady_state_allocations },
     };
     try

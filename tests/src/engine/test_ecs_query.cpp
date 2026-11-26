@@ -2550,6 +2550,79 @@ void test_performance_smoke()
            count, query.Get()->GetChunkCount(), p, k, k / p, c, c / p, e, e / p, i, checksum);
 }
 
+// RowTracked (D9, plan step E7, item E7.5): ChunkView::rowVersions, and the chunk-only writer rule. A write that stamps
+// only the chunk makes every row of it changed, also when a row write follows it before anyone reads; rows that a
+// writer stamps through its view stay apart.
+void test_row_versions_chunk_only_writer()
+{
+    auto world = MakeWorld(true);
+    ComponentTypeDesc desc = ComponentTraits<Position>::Desc();
+    desc.flags |= ComponentFlags::RowTracked;
+    ComponentId position = ComponentId::Invalid;
+    CHECK(world->RegisterComponent(desc, position) == nvrhi::FS_OK);
+    const ComponentId id = RegisterComponent<Id>(world);
+    Entity e[4];
+    CreateMany(world, { position, id }, 4, e);   // one chunk, rows 0-3, at version 1
+    nvrhi::AutoPtr<IQuery> writer = MakeQuery(world, { Term(position, TermOp::All, Access::Write) }, "writer");
+    nvrhi::AutoPtr<IQuery> reader = MakeQuery(world, { Term(position, TermOp::Changed, Access::Read),
+                                                       Term(id, TermOp::All, Access::Read) }, "reader");
+    // The rows a reader of changed positions takes since `since` (IsRowChanged); none when the chunk is not handed out.
+    auto changedRows = [&](uint64_t since)
+    {
+        std::vector<uint32_t> rows;
+        ChunkView view{};
+        if (reader->GetChunks(0, ChunkRequest{ since, c_WorldVersion, nullptr }, 1, &view) == 0)
+            return rows;
+        CHECK(view.count == 4 && view.rowVersions[0] != nullptr && view.rowVersions[1] == nullptr);
+        for (uint32_t r = 0; r < view.count; ++r)
+            if (view.IsRowChanged(0, r, since))
+                rows.push_back(r);
+        return rows;
+    };
+    const std::vector<uint32_t> all = { 0, 1, 2, 3 };
+    CHECK(changedRows(c_AllVersions) == all);
+    CHECK(changedRows(1).empty());
+    const ecs::Archetype& archetype = Impl(world).GetArchetypeStorage(Record(world, e[0]).archetype);
+    const uint32_t column = archetype.FindColumn(position);
+    const uint64_t* rowVersions = archetype.RowVersions(0, column);
+
+    // A Write term whose rows are not stamped: the chunk is newer than its rows, so it is wholly changed; the
+    // reader's hand-out stamps every row with the chunk's version first.
+    const uint64_t v2 = world->AdvanceVersion();
+    ChunkView view{};
+    CHECK(writer->GetChunks(0, ChunkRequest{ c_AllVersions, v2, nullptr }, 1, &view) == 1);
+    CHECK(view.rowVersions[0] == rowVersions && rowVersions[1] == 1);
+    CHECK(ecs::ChangedRowVersions(archetype, 0, column) == nullptr);
+    CHECK(changedRows(1) == all);
+    CHECK(ecs::ChangedRowVersions(archetype, 0, column) == rowVersions);
+    for (uint32_t r = 0; r < 4; ++r)
+        CHECK(rowVersions[r] == v2);
+
+    // A chunk-only write, then a row write before any reader: the chunk-only write stays seen.
+    const uint64_t v3 = world->AdvanceVersion();
+    CHECK(writer->GetChunks(0, ChunkRequest{ c_AllVersions, v3, nullptr }, 1, &view) == 1);
+    world->AdvanceVersion();
+    CHECK(world->GetComponentForWrite(e[2], position, c_WorldVersion) != nullptr);
+    CHECK(changedRows(v2) == all);
+    CHECK(changedRows(v3) == std::vector<uint32_t>{ 2 });
+
+    // A writer that stamps the rows it wrote through its view: only those rows changed.
+    const uint64_t v4 = world->GetVersion();
+    const uint64_t v5 = world->AdvanceVersion();
+    CHECK(writer->GetChunks(0, ChunkRequest{ c_AllVersions, v5, nullptr }, 1, &view) == 1);
+    view.StampRow(0, 1, v5);
+    CHECK(rowVersions[-1] == v5);
+    CHECK(changedRows(v4) == std::vector<uint32_t>{ 1 });
+
+    // A row write, then a chunk-only write of the same version (a setter, then a c_WorldVersion query, outside
+    // phases): the chunk is not newer than its rows, so the hand-out stamps every row.
+    world->AdvanceVersion();
+    CHECK(world->GetComponentForWrite(e[0], position, c_WorldVersion) != nullptr);
+    CHECK(writer->GetChunks(0, ChunkRequest{ c_AllVersions, c_WorldVersion, nullptr }, 1, &view) == 1);
+    CHECK(changedRows(v5) == all);
+    CHECK(Impl(world).GetValidationErrorCount() == 0);
+}
+
 int main(int, char**)
 {
     struct Test
@@ -2571,6 +2644,7 @@ int main(int, char**)
         { "query_lifetime", &test_query_lifetime },
         { "typed_forms", &test_typed_forms },
         { "determinism", &test_determinism },
+        { "row_versions_chunk_only_writer", &test_row_versions_chunk_only_writer },
         { "steady_state_allocations", &test_steady_state_allocations },
         { "performance_smoke", &test_performance_smoke },
     };

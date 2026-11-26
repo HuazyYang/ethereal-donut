@@ -105,13 +105,14 @@ namespace donut::engine::ecs
             uint64_t* versions;             // Archetype::Versions
             const Entity* entities;
             uint32_t count;
+            uint32_t chunk;                 // the chunk's index in the archetype
         };
         ChunkPlace GetChunkPlace(uint32_t index) const noexcept
         {
             const ChunkEntry& entry = m_Chunks[index];
             return ChunkPlace{ &m_World->GetArchetypeStorage(m_Matched[entry.matched].archetype),
                                reinterpret_cast<uint8_t*>(const_cast<Entity*>(entry.entities)), entry.versions,
-                               entry.entities, entry.count };
+                               entry.entities, entry.count, entry.chunk };
         }
 
     private:
@@ -136,6 +137,8 @@ namespace donut::engine::ecs
             uint32_t checkCount;
             uint32_t firstWrite;        // m_Slots: version slots that Write terms stamp
             uint32_t writeCount;
+            uint32_t firstTracked;      // m_Slots: the RowTracked columns of data terms (E7.5), whose chunk-only
+            uint32_t trackedCount;      // writes are spread onto their rows when a chunk is handed out
         };
 
         struct ChunkEntry
@@ -144,6 +147,8 @@ namespace donut::engine::ecs
             uint64_t* versions;
             uint32_t count;
             uint32_t matched;           // index in m_Matched
+            uint32_t chunk;             // index in the archetype
+            uint32_t reserved;
         };
 
         // A per-row filter, as the typed layer applies it (EcsQuery.h): the rows a term lets through are the set bits
@@ -186,13 +191,17 @@ namespace donut::engine::ecs
         Vector<uint32_t> m_Slots;
 
         // The chunk list, rebuilt by Rebuild. Chunk i's arrays start at i * GetDataTermCount() in m_Columns and at
-        // i * GetTermCount() in m_EnabledMasks and m_PresenceMasks; queries without Enableable or Sparse terms point
-        // every view at m_NullMasks instead.
+        // i * GetTermCount() in m_EnabledMasks, m_PresenceMasks and m_RowVersions; queries without Enableable or
+        // Sparse terms, and chunk lists without RowTracked data terms, point every view at m_NullMasks or
+        // m_NullRowVersions instead.
         Vector<ChunkEntry> m_Chunks;
         Vector<void*> m_Columns;
         Vector<const uint64_t*> m_EnabledMasks;
         Vector<const uint64_t*> m_PresenceMasks;
+        Vector<uint64_t*> m_RowVersions;
         Vector<const uint64_t*> m_NullMasks;
+        Vector<uint64_t*> m_NullRowVersions;
+        bool m_HasRowVersions = false;  // some matched archetype has a RowTracked data term: per-chunk row versions
         uint32_t m_EntityCount = 0;
 
         // What the chunk list was built from. Published with release stores after a rebuild, read with acquire loads.

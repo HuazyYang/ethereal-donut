@@ -116,6 +116,12 @@ namespace donut::engine
         GpuMirrored = 1u << 7,   // the render service mirrors the column (7.2)
         NoSerialize = 1u << 8,   // skipped by snapshots and world hashes
         Resource    = 1u << 9,   // a world resource: one value per world, never on an entity (4.9)
+        RowTracked  = 1u << 10,  // a change version per row beside the chunk's (D9): ChunkView::rowVersions. Only for
+                                 // components with a value per row (not Tag, Sparse, Shared, Chunk, Buffer, Resource).
+                                 // A storage option, not a layout: the world that registers the GUID first decides it,
+                                 // a later registration with or without it gets the same id, and snapshots, hashes
+                                 // and copies between worlds ignore it. The versions live outside the chunk's rows,
+                                 // so rows per chunk do not change.
     };
     template <> struct EnableEcsFlagOperators<ComponentFlags> : std::true_type { };
 
@@ -257,6 +263,15 @@ namespace donut::engine
 
     // One chunk as a query sees it. Valid until the next sync point. Row filters are not applied: rows that Enabled,
     // Disabled or Sparse terms exclude are still in [0, count); the typed layer's ForEach skips them.
+    //
+    // Row versions (RowTracked components, D9): rowVersions[term][row] is the version of the row's last write: rows
+    // created or moved are stamped with the version of the change, IWorld::GetComponentForWrite, SetComponent and the
+    // other writes of one entity stamp its row, and a writer that knows its rows stamps them with StampRow. A write
+    // that stamps only the chunk (a Write term whose rows are not stamped, a simulation domain's column view) still
+    // counts: a chunk whose version is newer than the newest row version is wholly changed, and the next time the
+    // chunk is handed out (or a row of it is stamped) every row is stamped with that chunk version first. So a reader
+    // that got the chunk from a Changed term takes the rows with IsRowChanged. rowVersions[term][-1] is the column's
+    // newest row version in this chunk, which StampRow keeps.
     struct ChunkView
     {
         const Entity* entities;
@@ -270,6 +285,8 @@ namespace donut::engine
         uint32_t count;
         uint32_t chunkIndex;                   // position among the query's matched chunks; stable until the next
                                                // sync point; part of command sort keys (6.5)
+        uint64_t* const* rowVersions;          // one per term: the rows' change versions of a RowTracked component
+                                               // (above); null for other terms and absent components
 
         bool IsRowEnabled(uint32_t term, uint32_t row) const noexcept
         {
@@ -281,8 +298,27 @@ namespace donut::engine
             const uint64_t* mask = presenceMasks[term];
             return !mask || ((mask[row >> 6] >> (row & 63)) & 1) != 0;
         }
+        // Whether the row was written after sinceVersion; true for a term without row versions.
+        bool IsRowChanged(uint32_t term, uint32_t row, uint64_t sinceVersion) const noexcept
+        {
+            const uint64_t* versions = rowVersions[term];
+            return !versions || versions[row] > sinceVersion;
+        }
+        // For the writer of a Write term: stamps the row it wrote with its version (the request's writeVersion; a
+        // c_WorldVersion request passes IWorld::GetVersion()). Nothing for a term without row versions. One thread
+        // per chunk and column, as the scheduler runs writers.
+        void StampRow(uint32_t term, uint32_t row, uint64_t version) const noexcept
+        {
+            uint64_t* versions = rowVersions[term];
+            if (!versions)
+                return;
+            if (versions[row] < version)
+                versions[row] = version;
+            if (versions[-1] < version)
+                versions[-1] = version;
+        }
     };
-    static_assert(sizeof(void*) != 8 || sizeof(ChunkView) == 40, "ChunkView layout");
+    static_assert(sizeof(void*) != 8 || sizeof(ChunkView) == 48, "ChunkView layout");
 
     // One chunk's column of one component, as simulation domains exchange it (8.2). All views a domain gets follow the
     // chunk order of its lifetime query, so views of different components with the same chunkIndex line up row by row.

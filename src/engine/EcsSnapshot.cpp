@@ -836,7 +836,8 @@ namespace donut::engine::ecs
         {
             const ComponentTypeDesc& desc = type->desc;
             sink.Put(&desc.uuid, sizeof(nvrhi::GUID));
-            PutU32(sink, uint32_t(desc.flags));
+            // RowTracked is the world's storage option (EcsTypes.h): row versions are versions, not values (E7.5).
+            PutU32(sink, uint32_t(desc.flags & ~ComponentFlags::RowTracked));
             PutU32(sink, desc.size);
             PutU32(sink, desc.alignment);
             PutU32(sink, desc.bufferInlineCapacity);
@@ -1103,7 +1104,9 @@ namespace donut::engine::ecs
             }
             const ComponentType& type = *world.m_Types[local];
             const ComponentTypeDesc& desc = type.desc;
-            bool same = uint32_t(desc.flags) == flags && desc.size == size && desc.alignment == alignment &&
+            const uint32_t rowTracked = uint32_t(ComponentFlags::RowTracked);   // not a layout flag (EcsTypes.h)
+            bool same = (uint32_t(desc.flags) & ~rowTracked) == (flags & ~rowTracked) &&
+                        desc.size == size && desc.alignment == alignment &&
                         desc.bufferInlineCapacity == inlineCapacity && desc.fieldCount == fieldCount;
             for (uint32_t f = 0; same && f < fieldCount; ++f)
             {
@@ -1404,12 +1407,16 @@ namespace donut::engine::ecs
         if (NVRHI_FAILED(result))
             return result;
 
-        // Containers grow now, so that the commit allocates nothing.
+        // Containers grow now, so that the commit allocates nothing; so do the blocks of the row versions (the commit
+        // stamps every row with the load version).
         for (uint32_t a = 0; a < archetypeCount; ++a)
             if (image.archetypeRows[a] != 0)
             {
                 Archetype& archetype = *world.m_Archetypes[a];
-                archetype.chunks.reserve(size_t(ChunksFor(image.archetypeRows[a], archetype.rowsPerChunk)));
+                const uint64_t chunks = ChunksFor(image.archetypeRows[a], archetype.rowsPerChunk);
+                archetype.chunks.reserve(size_t(chunks));
+                if (!world.ReserveRowVersionBlocks(archetype, uint32_t(chunks)))
+                    return nvrhi::FE_OUT_OF_MEMORY;
             }
         world.m_Entities.reserve(image.tableSize);
 

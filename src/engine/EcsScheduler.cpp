@@ -774,8 +774,8 @@ namespace donut::engine::ecs
                 uint64_t* slot = place.versions + column;
                 if (sinceVersion != c_AllVersions && LoadVersion(slot) <= sinceVersion)
                     continue;
-                if (access->access == Access::Write)
-                    StampVersion(slot, m_Domain->current->GetVersion());
+                if (access->access == Access::Write)   // the chunk only: a RowTracked column counts it as wholly changed
+                    StampChunkWrite(*place.archetype, place.chunk, column, m_Domain->current->GetVersion());
                 const ArchetypeColumn& c = place.archetype->columns[column];
                 views[written++] = ColumnView{ place.memory + c.offset, c.stride, place.count, component, uint32_t(i),
                                                LoadVersion(slot) };
@@ -1552,7 +1552,7 @@ namespace donut::engine::ecs
                 const uint32_t column = place.archetype->FindColumn(term.component);
                 record.batchColumns[t] = column != c_NoColumn ? BatchColumn(place, column) : nullptr;
                 if (column != c_NoColumn && term.access == Access::Write)
-                    StampVersion(place.versions + column, version);
+                    StampRowWrites(*place.archetype, place.chunk, column, 0, place.count, version);
             }
             EntityBatch batch{};
             batch.entities = place.entities;
@@ -1836,7 +1836,7 @@ namespace donut::engine::ecs
                             std::memcpy(place.memory + place.archetype->columns[column].offset, values, size_t(bytes));
                         for (uint32_t row = 0; row < place.count && enabled; ++row)
                             SetMaskBit(EnabledMaskOf(place, column), row, bit(enabled, entity + row));
-                        StampVersion(place.versions + column, version);
+                        StampRowWrites(*place.archetype, place.chunk, column, 0, place.count, version);
                     }
                 }
                 entity += place.count;

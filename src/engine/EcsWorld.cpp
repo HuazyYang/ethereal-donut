@@ -39,7 +39,8 @@ namespace donut::engine::ecs
     {
         constexpr ComponentFlags c_KnownFlags = ComponentFlags::Tag | ComponentFlags::Sparse | ComponentFlags::Shared |
             ComponentFlags::Chunk | ComponentFlags::Enableable | ComponentFlags::Buffer | ComponentFlags::Relocatable |
-            ComponentFlags::GpuMirrored | ComponentFlags::NoSerialize | ComponentFlags::Resource;
+            ComponentFlags::GpuMirrored | ComponentFlags::NoSerialize | ComponentFlags::Resource |
+            ComponentFlags::RowTracked;
 
         constexpr uint32_t c_LayoutClash = 0xfffffffeu;   // in the CopyEntitiesFrom type map
 
@@ -77,9 +78,11 @@ namespace donut::engine::ecs
 
         // The same type, as two modules or two worlds see it: what decides the storage and the reflected fields. Names
         // and hook addresses differ between modules; whether a hook exists does not.
+        // RowTracked is a storage option of the registering world, not part of the layout (EcsTypes.h).
         bool SameLayout(const ComponentTypeDesc& a, const ComponentTypeDesc& b) noexcept
         {
-            if (a.size != b.size || a.alignment != b.alignment || a.flags != b.flags ||
+            const ComponentFlags layout = ~ComponentFlags::RowTracked;
+            if (a.size != b.size || a.alignment != b.alignment || (a.flags & layout) != (b.flags & layout) ||
                 a.bufferInlineCapacity != b.bufferInlineCapacity || a.fieldCount != b.fieldCount)
                 return false;
             if (!a.construct != !b.construct || !a.destruct != !b.destruct || !a.relocate != !b.relocate ||
@@ -197,6 +200,8 @@ namespace donut::engine::ecs
                 if (column.kind == StorageKind::Shared)
                     DestructValues(*column.type, archetype->sharedValues + column.offset, 1);
             HeapFree(archetype->sharedValues);
+            for (uint64_t* block : archetype->rowVersionBlocks)
+                HeapFree(block);
             archetype->~Archetype();
             HeapFree(archetype);
         }
@@ -300,6 +305,8 @@ namespace donut::engine::ecs
             return fail("Enableable needs a component stored per row");
         if (Has(flags, ComponentFlags::GpuMirrored) && !Has(flags, ComponentFlags::Relocatable))
             return fail("GpuMirrored needs Relocatable (D14)");
+        if (Has(flags, ComponentFlags::RowTracked) && (tag || storage != 0))
+            return fail("RowTracked needs a value per row: not a Tag, Sparse, Shared, Chunk, Buffer or Resource");
         // Hooks and Relocatable agree (D14): memcpy moves and copies a Relocatable type, so it has no destruct,
         // relocate or copy hook; a type that owns something (a destruct hook) says how it moves; and a type that is
         // neither Relocatable nor has a copy hook is never copied (FE_UNSUPPORTED), never memcpy'd.
@@ -683,7 +690,7 @@ namespace donut::engine::ecs
             const Archetype& archetype = *m_Archetypes[record->archetype];
             const StorageKind kind = archetype.columns[column].kind;
             if (kind == StorageKind::Data || kind == StorageKind::Buffer || kind == StorageKind::Chunk)
-                StampVersion(archetype.Versions(record->chunk) + column, ResolveWriteVersion(writeVersion));
+                StampRowWrite(archetype, record->chunk, column, record->row, ResolveWriteVersion(writeVersion));
         }
         return pointer;
     }
@@ -724,7 +731,7 @@ namespace donut::engine::ecs
                 continue;
             }
             SetMaskBit(archetype.EnabledMask(record->chunk, column), record->row, enabled);
-            StampVersion(archetype.Versions(record->chunk) + column, version);
+            StampRowWrite(archetype, record->chunk, column, record->row, version);
         }
         return result;
     }
@@ -1275,7 +1282,7 @@ namespace donut::engine::ecs
                     uint8_t* dst = static_cast<uint8_t*>(from.ColumnData(record->chunk, column)) +
                         size_t(record->row) * from.columns[column].stride;
                     OverwriteValue(dst, *type, value, transfer);
-                    StampVersion(from.Versions(record->chunk) + column, version);
+                    StampRowWrite(from, record->chunk, column, record->row, version);
                 }
                 continue;
             }
@@ -1405,7 +1412,7 @@ namespace donut::engine::ecs
             uint8_t* dst = static_cast<uint8_t*>(archetype.ColumnData(record->chunk, column)) +
                 size_t(record->row) * archetype.columns[column].stride;
             OverwriteValue(dst, *archetype.columns[column].type, value.value, value.transfer);
-            StampVersion(archetype.Versions(record->chunk) + column, version);
+            StampRowWrite(archetype, record->chunk, column, record->row, version);
         }
         return nvrhi::FS_OK;
     }
@@ -1484,7 +1491,7 @@ namespace donut::engine::ecs
                 uint8_t* dst = static_cast<uint8_t*>(archetype.ColumnData(record->chunk, column)) +
                     size_t(record->row) * archetype.columns[column].stride;
                 OverwriteValue(dst, *type, value, transfer);
-                StampVersion(archetype.Versions(record->chunk) + column, version);
+                StampRowWrite(archetype, record->chunk, column, record->row, version);
             }
             ObserveSet(component, entity);
         }

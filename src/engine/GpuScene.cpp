@@ -146,6 +146,8 @@ namespace donut::engine
             const MeshRef* refs;
             const RenderFlags* flags;
             const WorldTransform* worlds;
+            const uint64_t* rowVersions;   // E7.5: only WorldTransform changed, by these rows (newer than `since`)
+            uint64_t since;
             uint32_t count;
             bool headCheck;            // MeshRef, RenderFlags, GpuInstanceSlot or rows changed: compare the heads too
             uint32_t markOffset;       // its candidate rows' range in the marks
@@ -483,10 +485,13 @@ namespace donut::engine
             {
                 ++stats.chunksVisited;
                 const uint64_t* versions = archetype.Versions(c);
-                if (!all && versions[slotColumn] <= since && versions[refColumn] <= since &&
-                    versions[flagsColumn] <= since && versions[worldColumn] <= since && versions[added] <= since)
+                const bool head = all || versions[slotColumn] > since || versions[refColumn] > since ||
+                                  versions[flagsColumn] > since || versions[added] > since;
+                if (!head && versions[worldColumn] <= since)
                     continue;
                 ++stats.chunksChanged;
+                // E7.5: a chunk whose WorldTransform alone changed, with row versions: only the rows written since
+                const uint64_t* rowVersions = head ? nullptr : ChangedRowVersions(archetype, c, worldColumn);
 
                 uint8_t* memory = archetype.chunks[c].memory;
                 const Entity* entities = archetype.Entities(c);
@@ -497,6 +502,8 @@ namespace donut::engine
                 const uint32_t count = archetype.chunks[c].count;
                 for (uint32_t r = 0; r < count; ++r)
                 {
+                    if (rowVersions && rowVersions[r] <= since)
+                        continue;   // as it was: the settle below covers last frame's move
                     const uint32_t slot = slots[r].instance;
                     if (slot >= instances.size())
                         continue;   // cannot happen: Ensure covered the allocator's end
@@ -570,6 +577,8 @@ namespace donut::engine
         const uint32_t slotEnd = uint32_t(instances.size());
         for (uint32_t r = 0; r < chunk.count; ++r)
         {
+            if (chunk.rowVersions && chunk.rowVersions[r] <= chunk.since)
+                continue;   // as it was: no record (a settle record covers last frame's move)
             const uint32_t slot = chunk.slots[r].instance;
             if (slot >= slotEnd)
                 continue;   // cannot happen: Ensure covered the allocator's end
@@ -722,6 +731,9 @@ namespace donut::engine
                 chunk.refs = reinterpret_cast<const MeshRef*>(memory + archetype.columns[refColumn].offset);
                 chunk.flags = reinterpret_cast<const RenderFlags*>(memory + archetype.columns[flagsColumn].offset);
                 chunk.worlds = reinterpret_cast<const WorldTransform*>(memory + archetype.columns[worldColumn].offset);
+                // E7.5: a chunk whose WorldTransform alone changed, with row versions: only the rows written since
+                chunk.rowVersions = headCheck ? nullptr : ChangedRowVersions(archetype, c, worldColumn);
+                chunk.since = since;
                 chunk.count = count;
                 chunk.headCheck = headCheck;
                 chunk.markOffset = candidateRows;

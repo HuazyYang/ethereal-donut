@@ -32,6 +32,7 @@
 #include "SceneGraphStore.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 
 using namespace donut::engine;
@@ -1229,6 +1230,21 @@ void SceneGraph::ReleaseRenderService() noexcept
 uint64_t SceneGraph::GetSchedulerGeneration() const noexcept
 {
     return m_Store->GetSchedulerGeneration();
+}
+
+namespace
+{
+    std::atomic<bool> g_RowTrackedTransforms{ false };   // E7.5: off until measured
+}
+
+void SceneGraph::SetRowTrackedTransforms(bool enabled) noexcept
+{
+    g_RowTrackedTransforms.store(enabled, std::memory_order_relaxed);
+}
+
+bool SceneGraph::GetRowTrackedTransforms() noexcept
+{
+    return g_RowTrackedTransforms.load(std::memory_order_relaxed);
 }
 
 nvrhi::AutoPtr<SceneGraphNode> SceneGraph::SetRootNode(SceneGraphNode *root)

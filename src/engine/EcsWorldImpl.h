@@ -298,13 +298,17 @@ namespace donut::engine::ecs
     // Row indices fit the 16 bits of a command sort key (EcsCommandBuffer.h) and of EntityRecord::row.
     constexpr uint32_t c_MaxRowsPerChunk = c_MaxSortKeyRow + 1;
 
+    // ArchetypeColumn::rowVersionSlot of a column without row versions.
+    constexpr uint16_t c_NoRowVersions = 0xffff;
+
     struct ArchetypeColumn
     {
         const ComponentType* type;
         ComponentId component;
         StorageKind kind;           // Data, Tag, Buffer, Shared or Chunk
         bool enableable;
-        uint8_t reserved[2];
+        uint16_t rowVersionSlot;    // RowTracked Data: the column's array in Archetype::rowVersionBlocks; else
+                                    // c_NoRowVersions
         uint32_t offset;            // Data, Buffer: the column in the chunk. Chunk: the value in the chunk. Shared:
                                     // the value in Archetype::sharedValues
         uint32_t stride;            // Data: the value size; Buffer: sizeof(BufferHeader); Shared, Chunk: the value size
@@ -359,7 +363,13 @@ namespace donut::engine::ecs
         // while the count is unchanged: appending rows moves nothing (plan step E3, the scene graph's row hints).
         uint64_t rowMoves = 0;
         bool destructRows = false;      // some column needs work to destroy a row (hooks, spilled buffers)
-        uint8_t reserved[7] = {};
+        uint8_t reserved[3] = {};
+        // RowTracked columns (D9; plan step E7, item E7.5): their row versions live outside the chunk, so that they do
+        // not lower rowsPerChunk. Per chunk one block of rowVersionSlots arrays, each the column's newest row version
+        // followed by rowsPerChunk row versions. Blocks are kept by chunk index: a released chunk's block waits for
+        // the next chunk at that index, and the world frees them when it dies (steady state allocates nothing).
+        uint32_t rowVersionSlots = 0;
+        Vector<uint64_t*> rowVersionBlocks;
         Vector<ComponentId> components; // sorted
         Vector<ArchetypeColumn> columns;// one per component, in the same order
         Vector<ChunkRecord> chunks;
@@ -388,7 +398,65 @@ namespace donut::engine::ecs
             const ArchetypeColumn& c = columns[column];
             return chunks[chunk].memory + c.inlineOffset + size_t(row) * c.inlineStride;
         }
+        // The row versions of a RowTracked column in a chunk (ChunkView::rowVersions): [-1] is the newest row
+        // version, [row] each row's. Null for other columns.
+        uint64_t* RowVersions(uint32_t chunk, uint32_t column) const noexcept
+        {
+            const uint32_t slot = columns[column].rowVersionSlot;
+            return slot == c_NoRowVersions ? nullptr
+                                           : rowVersionBlocks[chunk] + size_t(slot) * (size_t(rowsPerChunk) + 1) + 1;
+        }
     };
+
+    // ------------------------------------------------------------------------------- row versions (D9, E7.5)
+
+    // A version slot or row version written by other threads (StampVersion), read as a whole.
+    inline uint64_t LoadVersionWord(const uint64_t* slot) noexcept
+    {
+#if defined(_MSC_VER)
+        return uint64_t(*reinterpret_cast<const volatile long long*>(slot));
+#else
+        return __atomic_load_n(slot, __ATOMIC_RELAXED);
+#endif
+    }
+
+    // The chunk-only writer rule (ChunkView): a RowTracked column whose chunk version is newer than its newest row
+    // version had a write that stamped only the chunk. Before anything stamps that column's rows or chunk again, every
+    // row in use is stamped with the chunk version, so that the write stays seen. Nothing when the versions agree;
+    // nothing for a column without row versions. Rows, then the newest version, with StampVersion: parallel readers of
+    // the column may do it at once.
+    void SpreadChunkWrite(const Archetype& archetype, uint32_t chunk, uint32_t column) noexcept;
+
+    // A write that stamps the chunk only (a query's Write term, a domain's column view). On a RowTracked column whose
+    // newest row version is this version or a later one (a row write of the same version came first, such as a node
+    // setter and a c_WorldVersion query outside phases), the chunk version would not be newer than the rows, so the
+    // rule above could not see the write: every row in use is stamped with the version at once.
+    void StampChunkWrite(const Archetype& archetype, uint32_t chunk, uint32_t column, uint64_t version) noexcept;
+
+    // A write of rows [firstRow, firstRow + count) of a column: their row versions, the newest one, then the chunk's.
+    // For a column without row versions, the chunk's only.
+    void StampRowWrites(const Archetype& archetype, uint32_t chunk, uint32_t column, uint32_t firstRow, uint32_t count,
+                        uint64_t version) noexcept;
+    inline void StampRowWrite(const Archetype& archetype, uint32_t chunk, uint32_t column, uint32_t row,
+                              uint64_t version) noexcept
+    {
+        if (archetype.columns[column].rowVersionSlot != c_NoRowVersions)
+            StampRowWrites(archetype, chunk, column, row, 1, version);
+        else
+            StampVersion(archetype.Versions(chunk) + column, version);
+    }
+
+    // For readers that test chunk versions themselves (the scene graph's systems, GpuScene): the row versions of a
+    // column in a chunk when they tell its changed rows apart, else null: no row versions, or a chunk-only write made
+    // the chunk wholly changed. With them, a chunk whose column version is newer than sinceVersion changed in exactly
+    // its rows whose version is newer. Reads only.
+    inline const uint64_t* ChangedRowVersions(const Archetype& archetype, uint32_t chunk, uint32_t column) noexcept
+    {
+        const uint64_t* rows = archetype.RowVersions(chunk, column);
+        if (!rows || LoadVersionWord(archetype.Versions(chunk) + column) > LoadVersionWord(rows - 1))
+            return nullptr;
+        return rows;
+    }
 
     // ------------------------------------------------------------------------------------------ sparse sets (4.3)
 
@@ -825,6 +893,13 @@ namespace donut::engine::ecs
         bool AppendChunk(Archetype& archetype, uint64_t version) noexcept;
         void ReleaseLastChunk(Archetype& archetype) noexcept;
         static void StampChunk(const Archetype& archetype, uint32_t chunk, uint64_t version) noexcept;
+        // Rows placed by a structural change (appended, or moved into a hole): their row versions in every RowTracked
+        // column, after the chunk-only writer rule; StampChunk then stamps the chunk.
+        static void StampPlacedRows(const Archetype& archetype, uint32_t chunk, uint32_t firstRow, uint32_t count,
+                                    uint64_t version) noexcept;
+        // Makes sure that chunk indices [0, chunkCount) have their row-version blocks, so that appending chunks up to
+        // that count cannot fail for them (LoadSnapshot). False when out of memory.
+        bool ReserveRowVersionBlocks(Archetype& archetype, uint32_t chunkCount) noexcept;
         // Allocates the chunks that `count` more rows need (empty, at the end), so that the next AppendRows of at most
         // `count` rows cannot fail; false, with nothing changed, when out of memory.
         bool ReserveRows(Archetype& archetype, uint32_t count, uint64_t version) noexcept;
@@ -965,6 +1040,8 @@ namespace donut::engine::ecs
             const uint32_t chunk = position / rows;
             const uint32_t row = position % rows;
             const uint32_t run = count - done < rows - row ? count - done : rows - row;
+            if (archetype.rowVersionSlots != 0)
+                StampPlacedRows(archetype, chunk, row, run, version);
             archetype.chunks[chunk].count += run;
             StampChunk(archetype, chunk, version);
             fill(chunk, row, run, done);
