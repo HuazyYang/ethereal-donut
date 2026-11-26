@@ -48,6 +48,10 @@
 //   4. per view and pass, a stable LSD radix sort of the keys, so equal keys keep chunk order: the views' and passes'
 //      sorts side by side, a large one on the job system inside too;
 //   5. in parallel: the packets gathered into the arena's arrays in key order.
+// With compact packet records (RenderService::SetCompactPacketRecords; plan step E7, item E7.4, remedy 2; off by
+// default) a range lists 24-byte records (CompactPacketRecord) instead of 32-byte ones; step 2 also prepares each
+// segment's sort; step 3 copies the records into one array and writes the sort's words itself (the key's varying
+// bits and the position), so that the sort reads no keys; step 5 gathers from that array. The output is the same.
 // The output does not depend on the worker count or the range size. Arena arrays are sized by high-water marks with a
 // quarter of headroom (the arena reuses its blocks only while a frame asks for no more than before), heap scratch keeps
 // its capacity and grows with the same headroom: once the marks have settled, no allocation.
@@ -213,24 +217,66 @@ namespace donut::render::visibility
         bool Sort(const uint64_t* keys, uint32_t count, uint64_t varying, uint32_t base, uint32_t* order,
                   engine::IJobSystem* jobs) noexcept
         {
+            return Prepare(count, varying) && Order(keys, base, order, jobs);
+        }
+
+        // Sort in two steps, for a caller that writes the sort words itself (the compact packet records: the words
+        // are written in the copy step, so that the keys are read once). Prepare, then for each element i with key k:
+        // Words()[i] = Word(k, i), and Indices()[i] = i when Indices() is not null; then Finish, whose order is Sort's
+        // exactly. Words() is null when the order is the identity (fewer than two elements, or no varying bit): then
+        // nothing is written. Between Prepare and Finish, different elements may be written from different threads.
+        bool Prepare(uint32_t count, uint64_t varying) noexcept
+        {
+            m_Count = count;
+            m_Runs = BitRuns(varying);
+            m_Identity = count <= 1 || m_Runs.bits == 0;
+            m_Packed = true;
+            m_PositionBits = 0;
+            m_IndexBits = 0;
+            if (m_Identity)
+                return true;
+            uint32_t indexBits = 0;
+            while (indexBits < 32 && (uint64_t(count - 1) >> indexBits) != 0)
+                ++indexBits;
+            m_IndexBits = indexBits;
+            m_Packed = m_Runs.bits + indexBits <= 64;
+            m_PositionBits = m_Packed ? indexBits : 0;
+            if (!m_A.Reserve(count) || !m_B.Reserve(count))
+                return false;
+            if (!m_Packed && (!m_IndexA.Reserve(count) || !m_IndexB.Reserve(count)))
+                return false;
+            return true;
+        }
+
+        [[nodiscard]] uint64_t* Words() const noexcept { return m_Identity ? nullptr : m_A.Data(); }
+        [[nodiscard]] uint32_t* Indices() const noexcept { return m_Identity || m_Packed ? nullptr : m_IndexA.Data(); }
+        [[nodiscard]] const BitRuns& Runs() const noexcept { return m_Runs; }
+        // The position's bits in a word: those of count - 1 when packed (Indices() null), else 0.
+        [[nodiscard]] uint32_t PositionBits() const noexcept { return m_PositionBits; }
+        // The word of a key: its compacted bits, with the element's position below them when packed.
+        [[nodiscard]] uint64_t Word(uint64_t key, uint32_t position) const noexcept
+        {
+            return m_Packed ? (m_Runs.Compact(key) << m_PositionBits) | position : m_Runs.Compact(key);
+        }
+
+        bool Finish(uint32_t base, uint32_t* order, engine::IJobSystem* jobs) noexcept
+        {
+            return Order(nullptr, base, order, jobs);
+        }
+
+    private:
+        // The passes over the prepared elements; with `keys`, the elements are filled from them first (Sort).
+        bool Order(const uint64_t* keys, uint32_t base, uint32_t* order, engine::IJobSystem* jobs) noexcept
+        {
+            const uint32_t count = m_Count;
             if (count == 0)
                 return true;
-            const BitRuns runs(varying);
-            if (count == 1 || runs.bits == 0)
+            if (m_Identity)
             {
                 for (uint32_t i = 0; i < count; ++i)
                     order[i] = base + i;
                 return true;
             }
-
-            uint32_t indexBits = 0;
-            while (indexBits < 32 && (uint64_t(count - 1) >> indexBits) != 0)
-                ++indexBits;
-            const bool packed = runs.bits + indexBits <= 64;
-            if (!m_A.Reserve(count) || !m_B.Reserve(count))
-                return false;
-            if (!packed && (!m_IndexA.Reserve(count) || !m_IndexB.Reserve(count)))
-                return false;
 
             uint32_t tasks = 1;
             if (jobs && count >= c_ParallelThreshold)
@@ -241,21 +287,22 @@ namespace donut::render::visibility
             Job job;
             job.keys = keys;
             job.count = count;
-            job.runs = &runs;
-            job.indexBits = packed ? indexBits : 0;
+            job.runs = &m_Runs;
+            job.indexBits = m_PositionBits;
             job.tasks = tasks;
             job.block = (count + tasks - 1) / tasks;
             job.a = m_A.Data();
             job.b = m_B.Data();
-            job.indexA = packed ? nullptr : m_IndexA.Data();
-            job.indexB = packed ? nullptr : m_IndexB.Data();
-            job.passes = (runs.bits + c_MaxDigitBits - 1) / c_MaxDigitBits;
-            job.width = (runs.bits + job.passes - 1) / job.passes;
+            job.indexA = m_Packed ? nullptr : m_IndexA.Data();
+            job.indexB = m_Packed ? nullptr : m_IndexB.Data();
+            job.passes = (m_Runs.bits + c_MaxDigitBits - 1) / c_MaxDigitBits;
+            job.width = (m_Runs.bits + job.passes - 1) / job.passes;
 
             if (tasks > 1)
             {
                 job.histograms = m_Histograms.Data();
-                jobs->ParallelFor(tasks, 1, &Job::Fill, &job);
+                if (keys)
+                    jobs->ParallelFor(tasks, 1, &Job::Fill, &job);
                 for (uint32_t p = 0; p < job.passes; ++p)
                 {
                     job.Pass(p);
@@ -272,7 +319,9 @@ namespace donut::render::visibility
                     return false;
                 uint32_t* histograms = m_Histograms.Data();
                 std::fill(histograms, histograms + (size_t(job.passes) << c_MaxDigitBits), 0u);
-                job.FillCounting(histograms);
+                if (keys)
+                    job.FillRange(0, count);
+                job.Count(histograms);
                 for (uint32_t p = 0; p < job.passes; ++p)
                 {
                     job.Pass(p);
@@ -283,9 +332,9 @@ namespace donut::render::visibility
                 }
             }
 
-            if (packed)
+            if (m_Packed)
             {
-                const uint64_t mask = BitRuns::Low(indexBits);
+                const uint64_t mask = BitRuns::Low(m_IndexBits);
                 const uint64_t* a = job.a;
                 for (uint32_t i = 0; i < count; ++i)
                     order[i] = base + uint32_t(a[i] & mask);
@@ -299,7 +348,6 @@ namespace donut::render::visibility
             return true;
         }
 
-    private:
         struct Job
         {
             const uint64_t* keys = nullptr;
@@ -370,10 +418,9 @@ namespace donut::render::visibility
                 }
             }
 
-            // Serially: the elements and every pass's digit counts.
-            void FillCounting(uint32_t* passHistograms) noexcept
+            // Serially: every pass's digit counts, in one read of the elements.
+            void Count(uint32_t* passHistograms) noexcept
             {
-                FillRange(0, count);
                 const uint64_t* elements = a;
                 uint32_t shifts[c_MaxPasses] = {};
                 uint64_t masks[c_MaxPasses] = {};
@@ -465,6 +512,13 @@ namespace donut::render::visibility
         PodBuffer<uint64_t> m_A, m_B;
         PodBuffer<uint32_t> m_IndexA, m_IndexB;
         PodBuffer<uint32_t> m_Histograms;   // per task (parallel) or per pass (serial), 2^c_MaxDigitBits each
+        // Prepare's: the varying bits, the elements, and the words' form.
+        BitRuns m_Runs{ 0 };
+        uint32_t m_Count = 0;
+        uint32_t m_IndexBits = 0;      // the bits of a position (count - 1)
+        uint32_t m_PositionBits = 0;   // the position's bits in a word: m_IndexBits when packed, else 0
+        bool m_Packed = true;          // the position rides in the word; else in the index arrays
+        bool m_Identity = true;        // fewer than two elements or no varying bit: no passes
     };
 
     // ------------------------------------------------------------------------------------------ visibility
@@ -502,6 +556,7 @@ namespace donut::render::visibility
         ExtractedView* views = nullptr;                 // the snapshot's; Run sets their instance and packet ranges
         uint32_t viewCount = 0;
         bool drawDoubleSidedMaterialsSeparately = true;
+        bool compactPacketRecords = false;              // RenderService::GetCompactPacketRecords, read per extraction
     };
 
     class InstanceVisibility
@@ -558,10 +613,12 @@ namespace donut::render::visibility
             job.viewCount = viewCount;
             job.grain = grain;
             job.separateDoubleSided = frame.drawDoubleSidedMaterialsSeparately;
+            const bool compact = frame.compactPacketRecords;
+            const engine::PFN_JobFunction rangeRun = compact ? &RangeJob::Run<true> : &RangeJob::Run<false>;
             if (parallelRanges)
-                jobs->ParallelFor(chunkCount, grain, &RangeJob::Run, &job);
+                jobs->ParallelFor(chunkCount, grain, rangeRun, &job);
             else if (chunkCount != 0)
-                RangeJob::Run(&job, 0, chunkCount, 0);
+                rangeRun(&job, 0, chunkCount, 0);
             if (job.failed.load(std::memory_order_relaxed))
                 return nvrhi::FE_OUT_OF_MEMORY;
 
@@ -621,8 +678,11 @@ namespace donut::render::visibility
             out.materialSlots = arena.Allocate<uint32_t>(packetCapacity);
             out.cullModes = arena.Allocate<uint8_t>(packetCapacity);
             out.flags = arena.Allocate<uint8_t>(packetCapacity);
-            if (arena.failed || !m_SortKeys.Reserve(packetTotal) || !m_SortRecords.Reserve(packetTotal) ||
-                !m_Order.Reserve(packetTotal))
+            if (arena.failed ||
+                !(compact ? m_CompactRecords.Reserve(packetTotal) && m_Order.Reserve(packetTotal) &&
+                                PrepareSorts(segmentCount)
+                          : m_SortKeys.Reserve(packetTotal) && m_SortRecords.Reserve(packetTotal) &&
+                                m_Order.Reserve(packetTotal)))
             {
                 ClearRanges(frame);
                 return nvrhi::FE_OUT_OF_MEMORY;
@@ -636,20 +696,22 @@ namespace donut::render::visibility
             copy.self = this;
             copy.out = &out;
             copy.viewCount = viewCount;
+            const engine::PFN_JobFunction copyRun = compact ? &CopyJob::Run<true> : &CopyJob::Run<false>;
             if (rangeCount > 1 && parallelRecords)
-                jobs->ParallelFor(rangeCount, 1, &CopyJob::Run, &copy);
+                jobs->ParallelFor(rangeCount, 1, copyRun, &copy);
             else if (rangeCount != 0)
-                CopyJob::Run(&copy, 0, rangeCount, 0);
+                copyRun(&copy, 0, rangeCount, 0);
 
             // 4. Each view's packets of each pass sorted by key, stably: the segments side by side, a large one on the
             // job system inside too.
             SortJob sort;
             sort.self = this;
             sort.jobs = jobs;
+            const engine::PFN_JobFunction sortRun = compact ? &SortJob::Run<true> : &SortJob::Run<false>;
             if (segmentCount > 1 && parallelRecords)
-                jobs->ParallelFor(segmentCount, 1, &SortJob::Run, &sort);
+                jobs->ParallelFor(segmentCount, 1, sortRun, &sort);
             else
-                SortJob::Run(&sort, 0, segmentCount, 0);
+                sortRun(&sort, 0, segmentCount, 0);
             if (sort.failed.load(std::memory_order_relaxed))
             {
                 ClearRanges(frame);
@@ -662,10 +724,11 @@ namespace donut::render::visibility
             gather.out = &out;
             gather.count = packetTotal;
             const uint32_t gatherGrain = 8192;
+            const engine::PFN_JobFunction gatherRun = compact ? &GatherJob::Run<true> : &GatherJob::Run<false>;
             if (packetTotal > gatherGrain && jobs)
-                jobs->ParallelFor(packetTotal, gatherGrain, &GatherJob::Run, &gather);
+                jobs->ParallelFor(packetTotal, gatherGrain, gatherRun, &gather);
             else if (packetTotal != 0)
-                GatherJob::Run(&gather, 0, packetTotal, 0);
+                gatherRun(&gather, 0, packetTotal, 0);
 
             VisibleInstances& instances = snapshot.instances;
             instances.entities = out.entities;
@@ -730,6 +793,9 @@ namespace donut::render::visibility
         static constexpr uint32_t c_LeafCheckWarnings = 4;
         // A slot a packet has no value for (a geometry beyond its mesh row, a geometry without a material).
         static constexpr uint32_t c_NoSlot = ~0u;
+        // Compact packet records hold the geometry index in 26 bits: a mesh's geometries from this one on get no packet
+        // with them (a warning, once per process).
+        static constexpr uint32_t c_CompactGeometryLimit = 1u << 26;
 
     private:
         // One visible instance as a range lists it (the snapshot's VisibleInstances, one record).
@@ -757,12 +823,36 @@ namespace donut::render::visibility
             uint8_t flags;
         };
 
+        // The same packet in a compact record (RenderService::SetCompactPacketRecords): 24 bytes instead of 32.
+        struct CompactPacketRecord
+        {
+            uint64_t key;
+            uint32_t instance;
+            uint32_t geometrySlot;
+            uint32_t materialSlot;
+            uint32_t geometryCullFlags;   // [25:0] geometry index, [27:26] cull mode, [31:28] flags
+        };
+        static_assert(sizeof(CompactPacketRecord) == 24, "CompactPacketRecord layout");
+        static constexpr uint32_t c_CompactCullShift = 26;
+        static constexpr uint32_t c_CompactFlagsShift = 28;
+        static_assert(uint32_t(nvrhi::RasterCullMode::None) < 4, "the cull mode's two bits");
+        static_assert((c_DrawPacketFlagOpaquePass | c_DrawPacketFlagTransparentPass | c_DrawPacketFlagDoubleSided |
+                       c_DrawPacketFlagGeometryCulled) < 16, "the flags' four bits");
+
+        static CompactPacketRecord MakeCompactRecord(const PacketRecord& packet) noexcept
+        {
+            return CompactPacketRecord{ packet.key, packet.instance, packet.geometrySlot, packet.materialSlot,
+                                        packet.geometryIndex | uint32_t(packet.cullMode) << c_CompactCullShift |
+                                            uint32_t(packet.flags) << c_CompactFlagsShift };
+        }
+
         // A range's lists for one view. A cache line of its own: the range's task updates the counts and masks for
         // every packet, and neighbouring ranges run on other threads.
         struct alignas(64) RangeView
         {
             PodBuffer<InstanceRecord> instances;
             PodBuffer<PacketRecord> packets[c_DrawPacketPassCount];
+            PodBuffer<CompactPacketRecord> compactPackets[c_DrawPacketPassCount];   // with compact records
             uint32_t instanceCount = 0;
             uint32_t packetCount[c_DrawPacketPassCount] = {};
             uint64_t keyOr[c_DrawPacketPassCount] = {};
@@ -860,6 +950,7 @@ namespace donut::render::visibility
             bool separateDoubleSided = true;
             std::atomic<bool> failed{ false };
 
+            template <bool Compact>
             static void Run(void* context, uint32_t begin, uint32_t end, uint32_t) noexcept
             {
                 RangeJob& job = *static_cast<RangeJob*>(context);
@@ -875,7 +966,7 @@ namespace donut::render::visibility
                         const uint32_t capacity = std::min(16u, rangeEnd - first);
                         const uint32_t written = job.query->GetChunks(first, job.request, capacity, chunks);
                         for (uint32_t i = 0; i < written; ++i)
-                            job.Chunk(chunks[i], scratch);
+                            job.Chunk<Compact>(chunks[i], scratch);
                     }
                 }
             }
@@ -888,6 +979,7 @@ namespace donut::render::visibility
                 return static_cast<const T*>(chunk.columns[column]);
             }
 
+            template <bool Compact>
             void Chunk(const engine::ChunkView& chunk, RangeView* scratch) noexcept
             {
                 using namespace engine;
@@ -911,27 +1003,42 @@ namespace donut::render::visibility
                             continue;
                         if (!frustum.intersectsWith(bounds[row].bounds))
                             continue;
-                        Row(chunk, row, views[v], out);
+                        Row<Compact>(chunk, row, views[v], out);
                     }
                 }
             }
 
+            template <bool Compact>
             bool Push(RangeView& out, uint32_t pass, const PacketRecord& packet) noexcept
             {
-                PodBuffer<PacketRecord>& buffer = out.packets[pass];
                 uint32_t& count = out.packetCount[pass];
-                if (!buffer.Reserve(size_t(count) + 1, count))
+                if constexpr (Compact)
                 {
-                    Fail();
-                    return false;
+                    PodBuffer<CompactPacketRecord>& buffer = out.compactPackets[pass];
+                    if (!buffer.Reserve(size_t(count) + 1, count))
+                    {
+                        Fail();
+                        return false;
+                    }
+                    buffer.Data()[count++] = MakeCompactRecord(packet);
                 }
-                buffer.Data()[count++] = packet;
+                else
+                {
+                    PodBuffer<PacketRecord>& buffer = out.packets[pass];
+                    if (!buffer.Reserve(size_t(count) + 1, count))
+                    {
+                        Fail();
+                        return false;
+                    }
+                    buffer.Data()[count++] = packet;
+                }
                 out.keyOr[pass] |= packet.key;
                 out.keyAnd[pass] &= packet.key;
                 return true;
             }
 
             // A visible row: its instance record, then its packets by the legacy rules.
+            template <bool Compact>
             void Row(const engine::ChunkView& chunk, uint32_t row, const ExtractedView& view, RangeView& out) noexcept
             {
                 using namespace engine;
@@ -965,8 +1072,16 @@ namespace donut::render::visibility
                 const MeshTable::MeshRow* meshRow = meshRef.mesh != MeshId::Invalid
                     ? &meshes->GetMeshRow(MeshTable::SlotOf(meshRef.mesh)) : nullptr;
 
-                const size_t geometryCount = mesh->geometries.size();
+                size_t geometryCount = mesh->geometries.size();
                 const bool multiple = geometryCount > 1;
+                if constexpr (Compact)
+                {
+                    if (geometryCount > c_CompactGeometryLimit)
+                    {
+                        geometryCount = c_CompactGeometryLimit;
+                        WarnGeometryLimit();
+                    }
+                }
                 const bool skinned = mesh->skinPrototype != nullptr;
                 // The node's float world transform (SceneGraphNode::GetLocalToWorldTransformFloat), when a geometry
                 // test needs it; the transparent box of the instance, when a distance needs it.
@@ -1044,7 +1159,7 @@ namespace donut::render::visibility
                         packet.cullMode = uint8_t(cull);
                         packet.key = MakeOpaqueDrawKey(uint32_t(domain), uint32_t(cull), packet.materialSlot,
                                                        packet.geometrySlot, slot.instance);
-                        if (!Push(out, uint32_t(DrawPacketPass::Opaque), packet))
+                        if (!Push<Compact>(out, uint32_t(DrawPacketPass::Opaque), packet))
                             return;
                         continue;
                     }
@@ -1066,7 +1181,7 @@ namespace donut::render::visibility
                     {
                         packet.cullMode = uint8_t(cull);
                         packet.key = MakeTransparentDrawKey(distance, slot.instance, uint32_t(cull));
-                        return Push(out, uint32_t(DrawPacketPass::Transparent), packet);
+                        return Push<Compact>(out, uint32_t(DrawPacketPass::Transparent), packet);
                     };
                     if (material->doubleSided)
                     {
@@ -1093,13 +1208,12 @@ namespace donut::render::visibility
             const Output* out = nullptr;
             uint32_t viewCount = 0;
 
+            template <bool Compact>
             static void Run(void* context, uint32_t begin, uint32_t end, uint32_t) noexcept
             {
                 CopyJob& job = *static_cast<CopyJob*>(context);
                 InstanceVisibility& self = *job.self;
                 const Output& out = *job.out;
-                uint64_t* keys = self.m_SortKeys.Data();
-                const PacketRecord** records = self.m_SortRecords.Data();
                 for (uint32_t r = begin; r < end; ++r)
                 {
                     for (uint32_t v = 0; v < job.viewCount; ++v)
@@ -1120,17 +1234,66 @@ namespace donut::render::visibility
                             out.meshInfos[at] = record.mesh;
                             out.worldBounds[at] = record.bounds;
                         }
-                        for (uint32_t p = 0; p < c_DrawPacketPassCount; ++p)
+                        if constexpr (Compact)
+                            CopyCompact(self, scratch, v);
+                        else
                         {
-                            PacketRecord* packets = scratch.packets[p].Data();
-                            const uint32_t first = scratch.packetOffset[p];
-                            for (uint32_t i = 0; i < scratch.packetCount[p]; ++i)
+                            uint64_t* keys = self.m_SortKeys.Data();
+                            const PacketRecord** records = self.m_SortRecords.Data();
+                            for (uint32_t p = 0; p < c_DrawPacketPassCount; ++p)
                             {
-                                packets[i].instance += base;   // the snapshot's visible-instance index
-                                keys[first + i] = packets[i].key;
-                                records[first + i] = &packets[i];
+                                PacketRecord* packets = scratch.packets[p].Data();
+                                const uint32_t first = scratch.packetOffset[p];
+                                for (uint32_t i = 0; i < scratch.packetCount[p]; ++i)
+                                {
+                                    packets[i].instance += base;   // the snapshot's visible-instance index
+                                    keys[first + i] = packets[i].key;
+                                    records[first + i] = &packets[i];
+                                }
                             }
                         }
+                    }
+                }
+            }
+
+            // Compact records: each into the one array, its instance index made global, and its word into its
+            // segment's sort (the key's varying bits, the position in the segment).
+            static void CopyCompact(InstanceVisibility& self, const RangeView& scratch, uint32_t view) noexcept
+            {
+                const uint32_t base = scratch.instanceOffset;
+                for (uint32_t p = 0; p < c_DrawPacketPassCount; ++p)
+                {
+                    const uint32_t count = scratch.packetCount[p];
+                    if (count == 0)
+                        continue;
+                    const CompactPacketRecord* packets = scratch.compactPackets[p].Data();
+                    const uint32_t first = scratch.packetOffset[p];
+                    CompactPacketRecord* records = self.m_CompactRecords.Data() + first;
+                    for (uint32_t i = 0; i < count; ++i)
+                    {
+                        records[i] = packets[i];
+                        records[i].instance += base;   // the snapshot's visible-instance index
+                    }
+                    const uint32_t segment = view * c_DrawPacketPassCount + p;
+                    const RadixSorter& sorter = self.m_Sorters[segment];
+                    uint64_t* const words = sorter.Words();
+                    if (!words)
+                        continue;   // the identity order
+                    const uint32_t position = first - self.m_Segments[segment].first;
+                    const BitRuns runs = sorter.Runs();
+                    const uint32_t shift = sorter.PositionBits();
+                    if (uint32_t* const indices = sorter.Indices())
+                    {
+                        for (uint32_t i = 0; i < count; ++i)
+                        {
+                            words[position + i] = runs.Compact(packets[i].key);
+                            indices[position + i] = position + i;
+                        }
+                    }
+                    else
+                    {
+                        for (uint32_t i = 0; i < count; ++i)
+                            words[position + i] = (runs.Compact(packets[i].key) << shift) | (position + i);
                     }
                 }
             }
@@ -1144,6 +1307,7 @@ namespace donut::render::visibility
             engine::IJobSystem* jobs = nullptr;
             std::atomic<bool> failed{ false };
 
+            template <bool Compact>
             static void Run(void* context, uint32_t begin, uint32_t end, uint32_t) noexcept
             {
                 SortJob& job = *static_cast<SortJob*>(context);
@@ -1151,13 +1315,39 @@ namespace donut::render::visibility
                 for (uint32_t s = begin; s < end; ++s)
                 {
                     const Segment& segment = self.m_Segments[s];
-                    if (!self.m_Sorters[s].Sort(self.m_SortKeys.Data() + segment.first, segment.count,
-                                                segment.keyOr ^ segment.keyAnd, segment.first,
-                                                self.m_Order.Data() + segment.first, job.jobs))
+                    bool sorted;
+                    if constexpr (Compact)
+                        sorted = self.m_Sorters[s].Finish(segment.first, self.m_Order.Data() + segment.first, job.jobs);
+                    else
+                        sorted = self.m_Sorters[s].Sort(self.m_SortKeys.Data() + segment.first, segment.count,
+                                                        segment.keyOr ^ segment.keyAnd, segment.first,
+                                                        self.m_Order.Data() + segment.first, job.jobs);
+                    if (!sorted)
                         job.failed.store(true, std::memory_order_relaxed);
                 }
             }
         };
+
+        // Compact records: each segment's sort prepared (its buffers reserved, its word form known) before the copy
+        // writes the words.
+        bool PrepareSorts(uint32_t segmentCount) noexcept
+        {
+            for (uint32_t s = 0; s < segmentCount; ++s)
+            {
+                const Segment& segment = m_Segments[s];
+                if (!m_Sorters[s].Prepare(segment.count, segment.keyOr ^ segment.keyAnd))
+                    return false;
+            }
+            return true;
+        }
+
+        static void WarnGeometryLimit() noexcept
+        {
+            static std::atomic<bool> s_Warned{ false };
+            if (!s_Warned.exchange(true, std::memory_order_relaxed))
+                log::warning("RenderService: a mesh has more than %u geometries; with compact packet records the ones "
+                             "beyond get no packets", c_CompactGeometryLimit);
+        }
 
         static void ClearRanges(const VisibilityFrame& frame) noexcept
         {
@@ -1177,22 +1367,41 @@ namespace donut::render::visibility
             const Output* out = nullptr;
             uint32_t count = 0;
 
+            template <bool Compact>
             static void Run(void* context, uint32_t begin, uint32_t end, uint32_t) noexcept
             {
                 GatherJob& job = *static_cast<GatherJob*>(context);
                 const Output& out = *job.out;
                 const uint32_t* order = job.self->m_Order.Data();
-                const PacketRecord* const* records = job.self->m_SortRecords.Data();
-                for (uint32_t i = begin; i < end; ++i)
+                if constexpr (Compact)
                 {
-                    const PacketRecord& packet = *records[order[i]];
-                    out.keys[i] = packet.key;
-                    out.visibleInstances[i] = packet.instance;
-                    out.geometryIndices[i] = packet.geometryIndex;
-                    out.geometrySlots[i] = packet.geometrySlot;
-                    out.materialSlots[i] = packet.materialSlot;
-                    out.cullModes[i] = packet.cullMode;
-                    out.flags[i] = packet.flags;
+                    const CompactPacketRecord* records = job.self->m_CompactRecords.Data();
+                    for (uint32_t i = begin; i < end; ++i)
+                    {
+                        const CompactPacketRecord& packet = records[order[i]];
+                        out.keys[i] = packet.key;
+                        out.visibleInstances[i] = packet.instance;
+                        out.geometryIndices[i] = packet.geometryCullFlags & (c_CompactGeometryLimit - 1);
+                        out.geometrySlots[i] = packet.geometrySlot;
+                        out.materialSlots[i] = packet.materialSlot;
+                        out.cullModes[i] = uint8_t((packet.geometryCullFlags >> c_CompactCullShift) & 3u);
+                        out.flags[i] = uint8_t(packet.geometryCullFlags >> c_CompactFlagsShift);
+                    }
+                }
+                else
+                {
+                    const PacketRecord* const* records = job.self->m_SortRecords.Data();
+                    for (uint32_t i = begin; i < end; ++i)
+                    {
+                        const PacketRecord& packet = *records[order[i]];
+                        out.keys[i] = packet.key;
+                        out.visibleInstances[i] = packet.instance;
+                        out.geometryIndices[i] = packet.geometryIndex;
+                        out.geometrySlots[i] = packet.geometrySlot;
+                        out.materialSlots[i] = packet.materialSlot;
+                        out.cullModes[i] = packet.cullMode;
+                        out.flags[i] = packet.flags;
+                    }
                 }
             }
         };
@@ -1254,6 +1463,7 @@ namespace donut::render::visibility
         std::vector<Segment> m_Segments;             // view-major, a segment per pass
         PodBuffer<uint64_t> m_SortKeys;              // the packets' keys, segment by segment, unsorted
         PodBuffer<const PacketRecord*> m_SortRecords;
+        PodBuffer<CompactPacketRecord> m_CompactRecords;   // with compact records: every packet, unsorted
         PodBuffer<uint32_t> m_Order;                 // the sorted positions in m_SortKeys
         std::vector<RadixSorter> m_Sorters;          // one per segment, so that segments sort side by side
         uint32_t m_InstanceCapacity = 0;

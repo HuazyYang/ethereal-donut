@@ -319,6 +319,16 @@ namespace donut::engine
     struct RuntimeMeshInstance { };
     DONUT_ECS_TAG(RuntimeMeshInstance, "6ad8bdeb-5ffa-4f0e-b4e0-c705b8abd49c")
 
+    // ------------------------------------------------------------------------------ static rows (4.7, plan step E7)
+
+    // A row that never moves once created (design 4.7: "skipped by propagation, uploaded once"; plan step E7, item E7.4,
+    // remedy 3). Honoured only by graphs made while SceneGraph::SetStaticTag is on (off by default): there, the
+    // archetypes that carry it leave the TransformPropagation and Bounds work after their first run and come back only
+    // when rows join or leave them (SceneGraph.h). Elsewhere a tag like any other. The creator adds it (with the row's
+    // other components, or later through the world); the graph never does.
+    struct Static { };
+    DONUT_ECS_TAG(Static, "c6dff561-26af-4879-a863-007dc81e967e")
+
     // --------------------------------------------------------------------- the inspector's read-only list (11.4)
 
     // A world resource (4.9) that the graph's store registers in its world (plan step E7, item E7.7): the components

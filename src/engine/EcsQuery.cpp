@@ -25,6 +25,7 @@
 #include "EcsQueryImpl.h"
 #include "EcsSchedulerImpl.h"
 
+#include <atomic>
 #include <thread>
 
 namespace donut::engine::ecs
@@ -564,5 +565,23 @@ namespace donut::engine::ecs
                                                 : m_NullRowVersions.data();
         }
         return written;
+    }
+}
+
+namespace donut::engine
+{
+    namespace
+    {
+        std::atomic<bool> g_QueryChunkPrefetch{ false };   // E7.4 remedy 1: off until measured
+    }
+
+    void SetQueryChunkPrefetch(bool enabled) noexcept
+    {
+        g_QueryChunkPrefetch.store(enabled, std::memory_order_relaxed);
+    }
+
+    bool GetQueryChunkPrefetch() noexcept
+    {
+        return g_QueryChunkPrefetch.load(std::memory_order_relaxed);
     }
 }

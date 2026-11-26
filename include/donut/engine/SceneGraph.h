@@ -972,6 +972,29 @@ namespace donut::engine
         static void SetRowTrackedTransforms(bool enabled) noexcept;
         [[nodiscard]] static bool GetRowTrackedTransforms() noexcept;
 
+        // The Static tag (SceneComponents.h; design 4.7; plan step E7, item E7.4, remedy 3): a process-wide switch, off
+        // by default, that stays off until measured (sub-plan revision 2, stage B), read once by the graph's constructor
+        // like SetRowTrackedTransforms; a graph keeps what it was made with. In a graph made while it is on, an archetype
+        // of depth below c_MaxHierarchyDepth that carries Static, and that is not simulation-driven, leaves the
+        // TransformPropagation work after a run that took it, and so does one that has no dynamic-bounds leaves the
+        // Bounds work: a later run takes it again only when rows joined or left it (Bounds also after a structural
+        // change through the API, SetLeaf or InvalidateContent), and then computes the chunks that rows joined, from
+        // their local transforms and their parents' worlds at that time. Their world transforms do not follow later
+        // writes of their LocalTransform, nor moves of their parents. Such a write is refused in Debug builds, with a
+        // warning: SceneGraphNode::SetTransform does not write; a write through the world is found by the next
+        // propagation, which does not propagate it. Release builds do not check, and do not propagate it either.
+        static void SetStaticTag(bool enabled) noexcept;
+        [[nodiscard]] static bool GetStaticTag() noexcept;
+
+        // The Bounds phase's path for chunks without children (plan step E7, item E7.4, remedy 4): a chunk whose rows
+        // have no children and one parent (its subgraph summary says so; it changes only with a full subgraph pass) takes
+        // its subgraph step from its summary and its new box, with one mark for the parent, instead of reading every
+        // row's links, parent and content. A process-wide switch, off by default, that stays off until measured
+        // (stage B), read at every run of the Bounds system; it changes no output (subgraph values, marks, summaries),
+        // only the work. Set it on any thread.
+        static void SetChildlessBoundsPath(bool enabled) noexcept;
+        [[nodiscard]] static bool GetChildlessBoundsPath() noexcept;
+
         // Replaces the current root node of the graph with the new one.
         nvrhi::AutoPtr<SceneGraphNode> SetRootNode(SceneGraphNode *root);
         

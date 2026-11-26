@@ -1247,6 +1247,32 @@ bool SceneGraph::GetRowTrackedTransforms() noexcept
     return g_RowTrackedTransforms.load(std::memory_order_relaxed);
 }
 
+namespace
+{
+    std::atomic<bool> g_StaticTag{ false };             // E7.4 remedy 3: off until measured
+    std::atomic<bool> g_ChildlessBoundsPath{ false };   // E7.4 remedy 4: off until measured
+}
+
+void SceneGraph::SetStaticTag(bool enabled) noexcept
+{
+    g_StaticTag.store(enabled, std::memory_order_relaxed);
+}
+
+bool SceneGraph::GetStaticTag() noexcept
+{
+    return g_StaticTag.load(std::memory_order_relaxed);
+}
+
+void SceneGraph::SetChildlessBoundsPath(bool enabled) noexcept
+{
+    g_ChildlessBoundsPath.store(enabled, std::memory_order_relaxed);
+}
+
+bool SceneGraph::GetChildlessBoundsPath() noexcept
+{
+    return g_ChildlessBoundsPath.load(std::memory_order_relaxed);
+}
+
 nvrhi::AutoPtr<SceneGraphNode> SceneGraph::SetRootNode(SceneGraphNode *root)
 {
     DONUT_SCENE_GRAPH_WARN_RENDER_READ(m_Store, "SetRootNode");

@@ -1834,6 +1834,133 @@ void test_walker_order()
     graph->Refresh(2);
 }
 
+// ------------------------------------------------------- the Bounds path for chunks without children (E7.4 remedy 4)
+
+namespace
+{
+    // SceneGraph::m_Store (an explicit instantiation may name a private member), for the store's counters.
+    template <typename Tag, typename Tag::Type Member>
+    struct PrivateMember
+    {
+        friend typename Tag::Type GetMember(Tag) { return Member; }
+    };
+    struct StoreTag
+    {
+        using Type = SceneGraphStore* SceneGraph::*;
+        friend Type GetMember(StoreTag);
+    };
+    template struct PrivateMember<StoreTag, &SceneGraph::m_Store>;
+    const SceneGraphStore::Counters& CountersOf(SceneGraph* graph)
+    {
+        return (graph->*GetMember(StoreTag()))->GetCounters();
+    }
+}
+
+// SceneGraph::SetChildlessBoundsPath is off by default and read at each Bounds run. Two graphs built and moved alike
+// (leaves under the root, groups of leaves, leaves with children), the second refreshed with it on: every node's
+// subgraph box and content equal, and equal to the brute force, over incremental passes and the full passes of an
+// attach and of InvalidateContent; the path is taken only by the second graph.
+void test_childless_bounds_path()
+{
+    CHECK(!SceneGraph::GetChildlessBoundsPath());
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    std::vector<nvrhi::AutoPtr<MeshInfo>> meshes;
+    for (int i = 0; i < 3; ++i)
+        meshes.push_back(MakeMesh(factory, 0.5f + float(i)));
+    struct Built
+    {
+        nvrhi::AutoPtr<SceneGraph> graph;
+        std::vector<nvrhi::AutoPtr<SceneGraphNode>> nodes;
+    };
+    auto build = [&]()
+    {
+        Built b;
+        b.graph = MAKE_RC_OBJ_PTR(SceneGraph);
+        b.graph->SetRootNode(MakeNode("root"));
+        Rng rng(91);
+        auto add = [&](SceneGraphNode* parent, uint32_t i)
+        {
+            auto node = MakeNode("n");
+            RandomMove(rng, node);
+            node->SetLeaf(factory->CreateMeshInstance(meshes[i % 3]));
+            b.graph->Attach(parent, node);
+            b.nodes.push_back(node);
+            return node.Get();
+        };
+        for (uint32_t i = 0; i < 400; ++i)
+            add(b.graph->GetRootNode(), i);
+        for (uint32_t g = 0; g < 8; ++g)
+        {
+            auto group = MakeNode("group");
+            RandomMove(rng, group);
+            b.graph->Attach(b.graph->GetRootNode(), group);
+            b.nodes.push_back(group);
+            for (uint32_t i = 0; i < 40; ++i)
+                add(group, i);
+        }
+        for (uint32_t i = 0; i < 10; ++i)
+        {
+            SceneGraphNode* parent = add(b.graph->GetRootNode(), i);
+            for (uint32_t k = 0; k < 3; ++k)
+                add(parent, k);
+        }
+        return b;
+    };
+    Built built[2] = { build(), build() };
+    auto refresh = [&](uint32_t frame)
+    {
+        built[0].graph->Refresh(frame);
+        SceneGraph::SetChildlessBoundsPath(true);
+        built[1].graph->Refresh(frame);
+        SceneGraph::SetChildlessBoundsPath(false);
+    };
+    auto compare = [&]()
+    {
+        CheckAgainstBruteForce(built[1].graph);
+        SceneGraphWalker a(built[0].graph->GetRootNode());
+        SceneGraphWalker b(built[1].graph->GetRootNode());
+        uint32_t nodes = 0;
+        for (; a && b; a.Next(true), b.Next(true), ++nodes)
+        {
+            const dm::box3 boxA = a->GetGlobalBoundingBox();
+            const dm::box3 boxB = b->GetGlobalBoundingBox();
+            CHECK(SameBits(&boxA, &boxB, sizeof(dm::box3)));
+            CHECK(a->GetSubgraphContentFlags() == b->GetSubgraphContentFlags());
+        }
+        CHECK(!a && !b && nodes > 700);
+    };
+    refresh(1);
+    compare();
+    for (uint32_t frame = 2; frame <= 12; ++frame)
+    {
+        for (uint32_t k = 0; k < 60; ++k)
+        {
+            for (Built& b : built)
+            {
+                Rng rng(frame * 1000 + k);
+                RandomMove(rng, b.nodes[rng.Below(uint32_t(b.nodes.size()))]);
+            }
+        }
+        if (frame == 5)
+            for (Built& b : built)
+                b.graph->Attach(b.nodes[3], MakeNode("late"));   // a leaf gets a child: a full pass
+        if (frame == 8)
+            for (Built& b : built)
+                b.nodes[17]->InvalidateContent();
+        refresh(frame);
+        compare();
+    }
+    const SceneGraphStore::Counters& off = CountersOf(built[0].graph);
+    const SceneGraphStore::Counters& on = CountersOf(built[1].graph);
+    CHECK(off.childlessChunks == 0 && on.childlessChunks > 0);
+    CHECK(off.subgraphPasses == on.subgraphPasses && off.fullSubgraphPasses == on.fullSubgraphPasses);
+    CHECK(on.subgraphPasses > on.fullSubgraphPasses);
+    CHECK(!SceneGraph::GetChildlessBoundsPath());
+    std::printf("  equal over 12 frames (%llu passes, %llu full); %llu chunks took the path, %llu bounds chunks\n",
+                (unsigned long long)on.subgraphPasses, (unsigned long long)on.fullSubgraphPasses,
+                (unsigned long long)on.childlessChunks, (unsigned long long)on.boundsChunks);
+}
+
 int main(int argc, char** argv)
 {
     struct Case { const char* name; void (*run)(); };
@@ -1854,6 +1981,7 @@ int main(int argc, char** argv)
         { "simulation_components", test_simulation_components },
         { "row_hints", test_row_hints },
         { "review_fixes", test_review_fixes },
+        { "childless_bounds_path", test_childless_bounds_path },
         { "steady_state", test_steady_state_allocations },
     };
     log::SetCallback([](log::Severity severity, const char* message)

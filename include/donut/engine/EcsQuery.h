@@ -44,6 +44,10 @@
 #include <type_traits>
 #include <utility>
 
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
+#include <xmmintrin.h>
+#endif
+
 namespace donut::engine
 {
     // What a chunk request is for. Versions are explicit, never inferred from the calling thread (EcsScheduler.h).
@@ -83,6 +87,15 @@ namespace donut::engine
         virtual uint32_t GetTermCount() noexcept = 0;
         virtual uint32_t GetDataTermCount() noexcept = 0;
     };
+
+    // Chunk prefetch in the typed loops (plan step E7, item E7.4, remedy 1; sub-plan revision 2, part I5): while the
+    // callback runs on a chunk, the first bytes of the next chunk's data columns (and its entities, in the row forms) are
+    // fetched, the next chunk of the same IQuery::GetChunks batch. A process-wide switch, off by default, which stays off
+    // until measured (revision 2, stage B). ForEachChunk, ForEach, ParallelForChunks and ParallelForEach read it once
+    // per call; a call keeps what it read. It changes no result (the same chunks, rows, order and stamps), only memory
+    // traffic. Set it on any thread.
+    void SetQueryChunkPrefetch(bool enabled) noexcept;
+    [[nodiscard]] bool GetQueryChunkPrefetch() noexcept;
 
     // ------------------------------------------------------------ typed terms (header-only, outside the ABI)
 
@@ -181,6 +194,30 @@ namespace donut::engine
         {
             return QueryTerm{ RegisterComponent<typename Term::Component>(world), Term::op, Term::access, {} };
         }
+
+        // SetQueryChunkPrefetch: a hint per cache line, and at most c_PrefetchBytesPerColumn of each column (the start of
+        // its stream, where the hardware prefetcher has no history yet; the next chunk is another page).
+        constexpr size_t c_PrefetchLineBytes = 64;
+        constexpr size_t c_PrefetchBytesPerColumn = 1024;
+
+        inline void PrefetchLine(const void* address) noexcept
+        {
+#if defined(__GNUC__) || defined(__clang__)
+            __builtin_prefetch(address);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+            _mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
+#else
+            (void)address;
+#endif
+        }
+
+        inline void PrefetchBytes(const void* address, size_t bytes) noexcept
+        {
+            const char* const first = static_cast<const char*>(address);
+            const size_t count = bytes < c_PrefetchBytesPerColumn ? bytes : c_PrefetchBytesPerColumn;
+            for (size_t offset = 0; offset < count; offset += c_PrefetchLineBytes)
+                PrefetchLine(first + offset);
+        }
     }
 
     template <typename... Terms>
@@ -223,14 +260,10 @@ namespace donut::engine
         template <typename F>
         void ForEachChunk(const ChunkRequest& request, F&& f) const
         {
-            ChunkView views[c_ChunkBatch];
-            const uint32_t chunkCount = m_Query->GetChunkCount();
-            for (uint32_t first = 0; first < chunkCount; first += c_ChunkBatch)
-            {
-                const uint32_t written = m_Query->GetChunks(first, request, c_ChunkBatch, views);
-                for (uint32_t i = 0; i < written; ++i)
-                    InvokeChunk(f, views[i], std::make_index_sequence<List::dataCount>());
-            }
+            if (GetQueryChunkPrefetch())
+                RunSerial<false, true>(request, f);
+            else
+                RunSerial<false, false>(request, f);
         }
 
         // f(Entity, Ref...) for each row that passes the row filters. One argument per data term: const T& for reads,
@@ -244,10 +277,10 @@ namespace donut::engine
         template <typename F>
         void ForEach(const ChunkRequest& request, F&& f) const
         {
-            ForEachChunk(request, [&](const ChunkView& view, auto...)
-            {
-                InvokeRows(f, view, std::make_index_sequence<List::dataCount>());
-            });
+            if (GetQueryChunkPrefetch())
+                RunSerial<true, true>(request, f);
+            else
+                RunSerial<true, false>(request, f);
         }
 
         // Splits the matched chunks into tasks of `chunksPerTask` consecutive chunks on the context's job system and
@@ -345,33 +378,94 @@ namespace donut::engine
                 return column[row];
         }
 
+        // The chunks of one GetChunks batch, each to f (the chunk form or the row form); with Prefetch, the next chunk
+        // of the batch is prefetched before f runs on this one. Without, the plain loop.
+        template <bool PerRow, bool Prefetch, typename F>
+        static void RunBatch(F& f, const ChunkView* views, uint32_t written)
+        {
+            for (uint32_t i = 0; i < written; ++i)
+            {
+                if constexpr (Prefetch)
+                {
+                    if (i + 1 < written)
+                        PrefetchChunk<PerRow>(views[i + 1], std::make_index_sequence<List::dataCount>());
+                }
+                if constexpr (PerRow)
+                    InvokeRows(f, views[i], std::make_index_sequence<List::dataCount>());
+                else
+                    InvokeChunk(f, views[i], std::make_index_sequence<List::dataCount>());
+            }
+        }
+
+        template <bool PerRow, size_t... K>
+        static void PrefetchChunk(const ChunkView& view, std::index_sequence<K...>) noexcept
+        {
+            if constexpr (PerRow)
+                detail::PrefetchBytes(view.entities, size_t(view.count) * sizeof(Entity));
+            (PrefetchColumn<K>(view), ...);
+            (void)view;
+        }
+
+        template <size_t K>
+        static void PrefetchColumn(const ChunkView& view) noexcept
+        {
+            using Term = DataTerm<K>;
+            const void* const column = view.columns[K];
+            if (!column)
+                return;   // an Optional term the chunk does not have
+            if constexpr (Term::perChunk)
+                detail::PrefetchLine(column);
+            else
+                detail::PrefetchBytes(column, size_t(view.count) *
+                                                  sizeof(std::remove_pointer_t<typename Term::Pointer>));
+        }
+
+        template <bool PerRow, bool Prefetch, typename F>
+        void RunSerial(const ChunkRequest& request, F& f) const
+        {
+            ChunkView views[c_ChunkBatch];
+            const uint32_t chunkCount = m_Query->GetChunkCount();
+            for (uint32_t first = 0; first < chunkCount; first += c_ChunkBatch)
+            {
+                const uint32_t written = m_Query->GetChunks(first, request, c_ChunkBatch, views);
+                RunBatch<PerRow, Prefetch>(f, views, written);
+            }
+        }
+
+        // A task of RunParallel (a member template: a local class cannot have one).
+        template <bool PerRow, bool Prefetch, typename F>
+        struct ParallelTask
+        {
+            IQuery* query;
+            F* function;
+            ChunkRequest request;
+
+            static void Run(void* taskContext, uint32_t begin, uint32_t end, uint32_t) noexcept
+            {
+                const ParallelTask* task = static_cast<const ParallelTask*>(taskContext);
+                ChunkView views[c_ChunkBatch];
+                for (uint32_t first = begin; first < end; first += c_ChunkBatch)
+                {
+                    const uint32_t capacity = end - first < c_ChunkBatch ? end - first : c_ChunkBatch;
+                    const uint32_t written = task->query->GetChunks(first, task->request, capacity, views);
+                    RunBatch<PerRow, Prefetch>(*task->function, views, written);
+                }
+            }
+        };
+
         template <bool PerRow, typename F>
         void RunParallel(ISystemContext* context, uint32_t chunksPerTask, F& f) const
         {
-            struct Task
-            {
-                IQuery* query;
-                F* function;
-                ChunkRequest request;
+            if (GetQueryChunkPrefetch())
+                RunParallelTasks<PerRow, true>(context, chunksPerTask, f);
+            else
+                RunParallelTasks<PerRow, false>(context, chunksPerTask, f);
+        }
 
-                static void Run(void* taskContext, uint32_t begin, uint32_t end, uint32_t) noexcept
-                {
-                    const Task* task = static_cast<const Task*>(taskContext);
-                    ChunkView views[c_ChunkBatch];
-                    for (uint32_t first = begin; first < end; first += c_ChunkBatch)
-                    {
-                        const uint32_t capacity = end - first < c_ChunkBatch ? end - first : c_ChunkBatch;
-                        const uint32_t written = task->query->GetChunks(first, task->request, capacity, views);
-                        for (uint32_t i = 0; i < written; ++i)
-                        {
-                            if constexpr (PerRow)
-                                InvokeRows(*task->function, views[i], std::make_index_sequence<List::dataCount>());
-                            else
-                                InvokeChunk(*task->function, views[i], std::make_index_sequence<List::dataCount>());
-                        }
-                    }
-                }
-            };
+        template <bool PerRow, bool Prefetch, typename F>
+        void RunParallelTasks(ISystemContext* context, uint32_t chunksPerTask, F& f) const
+        {
+            using Task = ParallelTask<PerRow, Prefetch, F>;
             Task task{ m_Query.Get(), &f, MakeChunkRequest(context) };
             context->GetJobSystem()->ParallelFor(m_Query->GetChunkCount(), chunksPerTask, &Task::Run, &task);
         }

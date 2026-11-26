@@ -1635,6 +1635,110 @@ namespace
         }
     }
 
+    // Compact packet records (plan step E7, item E7.4, remedy 2; part I5): RenderService::SetCompactPacketRecords is off
+    // by default; with it on, each extraction's snapshot (the views' ranges, the instances, the packets with their keys
+    // and order) equals the one with it off, over a scene edited for eight frames, serially and with every step on the
+    // job system. The sorter's two-step form gives Sort's order, with the position in the word and in the index arrays.
+    void test_compact_packet_records()
+    {
+        CHECK(!RenderService::GetCompactPacketRecords());
+        JobSystemDesc jobDesc;
+        jobDesc.debugName = "test_draw_packets.compact";
+        jobDesc.workerThreadCount = 8;
+        nvrhi::AutoPtr<IJobSystem> inner;
+        CHECK(CreateJobSystem(jobDesc, &inner) == nvrhi::FS_OK);
+        auto jobs = MAKE_RC_OBJ_PTR(CountingJobSystem, inner.Get());
+
+        // The sorter: Prepare, the words written by the caller, Finish; against Sort.
+        visibility::RadixSorter sorter;
+        visibility::RadixSorter reference;
+        Rng rng{ 0x5eed };
+        uint32_t cases = 0;
+        uint32_t unpacked = 0;
+        for (uint64_t mask : { uint64_t(0), uint64_t(0xff), (uint64_t(1) << 62) - 1, ~uint64_t(0) })
+        {
+            for (uint32_t count : { 1u, 2u, 100u, 20000u })
+            {
+                for (bool parallel : { false, true })
+                {
+                    std::vector<uint64_t> keys(count);
+                    uint64_t keyOr = 0, keyAnd = ~uint64_t(0);
+                    for (uint64_t& key : keys)
+                    {
+                        key = (rng.Next() % 13 * 0x0123456789abcdefull & mask) | (0x4000000000000000ull & ~mask);
+                        keyOr |= key;
+                        keyAnd &= key;
+                    }
+                    IJobSystem* sortJobs = parallel ? inner.Get() : nullptr;
+                    std::vector<uint32_t> expected(count), order(count);
+                    CHECK(reference.Sort(keys.data(), count, keyOr ^ keyAnd, 3, expected.data(), sortJobs));
+                    CHECK(sorter.Prepare(count, keyOr ^ keyAnd));
+                    if (uint64_t* words = sorter.Words())
+                    {
+                        uint32_t* indices = sorter.Indices();
+                        unpacked += indices ? 1 : 0;
+                        for (uint32_t i = 0; i < count; ++i)
+                        {
+                            words[i] = sorter.Word(keys[i], i);
+                            if (indices)
+                                indices[i] = i;
+                        }
+                    }
+                    CHECK(sorter.Finish(3, order.data(), sortJobs));
+                    CHECK(order == expected);
+                    ++cases;
+                }
+            }
+        }
+        CHECK(unpacked > 0);
+        std::printf("  %u two-step sorts equal to Sort (%u unpacked)\n", cases, unpacked);
+
+        // The extraction, off against on, serially and with every step on the job system.
+        const ExtractionMode modes[2] = { { false, false }, { true, true } };
+        TestViews views;
+        PacketScene scene(0xc0ffee);
+        scene.Build(150);
+        RenderFrame frame;
+        auto service = MakeService(scene.graph);
+        scene.graph->SetJobSystem(jobs.Get());
+        uint64_t packets[c_DrawPacketPassCount] = {};
+        for (uint32_t f = 1; f <= 8; ++f)
+        {
+            scene.Edit(f);
+            scene.graph->Refresh(f);
+            const ExtractDesc desc = views.Desc(f, f % 2 == 0);
+            for (const ExtractionMode& mode : modes)
+            {
+                mode.Set();
+                uint64_t hashes[2] = {};
+                for (uint32_t compact = 0; compact < 2; ++compact)
+                {
+                    RenderService::SetCompactPacketRecords(compact != 0);
+                    const RenderSnapshot& s = ExtractFrame(service, frame, desc);
+                    Hasher pointers;
+                    pointers.Array(s.instances.leaves, s.instances.count);
+                    pointers.Array(s.instances.meshInfos, s.instances.count);
+                    hashes[compact] = HashPackets(s) ^ pointers.value;
+                    if (compact)
+                    {
+                        for (uint32_t v = 0; v < s.viewCount; ++v)
+                            for (uint32_t p = 0; p < c_DrawPacketPassCount; ++p)
+                                packets[p] += s.views[v].packets[p].count;
+                    }
+                    service->EndFrame(true);
+                }
+                CHECK(hashes[0] == hashes[1]);
+            }
+        }
+        RenderService::SetCompactPacketRecords(false);
+        ExtractionMode::Reset();
+        scene.graph->SetJobSystem(nullptr);
+        std::printf("  16 extractions equal with compact records: %llu opaque and %llu transparent packets\n",
+                    (unsigned long long)packets[0], (unsigned long long)packets[1]);
+        CHECK(packets[0] > 1000 && packets[1] > 1000);
+        CHECK(!RenderService::GetCompactPacketRecords());
+    }
+
     // Ten frames of runtime rows moving beside nodes after warm-up, five views: no operator new, no ECS heap block. A
     // tenth of the rows swing between two places every frame through the world, so that the views' sets change.
     void test_runtime_steady_state()
@@ -1723,6 +1827,7 @@ int main(int argc, char** argv)
         { "parallel_sort_workers", test_parallel_sort_workers },
         { "runtime_rows", test_runtime_rows },
         { "runtime_steady_state", test_runtime_steady_state },
+        { "compact_packet_records", test_compact_packet_records },
     };
     try
     {

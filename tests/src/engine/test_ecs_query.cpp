@@ -2623,6 +2623,97 @@ void test_row_versions_chunk_only_writer()
     CHECK(Impl(world).GetValidationErrorCount() == 0);
 }
 
+// --------------------------------------------------------------------- chunk prefetch (E7.4 remedy 1, part I5)
+
+// SetQueryChunkPrefetch: off by default; every typed form visits the same chunks, rows and values, in the same order,
+// with the same stamps, with it on and off. Small chunks, so that batches of 16 views are full and the next chunk is
+// prefetched across many of them; an Optional term absent in one archetype, a per-chunk term, and a form without data.
+void test_chunk_prefetch()
+{
+    CHECK(!GetQueryChunkPrefetch());
+    auto world = MakeWorld(true, 1024, 4096);
+    const Ids ids = RegisterAll(world);
+    std::vector<Entity> e(3000);
+    std::vector<Position> positions(3000);
+    for (uint32_t i = 0; i < 3000; ++i)
+        positions[i] = Position{ float(i), float(i % 7), 2 };
+    CreateMany(world, { ids.position, ids.velocity }, 1800, e.data(), { positions.data(), nullptr });
+    CreateMany(world, { ids.position, ids.velocity, ids.toggle }, 700, e.data() + 1800,
+               { positions.data() + 1800, nullptr, nullptr });
+    CreateMany(world, { ids.position, ids.velocity, ids.chunkBounds }, 500, e.data() + 2500,
+               { positions.data() + 2500, nullptr, nullptr });
+    auto jobs = MAKE_RC_OBJ_PTR(TestJobSystem, 4u);
+    auto context = MAKE_RC_OBJ_PTR(TestContext, world.Get(), jobs.Get());
+    Query<Read<Position>, Write<Velocity>, Optional<Toggle>> query(world, "prefetch");
+    Query<ReadChunk<ChunkBounds>, Read<Position>> perChunk(world, "prefetch per chunk");
+    Query<With<Toggle>> withoutData(world, "prefetch without data");
+    const uint32_t chunkCount = query.Get()->GetChunkCount();
+    CHECK(chunkCount > 40);
+    const uint32_t tableSize = Impl(world).GetEntityTableSize();
+
+    // Everything the forms see and write, as numbers; stamps relative to the run's version.
+    auto trace = [&](bool prefetch)
+    {
+        SetQueryChunkPrefetch(prefetch);
+        CHECK(GetQueryChunkPrefetch() == prefetch);
+        std::vector<uint64_t> out;
+        context->NextRun();
+        query.ForEachChunk(context.Get(), [&](const ChunkView& view, const Position* p, Velocity* v,
+                                              const Toggle* t) {
+            out.push_back(view.chunkIndex);
+            out.push_back(view.count);
+            out.push_back(t != nullptr);
+            for (uint32_t row = 0; row < view.count; ++row)
+            {
+                out.push_back(GetEntityIndex(view.entities[row]));
+                v[row] = Velocity{ p[row].x * 2, 0, 0 };
+            }
+        });
+        query.ForEach(context.Get(), [&](Entity entity, const Position& p, Velocity& v, const Toggle* t) {
+            out.push_back(GetEntityIndex(entity));
+            out.push_back(t != nullptr);
+            v.y = p.y + 1;
+        });
+        perChunk.ForEach(context.Get(), [&](Entity entity, const ChunkBounds& bounds, const Position& p) {
+            out.push_back(GetEntityIndex(entity));
+            out.push_back(uint64_t(p.x));
+            out.push_back(&bounds == world->GetComponent(entity, ids.chunkBounds));
+        });
+        uint64_t tagged = 0;
+        withoutData.ForEach(context.Get(), [&](Entity entity) { tagged += GetEntityIndex(entity); });
+        out.push_back(tagged);
+        context->NextRun();
+        std::unique_ptr<std::atomic<uint32_t>[]> chunkHits(new std::atomic<uint32_t>[chunkCount]());
+        query.ParallelForChunks(context.Get(), 3, [&](const ChunkView& view, const Position* p, Velocity* v,
+                                                      const Toggle*) {
+            chunkHits[view.chunkIndex].fetch_add(1);
+            for (uint32_t row = 0; row < view.count; ++row)
+                v[row].z = p[row].x + float(view.chunkIndex);
+        });
+        std::unique_ptr<std::atomic<uint32_t>[]> rowHits(new std::atomic<uint32_t>[tableSize]());
+        query.ParallelForEach(context.Get(), 2, [&](Entity entity, const Position&, Velocity& v, const Toggle*) {
+            rowHits[GetEntityIndex(entity)].fetch_add(1);
+            v.x += 1;
+        });
+        for (uint32_t c = 0; c < chunkCount; ++c)
+            out.push_back(chunkHits[c].load());
+        for (const Entity entity : e)
+        {
+            const Velocity* v = static_cast<const Velocity*>(world->GetComponent(entity, ids.velocity));
+            out.push_back(rowHits[GetEntityIndex(entity)].load());
+            out.push_back(uint64_t(v->x) * 1000003 + uint64_t(v->y) * 1009 + uint64_t(v->z));
+            out.push_back(context->version - ColumnVersion(world, entity, ids.velocity));
+        }
+        return out;
+    };
+    const std::vector<uint64_t> off = trace(false);
+    const std::vector<uint64_t> on = trace(true);
+    SetQueryChunkPrefetch(false);
+    CHECK(off.size() > 3 * 3000 && off == on);
+    CHECK(!GetQueryChunkPrefetch());
+    CHECK(Impl(world).GetValidationErrorCount() == 0);
+}
+
 int main(int, char**)
 {
     struct Test
@@ -2645,6 +2736,7 @@ int main(int, char**)
         { "typed_forms", &test_typed_forms },
         { "determinism", &test_determinism },
         { "row_versions_chunk_only_writer", &test_row_versions_chunk_only_writer },
+        { "chunk_prefetch", &test_chunk_prefetch },
         { "steady_state_allocations", &test_steady_state_allocations },
         { "performance_smoke", &test_performance_smoke },
     };

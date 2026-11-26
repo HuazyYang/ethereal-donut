@@ -68,6 +68,7 @@ using namespace donut::math;
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <new>
 #include <set>
 #include <sstream>
@@ -2201,6 +2202,185 @@ void test_script_golden()
     CHECK(TakeWarnings() == 0);
 }
 
+// ------------------------------------------------------------------------- the Static tag (E7.4 remedy 3, part I5)
+
+// SceneGraph::SetStaticTag is off by default and read when a graph is made. Two rigs built and run alike, the second
+// made with it on: Static runtime rows and Static nodes (one with a moving child) beside moving rows and nodes; rows
+// spawned into and destroyed from the Static archetype; a content change. World transforms, world bounds, chunk bounds
+// and subgraph boxes are equal with it on and off, and the second graph leaves its Static archetypes out. Then a write
+// of a Static row's LocalTransform: SetTransform is refused in Debug with a warning (written in Release); a write through
+// the world is not propagated (a warning in Debug); neither moves the row there. The first graph moves both.
+void test_static_tag()
+{
+    CHECK(!SceneGraph::GetStaticTag());
+    Assets assets;
+    std::unique_ptr<Rig> rigs[2];
+    rigs[0] = std::make_unique<Rig>(4);
+    SceneGraph::SetStaticTag(true);
+    rigs[1] = std::make_unique<Rig>(4);
+    SceneGraph::SetStaticTag(false);
+    CHECK(!SceneGraph::GetStaticTag());
+
+    struct Content
+    {
+        ComponentId staticId = ComponentId::Invalid;
+        MeshId mesh = MeshId::Invalid;
+        std::vector<Entity> staticRows;
+        std::vector<Entity> movingRows;
+        std::vector<SceneGraphNode*> staticNodes;
+        std::vector<SceneGraphNode*> movingNodes;
+        Query<Write<LocalTransform>, With<RuntimeMeshInstance>, Without<Static>> movers;
+    };
+    Content content[2];
+    auto spawnStatic = [&](Rig& rig, Content& c, uint32_t count, double x0)
+    {
+        std::vector<LocalTransform> locals;
+        for (uint32_t i = 0; i < count; ++i)
+            locals.push_back(MakeLocal(dm::double3(x0 + 2.0 * double(i), 3.0, -1.0), dm::dquat::identity(), 0.5));
+        const std::vector<Entity> rows = rig.Spawn(std::vector<MeshId>(count, c.mesh), locals,
+                                                   { { c.staticId, nullptr } });
+        c.staticRows.insert(c.staticRows.end(), rows.begin(), rows.end());
+    };
+    for (uint32_t g = 0; g < 2; ++g)
+    {
+        Rig& rig = *rigs[g];
+        Content& c = content[g];
+        c.staticId = RegisterComponent<Static>(rig.world);
+        c.mesh = rig.graph->AcquireRuntimeMesh(assets.two);
+        rig.graph->SetRootNode(MAKE_RC_OBJ_PTR(SceneGraphNode));
+        spawnStatic(rig, c, 300, 0.0);
+        std::vector<LocalTransform> locals;
+        for (uint32_t i = 0; i < 200; ++i)
+            locals.push_back(MakeLocal(dm::double3(double(i), -4.0, 6.0)));
+        c.movingRows = rig.Spawn(std::vector<MeshId>(200, c.mesh), locals);
+        for (int i = 0; i < 30; ++i)
+        {
+            auto node = MAKE_RC_OBJ_PTR(SceneGraphNode);
+            node->SetTranslation(dm::double3(double(i), 10.0, 0.0));
+            node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, assets.one.Get()));
+            SceneGraphNode* attached = rig.graph->Attach(rig.graph->GetRootNode(), node);
+            if (i % 3 != 0)
+            {
+                c.movingNodes.push_back(attached);
+                continue;
+            }
+            CHECK(rig.world->AddComponent(rig.graph->GetEntity(attached), c.staticId, nullptr) == nvrhi::FS_OK);
+            c.staticNodes.push_back(attached);
+            if (i == 0)
+            {
+                auto child = MAKE_RC_OBJ_PTR(SceneGraphNode);
+                child->SetTranslation(dm::double3(0.0, 1.0, 0.0));
+                child->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, assets.one.Get()));
+                c.movingNodes.push_back(rig.graph->Attach(attached, child));
+            }
+        }
+        CHECK(c.movers.Create(rig.world, "static_tag movers") == nvrhi::FS_OK);
+        const ComponentId localId = FindComponent<LocalTransform>(rig.world);
+        Query<Write<LocalTransform>, With<RuntimeMeshInstance>, Without<Static>>* movers = &c.movers;
+        rig.AddSystem("move", Phase::PreSimulation, { { localId, Access::Write, {} } }, [movers](ISystemContext* context)
+        {
+            movers->ParallelForChunks(context, 1, [](const ChunkView& view, LocalTransform* local)
+            {
+                for (uint32_t r = 0; r < view.count; ++r)
+                    local[r].translation.y += 1.0;
+            });
+            return nvrhi::FS_OK;
+        });
+    }
+
+    // Every row's and node's results, the two graphs against each other.
+    auto compare = [&]()
+    {
+        const ComponentId chunkBoundsId = FindComponent<ChunkWorldBounds>(rigs[0]->world);
+        for (int list = 0; list < 2; ++list)
+        {
+            const std::vector<Entity>& a = list ? content[0].movingRows : content[0].staticRows;
+            const std::vector<Entity>& b = list ? content[1].movingRows : content[1].staticRows;
+            CHECK(a.size() == b.size());
+            for (size_t i = 0; i < a.size(); ++i)
+            {
+                CHECK(a[i] == b[i]);
+                CHECK(SameValue(*rigs[0]->Get<WorldTransform>(a[i]), *rigs[1]->Get<WorldTransform>(b[i])));
+                CHECK(SameValue(*rigs[0]->Get<WorldBounds>(a[i]), *rigs[1]->Get<WorldBounds>(b[i])));
+                CHECK(SameBits(rigs[0]->world->GetComponent(a[i], chunkBoundsId),
+                               rigs[1]->world->GetComponent(b[i], chunkBoundsId), sizeof(ChunkWorldBounds)));
+            }
+        }
+        for (int list = 0; list < 2; ++list)
+        {
+            const std::vector<SceneGraphNode*>& a = list ? content[0].movingNodes : content[0].staticNodes;
+            const std::vector<SceneGraphNode*>& b = list ? content[1].movingNodes : content[1].staticNodes;
+            for (size_t i = 0; i < a.size(); ++i)
+            {
+                CHECK(SameValue(a[i]->GetLocalToWorldTransform(), b[i]->GetLocalToWorldTransform()));
+                CHECK(SameValue(a[i]->GetGlobalBoundingBox(), b[i]->GetGlobalBoundingBox()));
+            }
+        }
+        CHECK(SameValue(rigs[0]->graph->GetRootNode()->GetGlobalBoundingBox(),
+                        rigs[1]->graph->GetRootNode()->GetGlobalBoundingBox()));
+    };
+
+    for (uint32_t f = 1; f <= 8; ++f)
+    {
+        for (uint32_t g = 0; g < 2; ++g)
+        {
+            Rig& rig = *rigs[g];
+            Content& c = content[g];
+            c.movingNodes[f % c.movingNodes.size()]->SetTranslation(dm::double3(double(f), 20.0, 0.0));
+            if (f == 3)
+                spawnStatic(rig, c, 50, 1000.0);   // rows join the Static archetype: computed once
+            if (f == 5)
+            {
+                // rows leave it: the last rows move into the holes
+                rig.Destroy(std::vector<Entity>(c.staticRows.begin() + 10, c.staticRows.begin() + 30));
+                c.staticRows.erase(c.staticRows.begin() + 10, c.staticRows.begin() + 30);
+            }
+            if (f == 6)
+                c.staticNodes[2]->InvalidateContent();
+            rig.Frame();
+        }
+        compare();
+    }
+    const SceneGraphStore::Counters& off = rigs[0]->Store().GetCounters();
+    const SceneGraphStore::Counters& on = rigs[1]->Store().GetCounters();
+    CHECK(off.staticSkips == 0 && on.staticSkips > 8);
+    std::printf("  equal over 8 frames; Static archetypes left out %llu times\n", (unsigned long long)on.staticSkips);
+    CHECK(TakeWarnings() == 0);
+
+    // Writes of a Static row's LocalTransform.
+#ifndef NDEBUG
+    const bool debug = true;
+#else
+    const bool debug = false;
+#endif
+    for (uint32_t g = 0; g < 2; ++g)
+    {
+        Rig& rig = *rigs[g];
+        Content& c = content[g];
+        const bool honoured = g == 1;
+        SceneGraphNode* node = c.staticNodes[1];
+        const dm::daffine3 nodeWorld = node->GetLocalToWorldTransform();
+        node->SetTranslation(dm::double3(500.0, 0.0, 0.0));
+        const bool written = node->GetTranslation().x == 500.0;
+        CHECK(written == (!honoured || !debug));
+        CHECK(TakeWarnings() == (honoured && debug ? 1u : 0u));
+        rig.Frame();
+        CHECK(SameValue(node->GetLocalToWorldTransform(), nodeWorld) == honoured);
+
+        const Entity row = c.staticRows[7];
+        const WorldTransform rowWorld = *rig.Get<WorldTransform>(row);
+        rig.world->AdvanceVersion();
+        auto* local = static_cast<LocalTransform*>(
+            rig.world->GetComponentForWrite(row, FindComponent<LocalTransform>(rig.world), c_WorldVersion));
+        CHECK(local);
+        local->translation.x += 100.0;
+        rig.Frame();
+        CHECK(SameValue(*rig.Get<WorldTransform>(row), rowWorld) == honoured);
+        CHECK(TakeWarnings() == (honoured && debug ? 1u : 0u));
+    }
+    CHECK(TakeWarnings() == 0);
+}
+
 // ----------------------------------------------------------------------------------------------- allocations
 
 // Steady state: runtime rows moved every frame by a system (parallel by chunk), Simulate, Refresh, GpuScene update,
@@ -2350,6 +2530,7 @@ int main(int argc, char** argv)
         { "reentrant_callbacks", test_reentrant_callbacks },
         { "parent_is_root", test_parent_is_root },
         { "script_golden", test_script_golden },
+        { "static_tag", test_static_tag },
         { "steady_state_allocations", test_steady_state_allocations },
         { "spawn_allocations", test_spawn_allocations },
     };

@@ -860,6 +860,7 @@ namespace donut::render
             frame.views = views;
             frame.viewCount = snapshot->viewCount;
             frame.drawDoubleSidedMaterialsSeparately = desc->drawDoubleSidedMaterialsSeparately;
+            frame.compactPacketRecords = RenderService::GetCompactPacketRecords();
             if (NVRHI_FAILED(instanceVisibility.Run(instanceQuery, frame, *snapshot, bytes)))
                 return Fail();
             return nvrhi::FS_OK;
@@ -1489,5 +1490,20 @@ namespace donut::render
     const LightShadowTable* RenderService::GetLightShadows() const noexcept
     {
         return m_Impl ? &m_Impl->shadows : nullptr;
+    }
+
+    namespace
+    {
+        std::atomic<bool> g_CompactPacketRecords{ false };   // E7.4 remedy 2: off until measured
+    }
+
+    void RenderService::SetCompactPacketRecords(bool enabled) noexcept
+    {
+        g_CompactPacketRecords.store(enabled, std::memory_order_relaxed);
+    }
+
+    bool RenderService::GetCompactPacketRecords() noexcept
+    {
+        return g_CompactPacketRecords.load(std::memory_order_relaxed);
     }
 }

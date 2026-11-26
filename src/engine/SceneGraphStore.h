@@ -530,6 +530,9 @@ namespace donut::engine
             uint64_t fullSubgraphPasses = 0;   // after a structural change, SetLeaf or InvalidateContent
             uint64_t subgraphNodes = 0;        // nodes with children whose values a pass computed
             uint64_t summarisedChunks = 0;     // chunks a pass took whole from their summary
+            uint64_t staticSkips = 0;          // E7.4 remedy 3: Static archetypes a propagation or bounds run left out
+            uint64_t childlessChunks = 0;      // E7.4 remedy 4: chunks whose subgraph step the Bounds system took from
+                                               // their summary
         };
         const Counters& GetCounters() const noexcept { return m_Counters; }
         // Test seam: the CreateEntities call of attach number `calls` from now (0: the next) is refused by the world
@@ -587,6 +590,11 @@ namespace donut::engine
             uint8_t world;
             bool driven;               // the interpolation writes its rows' worlds, not propagation
             bool runtime;              // runtime-only mesh instances: roots (parent c_Absent), in no node's subgraph
+            // E7.4 remedy 3: carries Static in a graph that honours it (SceneGraph::SetStaticTag), not driven, not in
+            // the deep bucket; and its entityCount and rowMoves at the run that last took it (RunPropagation)
+            bool staticRows = false;
+            uint32_t settledCount = ~0u;
+            uint64_t settledMoves = ~0ull;
         };
 
         // Rows that the interpolation writes: driven, with the columns that SetSimulationDriven adds.
@@ -617,6 +625,12 @@ namespace donut::engine
             uint8_t worldBounds;
             uint8_t chunkBounds;
             uint8_t leaf;              // LeafObject, for leaves with dynamic bounds (c_Absent otherwise)
+            // E7.4 remedy 3: carries Static in a graph that honours it, not driven, no dynamic bounds; and its
+            // entityCount, rowMoves and m_ContentChanges at the run that last took it (RunBounds)
+            bool staticRows = false;
+            uint32_t settledCount = ~0u;
+            uint64_t settledMoves = ~0ull;
+            uint64_t settledContent = ~0ull;
         };
 
         struct JointArchetype
@@ -673,9 +687,11 @@ namespace donut::engine
         };
 
         void MarkPath(Entity entity, uint32_t pass) noexcept;
-        // The Bounds system's part of an incremental pass, for one chunk it wrote: its summary and the marks.
-        void SubgraphFromBounds(const ecs::Archetype& archetype, uint32_t archetypeIndex, uint32_t chunk,
-                                const dm::box3& chunkBounds) noexcept;
+        // The Bounds system's part of an incremental pass, for one chunk it wrote: its summary and the marks. With
+        // `childless` (SceneGraph::SetChildlessBoundsPath), a chunk whose summary has one parent and no children takes
+        // them from the summary instead of its rows, and returns true.
+        bool SubgraphFromBounds(const ecs::Archetype& archetype, uint32_t archetypeIndex, uint32_t chunk,
+                                const dm::box3& chunkBounds, bool childless) noexcept;
         struct SubgraphRun;
         void SubgraphChunk(SubgraphContext& ctx, uint32_t archetypeIndex, uint32_t chunk, SubgraphRun& run) noexcept;
         void FinalizeSubgraph(SceneGraphNode* node, const SubgraphKeys& keys, uint64_t epoch) const noexcept;
@@ -766,6 +782,14 @@ namespace donut::engine
         void MarkSkinnedJoints(uint64_t since);
         static void RunPropagationTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
         static void RunBoundsTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
+        // E7.4 remedy 3 (SceneGraph::SetStaticTag): the Static tag's id once registered (looked up, never registered by
+        // the graph), whether a row carries it, the propagation tasks of a Static archetype, and in Debug builds the
+        // warning about writes of its LocalTransform.
+        ComponentId ResolveStaticTag() noexcept;
+        bool IsStaticRow(const RowRef& row) noexcept;
+        void QueueStaticLevel(LevelArchetype& level, uint32_t index, const ecs::Archetype& archetype,
+                              uint64_t since);
+        void WarnStaticWrites(const LevelArchetype& level, const ecs::Archetype& archetype, uint64_t since) const;
         static void RunTeleportTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
         static void RunInterpolationTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
 
@@ -825,6 +849,10 @@ namespace donut::engine
         ComponentId m_DepthId = ComponentId::Invalid;
         ComponentId m_JointTag = ComponentId::Invalid;   // SkinnedMeshReferenceLeaf, once a joint leaf was attached
         ComponentId m_DynamicBoundsTag = ComponentId::Invalid;   // DynamicBoundsLeaf, once such a leaf was attached
+        // E7.4 remedy 3: SceneGraph::GetStaticTag when the graph was made; the tag's id once something registered it
+        bool m_StaticTagHonoured = false;
+        ComponentId m_StaticTag = ComponentId::Invalid;
+        uint64_t m_ContentChanges = 0;   // InvalidateContent calls that changed a row: Static bounds read them again
 
         // Column indices per archetype, for the accessors; synchronised after structural changes.
         std::vector<std::array<uint8_t, SlotCount>> m_ArchetypeColumns;

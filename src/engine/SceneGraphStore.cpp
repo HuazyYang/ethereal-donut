@@ -867,7 +867,9 @@ namespace donut::engine
         SceneGraphStore* store;
         uint64_t version;
         bool subgraph;   // an incremental subgraph pass is prepared: summaries and marks of the chunks written
+        bool childless;  // E7.4 remedy 4 (SceneGraph::GetChildlessBoundsPath at this run)
         std::atomic<uint64_t> chunks{ 0 };
+        std::atomic<uint64_t> childlessChunks{ 0 };
     };
 
     // ---------------------------------------------------------------------------------------- the store
@@ -904,6 +906,9 @@ namespace donut::engine
             return id;
         };
         m_Ids[SlotLocal] = registerTransform(ComponentTraits<LocalTransform>::Desc());
+        // E7.4 remedy 3: whether Static rows are honoured (off by default); the tag is looked up, never registered here,
+        // so that the world's types and ids are the same either way.
+        m_StaticTagHonoured = SceneGraph::GetStaticTag();
         m_Ids[SlotLocalMatrix] = RegisterComponent<LocalMatrix>(m_World);
         m_Ids[SlotWorld] = registerTransform(ComponentTraits<WorldTransform>::Desc());
         m_Ids[SlotLeaf] = RegisterComponent<LeafObject>(m_World);
@@ -2581,6 +2586,16 @@ namespace donut::engine
         if (!LocateNode(node, row))
             return;
         RememberRow(node, row);
+#ifndef NDEBUG
+        // E7.4 remedy 3: a Static row does not move (refused in Debug builds; Release builds write, and propagation
+        // does not take it)
+        if (m_StaticTagHonoured && IsStaticRow(row) && !IsDriven(row))
+        {
+            log::warning("SceneGraph: SetTransform of node '%s' is refused: its row is Static (SceneComponents.h)",
+                         node->GetName().c_str());
+            return;
+        }
+#endif
         // the hot path of the API (design 10.1): one column lookup, the write, the stamp
         const uint8_t column = ColumnIndex(*row.archetype, row.archetypeIndex, SlotLocal);
         if (column != c_Absent)
@@ -2639,6 +2654,7 @@ namespace donut::engine
                     Stamp(row, SlotRenderFlags);
                 }
                 m_PendingContent = true;   // the next Refresh runs Bounds for it
+                ++m_ContentChanges;        // E7.4 remedy 3: Static archetypes' bounds are read again
                 BumpEpoch();
             }
         }
@@ -3188,6 +3204,9 @@ namespace donut::engine
     void SceneGraphStore::UpdateSystemLists() noexcept
     {
         const uint32_t count = m_Impl->GetArchetypeStorageCount();
+        // E7.4 remedy 3: an archetype with Static is made after the tag is registered, so the id is known for it here
+        const ComponentId staticTag = m_StaticTagHonoured && m_SystemArchetypesSeen < count ? ResolveStaticTag()
+                                                                                           : ComponentId::Invalid;
         for (uint32_t a = m_SystemArchetypesSeen; a < count; ++a)
         {
             const Archetype& archetype = m_Impl->GetArchetypeStorage(a);
@@ -3216,9 +3235,11 @@ namespace donut::engine
                 level = uint8_t(std::min(depth, c_MaxHierarchyDepth));
                 m_ArchetypeLevelSlot.resize(a + 1, c_None);
                 m_ArchetypeLevelSlot[a] = uint32_t(m_Levels[level].size());
-                m_Levels[level].push_back(LevelArchetype{ a, local, column(m_Ids[SlotLocalMatrix]),
-                                                          runtime ? c_Absent : column(m_Ids[SlotParent]), world,
-                                                          driven, runtime });
+                const bool staticRows = staticTag != ComponentId::Invalid && column(staticTag) != c_Absent && !driven;
+                LevelArchetype entry{ a, local, column(m_Ids[SlotLocalMatrix]),
+                                      runtime ? c_Absent : column(m_Ids[SlotParent]), world, driven, runtime };
+                entry.staticRows = staticRows && level != c_MaxHierarchyDepth;
+                m_Levels[level].push_back(entry);
 
                 const uint8_t localBounds = column(m_Ids[SlotLocalBounds]);
                 const uint8_t worldBounds = column(m_Ids[SlotWorldBounds]);
@@ -3226,8 +3247,12 @@ namespace donut::engine
                 const bool dynamicBounds =
                     m_DynamicBoundsTag != ComponentId::Invalid && column(m_DynamicBoundsTag) != c_Absent;
                 if (localBounds != c_Absent && worldBounds != c_Absent && chunkBounds != c_Absent)
-                    m_BoundsArchetypes.push_back(BoundsArchetype{ a, world, localBounds, worldBounds, chunkBounds,
-                                                                  dynamicBounds ? column(m_Ids[SlotLeaf]) : c_Absent });
+                {
+                    BoundsArchetype boundsEntry{ a, world, localBounds, worldBounds, chunkBounds,
+                                                 dynamicBounds ? column(m_Ids[SlotLeaf]) : c_Absent };
+                    boundsEntry.staticRows = staticRows && !dynamicBounds;
+                    m_BoundsArchetypes.push_back(boundsEntry);
+                }
             }
             m_ArchetypeLevel.push_back(level);
 
@@ -3244,6 +3269,62 @@ namespace donut::engine
                 m_DrivenArchetypes.push_back(poses);
         }
         m_SystemArchetypesSeen = count;
+    }
+
+    // ------------------------------------------------------------------ Static rows (4.7; E7.4 remedy 3)
+
+    ComponentId SceneGraphStore::ResolveStaticTag() noexcept
+    {
+        if (m_StaticTag == ComponentId::Invalid)
+            m_StaticTag = m_World->FindComponent(ComponentTraits<Static>::Desc().uuid);
+        return m_StaticTag;
+    }
+
+    bool SceneGraphStore::IsStaticRow(const RowRef& row) noexcept
+    {
+        const ComponentId tag = ResolveStaticTag();
+        return tag != ComponentId::Invalid && row.archetype->FindColumn(tag) != c_NoColumn;
+    }
+
+    // A Static archetype gets tasks only when rows joined or left it since the run that last took it: then the chunks
+    // that rows joined (their Added version), whole, from their parents' worlds as they are. Its LocalTransform and its
+    // parents are not followed; in Debug builds a write of its LocalTransform is reported.
+    void SceneGraphStore::QueueStaticLevel(LevelArchetype& level, uint32_t index, const Archetype& archetype,
+                                           uint64_t since)
+    {
+#ifndef NDEBUG
+        WarnStaticWrites(level, archetype, since);
+#endif
+        if (archetype.entityCount == level.settledCount && archetype.rowMoves == level.settledMoves)
+        {
+            ++m_Counters.staticSkips;
+            return;
+        }
+        level.settledCount = archetype.entityCount;
+        level.settledMoves = archetype.rowMoves;
+        for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+        {
+            if (archetype.chunks[c].count != 0 && archetype.Versions(c)[archetype.AddedVersionSlot()] > since)
+                m_Tasks.push_back(Task{ index, c, true, nullptr });
+        }
+    }
+
+    void SceneGraphStore::WarnStaticWrites(const LevelArchetype& level, const Archetype& archetype,
+                                           uint64_t since) const
+    {
+        if (level.local == c_Absent)
+            return;
+        uint32_t written = 0;
+        for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+        {
+            const uint64_t* versions = archetype.Versions(c);
+            if (archetype.chunks[c].count != 0 && versions[level.local] > since &&
+                versions[archetype.AddedVersionSlot()] <= since)
+                ++written;
+        }
+        if (written != 0)
+            log::warning("SceneGraph: the LocalTransform of Static rows was written in %u chunk(s); refused: Static rows "
+                         "do not move (SceneComponents.h)", written);
     }
 
     // ------------------------------------------------------------------- TransformPropagation (4.6, D5)
@@ -3387,16 +3468,21 @@ namespace donut::engine
         bool levelAboveWrote = false;
         for (uint32_t d = 0; d < c_MaxHierarchyDepth; ++d)
         {
-            const std::vector<LevelArchetype>& levels = m_Levels[d];
+            std::vector<LevelArchetype>& levels = m_Levels[d];
             bool drivenWritten = false;
             m_Tasks.clear();
             for (uint32_t i = 0; i < uint32_t(levels.size()); ++i)
             {
-                const LevelArchetype& level = levels[i];
+                LevelArchetype& level = levels[i];
                 const Archetype& archetype = m_Impl->GetArchetypeStorage(level.archetype);
                 if (level.driven)
                 {
                     drivenWritten = drivenWritten || DrivenWritten(level, archetype, since);
+                    continue;
+                }
+                if (level.staticRows)
+                {
+                    QueueStaticLevel(level, i, archetype, since);
                     continue;
                 }
                 for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
@@ -4277,6 +4363,7 @@ namespace donut::engine
     {
         BoundsContext& ctx = *static_cast<BoundsContext*>(context);
         const SceneGraphStore& store = *ctx.store;
+        uint64_t childless = 0;
         for (uint32_t t = begin; t < end; ++t)
         {
             const Task& task = store.m_Tasks[t];
@@ -4332,10 +4419,13 @@ namespace donut::engine
                 chunkBounds;
             StampVersion(versions + bounds.worldBounds, ctx.version);
             StampVersion(versions + bounds.chunkBounds, ctx.version);
-            if (ctx.subgraph)
-                ctx.store->SubgraphFromBounds(archetype, bounds.archetype, task.chunk, chunkBounds);
+            if (ctx.subgraph &&
+                ctx.store->SubgraphFromBounds(archetype, bounds.archetype, task.chunk, chunkBounds, ctx.childless))
+                ++childless;
         }
         ctx.chunks.fetch_add(end - begin, std::memory_order_relaxed);
+        if (childless)
+            ctx.childlessChunks.fetch_add(childless, std::memory_order_relaxed);
     }
 
     nvrhi::FRESULT SceneGraphStore::RunBounds(ISystemContext* context) noexcept
@@ -4353,8 +4443,22 @@ namespace donut::engine
         m_Tasks.clear();
         for (uint32_t i = 0; i < uint32_t(m_BoundsArchetypes.size()); ++i)
         {
-            const BoundsArchetype& bounds = m_BoundsArchetypes[i];
+            BoundsArchetype& bounds = m_BoundsArchetypes[i];
             const Archetype& archetype = m_Impl->GetArchetypeStorage(bounds.archetype);
+            if (bounds.staticRows)
+            {
+                // E7.4 remedy 3: a Static archetype is read again only when rows joined or left it, or a leaf's content
+                // was invalidated; then by the rule below
+                if (archetype.entityCount == bounds.settledCount && archetype.rowMoves == bounds.settledMoves &&
+                    m_ContentChanges == bounds.settledContent)
+                {
+                    ++m_Counters.staticSkips;
+                    continue;
+                }
+                bounds.settledCount = archetype.entityCount;
+                bounds.settledMoves = archetype.rowMoves;
+                bounds.settledContent = m_ContentChanges;
+            }
             for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
             {
                 if (archetype.chunks[c].count == 0)
@@ -4374,6 +4478,7 @@ namespace donut::engine
         ctx.store = this;
         ctx.version = context->GetVersion();
         ctx.subgraph = m_SubgraphPrepared && !m_SubgraphFull;
+        ctx.childless = SceneGraph::GetChildlessBoundsPath();
         const uint32_t taskCount = uint32_t(m_Tasks.size());
         const uint32_t grain = std::max(1u, taskCount / (WorkingThreads(jobs) * 4));
         if (!jobs || grain >= taskCount)
@@ -4381,6 +4486,7 @@ namespace donut::engine
         else
             jobs->ParallelFor(taskCount, grain, &RunBoundsTasks, &ctx);
         m_Counters.boundsChunks += ctx.chunks.load(std::memory_order_relaxed);
+        m_Counters.childlessChunks += ctx.childlessChunks.load(std::memory_order_relaxed);
         return nvrhi::FS_OK;
     }
 
@@ -5068,13 +5174,29 @@ namespace donut::engine
     // An incremental pass's step 1 for a chunk the Bounds system wrote (its boxes changed): the summary (its bounds the
     // chunk's union, ChunkWorldBounds, which the Bounds system just made in row order), and the paths to mark, from a
     // row with children itself, else from its parent (once per run of rows of one parent).
-    void SceneGraphStore::SubgraphFromBounds(const Archetype& archetype, uint32_t archetypeIndex, uint32_t chunk,
-                                             const dm::box3& chunkBounds) noexcept
+    bool SceneGraphStore::SubgraphFromBounds(const Archetype& archetype, uint32_t archetypeIndex, uint32_t chunk,
+                                             const dm::box3& chunkBounds, bool childless) noexcept
     {
         const uint32_t count = archetype.chunks[chunk].count;
         const uint8_t linksColumn = ColumnIndex(archetype, archetypeIndex, SlotLinks);
         if (linksColumn == c_Absent || count == 0)
-            return;
+            return false;
+        // E7.4 remedy 4: a chunk whose rows have one parent and no children, as its summary says (links, parents,
+        // leaves and content flags change only with a full pass, which computes every summary): the loop below would
+        // find the same parent and content and mark the parent once; only the box and the version change.
+        if (childless && archetypeIndex < m_ChunkSummaries.size() && chunk < m_ChunkSummaries[archetypeIndex].size())
+        {
+            ChunkSummary& summary = m_ChunkSummaries[archetypeIndex][chunk];
+            if (summary.version != 0 && summary.single)
+            {
+                if (summary.parent != Entity::Null)
+                    MarkPath(summary.parent, m_SubgraphPass);
+                uint32_t ignored;
+                KeysOf(chunkBounds, SceneContentFlags::None, summary.keys.keys, ignored);
+                summary.version = m_World->GetVersion();
+                return true;
+            }
+        }
         const SceneLinks* links = reinterpret_cast<const SceneLinks*>(ColumnBase(archetype, chunk, linksColumn));
         const uint8_t parentColumn = ColumnIndex(archetype, archetypeIndex, SlotParent);
         const Parent* parents = parentColumn != c_Absent
@@ -5090,7 +5212,7 @@ namespace donut::engine
         if (archetypeIndex >= m_ChunkSummaries.size() || chunk >= m_ChunkSummaries[archetypeIndex].size())
         {
             m_SubgraphNeedsFull.store(true, std::memory_order_relaxed);   // an archetype or chunk made during the phases
-            return;
+            return false;
         }
         ChunkSummary& summary = m_ChunkSummaries[archetypeIndex][chunk];
         summary.single = true;
@@ -5118,6 +5240,7 @@ namespace donut::engine
         KeysOf(chunkBounds, SceneContentFlags::None, summary.keys.keys, ignored);
         summary.keys.content = summaryContent;
         summary.version = m_World->GetVersion();
+        return false;
     }
 
     void SceneGraphStore::UpdateSubgraphs() noexcept
