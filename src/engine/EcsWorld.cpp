@@ -2019,10 +2019,21 @@ namespace donut::engine::ecs
 
     nvrhi::FRESULT WorldImpl::GetChunkInfo(uint32_t archetype, uint32_t chunk, ChunkInfo& out) noexcept
     {
-        (void)archetype;
-        (void)chunk;
         out = ChunkInfo{};
-        return nvrhi::FE_NOT_IMPLEMENT;   // a stub of plan step E7, item E7.0; item E7.7 implements it
+        if (m_InPhase && m_ExclusiveDepth == 0)
+            return nvrhi::FE_OUT_OF_DATE;   // systems may be writing rows and versions (EcsWorld.h)
+        if (archetype >= m_Archetypes.size())
+            return nvrhi::FE_INVALID_ARGS;
+        const Archetype& a = *m_Archetypes[archetype];
+        if (chunk >= a.GetChunkCount())
+            return nvrhi::FE_INVALID_ARGS;
+        const uint64_t* versions = a.Versions(chunk);
+        out.entities = a.Entities(chunk);
+        out.versions = versions;
+        out.addedVersion = versions[a.AddedVersionSlot()];
+        out.count = a.chunks[chunk].count;
+        out.capacity = a.rowsPerChunk;
+        return nvrhi::FS_OK;
     }
 }
 

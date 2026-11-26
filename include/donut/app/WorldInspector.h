@@ -37,7 +37,7 @@
 // application (SetEntityNames). Between calls the inspector holds no scheduler, and a world only through pending edits:
 // the command buffer that Draw records them into comes from IWorld::CreateCommandBuffer and holds a reference to its
 // world, from the first edit until Apply plays it back, the edits are dropped, or the inspector is destroyed. Nothing
-// allocates while its panels are closed; while they are open, only ImGui does. Until E7.7, declarations only.
+// allocates while its panels are closed; while they are open, only ImGui does.
 
 #pragma once
 

@@ -978,6 +978,26 @@ namespace donut::engine
         added = added && NVRHI_SUCCEEDED(m_World->AddObserver(runtime, m_RuntimeObserver, id));
         if (!added)
             log::warning("SceneGraph: cannot add the observers of runtime-only mesh instances");
+
+        // Donut's read-only list for inspectors (E7.7): registered last, after the store's own types, the scheduler's
+        // and the runtime tag, so that their ids stay as they were. NoSerialize: snapshots and hashes leave it out.
+        InspectorReadOnlyComponents readOnly{};
+        const ComponentId readOnlyIds[] = {
+            m_Ids[SlotLinks], m_Ids[SlotParent], m_DepthId,                       // the hierarchy
+            m_Ids[SlotLocalMatrix], m_Ids[SlotWorld], m_Ids[SlotLocalBounds],     // derived: systems overwrite them
+            m_Ids[SlotWorldBounds], m_Ids[SlotChunkBounds],
+            m_Ids[SlotInstance], m_Ids[SlotMeshRef], m_Ids[SlotRenderFlags],     // slots and references
+            m_SimBodyId,
+            m_Ids[SlotNode], m_Ids[SlotLeaf],                                     // hooked
+        };
+        static_assert(std::size(readOnlyIds) <= c_MaxInspectorReadOnlyComponents, "the read-only list");
+        for (const ComponentId component : readOnlyIds)
+            if (component != ComponentId::Invalid)
+                readOnly.components[readOnly.count++] = component;
+        ComponentId readOnlyId = ComponentId::Invalid;
+        if (NVRHI_FAILED(m_World->RegisterResource(ComponentTraits<InspectorReadOnlyComponents>::Desc(), &readOnly,
+                                                   readOnlyId)))
+            log::warning("SceneGraph: cannot register the inspector's read-only list");
         // ChangesScope makes its levels on first use (not here: the constructor's last allocations are reported ones)
     }
 

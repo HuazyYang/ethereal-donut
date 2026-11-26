@@ -71,6 +71,9 @@ foreach(test_src ${donut_engine_tests})
         target_include_directories("${test_name}" PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
     endif()
 endforeach()
+# The inspector's test (plan step E7, item E7.7) reaches its formatter and test seam through the private header in
+# src/app (WorldInspectorDetail.h).
+target_include_directories(test_world_inspector PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/app")
 # The exit test runs ~130 child processes; a child that hangs is killed after 30 s (Windows), this bounds the rest.
 set_tests_properties(test_job_system_exit PROPERTIES TIMEOUT 300)
 

@@ -1324,9 +1324,31 @@ namespace donut::engine::ecs
 
     nvrhi::FRESULT SchedulerImpl::GetSystemInfo(uint32_t index, SystemInfo& out) noexcept
     {
-        (void)index;
         out = SystemInfo{};
-        return nvrhi::FE_NOT_IMPLEMENT;   // a stub of plan step E7, item E7.0; item E7.7 implements it
+        // The threads that run systems write the statistics during a phase: read them between phases.
+        if (IsRunning() || m_World->IsInPhase())
+            return nvrhi::FE_OUT_OF_DATE;
+        if (index >= m_LiveSystemCount)
+            return nvrhi::FE_INVALID_ARGS;
+        EnsureBuilt();   // a cycle is no failure here: its phase lists its systems in registration order
+        for (Phase id : m_PhaseOrder)
+        {
+            const PhaseRecord& phase = *m_Phases[uint32_t(id)];
+            if (index >= phase.order.size())
+            {
+                index -= uint32_t(phase.order.size());
+                continue;
+            }
+            const SystemRecord& record = *phase.order[index];
+            out.name = record.name.c_str();
+            out.id = record.id;
+            out.phase = record.phase;
+            out.flags = record.flags;
+            out.enabled = record.enabled ? 1u : 0u;
+            out.stats = record.stats;
+            return nvrhi::FS_OK;
+        }
+        return nvrhi::FE_INVALID_ARGS;   // not reached: the orders hold every live system
     }
 
     // ------------------------------------------------------------------------------------ simulation domains
