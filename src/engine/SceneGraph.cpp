@@ -1215,6 +1215,11 @@ bool SceneGraph::IsRenderReadDeferring() const noexcept
     return m_Store->IsDeferring();
 }
 
+bool SceneGraph::IsAnyRenderReadDeferring() noexcept
+{
+    return SceneGraphStore::IsAnyDeferring();
+}
+
 nvrhi::FRESULT SceneGraph::RunReadOnlyPhase(Phase phase) noexcept
 {
     return m_Store->RunReadOnlyPhase(phase);

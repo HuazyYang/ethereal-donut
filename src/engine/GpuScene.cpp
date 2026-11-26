@@ -1070,6 +1070,24 @@ namespace donut::engine
             // never 0, the value of "no recording"
             return uint64_t(std::hash<std::thread::id>()(std::this_thread::get_id())) | 1u;
         }
+
+        // PipelinedRecordingWork's depth on this thread (part I7, backlog I6-R1).
+        thread_local uint32_t t_RecordingWork = 0;
+    }
+
+    PipelinedRecordingWork::PipelinedRecordingWork() noexcept
+    {
+        ++t_RecordingWork;
+    }
+
+    PipelinedRecordingWork::~PipelinedRecordingWork() noexcept
+    {
+        --t_RecordingWork;
+    }
+
+    bool PipelinedRecordingWork::IsActive() noexcept
+    {
+        return t_RecordingWork != 0;
     }
 
     void PipelinedRecordingCheck::Begin() noexcept
@@ -1086,7 +1104,9 @@ namespace donut::engine
     void PipelinedRecordingCheck::OnCheck(const char* operation) const noexcept
     {
         const uint64_t main = m_MainThread.load(std::memory_order_acquire);
-        if (main == 0 || main != CurrentThreadKey() || m_Warned.exchange(true, std::memory_order_relaxed))
+        // Recording work the main thread runs while it waits in the shared job system is not the main thread's.
+        if (main == 0 || main != CurrentThreadKey() || t_RecordingWork != 0 ||
+            m_Warned.exchange(true, std::memory_order_relaxed))
             return;
         log::warning("%s on the main thread while a pipelined frame records (between BeginPipelinedRecording and "
                      "EndPipelinedRecording): the recording owns it until the join; the call runs", operation);

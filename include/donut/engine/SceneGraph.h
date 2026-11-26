@@ -951,8 +951,12 @@ namespace donut::engine
         void BeginRenderRead(RenderReadMode mode = RenderReadMode::Warn) noexcept;
         void EndRenderRead() noexcept;
         [[nodiscard]] bool IsInRenderRead() const noexcept;
-        // A Defer scope is open: a pipelined frame records. Any thread may ask (the walking draw strategies refuse then).
+        // A Defer scope is open on this graph: a pipelined frame records. Any thread may ask.
         [[nodiscard]] bool IsRenderReadDeferring() const noexcept;
+        // Any graph of the process has a Defer scope open: a pipelined frame is open, from RenderService::Extract to
+        // the EndFrame after its join (plan step E7, part I7). The walking draw strategies refuse while it holds, on any
+        // thread and whatever graph their root node is in (fail-closed: a detached root has none to ask).
+        [[nodiscard]] static bool IsAnyRenderReadDeferring() noexcept;
         // Runs a phase of GetScheduler() whose systems only read (the render service's RenderExtract, plan step E5.1),
         // and accounts for it: when nothing else ran on the world since the last Refresh, the version the phase took is
         // not a change, so the next Refresh still returns at once when nothing changed and the on-demand caches stay. A

@@ -39,8 +39,9 @@
 //     ... the application's geometry and lighting passes read the snapshot: bound draw strategies (DrawStrategy.h),
 //         GeometryGraphInputs::bufferReads, the extracted-light inputs of the lighting passes
 //     RenderService::EndFrame       after the graph executed (or failed to compile or execute): closes the Debug
-//                                   render-read scope. app::RenderGraphLayer::OnGraphExecuted is the place; without
-//                                   the layer, call it after IRenderGraph::Execute.
+//                                   render-read scope (pipelined: the Defer scope, after the recording's join).
+//                                   app::RenderGraphLayer::OnGraphExecuted is the place; without the layer, call it
+//                                   after IRenderGraph::Execute.
 //
 // The snapshot is immutable once Extract returns, except ExtractedLight::shadowTexture, which AddShadowPasses fills
 // before any pass reads it. Its arrays are trivially destructible and released with the frame (IRenderGraph::Reset).
@@ -397,11 +398,12 @@ namespace donut::render
         CreateShadowTextureFunction createShadowTexture = nullptr;
         void* createShadowTextureContext = nullptr;
         // Pipelined rendering (design 7.5; plan step E7, items E7.8 and E7.9): the graph records frame N on another
-        // thread while the world runs frame N+1, and the service opens the graph's render-read scope in its deferring
-        // mode (SceneGraph::RenderReadMode::Defer). Off by default, enabled only after the A/B steps of E7.9 pass;
-        // ignored (the frame stays serial) until E7.9 reads it: E7.8 built the library's side (the Defer scope and
-        // its retire list, the deferred mesh reconciliation, the owner-thread checks of Scene::BeginPipelinedRecording
-        // and the walking strategies' refusal).
+        // thread while the world runs frame N+1. Extract then opens the graph's render-read scope in its deferring mode
+        // (SceneGraph::RenderReadMode::Defer: the retire list, the deferred mesh reconciliation; the walking strategies
+        // refuse while it is open), BeginPipelinedRecording brackets the hand-off to the recording thread with the
+        // scene's owner-thread checks (Scene::BeginPipelinedRecording), and EndFrame, after the join, ends them and
+        // closes the scope. The frame helper of the samples drives it (sample_harness/PipelinedFrame.h). Off by
+        // default, enabled only after the A/B steps of E7.9 pass; off, every behaviour and output is the serial one.
         bool pipelined = false;
     };
 
@@ -452,8 +454,10 @@ namespace donut::render
         // Called at the top of BuildGraph, after IRenderGraph::Reset and FrameData::Clear, and after the scene graph's
         // Refresh: sets the frame context and runs the graph scheduler's RenderExtract phase into a snapshot in
         // `graph`'s arena (open points 1 and 2). `frameData` (may be null) gets the SceneFrame entry; `outFrame` (may
-        // be null) receives it. Opens the Debug render-read scope (open point 12) until EndFrame; a scope still open
-        // from the previous frame (EndFrame not called) is closed first. A service serves the graph it was made for:
+        // be null) receives it. Opens the Debug render-read scope (open point 12) until EndFrame, a Defer scope for a
+        // pipelined service; a scope still open from the previous frame (EndFrame not called) is closed first, except
+        // while that frame records (BeginPipelinedRecording without its EndFrame): then FE_INVALID_ARGS with a warning,
+        // nothing changed (its scope keeps what the recording reads). A service serves the graph it was made for:
         // FE_INVALID_ARGS once the scene's graph was replaced (Scene::CreateSceneGraph, a new load); make a new
         // service then.
         nvrhi::FRESULT Extract(IRenderGraph* graph, FrameData* frameData, const ExtractDesc& desc,
@@ -479,18 +483,30 @@ namespace donut::render
         // buffers (RenderServiceStats::shadowBindingCacheResets). Nothing without RenderServiceDesc::serviceShadows, nor
         // for a second call in the frame. FE_INVALID_ARGS when no frame is open.
         nvrhi::FRESULT AddShadowPasses(IRenderGraph* graph, SceneFrame* frame) noexcept;
-        // After the graph has executed (`executed`), or failed to compile or execute: closes the render-read scope (a
-        // flag per service, not a count). Only an executed frame sets the leaves' skinningInitialized for its first-frame
-        // skinned instances; otherwise the next frame dispatches them as first frames again. Releases the shadow maps
-        // this frame's extraction retired (the frames that drew into them were submitted before it; nvrhi keeps a
-        // texture alive for the command lists that reference it). The service's references go; a retired texture can
-        // still be held by the binding caches of DeferredLightingPass and ForwardShadingPass, whose cached sets name the
-        // shadow texture, until the application calls their ResetBindingCache (RenderServiceStats::retiredShadowMaps
-        // non-zero is the signal; the service adds no mechanism for it). Idempotent per frame.
+        // After the graph has executed (`executed`), or failed to compile or execute: ends a pipelined recording
+        // (Scene::EndPipelinedRecording) and closes the render-read scope (a flag per service, not a count; the
+        // innermost scope of the graph: no other scope may be left open inside it). Only an executed frame sets the
+        // leaves' skinningInitialized for its first-frame skinned instances; otherwise the next frame dispatches them
+        // as first frames again. Releases the shadow maps this frame's extraction retired (the frames that drew into
+        // them were submitted before it; nvrhi keeps a texture alive for the command lists that reference it). The
+        // service's references go; a retired texture can still be held by the binding caches of DeferredLightingPass
+        // and ForwardShadingPass, whose cached sets name the shadow texture, until the application calls their
+        // ResetBindingCache (RenderServiceStats::retiredShadowMaps non-zero is the signal; the service adds no
+        // mechanism for it). Idempotent per frame.
         // app::RenderGraphLayer::OnGraphExecuted is the place to call it; without the layer, call it after
         // IRenderGraph::Execute. A frame whose EndFrame never came counts as not executed. The snapshot dies at the
         // next Reset.
         void EndFrame(bool executed) noexcept;
+
+        // Pipelined rendering (RenderServiceDesc::pipelined; plan step E7, item E7.9, part I7), on the main thread when
+        // it hands the open frame's graph to a recording thread: begins the scene's owner-thread checks
+        // (Scene::BeginPipelinedRecording, which also begins its GpuScene's) until the EndFrame after the join. Until
+        // then the main thread may run the next frame's Simulate and Refresh, but not Extract (refused) and not the
+        // Scene's or GpuScene's mesh-buffer and upload calls (Debug builds warn). FE_INVALID_ARGS with a warning for
+        // a service that is not pipelined (record serially then) or without an open frame; FS_OK again for a frame
+        // already handed over.
+        nvrhi::FRESULT BeginPipelinedRecording() noexcept;
+        [[nodiscard]] bool IsPipelinedRecording() const noexcept;
 
         [[nodiscard]] const RenderServiceStats& GetStats() const noexcept;
         // The service shadows, keyed by light entity; null before the first Extract.

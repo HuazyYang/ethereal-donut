@@ -121,11 +121,13 @@ namespace donut::render
     };
 
     // The legacy walking strategies (InstancedOpaqueDrawStrategy and TransparentDrawStrategy, unbound) read the scene
-    // graph live, from the root node a PrepareForView gets. While a pipelined frame records (plan step E7, item E7.8:
-    // the root node's graph has a SceneGraph::RenderReadMode::Defer scope open, SceneGraph::IsRenderReadDeferring),
-    // the main thread changes that graph, so they refuse: PrepareForView logs one warning per strategy object and the
-    // view gets no draw items. Only the packet adapters (bound strategies, PacketDrawStrategy) record a pipelined frame.
-    // The check reads the root node's graph on the recording thread: the root must not be detached while it records.
+    // graph live, from the root node a PrepareForView gets. While a pipelined frame is open (plan step E7, item E7.8 and
+    // part I7: a graph of the process has a SceneGraph::RenderReadMode::Defer scope open,
+    // SceneGraph::IsAnyRenderReadDeferring; RenderServiceDesc::pipelined opens it at Extract, before the hand-off, and
+    // closes it at the EndFrame after the join), the main thread changes the world, so they refuse: PrepareForView logs
+    // one warning per strategy object and the view gets no draw items. Only the packet adapters (bound strategies,
+    // PacketDrawStrategy) record a pipelined frame. The check reads no graph (fail-closed: whatever graph the root is
+    // in, or none); a serial frame of another graph in the same process while a pipelined one is open is refused too.
 
     class PassthroughDrawStrategy : public IDrawStrategy
     {

@@ -203,7 +203,8 @@ namespace donut::engine
     // the main thread touches them only after the join (model 3 of the E7 sub-plan: GpuScene::Update runs in the next
     // Extract). Begin, called on the main thread when it hands the frame to the recording thread, names that thread;
     // End, after the join, ends the recording. Check, at the guarded calls: in Debug builds a call made on the named
-    // thread in between logs one warning per recording (log::warning; the call still runs); Release builds check
+    // thread in between, outside a PipelinedRecordingWork scope (below), logs one warning per recording (log::warning;
+    // the call still runs); Release builds check
     // nothing. Never begun (serial frames), nothing is checked. Module-private.
     class PipelinedRecordingCheck
     {
@@ -225,6 +226,23 @@ namespace donut::engine
         void OnCheck(const char* operation) const noexcept;
         std::atomic<uint64_t> m_MainThread{ 0 };   // the thread that began the recording; 0 while none records
         mutable std::atomic<bool> m_Warned{ false };
+    };
+
+    // The recording's own work, on whatever thread runs it (part I7; backlog I6-R1). A thread that waits in a job
+    // system runs other jobs, so the main thread, waiting in Simulate on the job system the recording shares, may run
+    // a segment of the pipelined frame's recording: the calls made inside one of these scopes are the recording's and
+    // PipelinedRecordingCheck does not flag them. The frame helper opens one around every recording task it hands to
+    // the job system (and around the recording thread's own work). A thread_local depth: scopes nest, and a scope
+    // must close on the thread that opened it. Release builds count too (two thread_local increments per task).
+    class PipelinedRecordingWork
+    {
+    public:
+        PipelinedRecordingWork() noexcept;
+        ~PipelinedRecordingWork() noexcept;
+        PipelinedRecordingWork(const PipelinedRecordingWork&) = delete;
+        PipelinedRecordingWork& operator=(const PipelinedRecordingWork&) = delete;
+        // The calling thread runs recording work now.
+        [[nodiscard]] static bool IsActive() noexcept;
     };
 
     class GpuScene : public nvrhi::ObjectImpl<nvrhi::IObject>

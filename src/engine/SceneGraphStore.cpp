@@ -47,6 +47,22 @@
 
 namespace donut::engine
 {
+    namespace
+    {
+        // The stores with a Defer scope open (SceneGraphStore::IsAnyDeferring; plan step E7, part I7).
+        std::atomic<uint32_t> g_DeferringStores{ 0 };
+
+        void EnterDeferring() noexcept
+        {
+            g_DeferringStores.fetch_add(1, std::memory_order_acq_rel);
+        }
+
+        void LeaveDeferring() noexcept
+        {
+            g_DeferringStores.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+
     // ------------------------------------------------------------------------------ reference hooks (D14)
 
     SceneNode::SceneNode(const SceneNode& other) noexcept
@@ -1159,7 +1175,8 @@ namespace donut::engine
         // world holds one reference to each node; the graph has released its root already. One pre-order pass from
         // each root (a node without a Parent): a referenced node takes its subgraph along, so the walk skips it.
         // A Defer scope still open (E7.8): what it kept goes first, without the deferred reconciliation.
-        m_DeferReads.store(0, std::memory_order_release);
+        if (m_DeferReads.exchange(0, std::memory_order_acq_rel) != 0)
+            LeaveDeferring();
         m_ReconcileDeferred = false;
         ReleaseDeferred();
         SyncArchetypes();
@@ -1712,7 +1729,8 @@ namespace donut::engine
             return;
         }
         m_RenderReadModes |= uint64_t(1) << depth;
-        m_DeferReads.fetch_add(1, std::memory_order_acq_rel);
+        if (m_DeferReads.fetch_add(1, std::memory_order_acq_rel) == 0)
+            EnterDeferring();
     }
 
     void SceneGraphStore::EndRenderRead() noexcept
@@ -1725,7 +1743,15 @@ namespace donut::engine
         m_RenderReadModes &= ~(uint64_t(1) << depth);
         // The last Defer scope: what it deferred runs now, on this thread (after the pipelined frame's join).
         if (m_DeferReads.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        {
+            LeaveDeferring();
             ReleaseDeferred();
+        }
+    }
+
+    bool SceneGraphStore::IsAnyDeferring() noexcept
+    {
+        return g_DeferringStores.load(std::memory_order_acquire) != 0;
     }
 
     void SceneGraphStore::Retire(nvrhi::IObject* object) noexcept

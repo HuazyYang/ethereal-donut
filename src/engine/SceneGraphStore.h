@@ -503,6 +503,9 @@ namespace donut::engine
         // retirement order, on its thread. The list keeps its capacity: once it reached its high-water mark, retiring
         // allocates nothing. Read by any thread (the walking draw strategies' refusal, on the recording thread).
         bool IsDeferring() const noexcept { return m_DeferReads.load(std::memory_order_acquire) != 0; }
+        // Any store of the process has a Defer scope open (plan step E7, part I7; backlog I6-N5): the walking draw
+        // strategies' refusal, which reads no graph. Counts the stores whose open Defer scopes went from 0 to 1.
+        static bool IsAnyDeferring() noexcept;
         // Takes a reference to `object` for the retire list while deferring; nothing otherwise. Out of memory: the
         // reference is not taken (a warning), the object may go before the frame ends.
         void Retire(nvrhi::IObject* object) noexcept;

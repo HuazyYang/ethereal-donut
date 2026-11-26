@@ -49,12 +49,13 @@ namespace
         return uint64_t(std::hash<std::thread::id>()(std::this_thread::get_id())) | 1u;
     }
 
-    // A walking strategy in a pipelined frame (E7.8; DrawStrategy.h): true, with one warning per strategy object, when
-    // the root node's graph has a Defer scope open.
-    bool RefuseWalk(const SceneGraphNode* rootNode, bool& warned, const char* strategy) noexcept
+    // A walking strategy in a pipelined frame (E7.8; DrawStrategy.h): true, with one warning per strategy object, while
+    // a pipelined frame is open, that is while any graph has a Defer scope open (part I7, backlog I6-N5). Set on the
+    // main thread at Extract, before the hand-off, and cleared after the join: no graph is read here, so a root detached
+    // or re-attached by the main thread while the frame records is not raced, and a detached root is refused too.
+    bool RefuseWalk(bool& warned, const char* strategy) noexcept
     {
-        const SceneGraph* graph = rootNode ? rootNode->GetGraph() : nullptr;
-        if (!graph || !graph->IsRenderReadDeferring())
+        if (!SceneGraph::IsAnyRenderReadDeferring())
             return false;
         if (!warned)
         {
@@ -319,7 +320,7 @@ void donut::render::InstancedOpaqueDrawStrategy::PrepareForView(engine::SceneGra
     }
 
     m_UseCheck.Prepare();
-    if (RefuseWalk(rootNode, m_WarnedPipelined, "InstancedOpaqueDrawStrategy"))
+    if (RefuseWalk(m_WarnedPipelined, "InstancedOpaqueDrawStrategy"))
     {
         m_Walker = SceneGraphWalker();
         m_InstanceChunk.clear();
@@ -388,7 +389,7 @@ void TransparentDrawStrategy::PrepareForView(engine::SceneGraphNode* rootNode, c
 
     m_InstancesToDraw.clear();
     m_InstancePtrsToDraw.clear();
-    if (RefuseWalk(rootNode, m_WarnedPipelined, "TransparentDrawStrategy"))
+    if (RefuseWalk(m_WarnedPipelined, "TransparentDrawStrategy"))
         return;
 
     float3 viewOrigin = view.GetViewOrigin();

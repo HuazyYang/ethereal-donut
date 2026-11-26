@@ -2887,6 +2887,143 @@ namespace
         g_Warnings.store(warningsBefore);
     }
 
+    // Part I7: RenderServiceDesc::pipelined. A serial service opens a Warn scope at Extract and refuses
+    // BeginPipelinedRecording; a pipelined one opens a Defer scope (SceneGraph::IsAnyRenderReadDeferring holds), begins
+    // the recording only for an open frame, refuses an Extract while the frame records (backlog I6-R4: the scope stays
+    // open) and closes the scope at EndFrame, after which the next frame extracts.
+    void test_service_pipelined()
+    {
+        TestViews views;
+        TraceScene s(0x4008, c_SmallProfile);
+        BuildMixed(s, 120);
+        s.graph->Refresh(0);
+        RenderFrame frame;
+        const uint32_t warningsBefore = g_Warnings.load();
+        {
+            auto service = MakeService(s.graph);
+            ExtractFrame(service, frame, views.Desc(1));
+            CHECK(s.graph->IsInRenderRead() && !s.graph->IsRenderReadDeferring());
+            CHECK(!SceneGraph::IsAnyRenderReadDeferring());
+            CHECK(service->BeginPipelinedRecording() == nvrhi::FE_INVALID_ARGS);   // not pipelined: one warning
+            CHECK(!service->IsPipelinedRecording());
+            service->EndFrame(true);
+            CHECK(!s.graph->IsInRenderRead());
+        }
+        CHECK(g_Warnings.load() == warningsBefore + 1);
+
+        RenderServiceDesc desc;
+        desc.sceneGraph = s.graph;
+        desc.pipelined = true;
+        auto service = MAKE_RC_OBJ_PTR(RenderService, nullptr, desc);
+        CHECK(service->BeginPipelinedRecording() == nvrhi::FE_INVALID_ARGS);   // no frame open: one warning
+        CHECK(g_Warnings.load() == warningsBefore + 2);
+        const RenderSnapshot& snapshot = ExtractFrame(service, frame, views.Desc(2));
+        CHECK(s.graph->IsInRenderRead() && s.graph->IsRenderReadDeferring());
+        CHECK(SceneGraph::IsAnyRenderReadDeferring());
+        CHECK(service->BeginPipelinedRecording() == nvrhi::FS_OK);
+        CHECK(service->IsPipelinedRecording());
+        CHECK(service->BeginPipelinedRecording() == nvrhi::FS_OK);   // the same frame again
+
+        RenderFrame other;
+        other.Begin();
+        SceneFrame* refused = reinterpret_cast<SceneFrame*>(uintptr_t(1));
+        CHECK(service->Extract(other.graph, &other.data, views.Desc(3), &refused) == nvrhi::FE_INVALID_ARGS);
+        CHECK(refused == nullptr);
+        CHECK(g_Warnings.load() == warningsBefore + 3);
+        CHECK(s.graph->IsRenderReadDeferring() && service->IsPipelinedRecording());
+        CHECK(snapshot.frameIndex == 2);   // the recording's snapshot is untouched
+
+        service->EndFrame(true);
+        CHECK(!service->IsPipelinedRecording());
+        CHECK(!s.graph->IsInRenderRead() && !SceneGraph::IsAnyRenderReadDeferring());
+        ExtractFrame(service, frame, views.Desc(4));
+        CHECK(s.graph->IsRenderReadDeferring());
+        service->EndFrame(true);
+        CHECK(!s.graph->IsInRenderRead());
+        CHECK(g_Warnings.load() == warningsBefore + 3);
+        g_Warnings.store(warningsBefore);
+        service = nullptr;
+    }
+
+    // Backlog I6-N5 (part I7): the walking refusal reads no graph. A root detached while a pipelined frame is open
+    // (its graph is null then) is refused too, with the strategy's one warning; a serial frame walks it.
+    void test_walking_refused_detached()
+    {
+        TestViews views;
+        TraceScene s(0x4009, c_SmallProfile);
+        BuildMixed(s, 200);
+        s.graph->Refresh(0);
+        const IView& view = *views.perspective;
+        SceneGraphNode* drawn = nullptr;
+        uint32_t serialItems = 0;
+        for (SceneGraphNode* child = s.graph->GetRootNode()->GetFirstChild(); child && !drawn;
+             child = child->GetNextSibling())
+        {
+            auto probe = MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy);
+            serialItems = DrainItems(*probe, child, view);
+            if (serialItems > 0)
+                drawn = child;
+        }
+        CHECK(drawn != nullptr);
+        const uint32_t warningsBefore = g_Warnings.load();
+
+        RenderServiceDesc desc;
+        desc.sceneGraph = s.graph;
+        desc.pipelined = true;
+        auto service = MAKE_RC_OBJ_PTR(RenderService, nullptr, desc);
+        RenderFrame frame;
+        ExtractFrame(service, frame, views.Desc(1));
+        nvrhi::AutoPtr<SceneGraphNode> detached = s.graph->Detach(drawn);   // allowed in a Defer scope, no warning
+        CHECK(detached && detached->GetGraph() == nullptr);
+        auto opaque = MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy);
+        CHECK(DrainItems(*opaque, detached.Get(), view) == 0);
+        CHECK(DrainItems(*opaque, detached.Get(), view) == 0);
+        CHECK(g_Warnings.load() == warningsBefore + 1);
+        service->EndFrame(true);
+
+        CHECK(DrainItems(*opaque, detached.Get(), view) > 0);   // serial again: the orphan walks
+        CHECK(g_Warnings.load() == warningsBefore + 1);
+        g_Warnings.store(warningsBefore);
+        std::printf("  %u items walked serially from the subgraph; none once detached in a pipelined frame\n",
+                    serialItems);
+        service = nullptr;
+    }
+
+    // Backlog I6-R1 (part I7): recording work that the main thread runs (a segment stolen while it waits in the shared
+    // job system) is marked with PipelinedRecordingWork and not flagged; the main thread's own calls still are.
+    void test_recording_work_mark()
+    {
+        GpuSceneDesc desc;
+        desc.uploadMode = GpuSceneUploadMode::Scatter;
+        auto gpuScene = MAKE_RC_OBJ_PTR(GpuScene, nullptr, desc);
+        const uint32_t warningsBefore = g_Warnings.load();
+#ifdef NDEBUG
+        constexpr uint32_t c_PerRecording = 0;
+#else
+        constexpr uint32_t c_PerRecording = 1;
+#endif
+        gpuScene->BeginPipelinedRecording();
+        CHECK(!PipelinedRecordingWork::IsActive());
+        {
+            PipelinedRecordingWork work;
+            CHECK(PipelinedRecordingWork::IsActive());
+            {
+                PipelinedRecordingWork nested;
+                GpuSceneScatterRecords records;
+                gpuScene->GetScatterRecords(records);
+                gpuScene->CommitScatter(records.serial);
+            }
+            CHECK(PipelinedRecordingWork::IsActive());
+            (void)gpuScene->IsScatterPending();
+        }
+        CHECK(!PipelinedRecordingWork::IsActive());
+        CHECK(g_Warnings.load() == warningsBefore);
+        gpuScene->CommitScatter(0);   // the main thread's own
+        CHECK(g_Warnings.load() == warningsBefore + c_PerRecording);
+        gpuScene->EndPipelinedRecording();
+        g_Warnings.store(warningsBefore);
+    }
+
     struct Case
     {
         const char* name;
@@ -2940,6 +3077,9 @@ int main(int argc, char** argv)
         { "defer_no_warning", test_defer_no_warning },
         { "walking_refused", test_walking_refused },
         { "pipelined_owner_check", test_pipelined_owner_check },
+        { "service_pipelined", test_service_pipelined },
+        { "walking_refused_detached", test_walking_refused_detached },
+        { "recording_work_mark", test_recording_work_mark },
         { "measure", measure_extraction },   // by name only
     };
     try

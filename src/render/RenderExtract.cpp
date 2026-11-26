@@ -137,8 +137,12 @@ namespace donut::render
 
         // Between a successful Extract and its EndFrame.
         bool frameOpen = false;
-        // The graph's render-read scope (a flag per service, not a count; the graph counts the scopes).
+        // The graph's render-read scope (a flag per service, not a count; the graph counts the scopes). A Defer scope
+        // for a pipelined service (RenderServiceDesc::pipelined), a Warn scope otherwise.
         bool scopeOpen = false;
+        // Pipelined rendering (part I7): between BeginPipelinedRecording (the hand-off of the open frame to a recording
+        // thread) and the EndFrame after the join. The scene's owner-thread checks are begun meanwhile.
+        bool recording = false;
         // The leaves' own shadow maps the snapshot names (ExtractedLight::shadowMap), held until EndFrame: the
         // application may replace Light::shadowMap while the frame records. Capacity kept.
         std::vector<nvrhi::AutoPtr<IShadowMap>> frameShadowMaps;
@@ -947,9 +951,21 @@ namespace donut::render
             }
         }
 
+        // Pipelined rendering: the recording has joined; the scene's owner-thread checks end (before the scope closes,
+        // whose last EndRenderRead runs the deferred reconciliation and releases the retire list on this thread).
+        void EndRecording() noexcept
+        {
+            if (!recording)
+                return;
+            if (scene)
+                scene->EndPipelinedRecording();
+            recording = false;
+        }
+
         // Idempotent: the scope closes once, and the first-frame flags are set at most once, for an executed frame.
         void EndFrame(bool executed) noexcept
         {
+            EndRecording();
             CloseScope();
             if (frameOpen && executed)
             {
@@ -990,6 +1006,15 @@ namespace donut::render
                 return nvrhi::FE_OUT_OF_MEMORY;
         }
         Impl& s = *m_Impl;
+        // A pipelined frame handed to its recording thread and not yet joined (EndFrame not called after
+        // BeginPipelinedRecording): closing its Defer scope here would release what the recording still reads and run
+        // the deferred reconciliation under it (backlog I6-R4). Refused; nothing changes.
+        if (s.recording)
+        {
+            log::warning("RenderService::Extract: the previous frame is still recording (BeginPipelinedRecording "
+                         "without its EndFrame); join it and call EndFrame first; the frame is not extracted");
+            return nvrhi::FE_INVALID_ARGS;
+        }
         // A scope still open from the previous frame (EndFrame not called) closes; that frame counts as not executed.
         s.EndFrame(false);
 
@@ -1045,7 +1070,9 @@ namespace donut::render
         s.views = nullptr;
         s.failure = nvrhi::FS_OK;
         s.bytes = sizeof(RenderSnapshot);
-        s.graph->BeginRenderRead();
+        // Pipelined (part I7): the deferring scope, whose retire list keeps what the main thread drops while the frame
+        // records on another thread; serial: the warning scope, as before.
+        s.graph->BeginRenderRead(m_Desc.pipelined ? SceneGraph::RenderReadMode::Defer : SceneGraph::RenderReadMode::Warn);
         s.scopeOpen = true;
         // Through the graph, which accounts for the read-only phase: the next Refresh may still skip.
         result = s.graph->RunReadOnlyPhase(Phase::RenderExtract);
@@ -1479,6 +1506,34 @@ namespace donut::render
     {
         if (m_Impl)
             m_Impl->EndFrame(executed);
+    }
+
+    nvrhi::FRESULT RenderService::BeginPipelinedRecording() noexcept
+    {
+        if (!m_Desc.pipelined)
+        {
+            log::warning("RenderService::BeginPipelinedRecording: the service is not pipelined "
+                         "(RenderServiceDesc::pipelined); record the frame serially");
+            return nvrhi::FE_INVALID_ARGS;
+        }
+        if (!m_Impl || !m_Impl->frameOpen)
+        {
+            log::warning("RenderService::BeginPipelinedRecording: no frame is open (Extract did not run or failed, or "
+                         "EndFrame came)");
+            return nvrhi::FE_INVALID_ARGS;
+        }
+        Impl& s = *m_Impl;
+        if (s.recording)
+            return nvrhi::FS_OK;
+        if (s.scene)
+            s.scene->BeginPipelinedRecording();
+        s.recording = true;
+        return nvrhi::FS_OK;
+    }
+
+    bool RenderService::IsPipelinedRecording() const noexcept
+    {
+        return m_Impl && m_Impl->recording;
     }
 
     const RenderServiceStats& RenderService::GetStats() const noexcept
