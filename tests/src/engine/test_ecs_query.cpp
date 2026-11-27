@@ -30,6 +30,7 @@
 #include <donut/engine/EcsQuery.h>
 #include <donut/engine/EcsScheduler.h>
 #include <donut/engine/EcsWorld.h>
+#include <donut/tests/e7_switches.h>
 #include <donut/tests/utils.h>
 #include <nvrhi/core/autoptr.h>
 
@@ -2630,7 +2631,9 @@ void test_row_versions_chunk_only_writer()
 // prefetched across many of them; an Optional term absent in one archetype, a per-chunk term, and a form without data.
 void test_chunk_prefetch()
 {
-    CHECK(!GetQueryChunkPrefetch());
+    // Stage T1: on in the switches-on runs (tests/src/e7_switches.cpp); the value found is put back at the end.
+    const bool prefetchFound = GetQueryChunkPrefetch();
+    CHECK(prefetchFound == donut::tests::E7SwitchRequested("prefetch"));
     auto world = MakeWorld(true, 1024, 4096);
     const Ids ids = RegisterAll(world);
     std::vector<Entity> e(3000);
@@ -2711,6 +2714,7 @@ void test_chunk_prefetch()
     SetQueryChunkPrefetch(false);
     CHECK(off.size() > 3 * 3000 && off == on);
     CHECK(!GetQueryChunkPrefetch());
+    SetQueryChunkPrefetch(prefetchFound);
     CHECK(Impl(world).GetValidationErrorCount() == 0);
 }
 

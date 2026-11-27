@@ -821,6 +821,24 @@ namespace
         CHECK(record);
         return { record->archetype, record->chunk };
     }
+    // Whether the graph was made with RowTracked transforms (SceneGraph::SetRowTrackedTransforms; plan step E7, part I4;
+    // on in the switches-on runs of stage T1, tests/src/e7_switches.cpp). Propagation then composes by row, so that its
+    // work counters (propagated rows and chunks, deep rows) are lower than the chunk model below; the worlds are equal.
+    bool RowTrackedGraph(SceneGraph* graph)
+    {
+        IWorld* world = graph->GetWorld();
+        return !!(world->GetComponentTypeDesc(FindComponent<LocalTransform>(world))->flags & ComponentFlags::RowTracked);
+    }
+    // The rows below `node` that are not driven, through rows that are not driven: what propagation by row must compute
+    // when only `node` was written (stage T1, the lower bound with RowTracked transforms).
+    uint64_t NodesBelow(Rig& rig, SceneGraphNode* node)
+    {
+        uint64_t rows = 0;
+        for (SceneGraphNode* child : node->GetChildren())
+            if (!rig.IsDriven(child))
+                rows += 1 + NodesBelow(rig, child);
+        return rows;
+    }
     // The rows that propagation must compute when the interpolation wrote `written` and nothing else changed: per level
     // those below a written chunk, whose chunks are then written too (versions are per chunk).
     uint64_t RowsBelow(Rig& rig, std::set<ChunkKey> written)
@@ -1274,7 +1292,10 @@ void test_driver_propagation()
     rig.Simulate(0.0);
     rig.Refresh();
     CHECK(SameBits(driven[250]->GetLocalToWorldTransform(), rig.Posed(driven[250])));
-    CHECK(rig.PropagatedRows() - rows == rowsBelow);
+    // Stage T1: by row with RowTracked transforms (backlog I4-R1): at least the rows below the node, at most the chunks'.
+    const uint64_t computed = rig.PropagatedRows() - rows;
+    const bool byRow = RowTrackedGraph(rig.graph);
+    CHECK(byRow ? computed >= NodesBelow(rig, driven[250]) && computed <= rowsBelow : computed == rowsBelow);
     CheckChildrenFollow(rig);
 
     // all of them move; only the level of the driven rows has none to compute
@@ -2463,8 +2484,13 @@ void test_driver_propagated_rows()
             add(c.deepRows);
         }
         const SceneGraphStore::Counters& c = StoreOf(s.graph).GetCounters();
-        if (c.propagatedRows != spec.rows || c.propagatedChunks != spec.chunks || c.deepRows != spec.deepRows ||
-            hash != spec.hash)
+        // Stage T1: RowTracked transforms (the switches-on runs; backlog I4-R1) compose by row: no more work than the
+        // numbers of E6.1, which hold for chunk versions only, and the hash of the per-frame numbers is not theirs.
+        const bool byRow = RowTrackedGraph(s.graph);
+        if (byRow ? c.propagatedRows > spec.rows || c.propagatedChunks > spec.chunks || c.deepRows > spec.deepRows ||
+                    c.propagatedRows == 0
+                  : c.propagatedRows != spec.rows || c.propagatedChunks != spec.chunks || c.deepRows != spec.deepRows ||
+                    hash != spec.hash)
         {
             std::fprintf(stderr, "%s: %llu rows, %llu chunks, %llu deep rows, hash %016llx\n", spec.name,
                          (unsigned long long)c.propagatedRows, (unsigned long long)c.propagatedChunks,

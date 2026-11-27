@@ -42,4 +42,32 @@ include(test-core.cmake)
 if (DONUT_WITH_NVRHI)
     include(test-engine.cmake)
     include(test-render.cmake)
+
+    # The switches of plan step E7 (sub-plan revision 2, parts I4 and I5) from the environment (src/e7_switches.cpp:
+    # DONUT_E7_SWITCHES=all or a list; nothing without it). Linked into the device-free tests and smoke benches that build
+    # scene graphs, run queries or extract; each also runs as `<test>_switches_on` with every switch on (stage T1).
+    add_library(donut_tests_e7_switches OBJECT src/e7_switches.cpp)
+    target_link_libraries(donut_tests_e7_switches PRIVATE donut_render donut_engine donut_core donut_tests_utils)
+    set_property(TARGET donut_tests_e7_switches PROPERTY FOLDER "Donut/donut_tests")
+    set(_e7_switch_tests test_asset_tables test_gpu_scene test_runtime_instances test_world_inspector test_e7_fixes
+        test_render_extract test_draw_packets test_draw_strategy_adapters test_light_shadows test_render_pipelining
+        test_e7_render_fixes)
+    foreach(test_src ${donut_engine_tests})
+        get_filename_component(test_name "${test_src}" NAME_WE)
+        if(test_name MATCHES "^test_(ecs|scene_graph)_")
+            list(APPEND _e7_switch_tests "${test_name}")
+        endif()
+    endforeach()
+    foreach(_test ${_e7_switch_tests})
+        if(TARGET ${_test})
+            target_link_libraries(${_test} donut_tests_e7_switches)
+            add_test(NAME ${_test}_switches_on COMMAND ${_test})
+            set_tests_properties(${_test}_switches_on PROPERTIES ENVIRONMENT "DONUT_E7_SWITCHES=all")
+        endif()
+    endforeach()
+    foreach(_bench bench_scene_graph bench_gpu_scene bench_simulation bench_render_extract)
+        target_link_libraries(${_bench} donut_tests_e7_switches)
+        add_test(NAME ${_bench}_smoke_switches_on COMMAND ${_bench} --smoke)
+        set_tests_properties(${_bench}_smoke_switches_on PROPERTIES ENVIRONMENT "DONUT_E7_SWITCHES=all")
+    endforeach()
 endif()

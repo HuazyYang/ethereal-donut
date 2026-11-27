@@ -32,6 +32,7 @@
 #include <donut/engine/EcsWorld.h>
 #include <donut/engine/JobSystem.h>
 #include <donut/core/query_cast.h>
+#include <donut/tests/e7_switches.h>
 #include <donut/tests/utils.h>
 #include <donut/core/log.h>
 
@@ -1862,7 +1863,10 @@ namespace
 // attach and of InvalidateContent; the path is taken only by the second graph.
 void test_childless_bounds_path()
 {
-    CHECK(!SceneGraph::GetChildlessBoundsPath());
+    // Stage T1: on in the switches-on runs (tests/src/e7_switches.cpp); the first graph is refreshed with it off
+    // explicitly, and the value found is put back at the end.
+    const bool childlessFound = SceneGraph::GetChildlessBoundsPath();
+    CHECK(childlessFound == donut::tests::E7SwitchRequested("childless"));
     auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
     std::vector<nvrhi::AutoPtr<MeshInfo>> meshes;
     for (int i = 0; i < 3; ++i)
@@ -1909,6 +1913,7 @@ void test_childless_bounds_path()
     Built built[2] = { build(), build() };
     auto refresh = [&](uint32_t frame)
     {
+        SceneGraph::SetChildlessBoundsPath(false);
         built[0].graph->Refresh(frame);
         SceneGraph::SetChildlessBoundsPath(true);
         built[1].graph->Refresh(frame);
@@ -1956,6 +1961,7 @@ void test_childless_bounds_path()
     CHECK(off.subgraphPasses == on.subgraphPasses && off.fullSubgraphPasses == on.fullSubgraphPasses);
     CHECK(on.subgraphPasses > on.fullSubgraphPasses);
     CHECK(!SceneGraph::GetChildlessBoundsPath());
+    SceneGraph::SetChildlessBoundsPath(childlessFound);
     std::printf("  equal over 12 frames (%llu passes, %llu full); %llu chunks took the path, %llu bounds chunks\n",
                 (unsigned long long)on.subgraphPasses, (unsigned long long)on.fullSubgraphPasses,
                 (unsigned long long)on.childlessChunks, (unsigned long long)on.boundsChunks);

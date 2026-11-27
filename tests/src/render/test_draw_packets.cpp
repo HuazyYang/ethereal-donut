@@ -75,6 +75,7 @@
 #include <donut/engine/View.h>
 #include <donut/core/log.h>
 #include <donut/core/query_cast.h>
+#include <donut/tests/e7_switches.h>
 #include <donut/tests/utils.h>
 
 #include "CountingJobSystem.h"
@@ -1641,7 +1642,9 @@ namespace
     // job system. The sorter's two-step form gives Sort's order, with the position in the word and in the index arrays.
     void test_compact_packet_records()
     {
-        CHECK(!RenderService::GetCompactPacketRecords());
+        // Stage T1: on in the switches-on runs (tests/src/e7_switches.cpp); the value found is put back at the end.
+        const bool compactFound = RenderService::GetCompactPacketRecords();
+        CHECK(compactFound == donut::tests::E7SwitchRequested("compact"));
         JobSystemDesc jobDesc;
         jobDesc.debugName = "test_draw_packets.compact";
         jobDesc.workerThreadCount = 8;
@@ -1737,6 +1740,7 @@ namespace
                     (unsigned long long)packets[0], (unsigned long long)packets[1]);
         CHECK(packets[0] > 1000 && packets[1] > 1000);
         CHECK(!RenderService::GetCompactPacketRecords());
+        RenderService::SetCompactPacketRecords(compactFound);
     }
 
     // Ten frames of runtime rows moving beside nodes after warm-up, five views: no operator new, no ECS heap block. A

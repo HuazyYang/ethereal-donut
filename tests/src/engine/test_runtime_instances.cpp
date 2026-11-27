@@ -48,6 +48,7 @@
 #include <donut/engine/GpuScene.h>
 #include <donut/engine/JobSystem.h>
 #include <donut/engine/SceneGraph.h>
+#include <donut/tests/e7_switches.h>
 #include <donut/tests/utils.h>
 
 #include "EcsWorldImpl.h"
@@ -2212,14 +2213,17 @@ void test_script_golden()
 // the world is not propagated (a warning in Debug); neither moves the row there. The first graph moves both.
 void test_static_tag()
 {
-    CHECK(!SceneGraph::GetStaticTag());
+    // Stage T1: the switches-on runs (DONUT_E7_SWITCHES, tests/src/e7_switches.cpp) start with the switch on; the first
+    // graph is made with it off explicitly, and the value found is put back once the graphs are made.
+    const bool staticTagFound = SceneGraph::GetStaticTag();
+    CHECK(staticTagFound == donut::tests::E7SwitchRequested("static"));
     Assets assets;
     std::unique_ptr<Rig> rigs[2];
+    SceneGraph::SetStaticTag(false);
     rigs[0] = std::make_unique<Rig>(4);
     SceneGraph::SetStaticTag(true);
     rigs[1] = std::make_unique<Rig>(4);
-    SceneGraph::SetStaticTag(false);
-    CHECK(!SceneGraph::GetStaticTag());
+    SceneGraph::SetStaticTag(staticTagFound);
 
     struct Content
     {

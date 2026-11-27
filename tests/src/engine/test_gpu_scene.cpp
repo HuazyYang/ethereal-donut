@@ -35,6 +35,7 @@
 #include <donut/engine/JobSystem.h>
 #include <donut/engine/SceneGraph.h>
 #include <donut/core/log.h>
+#include <donut/tests/e7_switches.h>
 #include <donut/tests/utils.h>
 
 #include "EcsWorldImpl.h"
@@ -1810,7 +1811,9 @@ void test_scatter_lost_prepare()
 // propagation writes and stamps only that row's WorldTransform, and GpuScene builds only that row of the chunk.
 void test_row_tracked_transforms()
 {
-    CHECK(!SceneGraph::GetRowTrackedTransforms());
+    // Stage T1: on in the switches-on runs (tests/src/e7_switches.cpp); the value found is put back at the end.
+    const bool rowTrackedFound = SceneGraph::GetRowTrackedTransforms();
+    CHECK(rowTrackedFound == donut::tests::E7SwitchRequested("rowtracked"));
     auto material = make_material("m", MaterialDomain::Opaque);
     auto mesh = make_mesh("mesh", { material });
     for (const bool tracked : { false, true })
@@ -1853,6 +1856,7 @@ void test_row_tracked_transforms()
         stats = step();   // its previous transform settles
         CHECK(stats.rowsSettled == 1 && stats.rowsChanged == 0);
     }
+    SceneGraph::SetRowTrackedTransforms(rowTrackedFound);
 }
 
 int main(int, char**)
