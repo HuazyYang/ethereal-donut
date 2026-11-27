@@ -2692,7 +2692,8 @@ namespace
         graph->EndRenderRead();   // the Warn scope
         CHECK(graph->IsInRenderRead() && graph->IsRenderReadDeferring());
         CHECK(!Expired(weakNodeA) && !Expired(weakLeafA) && !Expired(weakLight) && !Expired(weakMaterial));
-        CHECK(!Expired(weakOwnMaterial));   // the tables' retirement holds the material, not only the mesh's geometry
+        CHECK(!Expired(weakOwnMaterial));   // kept (by the retired mesh's geometries too; test_render_pipelining's
+                                            // defer_retire_material isolates the tables' retirement of materials)
         CHECK(g_CountedMeshesDestroyed.load() == destroyedBefore);
         CHECK(graph->GetMeshes().GetMeshRow(editedSlot).geometryCount == 1);
 

@@ -971,6 +971,139 @@ namespace
         CHECK(pipelined.tasksOnMainThread > 0);
     }
 
+    // Stage T8 (mutants of part I6): what Defer scopes keep goes at the close of the last one, not of an inner Defer
+    // scope (two pipelined frames' scopes, or a frame's and the application's); the graph defers until then.
+    void test_defer_nested_scopes()
+    {
+        auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+        graph->SetRootNode(MAKE_RC_OBJ_PTR(SceneGraphNode));
+        nvrhi::AutoPtr<SceneGraphLeaf> light = MAKE_RC_OBJ_PTR(PointLight);
+        nvrhi::AutoPtr<SceneGraphNode> node = graph->AttachLeafNode(graph->GetRootNode(), light);
+        auto weakNode = WeakOf(node);
+        auto weakLight = WeakOf(light);
+        light = nullptr;
+        graph->Refresh(0);
+
+        graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+        graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+        (void)graph->Detach(node);
+        node = nullptr;
+        graph->EndRenderRead();   // the inner Defer scope
+        CHECK(graph->IsRenderReadDeferring() && SceneGraph::IsAnyRenderReadDeferring());
+        CHECK(weakNode->IsExpired() == 0 && weakLight->IsExpired() == 0);
+        graph->EndRenderRead();   // the last one
+        CHECK(!graph->IsRenderReadDeferring() && !SceneGraph::IsAnyRenderReadDeferring());
+        CHECK(weakNode->IsExpired() != 0 && weakLight->IsExpired() != 0);
+    }
+
+    // Stage T8 (part I6): a graph destroyed while a Defer scope is open releases what the scope kept, and no longer
+    // counts as deferring for the process (the walking strategies of other graphs walk again).
+    void test_defer_scope_at_destruction()
+    {
+        nvrhi::AutoPtr<nvrhi::IWeakReference> weakNode;
+        nvrhi::AutoPtr<nvrhi::IWeakReference> weakLeaf;
+        {
+            auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+            graph->SetRootNode(MAKE_RC_OBJ_PTR(SceneGraphNode));
+            nvrhi::AutoPtr<SceneGraphLeaf> light = MAKE_RC_OBJ_PTR(SpotLight);
+            nvrhi::AutoPtr<SceneGraphNode> node = graph->AttachLeafNode(graph->GetRootNode(), light);
+            weakNode = WeakOf(node);
+            weakLeaf = WeakOf(light);
+            light = nullptr;
+            graph->Refresh(0);
+            graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+            (void)graph->Detach(node);
+            node = nullptr;
+            CHECK(weakNode->IsExpired() == 0 && SceneGraph::IsAnyRenderReadDeferring());
+        }
+        CHECK(weakNode->IsExpired() != 0 && weakLeaf->IsExpired() != 0);
+        CHECK(!SceneGraph::IsAnyRenderReadDeferring());
+    }
+
+    // Stage T8 (mutant I6-16): a material the tables drop while a Defer scope is open is kept by the retire list itself,
+    // not only through the dropped mesh's geometries: here the mesh, still held by the test, lets go of it first.
+    void test_defer_retire_material()
+    {
+        auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+        auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+        graph->SetRootNode(MAKE_RC_OBJ_PTR(SceneGraphNode));
+        auto material = factory->CreateMaterial();
+        material->domain = MaterialDomain::Opaque;
+        auto weakMaterial = WeakOf(material);
+        auto mesh = factory->CreateMesh();
+        auto geometry = factory->CreateMeshGeometry();
+        geometry->material = material;
+        mesh->geometries.push_back(geometry);
+        material = nullptr;
+        nvrhi::AutoPtr<SceneGraphNode> node = graph->AttachLeafNode(graph->GetRootNode(),
+                                                                    factory->CreateMeshInstance(mesh));
+        graph->Refresh(0);
+
+        graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+        (void)graph->Detach(node);   // the mesh's last instance: the tables drop the mesh and its material
+        node = nullptr;
+        mesh->geometries[0]->material = nullptr;
+        CHECK(weakMaterial->IsExpired() == 0);   // retired
+        graph->EndRenderRead();
+        CHECK(weakMaterial->IsExpired() != 0);
+    }
+
+    // Stage T8 (mutant I6-29): a walking strategy refused in a pipelined frame gives no item, also after a walk that
+    // was not drained (its leftover items are dropped, not handed out).
+    void test_walking_refusal_partial()
+    {
+        TestViews views;
+        Scene scene(0x7e8, 2);
+        scene.Build(60);
+        auto opaque = MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy);
+        uint32_t items = 0;
+        opaque->PrepareForView(scene.graph->GetRootNode(), *views.perspective);
+        while (opaque->GetNextItem())
+            ++items;
+        CHECK(items >= 2);
+        opaque->PrepareForView(scene.graph->GetRootNode(), *views.perspective);
+        CHECK(opaque->GetNextItem() != nullptr);   // one taken, the rest left
+        const uint32_t warnings = g_Warnings.load();
+        scene.graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+        opaque->PrepareForView(scene.graph->GetRootNode(), *views.perspective);
+        CHECK(opaque->GetNextItem() == nullptr);
+        scene.graph->EndRenderRead();
+        CHECK(g_Warnings.load() == warnings + 1);
+        g_Warnings = warnings;
+    }
+
+    // Stage T8 (part I7): BeginPipelinedRecording is refused once the frame has ended (EndFrame) as before the first
+    // Extract; IsPipelinedRecording follows the hand-off and the EndFrame; a refused frame keeps no recording.
+    void test_service_recording_states()
+    {
+        TestViews views;
+        Scene scene(0x7e7, 2);
+        scene.Build(20);
+        RenderServiceDesc desc;
+        desc.sceneGraph = scene.graph;
+        desc.pipelined = true;
+        auto service = MAKE_RC_OBJ_PTR(RenderService, nullptr, desc);
+        RenderFrame frame;
+        const uint32_t warnings = g_Warnings.load();
+        for (uint32_t f = 0; f < 3; ++f)
+        {
+            frame.graph->Reset();
+            frame.data.Clear();
+            SceneFrame* sceneFrame = nullptr;
+            CHECK(service->Extract(frame.graph, &frame.data, views.Desc(f), &sceneFrame) == nvrhi::FS_OK);
+            CHECK(!service->IsPipelinedRecording());
+            CHECK(service->BeginPipelinedRecording() == nvrhi::FS_OK && service->IsPipelinedRecording());
+            service->EndFrame(true);
+            CHECK(!service->IsPipelinedRecording() && !scene.graph->IsInRenderRead());
+            CHECK(service->BeginPipelinedRecording() == nvrhi::FE_INVALID_ARGS);   // the frame ended: one warning
+            CHECK(!service->IsPipelinedRecording());
+            service->EndFrame(true);   // idempotent
+        }
+        CHECK(g_Warnings.load() == warnings + 3);
+        g_Warnings = warnings;
+        service = nullptr;
+    }
+
     struct Case
     {
         const char* name;
@@ -1002,6 +1135,11 @@ int main(int argc, char** argv)
         { "pipelined_equals_serial", test_pipelined_equals_serial, nullptr },
         { "pipelined_workers", test_pipelined_workers, nullptr },
         { "main_thread_runs_recording", test_main_thread_runs_recording, nullptr },
+        { "defer_nested_scopes", test_defer_nested_scopes, nullptr },
+        { "defer_scope_at_destruction", test_defer_scope_at_destruction, nullptr },
+        { "service_recording_states", test_service_recording_states, nullptr },
+        { "defer_retire_material", test_defer_retire_material, nullptr },
+        { "walking_refusal_partial", test_walking_refusal_partial, nullptr },
     };
     // No argument: every case not marked with a backlog item. --backlog: the marked ones. A name: that case.
     const bool backlog = argc > 1 && std::strcmp(argv[1], "--backlog") == 0;

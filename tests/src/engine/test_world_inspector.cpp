@@ -1360,6 +1360,32 @@ void test_system_info_storage()
 
 // A phase with an ordering cycle lists its systems in registration order and does not run; the build's warnings are
 // logged.
+// Stage T8 (mutant I3-40): GetSystemInfo of a scheduler is refused while a phase of another scheduler of the same world
+// runs (the world is in a phase; its systems may be writing the statistics of the shared world's resources).
+void test_system_info_other_scheduler()
+{
+    Env env;
+    nvrhi::AutoPtr<IScheduler> second;
+    CHECK(CreateScheduler(env.world.Get(), env.jobs.Get(), &second) == nvrhi::FS_OK);
+    SystemId listed = SystemId::Invalid;
+    CHECK(second->AddSystem(MakeSystem("listed", Phase::PreSimulation, SystemFlags::None, [](ISystemContext*) {}),
+                            listed) == nvrhi::FS_OK);
+    SystemInfo outside{};
+    CHECK(second->GetSystemInfo(0, outside) == nvrhi::FS_OK && outside.id == listed);
+    nvrhi::FRESULT inPhase = nvrhi::FS_OK;
+    uint32_t zeroed = 0;
+    env.Add(MakeSystem("asks", Phase::PreSimulation, SystemFlags::MainThread, [&](ISystemContext*)
+    {
+        SystemInfo info{};
+        info.enabled = 7;
+        inPhase = second->GetSystemInfo(0, info);
+        zeroed = info.enabled == 0 && !info.name ? 1 : 0;
+    }));
+    CHECK(env.scheduler->RunPhases(Phase::BeginFrame, Phase::EndFrame) == nvrhi::FS_OK);
+    CHECK(inPhase == nvrhi::FE_OUT_OF_DATE && zeroed == 1);
+    CHECK(second->GetSystemInfo(0, outside) == nvrhi::FS_OK);
+}
+
 void test_system_info_cycle()
 {
     Env env;
@@ -2123,8 +2149,12 @@ void test_refusals()
     CHECK(inObserver == nvrhi::FE_OUT_OF_DATE && versionStep == 0);
     CHECK(world->RemoveObserver(observerId) == nvrhi::FS_OK);
     CHECK(GetComponent<A>(world, rows[1])->value == 0.f && PendingShown(inspector, world) == 1);
+    WorldStats stats{};
+    const uint64_t played = world->GetStats(stats).commandsPlayedBack;
     CHECK(inspector.Apply(world) == nvrhi::FS_OK);
     CHECK(GetComponent<A>(world, rows[1])->value == 2.f);
+    // one command for the one pending value: the refused playback left none behind (stage T8, mutant I3-06)
+    CHECK(world->GetStats(stats).commandsPlayedBack == played + 1);
 
     // No world.
     warnings = g_Warnings.load();
@@ -2281,6 +2311,7 @@ int main(int argc, char** argv)
         { "chunk_info_storage", test_chunk_info_storage, nullptr },
         { "system_info_storage", test_system_info_storage, nullptr },
         { "system_info_cycle", test_system_info_cycle, nullptr },
+        { "system_info_other_scheduler", test_system_info_other_scheduler, nullptr },
         { "panels_show_storage", test_panels_show_storage, nullptr },
         { "systems_panel_other_world", test_systems_panel_other_world, nullptr },
         { "offers_scene_rows", test_offers_scene_rows, nullptr },
