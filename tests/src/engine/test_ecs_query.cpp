@@ -3160,29 +3160,37 @@ void test_row_versions_chunk_only_rule()
 // SetQueryChunkPrefetch: off by default; every typed form visits the same chunks, rows and values, in the same order,
 // with the same stamps, with it on and off. Small chunks, so that batches of 16 views are full and the next chunk is
 // prefetched across many of them; an Optional term absent in one archetype, a per-chunk term, and a form without data.
-void test_chunk_prefetch()
+// One world of the case below: `plain` rows of Position and Velocity (with Big when `big`, rows of 224 bytes that take
+// the large chunk size), `toggled` with Toggle too, `bounded` with a per-chunk ChunkBounds; returns the chunk count.
+uint32_t run_chunk_prefetch(uint32_t chunkSize, uint32_t largeChunkSize, uint32_t plain, uint32_t toggled,
+                            uint32_t bounded, bool big)
 {
-    // Stage T1: on in the switches-on runs (tests/src/e7_switches.cpp); the value found is put back at the end.
     const bool prefetchFound = GetQueryChunkPrefetch();
-    CHECK(prefetchFound == donut::tests::E7SwitchRequested("prefetch"));
-    auto world = MakeWorld(true, 1024, 4096);
+    auto world = MakeWorld(true, chunkSize, largeChunkSize);
     const Ids ids = RegisterAll(world);
-    std::vector<Entity> e(3000);
-    std::vector<Position> positions(3000);
-    for (uint32_t i = 0; i < 3000; ++i)
+    const uint32_t total = plain + toggled + bounded;
+    std::vector<Entity> e(total);
+    std::vector<Position> positions(total);
+    for (uint32_t i = 0; i < total; ++i)
         positions[i] = Position{ float(i), float(i % 7), 2 };
-    CreateMany(world, { ids.position, ids.velocity }, 1800, e.data(), { positions.data(), nullptr });
-    CreateMany(world, { ids.position, ids.velocity, ids.toggle }, 700, e.data() + 1800,
-               { positions.data() + 1800, nullptr, nullptr });
-    CreateMany(world, { ids.position, ids.velocity, ids.chunkBounds }, 500, e.data() + 2500,
-               { positions.data() + 2500, nullptr, nullptr });
+    if (plain && big)
+        CreateMany(world, { ids.position, ids.velocity, ids.big }, plain, e.data(), { positions.data(), nullptr,
+                                                                                     nullptr });
+    else if (plain)
+        CreateMany(world, { ids.position, ids.velocity }, plain, e.data(), { positions.data(), nullptr });
+    if (toggled)
+        CreateMany(world, { ids.position, ids.velocity, ids.toggle }, toggled, e.data() + plain,
+                   { positions.data() + plain, nullptr, nullptr });
+    if (bounded)
+        CreateMany(world, { ids.position, ids.velocity, ids.chunkBounds }, bounded, e.data() + plain + toggled,
+                   { positions.data() + plain + toggled, nullptr, nullptr });
     auto jobs = MAKE_RC_OBJ_PTR(TestJobSystem, 4u);
     auto context = MAKE_RC_OBJ_PTR(TestContext, world.Get(), jobs.Get());
     Query<Read<Position>, Write<Velocity>, Optional<Toggle>> query(world, "prefetch");
     Query<ReadChunk<ChunkBounds>, Read<Position>> perChunk(world, "prefetch per chunk");
     Query<With<Toggle>> withoutData(world, "prefetch without data");
     const uint32_t chunkCount = query.Get()->GetChunkCount();
-    CHECK(chunkCount > 40);
+    CHECK(chunkCount > 0);
     const uint32_t tableSize = Impl(world).GetEntityTableSize();
 
     // Everything the forms see and write, as numbers; stamps relative to the run's version.
@@ -3243,10 +3251,42 @@ void test_chunk_prefetch()
     const std::vector<uint64_t> off = trace(false);
     const std::vector<uint64_t> on = trace(true);
     SetQueryChunkPrefetch(false);
-    CHECK(off.size() > 3 * 3000 && off == on);
+    CHECK(off.size() > 3 * total && off == on);
     CHECK(!GetQueryChunkPrefetch());
     SetQueryChunkPrefetch(prefetchFound);
     CHECK(Impl(world).GetValidationErrorCount() == 0);
+    return chunkCount;
+}
+
+void test_chunk_prefetch()
+{
+    // Stage T1: on in the switches-on runs (tests/src/e7_switches.cpp); the value found is put back at the end.
+    CHECK(GetQueryChunkPrefetch() == donut::tests::E7SwitchRequested("prefetch"));
+    CHECK(run_chunk_prefetch(1024, 4096, 1800, 700, 500, false) > 40);
+}
+
+// Stage T5: the same over many chunk sizes and counts: 1 KiB to 256 KiB chunks, small rows and rows that take the
+// large chunk size, worlds of one row, of 15, 16 and 17 chunks (a batch of 16 views and its edges), and of many.
+void test_chunk_prefetch_sizes()
+{
+    uint32_t worlds = 0, chunks = 0;
+    for (const uint32_t chunkSize : { 1024u, 4096u, 16u * 1024, 64u * 1024, 256u * 1024 })
+    {
+        for (const bool big : { false, true })
+        {
+            const uint32_t largeChunkSize = std::max(chunkSize, 64u * 1024);
+            // rows per chunk of the plain archetype, from a first world of one chunk's worth
+            const uint32_t perChunk = std::max(1u, (big ? largeChunkSize : chunkSize) / (big ? 240u : 40u));
+            for (const uint32_t plain : { 1u, 15 * perChunk, 16 * perChunk, 17 * perChunk + 3, 40 * perChunk + 1 })
+            {
+                if (plain > 200000)
+                    continue;   // the largest chunks: the batch edges are enough
+                chunks += run_chunk_prefetch(chunkSize, largeChunkSize, plain, plain / 3 + 1, plain / 5 + 1, big);
+                ++worlds;
+            }
+        }
+    }
+    printf("  %u worlds, %u chunks: every typed form equal with and without prefetch\n", worlds, chunks);
 }
 
 int main(int, char**)
@@ -3274,6 +3314,7 @@ int main(int, char**)
         { "row_versions_model", &test_row_versions_model },
         { "row_versions_chunk_only_rule", &test_row_versions_chunk_only_rule },
         { "chunk_prefetch", &test_chunk_prefetch },
+        { "chunk_prefetch_sizes", &test_chunk_prefetch_sizes },
         { "steady_state_allocations", &test_steady_state_allocations },
         { "performance_smoke", &test_performance_smoke },
     };

@@ -30,6 +30,7 @@
 #include <donut/engine/SceneGraph.h>
 #include <donut/engine/EcsQuery.h>
 #include <donut/engine/EcsWorld.h>
+#include <donut/engine/GpuScene.h>
 #include <donut/engine/JobSystem.h>
 #include <donut/core/query_cast.h>
 #include <donut/tests/e7_switches.h>
@@ -42,6 +43,11 @@
 #include "EcsWorldImpl.h"
 #include "SceneGraphStore.h"
 
+// InstanceData, for the GpuScene rows of the Static switch's cases (stage T5); the shader header needs the math names.
+using namespace donut::math;
+#include <donut/shaders/bindless.h>
+
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <stdexcept>
@@ -50,9 +56,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <new>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -1967,6 +1975,708 @@ void test_childless_bounds_path()
                 (unsigned long long)on.childlessChunks, (unsigned long long)on.boundsChunks);
 }
 
+// The childless Bounds path under churn (stage T5; E7.4 remedy 4): two graphs built and edited alike, the second
+// refreshed with SceneGraph::SetChildlessBoundsPath on, for 60 frames of moves of leaves and groups (incremental
+// passes) and, every fourth frame, one structural or content edit (a full pass next): a leaf given a child (its chunk's
+// summary is no longer childless) and losing it again, a leaf leaving (a hole) while another gets a child for good, a
+// re-attach under a group, SetLeaf to another mesh and to none, InvalidateContent, and the box of a shared mesh edited
+// (InvalidateContent on its users). After every Refresh both graphs equal the brute force and each other (every node's
+// subgraph box and content flags); the second took the path, the first never did.
+void test_childless_bounds_churn()
+{
+    const bool childlessFound = SceneGraph::GetChildlessBoundsPath();
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    std::vector<nvrhi::AutoPtr<MeshInfo>> meshes;
+    for (int i = 0; i < 4; ++i)
+        meshes.push_back(MakeMesh(factory, 0.5f + float(i)));
+    struct Built
+    {
+        nvrhi::AutoPtr<SceneGraph> graph;
+        std::vector<SceneGraphNode*> leaves;    // attached leaves (no children of their own when made)
+        std::vector<SceneGraphNode*> groups;    // nodes without a leaf, with leaf children
+        std::vector<SceneGraphNode*> users;     // nodes of the mesh whose box is edited
+        std::vector<nvrhi::AutoPtr<SceneGraphNode>> pool;
+        SceneGraphNode* pendingChild = nullptr;   // a child given to a leaf, taken away the next frame
+        Rng rng{ 0x5eed };
+        SceneGraphNode* AddLeaf(SceneGraphNode* parent, uint32_t mesh)
+        {
+            auto node = MakeNode("leaf");
+            RandomMove(rng, node);
+            node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, (*meshList)[mesh].Get()));
+            SceneGraphNode* attached = graph->Attach(parent, node);
+            leaves.push_back(attached);
+            if (mesh == 3)
+                users.push_back(attached);
+            return attached;
+        }
+        const std::vector<nvrhi::AutoPtr<MeshInfo>>* meshList = nullptr;
+    };
+    Built built[2];
+    for (Built& b : built)
+    {
+        b.meshList = &meshes;
+        b.graph = MAKE_RC_OBJ_PTR(SceneGraph);
+        b.graph->SetRootNode(MakeNode("root"));
+        for (uint32_t i = 0; i < 500; ++i)
+            b.AddLeaf(b.graph->GetRootNode(), i % 4);
+        for (uint32_t g = 0; g < 10; ++g)
+        {
+            auto group = MakeNode("group");
+            RandomMove(b.rng, group);
+            SceneGraphNode* attached = b.graph->Attach(b.graph->GetRootNode(), group);
+            b.groups.push_back(attached);
+            for (uint32_t i = 0; i < 30; ++i)
+                b.AddLeaf(attached, i % 4);
+        }
+    }
+    auto refresh = [&](uint32_t frame)
+    {
+        SceneGraph::SetChildlessBoundsPath(false);
+        built[0].graph->Refresh(frame);
+        SceneGraph::SetChildlessBoundsPath(true);
+        built[1].graph->Refresh(frame);
+        SceneGraph::SetChildlessBoundsPath(childlessFound);
+    };
+    auto compare = [&]()
+    {
+        CheckAgainstBruteForce(built[0].graph);
+        CheckAgainstBruteForce(built[1].graph);
+        SceneGraphWalker a(built[0].graph->GetRootNode());
+        SceneGraphWalker b(built[1].graph->GetRootNode());
+        for (; a && b; a.Next(true), b.Next(true))
+        {
+            const dm::box3 boxA = a->GetGlobalBoundingBox();
+            const dm::box3 boxB = b->GetGlobalBoundingBox();
+            CHECK(SameBits(&boxA, &boxB, sizeof(dm::box3)));
+            CHECK(a->GetSubgraphContentFlags() == b->GetSubgraphContentFlags());
+        }
+        CHECK(!a && !b);
+    };
+    refresh(1);
+    compare();
+    for (uint32_t frame = 2; frame <= 60; ++frame)
+    {
+        // incremental passes in most frames (moves only); every fourth frame one structural edit or content change,
+        // which makes the next pass a full one
+        const bool structural = frame % 4 == 0;
+        const uint32_t kind = (frame / 4) % 6;
+        const bool meshEdited = structural && kind == 5;
+        if (meshEdited)
+        {
+            const float s = 1.f + 0.05f * float(frame);
+            meshes[3]->objectSpaceBounds = dm::box3(dm::float3(-s), dm::float3(s));
+            meshes[3]->geometries[0]->objectSpaceBounds = meshes[3]->objectSpaceBounds;
+        }
+        for (Built& b : built)
+        {
+            Rng& rng = b.rng;
+            for (uint32_t k = 0; k < 40; ++k)
+                RandomMove(rng, b.leaves[rng.Below(uint32_t(b.leaves.size()))]);
+            if (frame % 3 == 0)
+                RandomMove(rng, b.groups[rng.Below(uint32_t(b.groups.size()))]);
+            if (!structural)
+                continue;
+            if (kind == 0)   // a leaf gets a child (its chunk's summary is no longer childless) ...
+                b.pendingChild = b.AddLeaf(b.leaves[rng.Below(uint32_t(b.leaves.size()))], 1);
+            if (kind == 1 && b.pendingChild)
+            {
+                // ... and loses it again
+                b.leaves.erase(std::find(b.leaves.begin(), b.leaves.end(), b.pendingChild));
+                b.pool.push_back(b.graph->Detach(b.pendingChild));
+                b.pendingChild = nullptr;
+            }
+            if (kind == 2)
+            {
+                // a leaf leaves the graph (a hole in its chunk), another gets a child for good
+                const uint32_t i = rng.Below(uint32_t(b.leaves.size()));
+                SceneGraphNode* node = b.leaves[i];
+                if (node->GetFirstChild() == nullptr && node != b.pendingChild &&
+                    std::find(b.users.begin(), b.users.end(), node) == b.users.end())
+                {
+                    b.leaves.erase(b.leaves.begin() + i);
+                    b.pool.push_back(b.graph->Detach(node));
+                }
+                b.AddLeaf(b.leaves[rng.Below(uint32_t(b.leaves.size()))], 2);
+            }
+            if (kind == 3 && !b.pool.empty())
+            {
+                SceneGraphNode* group = b.groups[rng.Below(uint32_t(b.groups.size()))];
+                SceneGraphNode* attached = b.graph->Attach(group, b.pool.back());
+                b.pool.pop_back();
+                b.leaves.push_back(attached);
+            }
+            if (kind == 4)
+            {
+                b.leaves[rng.Below(uint32_t(b.leaves.size()))]->SetLeaf(
+                    MAKE_RC_OBJ_PTR(MeshInstance, meshes[rng.Below(3)].Get()));
+                b.leaves[rng.Below(uint32_t(b.leaves.size()))]->SetLeaf(nullptr);
+            }
+            if (kind == 5)
+            {
+                b.leaves[rng.Below(uint32_t(b.leaves.size()))]->InvalidateContent();
+                for (SceneGraphNode* node : b.users)
+                    node->InvalidateContent();
+            }
+        }
+        refresh(frame);
+        compare();
+    }
+    const SceneGraphStore::Counters& off = CountersOf(built[0].graph);
+    const SceneGraphStore::Counters& on = CountersOf(built[1].graph);
+    CHECK(off.childlessChunks == 0 && on.childlessChunks > 50);
+    CHECK(off.subgraphPasses == on.subgraphPasses && off.fullSubgraphPasses == on.fullSubgraphPasses);
+    CHECK(on.subgraphPasses > 2 * on.fullSubgraphPasses);
+    std::printf("  60 frames of churn equal to the brute force with and without the path (%llu passes, %llu full); "
+                "%llu chunks took it\n", (unsigned long long)on.subgraphPasses, (unsigned long long)on.fullSubgraphPasses,
+                (unsigned long long)on.childlessChunks);
+}
+
+// ------------------------------------------------------------ the Static tag under churn (stage T5; E7.4 remedy 3)
+
+namespace
+{
+    // A leaf class with LeafTypeDesc::dynamicBounds: its box follows `box`, without InvalidateContent.
+    class DynamicBoundsMesh final : public MeshInstance
+    {
+        NVRHI_INHERIT_INTERFACE_TABLE()
+    public:
+        explicit DynamicBoundsMesh(MeshInfo* mesh) : MeshInstance(mesh) { }
+        dm::box3 box = dm::box3(dm::float3(-1.f), dm::float3(1.f));
+        dm::box3 GetLocalBoundingBox() override { return box; }
+        const LeafTypeDesc& GetTypeDesc() const override
+        {
+            static const LeafTypeDesc s_Desc = [this]()
+            {
+                LeafTypeDesc desc = MeshInstance::GetTypeDesc();
+                desc.dynamicBounds = true;
+                return desc;
+            }();
+            return s_Desc;
+        }
+    };
+
+    // The local transform as propagation composes it (SceneGraphStore.cpp, ComposeLocal).
+    dm::daffine3 ComposeLocalTransform(const LocalTransform& local)
+    {
+        dm::daffine3 transform = dm::scaling(local.scaling);
+        transform *= local.rotation.toAffine();
+        transform *= dm::translation(local.translation);
+        return transform;
+    }
+
+    // A scene for the Static switch (stage T5), built and edited alike in any graph from one seed: Static nodes with
+    // leaves under the root (some with Static children, some with moving children of their own), moving nodes, Static
+    // children of moving parents, a chain of 70 nodes whose nodes from depth 59 on are Static (59-62 honoured, 63 and
+    // deeper in the deep bucket, which the tag does not take out), Static nodes without a transform of their own,
+    // Static nodes with dynamic-bounds leaves, and runtime-only rows with and without the tag. `Churn` edits it the
+    // same way in every graph: moves, Static subtrees attached (rows join Static chunks) and detached (they leave,
+    // swap-remove holes) and attached again, first transforms of Static nodes, SetLeaf, reparenting under Static
+    // nodes, a mesh box edited with InvalidateContent, dynamic boxes, runtime rows destroyed and made; `violate` adds
+    // what the documented contract leaves frozen: moves of Static rows' parents and of the chain's top, and writes of
+    // Static rows' LocalTransform (through the world, and through SetTranslation).
+    struct StaticScene
+    {
+        nvrhi::AutoPtr<SceneGraph> graph;
+        IWorld* world = nullptr;
+        ComponentId staticId = ComponentId::Invalid;
+        std::vector<MeshInfo*> meshes;   // [0..2] shared; [3] the one whose box the churn edits
+        std::vector<SceneGraphNode*> staticTops, movers, movingParents, deep, untransformed, editedUsers;
+        std::vector<nvrhi::AutoPtr<SceneGraphNode>> pool;   // detached Static subtrees
+        std::vector<DynamicBoundsMesh*> dynamics;
+        std::vector<ComponentId> runtimeComponents;
+        MeshId runtimeMesh = MeshId::Invalid;
+        std::vector<Entity> runtimeStatic, runtimePlain;
+        Rng rng;
+        uint32_t made = 0;
+
+        StaticScene(bool honoured, uint64_t seed, const std::vector<MeshInfo*>& meshList) : meshes(meshList), rng(seed)
+        {
+            const bool found = SceneGraph::GetStaticTag();
+            SceneGraph::SetStaticTag(honoured);
+            graph = MAKE_RC_OBJ_PTR(SceneGraph);
+            SceneGraph::SetStaticTag(found);
+            world = graph->GetWorld();
+            staticId = RegisterComponent<Static>(world);
+            graph->SetRootNode(MakeNode("root"));
+            SceneGraphNode* root = graph->GetRootNode();
+            for (uint32_t i = 0; i < 240; ++i)
+                staticTops.push_back(AddStaticSubtree(root));
+            for (uint32_t i = 0; i < 120; ++i)
+                movers.push_back(AddNode(root, true, false, meshes[i % 3]));
+            for (uint32_t i = 0; i < 30; ++i)
+            {
+                SceneGraphNode* parent = AddNode(root, true, false, meshes[i % 3]);
+                movingParents.push_back(parent);
+                for (uint32_t k = 0; k < 2; ++k)
+                    AddNode(parent, true, true, meshes[(i + k) % 3]);
+            }
+            SceneGraphNode* parent = root;
+            for (uint32_t d = 1; d <= 70; ++d)
+            {
+                parent = AddNode(parent, true, d >= 59, d % 3 ? meshes[d % 3] : nullptr);
+                deep.push_back(parent);
+            }
+            for (uint32_t i = 0; i < 24; ++i)
+                untransformed.push_back(AddNode(root, false, true, meshes[i % 3]));
+            for (uint32_t i = 0; i < 16; ++i)
+            {
+                auto leaf = MAKE_RC_OBJ_PTR(DynamicBoundsMesh, meshes[0]);
+                dynamics.push_back(leaf.Get());
+                SceneGraphNode* node = AddNode(root, true, true, nullptr);
+                node->SetLeaf(leaf);
+            }
+            for (uint32_t i = 0; i < 20; ++i)
+                editedUsers.push_back(AddNode(root, true, true, meshes[3]));
+
+            runtimeComponents.resize(graph->GetRuntimeMeshInstanceComponents(nullptr, 0));
+            graph->GetRuntimeMeshInstanceComponents(runtimeComponents.data(), uint32_t(runtimeComponents.size()));
+            runtimeMesh = graph->AcquireRuntimeMesh(meshes[1]);
+            CHECK(runtimeMesh != MeshId::Invalid);
+            SpawnRuntime(160, true);
+            SpawnRuntime(80, false);
+        }
+        ~StaticScene()
+        {
+            if (graph && runtimeMesh != MeshId::Invalid)
+                graph->ReleaseRuntimeMesh(runtimeMesh);
+        }
+
+        void Tag(SceneGraphNode* node)
+        {
+            const Entity entity = graph->GetEntity(node);
+            if (!world->HasComponent(entity, staticId))
+                CHECK(world->AddComponent(entity, staticId, nullptr) == nvrhi::FS_OK);
+        }
+        SceneGraphNode* AddNode(SceneGraphNode* parent, bool transform, bool isStatic, MeshInfo* mesh)
+        {
+            auto node = MakeNode("n");
+            if (transform)
+                RandomMove(rng, node);
+            if (mesh)
+                node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, mesh));
+            SceneGraphNode* attached = graph->Attach(parent, node);
+            if (isStatic)
+                Tag(attached);
+            ++made;
+            return attached;
+        }
+        // A Static node with a leaf, with 0-2 Static children and, one in three, a moving child.
+        SceneGraphNode* AddStaticSubtree(SceneGraphNode* parent)
+        {
+            SceneGraphNode* top = AddNode(parent, true, true, meshes[rng.Below(3)]);
+            for (uint32_t k = rng.Below(3); k > 0; --k)
+                AddNode(top, true, true, meshes[rng.Below(3)]);
+            if (rng.Below(3) == 0)
+                movers.push_back(AddNode(top, true, false, meshes[rng.Below(3)]));
+            return top;
+        }
+        void TagSubtree(SceneGraphNode* top)
+        {
+            // re-attached Static subtrees: their nodes carry the tag again (moving children are not Static)
+            for (SceneGraphWalker walker(top); walker; walker.Next(true))
+                if (std::find(movers.begin(), movers.end(), walker.Get()) == movers.end())
+                    Tag(walker.Get());
+        }
+        void SpawnRuntime(uint32_t count, bool isStatic)
+        {
+            std::vector<LocalTransform> locals(count);
+            std::vector<MeshRef> refs(count, MeshRef{ runtimeMesh });
+            for (LocalTransform& local : locals)
+                local = LocalTransform{ dm::double3(rng.Range(-30, 30), rng.Range(-30, 30), rng.Range(-30, 30)),
+                                        dm::dquat::identity(), dm::double3(rng.Range(0.5, 2.0)) };
+            std::vector<ComponentId> ids = runtimeComponents;
+            std::vector<const void*> values(ids.size(), nullptr);
+            for (size_t c = 0; c < ids.size(); ++c)
+            {
+                if (ids[c] == FindComponent<LocalTransform>(world))
+                    values[c] = locals.data();
+                else if (ids[c] == FindComponent<MeshRef>(world))
+                    values[c] = refs.data();
+            }
+            if (isStatic)
+            {
+                ids.push_back(staticId);
+                values.push_back(nullptr);
+            }
+            EntityCreateDesc desc{};
+            desc.components = ids.data();
+            desc.values = values.data();
+            desc.componentCount = uint32_t(ids.size());
+            desc.entityCount = count;
+            std::vector<Entity> rows(count);
+            CHECK(world->CreateEntities(desc, rows.data()) == nvrhi::FS_OK);
+            std::vector<Entity>& list = isStatic ? runtimeStatic : runtimePlain;
+            list.insert(list.end(), rows.begin(), rows.end());
+        }
+        void DestroyRuntime(uint32_t count)
+        {
+            std::vector<Entity> victims;
+            for (uint32_t k = 0; k < count && !runtimeStatic.empty(); ++k)
+            {
+                const uint32_t i = rng.Below(uint32_t(runtimeStatic.size()));
+                victims.push_back(runtimeStatic[i]);
+                runtimeStatic.erase(runtimeStatic.begin() + i);
+            }
+            CHECK(world->DestroyEntities(victims.data(), uint32_t(victims.size())) == nvrhi::FS_OK);
+        }
+
+        // One frame's edits (before Refresh); the mesh box edit is the caller's (the mesh is shared).
+        void Churn(uint32_t frame, bool violate, bool meshEdited)
+        {
+            for (uint32_t k = 0; k < 12; ++k)
+                RandomMove(rng, movers[rng.Below(uint32_t(movers.size()))]);
+            if (frame % 3 == 0)
+                staticTops.push_back(AddStaticSubtree(graph->GetRootNode()));   // rows join Static chunks
+            if (frame % 4 == 1 && staticTops.size() > 1)
+            {
+                // a Static subtree leaves: holes in its chunks, the last rows move in (its moving children leave too)
+                const uint32_t i = rng.Below(uint32_t(staticTops.size()));
+                SceneGraphNode* top = staticTops[i];
+                staticTops.erase(staticTops.begin() + i);
+                for (SceneGraphWalker walker(top); walker; walker.Next(true))
+                {
+                    const auto it = std::find(movers.begin(), movers.end(), walker.Get());
+                    if (it != movers.end())
+                        movers.erase(it);
+                }
+                pool.push_back(graph->Detach(top));
+            }
+            if (frame % 5 == 2 && !pool.empty())
+            {
+                SceneGraphNode* top = graph->Attach(graph->GetRootNode(), pool.back());
+                pool.pop_back();
+                TagSubtree(top);
+                staticTops.push_back(top);
+            }
+            if (frame % 6 == 3 && !untransformed.empty())
+            {
+                untransformed.back()->SetTranslation(dm::double3(rng.Range(-9, 9), 1.0, 2.0));   // its first transform
+                untransformed.pop_back();
+            }
+            if (frame % 7 == 4)
+                staticTops[rng.Below(uint32_t(staticTops.size()))]->SetLeaf(
+                    MAKE_RC_OBJ_PTR(MeshInstance, meshes[rng.Below(3)]));
+            if (frame % 8 == 5 && movers.size() > 10)
+            {
+                // a moving node goes under a Static node
+                SceneGraphNode* mover = movers[rng.Below(uint32_t(movers.size()))];
+                SceneGraphNode* top = staticTops[rng.Below(uint32_t(staticTops.size()))];
+                auto detached = graph->Detach(mover);
+                const auto it = std::find(movers.begin(), movers.end(), mover);
+                movers.erase(it);
+                movers.push_back(graph->Attach(top, detached));
+            }
+            if (meshEdited)
+                for (SceneGraphNode* node : editedUsers)
+                    node->InvalidateContent();
+            dynamics[rng.Below(uint32_t(dynamics.size()))]->box =
+                dm::box3(dm::float3(-float(rng.Range(0.5, 2.0))), dm::float3(float(rng.Range(0.5, 2.0))));
+            if (frame % 3 == 1)
+            {
+                DestroyRuntime(12);
+                SpawnRuntime(12, true);
+            }
+            if (!violate)
+                return;
+            for (uint32_t k = 0; k < 4; ++k)
+                RandomMove(rng, movingParents[rng.Below(uint32_t(movingParents.size()))]);
+            if (frame % 2 == 0)
+                RandomMove(rng, deep[0]);
+            // writes of Static rows' local transforms: through the world, and through the setter
+            world->AdvanceVersion();
+            const Entity written = graph->GetEntity(staticTops[rng.Below(uint32_t(staticTops.size()))]);
+            if (auto* local = static_cast<LocalTransform*>(
+                    world->GetComponentForWrite(written, FindComponent<LocalTransform>(world), c_WorldVersion)))
+                local->translation.y += 0.5;
+            staticTops[rng.Below(uint32_t(staticTops.size()))]->SetTranslation(dm::double3(rng.Range(-9, 9), 3.0, 0.0));
+        }
+    };
+
+    struct RowPlace
+    {
+        uint32_t archetype, chunk, row;
+    };
+
+    // Whether a row is one the tag takes out (SceneGraph.h, SetStaticTag): Static, below the deep bucket, not driven.
+    bool HonouredStatic(IWorld* world, Entity entity, ComponentId staticId)
+    {
+        if (!world->HasComponent(entity, staticId))
+            return false;
+        const ComponentId driven = FindComponent<SimulationDriven>(world);
+        if (driven != ComponentId::Invalid && world->HasComponent(entity, driven))
+            return false;
+        const auto* depth = static_cast<const HierarchyDepth*>(world->GetComponent(entity,
+                                                                                  FindComponent<HierarchyDepth>(world)));
+        return !depth || depth->depth < c_MaxHierarchyDepth;
+    }
+}
+
+// The Static switch where its documentation promises the switch-off results (stage T5): a scene whose Static rows and
+// their ancestors never move and whose Static rows' local transforms are never written after they settle, edited for
+// 36 frames (StaticScene::Churn without `violate`): rows join and leave Static chunks, Static nodes get their first
+// transform and a new leaf, moving nodes go under Static nodes, a mesh's box is edited (InvalidateContent), dynamic
+// boxes change, runtime-only rows with the tag are destroyed and made. Two graphs, the tag honoured in the second; after
+// every Refresh: every node's world transform (bits), box and content flags, every runtime row's world transform and
+// box, and GpuScene's instance rows equal between them, both against the brute force; the second graph left Static
+// archetypes out. Then 10 frames of moves only: the second graph allocates nothing.
+void test_static_tag_promised()
+{
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    std::vector<nvrhi::AutoPtr<MeshInfo>> owned;
+    std::vector<MeshInfo*> meshes;
+    for (int i = 0; i < 4; ++i)
+    {
+        owned.push_back(MakeMesh(factory, 0.5f + 0.5f * float(i)));
+        meshes.push_back(owned.back());
+    }
+    StaticScene scenes[2] = { StaticScene(false, 0x57a7, meshes), StaticScene(true, 0x57a7, meshes) };
+    GpuScene gpu[2] = { GpuScene(nullptr, GpuSceneDesc{}), GpuScene(nullptr, GpuSceneDesc{}) };
+    auto compare = [&](uint32_t frame)
+    {
+        SceneGraphWalker a(scenes[0].graph->GetRootNode());
+        SceneGraphWalker b(scenes[1].graph->GetRootNode());
+        uint32_t nodes = 0;
+        for (; a && b; a.Next(true), b.Next(true), ++nodes)
+        {
+            const dm::daffine3 wa = a->GetLocalToWorldTransform(), wb = b->GetLocalToWorldTransform();
+            const dm::box3 ba = a->GetGlobalBoundingBox(), bb = b->GetGlobalBoundingBox();
+            if (!SameBits(&wa, &wb, sizeof(wa)) || !SameBox(ba, bb) ||
+                a->GetSubgraphContentFlags() != b->GetSubgraphContentFlags())
+            {
+                std::fprintf(stderr, "frame %u: node %u differs (static %d)\n", frame, nodes,
+                             int(scenes[1].world->HasComponent(scenes[1].graph->GetEntity(b.Get()), scenes[1].staticId)));
+                CHECK(false);
+            }
+        }
+        CHECK(!a && !b && nodes > 600);
+        for (int list = 0; list < 2; ++list)
+        {
+            const std::vector<Entity>& x = list ? scenes[0].runtimeStatic : scenes[0].runtimePlain;
+            const std::vector<Entity>& y = list ? scenes[1].runtimeStatic : scenes[1].runtimePlain;
+            CHECK(x.size() == y.size());
+            for (size_t i = 0; i < x.size(); ++i)
+            {
+                CHECK(SameBits(GetComponent<WorldTransform>(scenes[0].world, x[i]),
+                               GetComponent<WorldTransform>(scenes[1].world, y[i]), sizeof(WorldTransform)));
+                CHECK(SameBits(GetComponent<WorldBounds>(scenes[0].world, x[i]),
+                               GetComponent<WorldBounds>(scenes[1].world, y[i]), sizeof(WorldBounds)));
+            }
+        }
+        for (uint32_t g = 0; g < 2; ++g)
+            CHECK(NVRHI_SUCCEEDED(gpu[g].Update(scenes[g].graph)));
+        CHECK(gpu[0].GetInstanceRowCount() == gpu[1].GetInstanceRowCount());
+        CHECK(SameBits(gpu[0].GetInstanceRows(), gpu[1].GetInstanceRows(),
+                       sizeof(InstanceData) * gpu[0].GetInstanceRowCount()));
+        CheckAgainstBruteForce(scenes[0].graph);
+        CheckAgainstBruteForce(scenes[1].graph);
+    };
+    for (uint32_t frame = 1; frame <= 36; ++frame)
+    {
+        const bool meshEdited = frame % 5 == 4;
+        if (meshEdited)
+        {
+            const float s = 0.5f + 0.1f * float(frame);
+            meshes[3]->objectSpaceBounds = dm::box3(dm::float3(-s), dm::float3(s));
+            meshes[3]->geometries[0]->objectSpaceBounds = meshes[3]->objectSpaceBounds;
+        }
+        for (StaticScene& scene : scenes)
+        {
+            if (frame > 1)
+                scene.Churn(frame, false, meshEdited);
+            scene.graph->Refresh(frame);
+        }
+        compare(frame);
+    }
+    const SceneGraphStore::Counters off = CountersOf(scenes[0].graph);   // copies: the steady frames go on below
+    const SceneGraphStore::Counters on = CountersOf(scenes[1].graph);
+    CHECK(off.staticSkips == 0 && on.staticSkips > 36);
+    CHECK(on.propagatedRows < off.propagatedRows);
+
+    // steady state: moves of moving nodes and dynamic boxes only
+    uint32_t frame = 36;
+    auto steady = [&]()
+    {
+        ++frame;
+        StaticScene& scene = scenes[1];
+        for (uint32_t k = 0; k < 12; ++k)
+            RandomMove(scene.rng, scene.movers[scene.rng.Below(uint32_t(scene.movers.size()))]);
+        scene.dynamics[frame % scene.dynamics.size()]->box = dm::box3(dm::float3(-float(frame % 3 + 1)),
+                                                                       dm::float3(1.f));
+        scene.graph->Refresh(frame);
+        CHECK(NVRHI_SUCCEEDED(gpu[1].Update(scene.graph)));
+    };
+    for (int i = 0; i < 5; ++i)
+        steady();
+    const uint64_t newBefore = g_NewCount.load();
+    const uint64_t heapBefore = ecs::GetHeapAllocationCount();
+    for (int i = 0; i < 10; ++i)
+        steady();
+    const uint64_t newCalls = g_NewCount.load() - newBefore;
+    const uint64_t heapBlocks = ecs::GetHeapAllocationCount() - heapBefore;
+    std::printf("  36 frames equal with the tag honoured (%llu and %llu rows propagated, Static archetypes left out "
+                "%llu times); steady state with it: %llu operator new, %llu storage blocks\n",
+                (unsigned long long)off.propagatedRows, (unsigned long long)on.propagatedRows,
+                (unsigned long long)on.staticSkips, (unsigned long long)newCalls, (unsigned long long)heapBlocks);
+    CHECK(newCalls == 0 && heapBlocks == 0);
+}
+
+// The Static switch's documented contract where it differs from the switch off (stage T5; SceneGraph.h, SetStaticTag,
+// as fixed in F1): the scene of test_static_tag_promised with the tag honoured, edited for 40 frames with `violate` too
+// (Static rows' parents and the deep chain's top move; Static rows' local transforms are written through the world and
+// through SetTranslation). After every Refresh, from the rows' places (archetype, chunk, row) before and after: a
+// Static row the tag takes out (below the deep bucket, not driven) whose chunk got rows (a join, a row moved into a
+// hole: a place with another row, or the chunk's Added version stamped since the last Refresh) or that is new is
+// composed from its current local transform and its parent's current world (so are the rows sharing that chunk:
+// documented at F1, backlog F1-N1); any other such row keeps the world it had (also where the switch off would move
+// it: counted); every other row (moving, deep bucket, runtime) is composed from its local
+// and its parent's world as stored; rows' boxes follow the stored worlds (the brute force). Debug builds refuse the
+// setter's writes of settled Static rows and warn about the world's (counted, then taken back); Release builds warn
+// about neither.
+void test_static_tag_contract()
+{
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    std::vector<nvrhi::AutoPtr<MeshInfo>> owned;
+    std::vector<MeshInfo*> meshes;
+    for (int i = 0; i < 4; ++i)
+    {
+        owned.push_back(MakeMesh(factory, 0.5f + 0.5f * float(i)));
+        meshes.push_back(owned.back());
+    }
+    StaticScene scene(true, 0xc0de, meshes);
+    IWorld* world = scene.world;
+    ecs::WorldImpl* impl = ecs::GetWorldImpl(world);
+    std::map<Entity, dm::daffine3> previousWorlds;
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, Entity> previousPlaces;
+    const uint32_t warnings = g_Warnings.load();
+    uint64_t frozen = 0, recomposed = 0, followed = 0, diverged = 0;
+    uint64_t lastRefreshVersion = 0;   // the world's version after the last Refresh: later stamps are this frame's
+
+    // Every row of the graph's world with a WorldTransform: nodes and runtime rows.
+    auto rows = [&]()
+    {
+        std::vector<Entity> out;
+        for (SceneGraphWalker walker(scene.graph->GetRootNode()); walker; walker.Next(true))
+            out.push_back(scene.graph->GetEntity(walker.Get()));
+        out.insert(out.end(), scene.runtimeStatic.begin(), scene.runtimeStatic.end());
+        out.insert(out.end(), scene.runtimePlain.begin(), scene.runtimePlain.end());
+        return out;
+    };
+    auto fresh = [&](Entity entity)
+    {
+        const LocalTransform* local = GetComponent<LocalTransform>(world, entity);
+        const Parent* parent = GetComponent<Parent>(world, entity);
+        const bool hasParent = parent && parent->entity != Entity::Null;
+        const dm::daffine3 parentWorld = hasParent
+            ? GetComponent<WorldTransform>(world, parent->entity)->transform : dm::daffine3::identity();
+        if (!local)
+            return parentWorld;
+        return hasParent ? ComposeLocalTransform(*local) * parentWorld : ComposeLocalTransform(*local);
+    };
+    for (uint32_t frame = 1; frame <= 40; ++frame)
+    {
+        const bool meshEdited = frame % 5 == 4;
+        if (meshEdited)
+        {
+            const float s = 0.5f + 0.1f * float(frame);
+            meshes[3]->objectSpaceBounds = dm::box3(dm::float3(-s), dm::float3(s));
+            meshes[3]->geometries[0]->objectSpaceBounds = meshes[3]->objectSpaceBounds;
+        }
+        if (frame > 1)
+            scene.Churn(frame, true, meshEdited);
+        scene.graph->Refresh(frame);
+        const uint64_t versionAfterLastRefresh = lastRefreshVersion;
+        lastRefreshVersion = world->GetVersion();
+
+        const std::vector<Entity> all = rows();
+        std::map<std::tuple<uint32_t, uint32_t, uint32_t>, Entity> places;
+        std::map<std::pair<uint32_t, uint32_t>, bool> chunkGotRow;   // a place of the chunk has another row than before
+        for (Entity entity : all)
+        {
+            const ecs::EntityRecord* record = impl->FindAlive(entity);
+            CHECK(record);
+            const auto place = std::make_tuple(record->archetype, record->chunk, record->row);
+            places[place] = entity;
+            const auto it = previousPlaces.find(place);
+            // a place with another row, or rows added since the last Refresh (also a row that left the chunk's end and
+            // came back to the same place: SetLeaf, a re-attach)
+            const ecs::Archetype& archetype = impl->GetArchetypeStorage(record->archetype);
+            const uint64_t added = archetype.Versions(record->chunk)[archetype.AddedVersionSlot()];
+            if (it == previousPlaces.end() || it->second != entity || added >= versionAfterLastRefresh)
+                chunkGotRow[{ record->archetype, record->chunk }] = true;
+        }
+        for (Entity entity : all)
+        {
+            const dm::daffine3 stored = GetComponent<WorldTransform>(world, entity)->transform;
+            const ecs::EntityRecord* record = impl->FindAlive(entity);
+            const auto prev = previousWorlds.find(entity);
+            if (frame > 1 && HonouredStatic(world, entity, scene.staticId))
+            {
+                const bool taken = prev == previousWorlds.end() ||
+                                   chunkGotRow.count({ record->archetype, record->chunk }) != 0;
+                const dm::daffine3 expected = taken ? fresh(entity) : prev->second;
+                if (!SameBits(&stored, &expected, sizeof(stored)))
+                {
+                    const dm::daffine3 composed = fresh(entity);
+                    const auto* depth = GetComponent<HierarchyDepth>(world, entity);
+                    std::fprintf(stderr, "frame %u: Static row %llu (%s; archetype %u chunk %u row %u, depth %d, local "
+                                 "%d, runtime %d): not the world the contract gives; it is %s\n", frame,
+                                 (unsigned long long)entity, taken ? "taken" : "settled", record->archetype,
+                                 record->chunk, record->row, depth ? int(depth->depth) : -1,
+                                 int(GetComponent<LocalTransform>(world, entity) != nullptr),
+                                 int(std::find(scene.runtimeStatic.begin(), scene.runtimeStatic.end(), entity) !=
+                                     scene.runtimeStatic.end()),
+                                 SameBits(&stored, &composed, sizeof(stored)) ? "composed again" :
+                                 prev != previousWorlds.end() && SameBits(&stored, &prev->second, sizeof(stored))
+                                     ? "the world it had" : "neither");
+                    CHECK(false);
+                }
+                (taken ? recomposed : frozen) += 1;
+                if (!taken)
+                {
+                    const dm::daffine3 composed = fresh(entity);
+                    diverged += SameBits(&stored, &composed, sizeof(stored)) ? 0 : 1;   // the switch off would move it
+                }
+            }
+            else
+            {
+                const dm::daffine3 expected = fresh(entity);
+                if (!SameBits(&stored, &expected, sizeof(stored)))
+                {
+                    std::fprintf(stderr, "frame %u: row %llu (static %d): not composed from its parent's world\n",
+                                 frame, (unsigned long long)entity, int(world->HasComponent(entity, scene.staticId)));
+                    CHECK(false);
+                }
+                ++followed;
+            }
+            // the rows' boxes follow their stored worlds (runtime rows here; nodes in the brute force below)
+            const LocalBounds* local = GetComponent<LocalBounds>(world, entity);
+            const WorldBounds* box = GetComponent<WorldBounds>(world, entity);
+            if (local && box && !local->bounds.isempty() &&
+                !world->HasComponent(entity, FindComponent<LeafObject>(world)))
+            {
+                const dm::box3 expectedBox = local->bounds * dm::affine3(stored);
+                CHECK(SameBox(box->bounds, expectedBox));
+            }
+        }
+        CheckAgainstBruteForce(scene.graph);
+        previousPlaces.swap(places);
+        previousWorlds.clear();
+        for (Entity entity : all)
+            previousWorlds[entity] = GetComponent<WorldTransform>(world, entity)->transform;
+    }
+#ifndef NDEBUG
+    CHECK(g_Warnings.load() > warnings);   // the refused setter calls and the world's writes
+#else
+    CHECK(g_Warnings.load() == warnings);
+#endif
+    g_Warnings = warnings;
+    std::printf("  40 frames of the contract: %llu settled Static rows kept their worlds (%llu where the switch off "
+                "would have moved them), %llu were composed again (their chunks got rows), %llu other rows followed "
+                "their parents\n", (unsigned long long)frozen, (unsigned long long)diverged,
+                (unsigned long long)recomposed, (unsigned long long)followed);
+    CHECK(frozen > 1000 && diverged > 100 && recomposed > 100 && followed > 1000);
+}
+
 int main(int argc, char** argv)
 {
     struct Case { const char* name; void (*run)(); };
@@ -1988,6 +2698,9 @@ int main(int argc, char** argv)
         { "row_hints", test_row_hints },
         { "review_fixes", test_review_fixes },
         { "childless_bounds_path", test_childless_bounds_path },
+        { "childless_bounds_churn", test_childless_bounds_churn },
+        { "static_tag_promised", test_static_tag_promised },
+        { "static_tag_contract", test_static_tag_contract },
         { "steady_state", test_steady_state_allocations },
     };
     log::SetCallback([](log::Severity severity, const char* message)

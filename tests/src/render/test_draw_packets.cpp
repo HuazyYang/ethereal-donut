@@ -1722,6 +1722,7 @@ namespace
         auto service = MakeService(scene.graph);
         scene.graph->SetJobSystem(jobs.Get());
         uint64_t packets[c_DrawPacketPassCount] = {};
+        uint64_t ties = 0;
         for (uint32_t f = 1; f <= 8; ++f)
         {
             scene.Edit(f);
@@ -1742,8 +1743,17 @@ namespace
                     if (compact)
                     {
                         for (uint32_t v = 0; v < s.viewCount; ++v)
+                        {
                             for (uint32_t p = 0; p < c_DrawPacketPassCount; ++p)
-                                packets[p] += s.views[v].packets[p].count;
+                            {
+                                const SnapshotRange range = s.views[v].packets[p];
+                                packets[p] += range.count;
+                                // stage T5: equal keys next to each other (a transparent instance's geometries at
+                                // one distance), whose order the hash pins: the stable order of the positions
+                                for (uint32_t i = range.first + 1; i < range.first + range.count; ++i)
+                                    ties += s.packets.keys[i - 1] == s.packets.keys[i] ? 1 : 0;
+                            }
+                        }
                     }
                     service->EndFrame(true);
                 }
@@ -1753,9 +1763,10 @@ namespace
         RenderService::SetCompactPacketRecords(false);
         ExtractionMode::Reset();
         scene.graph->SetJobSystem(nullptr);
-        std::printf("  16 extractions equal with compact records: %llu opaque and %llu transparent packets\n",
-                    (unsigned long long)packets[0], (unsigned long long)packets[1]);
-        CHECK(packets[0] > 1000 && packets[1] > 1000);
+        std::printf("  16 extractions equal with compact records: %llu opaque and %llu transparent packets, %llu "
+                    "equal keys in stable order\n", (unsigned long long)packets[0], (unsigned long long)packets[1],
+                    (unsigned long long)ties);
+        CHECK(packets[0] > 1000 && packets[1] > 1000 && ties > 0);
         CHECK(!RenderService::GetCompactPacketRecords());
         RenderService::SetCompactPacketRecords(compactFound);
     }
