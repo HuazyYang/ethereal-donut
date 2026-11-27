@@ -59,9 +59,11 @@
 //                        (meshes, transforms, creation order), one of nodes, one where all instances, or about half of
 //                        them, are runtime-only rows; 12 frames of moves and respawns, five views, extracted serially
 //                        and in parallel at 1 and 8 workers (equal bytes per graph): each view's visible instances and
-//                        each pass's packets equal the node graph's after slot remapping (keys rebuilt with the mapped
-//                        slot; fields, order, mesh, bounds); runtime rows have no leaf
-//   runtime_steady_state 10 frames of moving runtime rows beside nodes after warm-up: no operator new, no ECS heap block
+//                        each pass's packets equal the node graph's (the same slots and first geometry slots, one
+//                        instance per slot in each graph; keys, fields, order, mesh, bounds); runtime rows have no leaf
+//   runtime_steady_state 10 frames of moving runtime rows beside nodes after warm-up, serially, then on 8 workers with
+//                        every extraction step parallel, then on 8 workers with 100 runtime rows destroyed and made
+//                        again each frame: no operator new, no ECS heap block in any of the three
 //
 //     test_draw_packets [case]
 
@@ -96,6 +98,7 @@
 #include <map>
 #include <new>
 #include <numeric>
+#include <set>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -1455,8 +1458,10 @@ namespace
     }
 
     // Graph 1's snapshot `b` against graph 0's `a` (RuntimeTwins): each view's visible instances, matched by id, have
-    // the same mesh, bounds, geometry count and remapped slots; each pass's packets, in order, equal graph 0's with
-    // their keys rebuilt with the remapped slots (sorted again, stably). Graph 1's runtime rows have no leaf.
+    // the same mesh, bounds, geometry count and slots; each pass's packets, in order, equal graph 0's (keys rebuilt with
+    // graph 1's slots, sorted again, stably). Graph 1's runtime rows have no leaf. The twins' slot tables are alike by
+    // construction, so an instance's slot and first geometry slot are equal in both graphs (backlog E72-R1: the check
+    // was against graph 1 itself), and within each graph distinct instances hold distinct slots (a bijection).
     void CompareTwins(const tests::RuntimeTwins& twins, const RenderSnapshot& a, const RenderSnapshot& b,
                       TwinTally& tally)
     {
@@ -1477,12 +1482,24 @@ namespace
                 CHECK(slotsOf[g].emplace(ids[i], slots).first->second == slots);   // one slot per instance
             }
         }
-        std::map<uint32_t, uint32_t> slotMap;   // graph 0's instance slot -> graph 1's
+        std::map<uint32_t, uint32_t> slotMap;   // graph 0's instance slot -> graph 1's (equal: E72-R1)
         for (const auto& [id, slots] : slotsOf[0])
         {
             const auto it = slotsOf[1].find(id);
             CHECK(it != slotsOf[1].end());
+            CHECK(it->second == slots);   // the instance slot and the first geometry slot, both graphs alike
             CHECK(slotMap.emplace(slots.first, it->second.first).first->second == it->second.first);
+        }
+        CHECK(slotsOf[0].size() == slotsOf[1].size());
+        for (uint32_t g = 0; g < 2; ++g)
+        {
+            // one instance per slot, and per first geometry slot: no two visible instances share one
+            std::set<uint32_t> instanceSlots, geometrySlots;
+            for (const auto& [id, slots] : slotsOf[g])
+            {
+                CHECK(instanceSlots.insert(slots.first).second);
+                CHECK(geometrySlots.insert(slots.second).second);
+            }
         }
 
         for (uint32_t v = 0; v < a.viewCount; ++v)
@@ -1506,8 +1523,8 @@ namespace
                 const tests::RuntimeTwins::Instance& instance = twins.instances[id / 2];
                 const bool runtime = id % 2 == 0 && instance.runtime;
                 CHECK((ib.leaves[j] == nullptr) == runtime && ia.leaves[i] != nullptr);
-                CHECK(ib.instanceSlots[j] == slotMap.at(ia.instanceSlots[i]));
-                CHECK(ib.firstGeometryInstanceSlots[j] == slotsOf[1].at(id).second);
+                CHECK(ib.instanceSlots[j] == ia.instanceSlots[i]);
+                CHECK(ib.firstGeometryInstanceSlots[j] == ia.firstGeometryInstanceSlots[i]);
                 CHECK(ib.geometryCounts[j] == ia.geometryCounts[i]);
                 CHECK(ib.meshes[j] == ia.meshes[i] && ib.meshInfos[j] == ia.meshInfos[i]);
                 CHECK(SameBits(ib.worldBounds[j], ia.worldBounds[i]));
@@ -1744,7 +1761,10 @@ namespace
     }
 
     // Ten frames of runtime rows moving beside nodes after warm-up, five views: no operator new, no ECS heap block. A
-    // tenth of the rows swing between two places every frame through the world, so that the views' sets change.
+    // tenth of the rows swing between two places every frame through the world, so that the views' sets change. Three
+    // runs of warm-up and ten frames each (backlog E72-R7): serial; on 8 workers with every extraction step on the job
+    // system (Refresh too); on 8 workers with 100 other runtime rows destroyed and made again every frame, so that the
+    // observer frees and allocates their slots and references and the rows return to the chunks' holes.
     void test_runtime_steady_state()
     {
         TestViews views;
@@ -1763,34 +1783,106 @@ namespace
         for (size_t i = 0; i < twins.instances.size(); i += 10)
             if (twins.instances[i].runtime)
                 movers.emplace_back(twins.instances[i].row, twins.instances[i].local.translation);
+        // The respawned rows: runtime instances not among the movers, made again with the same mesh at the other of
+        // two places each frame (one CreateEntities per mesh, values in arrays made before the measured frames).
+        constexpr uint32_t c_Respawned = 100;
+        const ComponentId localId = FindComponent<LocalTransform>(world);
+        const ComponentId meshRefId = FindComponent<MeshRef>(world);
+        std::vector<std::vector<Entity>> respawnedRows(twins.meshes.size());
+        std::vector<std::vector<LocalTransform>> respawnedLocals(twins.meshes.size());
+        std::vector<std::vector<MeshRef>> respawnedRefs(twins.meshes.size());
+        {
+            uint32_t picked = 0;
+            for (size_t i = 5; i < twins.instances.size() && picked < c_Respawned; i += 10)
+            {
+                const tests::RuntimeTwins::Instance& instance = twins.instances[i];
+                if (!instance.runtime)
+                    continue;
+                respawnedRows[instance.mesh].push_back(instance.row);
+                respawnedLocals[instance.mesh].push_back(instance.local);
+                respawnedRefs[instance.mesh].push_back(MeshRef{ twins.meshIds[1][instance.mesh] });
+                ++picked;
+            }
+            CHECK(picked == c_Respawned);
+        }
+        std::vector<const void*> respawnValues(twins.components.size(), nullptr);
         uint32_t f = 0;
+        auto respawn = [&]()
+        {
+            const double shift = (f & 1) ? 7.0 : -7.0;
+            for (size_t m = 0; m < respawnedRows.size(); ++m)
+            {
+                std::vector<Entity>& rows = respawnedRows[m];
+                if (rows.empty())
+                    continue;
+                CHECK(world->DestroyEntities(rows.data(), uint32_t(rows.size())) == nvrhi::FS_OK);
+                for (LocalTransform& local : respawnedLocals[m])
+                    local.translation.x += shift;
+                for (size_t c = 0; c < twins.components.size(); ++c)
+                {
+                    respawnValues[c] = nullptr;
+                    if (twins.components[c] == localId)
+                        respawnValues[c] = respawnedLocals[m].data();
+                    else if (twins.components[c] == meshRefId)
+                        respawnValues[c] = respawnedRefs[m].data();
+                }
+                EntityCreateDesc desc{};
+                desc.components = twins.components.data();
+                desc.values = respawnValues.data();
+                desc.componentCount = uint32_t(twins.components.size());
+                desc.entityCount = uint32_t(rows.size());
+                CHECK(world->CreateEntities(desc, rows.data()) == nvrhi::FS_OK);
+            }
+        };
+
+        JobSystemDesc jobDesc;
+        jobDesc.debugName = "test_draw_packets.runtime_steady_state";
+        jobDesc.workerThreadCount = 8;
+        nvrhi::AutoPtr<IJobSystem> jobs;
+        CHECK(CreateJobSystem(jobDesc, &jobs) == nvrhi::FS_OK);
+
         uint32_t visible[2] = {};
+        bool respawning = false;
         auto run = [&]()
         {
             const dm::double3 swing = (f & 1) ? dm::double3(12.0, 0.0, 9.0) : dm::double3(0.0);
             world->AdvanceVersion();
             for (const auto& [row, home] : movers)
                 GetComponentForWrite<LocalTransform>(world, row)->translation = home + swing;
+            if (respawning)
+                respawn();
             graph->Refresh(++f);
             const RenderSnapshot& snapshot = ExtractFrame(service, frame, views.Desc(f));
             CHECK(snapshot.packets.count > 0);
             visible[f & 1] = snapshot.instances.count;
             service->EndFrame(true);
         };
-        for (int i = 0; i < 6; ++i)
-            run();
-        const uint64_t newBefore = g_NewCount.load();
-        const uint64_t heapBefore = ecs::GetHeapAllocationCount();
-        for (int i = 0; i < 10; ++i)
-            run();
-        const uint64_t newCalls = g_NewCount.load() - newBefore;
-        const uint64_t heapBlocks = ecs::GetHeapAllocationCount() - heapBefore;
-        std::printf("  %u runtime rows (%zu moving) and %u nodes: %u and %u visible instances; %llu operator new, %llu "
-                    "storage blocks over 10 frames\n", twins.RuntimeCount(), movers.size(),
-                    uint32_t(twins.instances.size()) - twins.RuntimeCount(), visible[0], visible[1],
-                    (unsigned long long)newCalls, (unsigned long long)heapBlocks);
-        CHECK(visible[0] != visible[1]);
-        CHECK(newCalls == 0 && heapBlocks == 0);
+        const char* const runNames[3] = { "serial", "8 workers, parallel steps", "8 workers, 100 rows respawned" };
+        for (uint32_t r = 0; r < 3; ++r)
+        {
+            if (r == 1)
+            {
+                graph->SetJobSystem(jobs);
+                ExtractionMode{ true, true }.Set();
+            }
+            respawning = r == 2;
+            for (int i = 0; i < 6; ++i)
+                run();
+            const uint64_t newBefore = g_NewCount.load();
+            const uint64_t heapBefore = ecs::GetHeapAllocationCount();
+            for (int i = 0; i < 10; ++i)
+                run();
+            const uint64_t newCalls = g_NewCount.load() - newBefore;
+            const uint64_t heapBlocks = ecs::GetHeapAllocationCount() - heapBefore;
+            std::printf("  %s: %u runtime rows (%zu moving) and %u nodes: %u and %u visible instances; %llu operator "
+                        "new, %llu storage blocks over 10 frames\n", runNames[r], twins.RuntimeCount(), movers.size(),
+                        uint32_t(twins.instances.size()) - twins.RuntimeCount(), visible[0], visible[1],
+                        (unsigned long long)newCalls, (unsigned long long)heapBlocks);
+            CHECK(visible[0] != visible[1]);
+            CHECK(newCalls == 0 && heapBlocks == 0);
+        }
+        ExtractionMode::Reset();
+        graph->SetJobSystem(nullptr);
     }
 
     struct Case

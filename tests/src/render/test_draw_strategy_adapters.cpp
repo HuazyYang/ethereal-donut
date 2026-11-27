@@ -54,8 +54,11 @@
 //                        instances, 8 frames of moves and respawns: every bound strategy's items carry the packets'
 //                        slots (and no leaf for a runtime row), and RenderView's batching of them gives the node graph's
 //                        draws exactly; the walking strategies do not see runtime rows and leave the slot at its default
-//   default_slot         a DrawItem made by hand keeps c_DrawItemSlotFromInstance, and RenderView's batching of such
-//                        items (the slot from the leaf) equals that of the same items with the slot set
+//   default_slot         a DrawItem made by hand keeps c_DrawItemSlotFromInstance; hand-made copies of the bound packet
+//                        strategies' items (the slot left at its default, so taken from the leaf) batch as the bound
+//                        items do (the packet's slot), and each bound item's slot is its leaf's instance index. The
+//                        batching is this test's model of RenderView (Batch); RenderView itself runs on a device only
+//                        (test_render_extract_gpu's runtime-rows and buffer-group cases)
 //
 //     test_draw_strategy_adapters [case]
 
@@ -1087,8 +1090,13 @@ namespace
         }
     }
 
-    // A DrawItem made by hand keeps the default slot; RenderView takes it from the leaf then, so that such items batch as
-    // the same items with the slot set (the packet adapters' items).
+    // A DrawItem made by hand keeps the default slot, and RenderView then takes the instance index from the leaf.
+    // Backlog E72-R2: the items compared are not the test's own. The bound packet strategies' items of a node graph
+    // (each with its packet's slot, from the instance's GpuInstanceSlot column) against hand-made copies of them with the
+    // slot left at its default (as deferred_shading_rdg and VXGI make theirs): each bound slot is its leaf's
+    // GetInstanceIndex, and the two lists batch alike in Batch, this test's device-free model of RenderView's two
+    // instance sources. RenderView itself is exercised on a device (test_render_extract_gpu: the runtime-rows case's
+    // walked image, and the buffer-group case's hand-made items).
     void test_default_slot()
     {
         const DrawItem made{};
@@ -1100,40 +1108,56 @@ namespace
         TestViews views;
         PacketScene scene(0x99);
         scene.Build(80);
-        scene.graph->Refresh(1);
-        uint64_t compared = 0;
-        for (uint32_t v = 0; v < TestViews::c_Count; ++v)
+        RenderFrame frame;
+        auto service = MakeService(scene.graph);
+        uint64_t compared = 0, draws = 0;
+        for (uint32_t f = 1; f <= 3; ++f)
         {
-            for (uint32_t p = 0; p < c_DrawPacketPassCount; ++p)
+            if (f > 1)
             {
-                // hand-made copies of the walk's items, as deferred_shading_rdg and VXGI make theirs
-                auto opaque = MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy);
-                auto transparent = MAKE_RC_OBJ_PTR(TransparentDrawStrategy);
-                IDrawStrategy* strategy = p == 0 ? static_cast<IDrawStrategy*>(opaque.Get())
-                                                 : static_cast<IDrawStrategy*>(transparent.Get());
-                std::vector<DrawItem> byHand, withSlot;
-                for (const DrawItem& item : Drain(strategy, scene.graph->GetRootNode(), *views.list[v]))
-                {
-                    DrawItem copy;
-                    copy.instance = item.instance;
-                    copy.mesh = item.mesh;
-                    copy.geometry = item.geometry;
-                    copy.material = item.material;
-                    copy.buffers = item.buffers;
-                    copy.distanceToCamera = item.distanceToCamera;
-                    copy.cullMode = item.cullMode;
-                    copy.userData = nullptr;
-                    CHECK(copy.instanceSlot == c_DrawItemSlotFromInstance);
-                    byHand.push_back(copy);
-                    copy.instanceSlot = uint32_t(item.instance->GetInstanceIndex());
-                    withSlot.push_back(copy);
-                }
-                CHECK(Batch(byHand) == Batch(withSlot));
-                compared += byHand.size();
+                const auto nodes = scene.Attached();
+                for (size_t i = f; i < nodes.size(); i += 7)
+                    nodes[i]->SetTranslation(dm::double3(scene.rng.Range(-30, 30), scene.rng.Range(-8, 8),
+                                                         scene.rng.Range(-10, 50)));
             }
+            scene.graph->Refresh(f);
+            const RenderSnapshot& snapshot = ExtractFrame(service, frame, views.Desc(f));
+            Strategies strategies;
+            strategies.Bind(&snapshot);
+            for (uint32_t v = 0; v < snapshot.viewCount; ++v)
+            {
+                for (uint32_t p = 0; p < c_DrawPacketPassCount; ++p)
+                {
+                    const std::vector<DrawItem> bound = Drain(strategies.packets[p], nullptr, *snapshot.views[v].view);
+                    CheckAgainstPackets(snapshot, v, DrawPacketPass(p), bound);
+                    std::vector<DrawItem> byHand;
+                    for (const DrawItem& item : bound)
+                    {
+                        CHECK(item.instance && item.instanceSlot != c_DrawItemSlotFromInstance);
+                        CHECK(item.instanceSlot == uint32_t(item.instance->GetInstanceIndex()));
+                        DrawItem copy;
+                        copy.instance = item.instance;
+                        copy.mesh = item.mesh;
+                        copy.geometry = item.geometry;
+                        copy.material = item.material;
+                        copy.buffers = item.buffers;
+                        copy.distanceToCamera = item.distanceToCamera;
+                        copy.cullMode = item.cullMode;
+                        copy.userData = nullptr;
+                        CHECK(copy.instanceSlot == c_DrawItemSlotFromInstance);
+                        byHand.push_back(copy);
+                    }
+                    const std::vector<ModelDraw> boundDraws = Batch(bound);
+                    CHECK(Batch(byHand) == boundDraws);
+                    compared += byHand.size();
+                    draws += boundDraws.size();
+                }
+            }
+            service->EndFrame(true);
         }
-        std::printf("  %llu hand-made items batch as with their slots set\n", (unsigned long long)compared);
-        CHECK(compared > 100);
+        std::printf("  %llu hand-made copies of bound items batch as the bound items (%llu draws)\n",
+                    (unsigned long long)compared, (unsigned long long)draws);
+        CHECK(compared > 100 && draws > 0);
     }
 
     // Debug: the in-use check of the strategies (DrawStrategyUseCheck).

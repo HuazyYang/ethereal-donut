@@ -70,4 +70,14 @@ if (DONUT_WITH_NVRHI)
         add_test(NAME ${_bench}_smoke_switches_on COMMAND ${_bench} --smoke)
         set_tests_properties(${_bench}_smoke_switches_on PROPERTIES ENVIRONMENT "DONUT_E7_SWITCHES=all")
     endforeach()
+    # The GPU case of the extraction (stage T2), per backend with every switch on: named so that `_switches_on$` (the
+    # device-free set) does not match them; GPU tests, run serially.
+    target_link_libraries(test_render_extract_gpu donut_tests_e7_switches)
+    foreach(_backend d3d11 d3d12 vulkan)
+        if(TEST test_render_extract_gpu_${_backend})
+            add_test(NAME test_render_extract_gpu_switches_on_${_backend} COMMAND test_render_extract_gpu ${_backend})
+            set_tests_properties(test_render_extract_gpu_switches_on_${_backend} PROPERTIES
+                ENVIRONMENT "DONUT_E7_SWITCHES=all" RUN_SERIAL TRUE LABELS gpu)
+        endif()
+    endforeach()
 endif()

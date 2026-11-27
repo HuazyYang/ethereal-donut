@@ -2246,11 +2246,15 @@ namespace
                 for (uint32_t side = 1; side < 3; ++side)
                 {
                     const std::vector<uint8_t> other = ReadTexture(device, targets[side][t]);
+                    // the sizes first, so that the loop never reads past `other` (backlog E72-R6)
+                    check(nodes.size() == other.size() && !nodes.empty(),
+                          where + ": target " + std::to_string(t) + ": " + sideNames[side] + " read back " +
+                              std::to_string(other.size()) + " bytes, BoundNodes " + std::to_string(nodes.size()));
                     size_t differing = 0;
                     const size_t texel = nvrhi::getFormatInfo(formats[t]).bytesPerBlock;
                     for (size_t i = 0; i + texel <= nodes.size(); i += texel)
                         differing += std::memcmp(nodes.data() + i, other.data() + i, texel) != 0 ? 1 : 0;
-                    check(nodes.size() == other.size() && differing == 0,
+                    check(differing == 0,
                           where + ": target " + std::to_string(t) + ": " + std::to_string(differing) + " texels of " +
                               sideNames[side] + " differ from BoundNodes");
                 }
