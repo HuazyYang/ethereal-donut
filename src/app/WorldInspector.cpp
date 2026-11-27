@@ -324,10 +324,10 @@ namespace donut::app
     struct WorldInspector::State
     {
         // Pending edits: the buffer holds its world (CommandBufferWorldReference::Held), so `bufferWorld` is valid while
-        // the buffer lives, and no other world can be made at its address meanwhile.
+        // the buffer lives, and no other world can be made at its address meanwhile. It is made at the first edit and
+        // stays empty until Apply records one command per pending value (backlog I3-R4: re-edits record nothing).
         nvrhi::AutoPtr<ICommandBuffer> buffer;
         IWorld* bufferWorld = nullptr;
-        uint64_t nextSortKey = 0;
         PendingEdit pending[c_MaxPendingEdits];
         uint32_t pendingCount = 0;
 
@@ -356,7 +356,6 @@ namespace donut::app
             buffer = nullptr;
             bufferWorld = nullptr;
             pendingCount = 0;
-            nextSortKey = 0;
         }
 
         PendingEdit* FindPending(Entity entity, ComponentId component) noexcept
@@ -400,14 +399,16 @@ namespace donut::app
             return label;
         }
 
-        void RecordEdit(IWorld* world, Entity entity, ComponentId component, const void* value, uint32_t size) noexcept
+        // The value becomes the pending one of (entity, component); false, with a warning, when it is dropped (the
+        // 65th value, no command buffer).
+        bool RecordEdit(IWorld* world, Entity entity, ComponentId component, const void* value, uint32_t size) noexcept
         {
             PendingEdit* edit = FindPending(entity, component);
             if (!edit && pendingCount == c_MaxPendingEdits)
             {
                 log::warning("WorldInspector: %u edits are pending already; call Apply first. The edit is dropped",
                              c_MaxPendingEdits);
-                return;
+                return false;
             }
             if (!buffer)
             {
@@ -415,7 +416,7 @@ namespace donut::app
                 {
                     log::warning("WorldInspector: cannot create the command buffer of the edits. The edit is dropped");
                     buffer = nullptr;
-                    return;
+                    return false;
                 }
                 bufferWorld = world;
             }
@@ -427,7 +428,7 @@ namespace donut::app
                 edit->size = size;
             }
             std::memcpy(edit->value, value, size);
-            buffer->SetComponent(entity, component, edit->value, nextSortKey++);   // the value is copied
+            return true;
         }
 
         void DrawWorld(IWorld* world) noexcept;
@@ -742,9 +743,11 @@ namespace donut::app
                 const detail::WorldInspectorTestHook* hook = g_TestHook;
                 if (hook && hook->edit && hook->edit(hook->context, component, scratch, desc.size))
                     commit = true;
+                // pending before, or recorded now; not for a dropped edit (backlog I3-R3)
+                bool pending = edit != nullptr;
                 if (commit)
-                    RecordEdit(world, selected, component, scratch, desc.size);
-                if (edit || commit)
+                    pending = RecordEdit(world, selected, component, scratch, desc.size) || pending;
+                if (pending)
                     ImGui::TextDisabled("edited; Apply writes it");
             }
             else
@@ -795,7 +798,9 @@ namespace donut::app
             return commit;
         }
         const ImGuiDataType type = DataType(field.type);
-        const char* format = field.type == FieldType::Float || field.type == FieldType::Double ? "%.6g" : nullptr;
+        // every digit the type holds, so that an edit of one digit keeps the others (backlog I3-R5)
+        const char* format = field.type == FieldType::Float ? "%.9g" : field.type == FieldType::Double ? "%.17g"
+                                                                                                         : nullptr;
         const uint32_t size = ScalarSize(field.type);
         const uint32_t width = EditRowWidth(field);
         for (uint32_t i = 0; i < field.scalarCount; ++i)
@@ -871,7 +876,12 @@ namespace donut::app
                 s.DrawWorld(world);
             if (OpenHeader("Archetypes"))
                 s.DrawArchetypes(world);
-            if (scheduler && OpenHeader("Systems"))
+            if (scheduler && scheduler->GetWorld() != world)
+            {
+                // its systems are another world's (backlog I3-R6)
+                log::warning("WorldInspector::Draw: the scheduler is not the world's; the Systems panel is not drawn");
+            }
+            else if (scheduler && OpenHeader("Systems"))
                 s.DrawSystems(scheduler);
             if (OpenHeader("Entities"))
                 s.DrawBrowser(world);
@@ -897,9 +907,13 @@ namespace donut::app
             s.DropEdits();
             return nvrhi::FE_INVALID_ARGS;
         }
+        // One command per pending value, in the order of their first edits; the buffer keeps no earlier ones.
+        for (uint32_t i = 0; i < s.pendingCount; ++i)
+            s.buffer->SetComponent(s.pending[i].entity, s.pending[i].component, s.pending[i].value, i);
         const nvrhi::FRESULT result = world->Playback(s.buffer.GetAddressOf(), 1);
         if (result == nvrhi::FE_OUT_OF_DATE)
         {
+            s.buffer->Reset();   // recorded again by the next Apply
             log::warning("WorldInspector::Apply: the world refuses playback now (an observer runs); the edits are kept");
             return result;
         }

@@ -65,9 +65,10 @@ target_compile_definitions(test_runtime_instances PRIVATE
 # store and the entity table, and the exit test of the shared job system (SharedJobSystem.h).
 foreach(test_src ${donut_engine_tests})
     get_filename_component(test_name "${test_src}" NAME_WE)
-    if(test_name MATCHES "^test_ecs_" OR test_name STREQUAL "test_scene_graph_store" OR test_name STREQUAL "test_gpu_scene"
-       OR test_name STREQUAL "test_scene_graph_leaf_columns" OR test_name STREQUAL "test_scene_graph_simulation"
-       OR test_name STREQUAL "test_runtime_instances" OR test_name STREQUAL "test_job_system_exit")
+    if(test_name MATCHES "^test_ecs_" OR test_name STREQUAL "test_scene_graph_store"
+       OR test_name STREQUAL "test_gpu_scene" OR test_name STREQUAL "test_scene_graph_leaf_columns"
+       OR test_name STREQUAL "test_scene_graph_simulation" OR test_name STREQUAL "test_runtime_instances"
+       OR test_name STREQUAL "test_job_system_exit")
         target_include_directories("${test_name}" PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
     endif()
 endforeach()

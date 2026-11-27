@@ -52,6 +52,14 @@ add_dependencies(donut_all_tests test_render_extract)
 add_test(NAME test_render_extract COMMAND test_render_extract)
 set_property(TARGET test_render_extract PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
+# The regression tests of the E7 fix track, render side (aggregate docs/plans/2026-11-26-donut-ecs-e7-rev2.md, stage
+# F), device-free.
+add_executable(test_e7_render_fixes src/render/test_e7_render_fixes.cpp)
+target_link_libraries(test_e7_render_fixes donut_render donut_engine donut_core donut_tests_utils)
+add_dependencies(donut_all_tests test_e7_render_fixes)
+add_test(NAME test_e7_render_fixes COMMAND test_e7_render_fixes)
+set_property(TARGET test_e7_render_fixes PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
 # Visibility and draw packets against the legacy strategies, device-free (sub-plan item E5.2). The ECS allocation
 # counter through src/engine, the radix sort through src/render (RenderVisibility.h); the per-frame packet hashes are
 # compared with tests/src/render/golden/render_extract_packets.txt (ECS_UPDATE_GOLDEN=1 rewrites it).

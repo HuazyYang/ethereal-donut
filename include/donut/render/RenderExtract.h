@@ -220,9 +220,11 @@ namespace donut::render
         const engine::MeshId* meshes = nullptr;               // MeshRef::mesh
         const uint32_t* firstGeometryInstanceSlots = nullptr; // GpuInstanceSlot::firstGeometryInstance
         const uint32_t* geometryCounts = nullptr;             // GpuInstanceSlot::geometryCount
-        // DrawItem::instance (MeshInstanceLeaf guarantees the class). From plan step E7, item E7.2, null for a
-        // runtime-only mesh instance (SceneComponents.h): the instance query then takes rows of both kinds (Read of
-        // MeshRef and GpuInstanceSlot, with SceneLinks, SceneNode and LeafObject Optional).
+        // DrawItem::instance: a MeshInstance, because the graph gives MeshRef, RenderFlags and GpuInstanceSlot only to
+        // the rows of that class, never to other leaf classes (LeafTypeDesc::columns; an application that adds them to
+        // a row through IWorld::AddComponent breaks this); the query does not filter on MeshInstanceLeaf. From plan
+        // step E7, item E7.2, null for a runtime-only mesh instance (SceneComponents.h): the instance query then takes
+        // rows of both kinds (Read of MeshRef and GpuInstanceSlot, with SceneLinks, SceneNode and LeafObject Optional).
         const engine::MeshInstance* const* leaves = nullptr;
         // The instance's mesh, taken at extraction (MeshInstance::GetMesh()): the adapters read it from here, so that
         // recording reads the snapshot and not the leaf (D8, 7.5).

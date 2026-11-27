@@ -1357,8 +1357,23 @@ namespace donut::engine
         }
         m_LeafTypeTags.push_back(m_Ids[SlotLeaf]);
         LeafType type{ &desc, uint32_t(m_LeafTypeTags.size()), 0, 0, false };
+        // The mesh-instance tags and columns say what a row's leaf is: the leaf observer, InvalidateContent and the
+        // render service's queries cast the leaf of a row with them (MeshRef, RenderFlags and GpuInstanceSlot, or
+        // MeshInstanceLeaf: MeshInstance; SkinnedMeshInstanceLeaf: SkinnedMeshInstance). A class that is not of their
+        // class gets none of them (backlog E72-R4), with one warning per class and graph. The class is known here: a
+        // descriptor is its class's alone.
+        const bool meshInstance = query_cast<MeshInstance>(leaf) != nullptr;
+        const bool skinnedInstance = query_cast<SkinnedMeshInstance>(leaf) != nullptr;
+        bool refused = false;
         for (uint32_t t = 0; t < desc.tagCount; ++t)
         {
+            const nvrhi::GUID& tag = desc.tags[t]->uuid;
+            if ((!meshInstance && tag == ComponentTraits<MeshInstanceLeaf>::Desc().uuid) ||
+                (!skinnedInstance && tag == ComponentTraits<SkinnedMeshInstanceLeaf>::Desc().uuid))
+            {
+                refused = true;
+                continue;
+            }
             ComponentId id = ComponentId::Invalid;
             if (NVRHI_FAILED(m_World->RegisterComponent(*desc.tags[t], id)))
             {
@@ -1387,6 +1402,14 @@ namespace donut::engine
         m_AnyLeafRecord |= desc.leafRecord;
         for (uint32_t c = 0; c < desc.columnCount; ++c)
         {
+            const nvrhi::GUID& uuid = desc.columns[c]->uuid;
+            if (!meshInstance && (uuid == ComponentTraits<MeshRef>::Desc().uuid ||
+                                  uuid == ComponentTraits<RenderFlags>::Desc().uuid ||
+                                  uuid == ComponentTraits<GpuInstanceSlot>::Desc().uuid))
+            {
+                refused = true;
+                continue;
+            }
             ComponentId id = ComponentId::Invalid;
             if (NVRHI_FAILED(m_World->RegisterComponent(*desc.columns[c], id)))
             {
@@ -1395,6 +1418,15 @@ namespace donut::engine
             }
             m_LeafTypeTags.push_back(id);
             ++type.columnCount;
+        }
+        if (refused)
+        {
+            const nvrhi::GUID& id = desc.classId;
+            log::warning("SceneGraph: the leaf class {%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x} declares mesh-"
+                         "instance tags or columns of a class it is not (MeshInstanceLeaf, SkinnedMeshInstanceLeaf, "
+                         "MeshRef, RenderFlags, GpuInstanceSlot); its rows get none of them (one warning per class and "
+                         "graph)", id.Data1, id.Data2, id.Data3, id.Data4[0], id.Data4[1], id.Data4[2], id.Data4[3],
+                         id.Data4[4], id.Data4[5], id.Data4[6], id.Data4[7]);
         }
         for (uint32_t t = 0; t < type.tagCount + type.columnCount; ++t)
             type.separate |= IsSeparate(m_LeafTypeTags[type.firstTag + t]);

@@ -161,6 +161,10 @@ namespace donut::engine
         [[nodiscard]] const LeafTypeDesc& GetTypeDesc() const override;
         [[nodiscard]] SceneContentFlags GetContentFlags() const override;
         bool SetProperty(const std::string& name, const dm::float4& value) override;
+        // The content flags of an instance of `mesh` (its geometries' material domains; None for null): what
+        // MeshInstance::GetContentFlags gives (a subclass may override it), and what a runtime-only mesh instance of
+        // `mesh` gets when it joins (SceneComponents.h).
+        [[nodiscard]] static SceneContentFlags GetMeshContentFlags(const MeshInfo* mesh) noexcept;
     };
 
     struct SkinnedMeshJoint

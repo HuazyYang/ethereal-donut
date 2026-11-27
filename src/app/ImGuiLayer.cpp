@@ -284,7 +284,6 @@ bool ImGui_ImplNVRHI_Init(ImGui_ImplNVRHI_InitInfo *init_info) {
     io.BackendRendererUserData = (void *)bd;
     io.BackendRendererName = "imgui_impl_nvrhi";
     io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
-    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
 
 #if DONUT_WITH_DX11
     if(init_info->Device->getGraphicsAPI() == nvrhi::GraphicsAPI::D3D11) {

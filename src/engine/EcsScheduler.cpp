@@ -697,6 +697,14 @@ namespace donut::engine::ecs
         nvrhi::FRESULT m_BuildResult = nvrhi::FS_OK;
         uint32_t m_AmbiguityCount = 0;
         nvrhi::string m_Report;                    // the last order build's diagnostics
+        // Orderings against a name that matches no system of their phase, by phase, system, relation, target and what
+        // the target is (no system, or a system of which phase), of the last order build and of the one in progress:
+        // each is warned at the build that first finds it, not again while it stays the same (the report has it at
+        // every build; backlog I3-N4).
+        Vector<nvrhi::string> m_Unmatched;
+        Vector<nvrhi::string> m_UnmatchedBuilding;
+        bool RecordUnmatched(const char* phase, const SystemRecord& from, const char* relation,
+                             const nvrhi::string& target, const char* targetPhase) noexcept;
 
         Vector<SystemRecord*> m_Pending;           // systems with commands, in playback order
         Vector<ICommandBuffer*> m_PlaybackScratch;
@@ -2045,8 +2053,10 @@ namespace donut::engine::ecs
             m_BuildResult = nvrhi::FS_OK;
             AppendFormat(m_Report, "ECS scheduler: %u systems in %u phases\n", m_LiveSystemCount,
                          uint32_t(m_PhaseOrder.size()));
+            m_UnmatchedBuilding.clear();
             for (Phase id : m_PhaseOrder)
                 BuildOrder(*m_Phases[uint32_t(id)]);
+            m_Unmatched.swap(m_UnmatchedBuilding);
             ++m_Counters.orderBuilds;
             m_OrderDirty = false;
             m_ExecutionDirty = true;
@@ -2104,6 +2114,21 @@ namespace donut::engine::ecs
         return false;
     }
 
+    // Records the mismatch for this build (`targetPhase` null: the target matches no system); true when the last build
+    // did not have it, so that it is warned once.
+    bool SchedulerImpl::RecordUnmatched(const char* phase, const SystemRecord& from, const char* relation,
+                                        const nvrhi::string& target, const char* targetPhase) noexcept
+    {
+        nvrhi::string key;
+        AppendFormat(key, "%s\x1f%s\x1f%s\x1f%s\x1f%s", phase, from.name.c_str(), relation, target.c_str(),
+                     targetPhase ? targetPhase : "\x1e");
+        bool known = false;
+        for (const nvrhi::string& entry : m_Unmatched)
+            known = known || std::strcmp(entry.c_str(), key.c_str()) == 0;
+        m_UnmatchedBuilding.push_back(key);
+        return !known;
+    }
+
     void SchedulerImpl::BuildOrder(PhaseRecord& phase) noexcept
     {
         const bool validation = m_World->IsValidationEnabled();
@@ -2142,15 +2167,18 @@ namespace donut::engine::ecs
                 AppendFormat(m_Report, "phase '%s': '%s' %s '%s', a system of phase '%s'; ignored\n", phaseName,
                              from.name.c_str(), relation, target.c_str(),
                              m_Phases[uint32_t(elsewhere->phase)]->name.c_str());
-                log::warning("ECS scheduler: '%s' %s '%s', which runs in another phase; ignored", from.name.c_str(),
-                             relation, target.c_str());
+                if (RecordUnmatched(phaseName, from, relation, target,
+                                    m_Phases[uint32_t(elsewhere->phase)]->name.c_str()))
+                    log::warning("ECS scheduler: '%s' %s '%s', which runs in another phase; ignored",
+                                 from.name.c_str(), relation, target.c_str());
             }
             else
             {
                 AppendFormat(m_Report, "phase '%s': '%s' %s '%s', which matches no system; ignored\n", phaseName,
                              from.name.c_str(), relation, target.c_str());
-                log::warning("ECS scheduler: '%s' %s '%s', which matches no system; ignored", from.name.c_str(),
-                             relation, target.c_str());
+                if (RecordUnmatched(phaseName, from, relation, target, nullptr))
+                    log::warning("ECS scheduler: '%s' %s '%s', which matches no system; ignored", from.name.c_str(),
+                                 relation, target.c_str());
             }
             return c_None;
         };

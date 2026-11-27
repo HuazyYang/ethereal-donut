@@ -151,7 +151,12 @@ nvrhi::AutoPtr<SceneGraphLeaf> MeshInstance::Clone()
 SceneContentFlags MeshInstance::GetContentFlags() const
 {
     // one home for the rule: runtime-only mesh instances take their content flags from it too (SceneGraphStore.cpp)
-    return GetMeshContentFlags(m_Mesh);
+    return ::donut::engine::GetMeshContentFlags(m_Mesh);
+}
+
+SceneContentFlags MeshInstance::GetMeshContentFlags(const MeshInfo* mesh) noexcept
+{
+    return ::donut::engine::GetMeshContentFlags(mesh);
 }
 
 bool MeshInstance::SetProperty(const std::string& name, const dm::float4& value)

@@ -29,6 +29,9 @@
 //   i5_r3_static_rows_join_late     rows joining a Static archetype after propagation get boxes of their worlds
 //   i5_r4_compose_through_static    a pose composed below a Static row starts from its world (binding)
 //   i3_r1_r2_read_only_list         SimTeleport and SimPosePrevious are on donut's read-only list
+//   e72_r4_mesh_columns_of_other_classes  no mesh-instance columns for a leaf class that is no MeshInstance
+//   e72_r4_mesh_tags_of_other_classes     no mesh-instance tags for a leaf class that is not of their class
+//   i3_n4_missing_name_warned_once  an ordering against a missing name warns once while it stays missing
 
 #include <donut/app/WorldInspector.h>
 #include <donut/core/log.h>
@@ -435,6 +438,184 @@ void test_i5_r4_compose_through_static()
     CHECK(TakeWarnings() == 0);
 }
 
+// ------------------------------------------------------------------------------------------------- E72-R4
+
+namespace e7_fixes
+{
+    // A leaf class that is no MeshInstance but declares the mesh-instance columns MeshRef and GpuInstanceSlot (and
+    // RenderFlags), which would put its rows in the render service's instance query, whose rows' leaves are cast to
+    // MeshInstance.
+    class MeshColumnsLeaf;
+    NVRHI_CLASS_CLSID(MeshColumnsLeaf, "1f5a9c3e-7b24-4d86-9e10-3c2b8a4f6d71")
+    class MeshColumnsLeaf final : public SceneGraphLeaf
+    {
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(MeshColumnsLeaf)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(MeshColumnsLeaf)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(MeshColumnsLeaf)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(SceneGraphLeaf)
+        NVRHI_END_INTERFACE_TABLE()
+
+        const LeafTypeDesc& GetTypeDesc() const override
+        {
+            static const ComponentTypeDesc* const s_Columns[] = { &ComponentTraits<MeshRef>::Desc(),
+                                                                  &ComponentTraits<RenderFlags>::Desc(),
+                                                                  &ComponentTraits<GpuInstanceSlot>::Desc() };
+            static const LeafTypeDesc s_Desc{ nvrhi::uuid_of<MeshColumnsLeaf>(), nullptr, 0, s_Columns,
+                                              uint32_t(std::size(s_Columns)) };
+            return s_Desc;
+        }
+        nvrhi::AutoPtr<SceneGraphLeaf> Clone() override { return MAKE_RC_OBJ_PTR(MeshColumnsLeaf); }
+    };
+
+    // A leaf class that is no (skinned) mesh instance but carries the tags MeshInstanceLeaf and
+    // SkinnedMeshInstanceLeaf, whose rows the render service's skinned query casts to SkinnedMeshInstance.
+    class MeshTagsLeaf;
+    NVRHI_CLASS_CLSID(MeshTagsLeaf, "8c2e4a61-0d3b-4f97-b5a8-6e1f2c9d7b30")
+    class MeshTagsLeaf final : public SceneGraphLeaf
+    {
+    public:
+        NVRHI_DECLARE_UUID_TRAITS(MeshTagsLeaf)
+        NVRHI_BEGIN_INTERFACE_TABLE_INLINE(MeshTagsLeaf)
+        NVRHI_IMPLEMENTS_INTERFACE(nvrhi::IWeakReferenceSource)
+        NVRHI_IMPLEMENTS_CLASS(MeshTagsLeaf)
+        NVRHI_IMPLEMENTS_ROUTE_PARENT(SceneGraphLeaf)
+        NVRHI_END_INTERFACE_TABLE()
+
+        const LeafTypeDesc& GetTypeDesc() const override
+        {
+            static const ComponentTypeDesc* const s_Tags[] = { &ComponentTraits<MeshInstanceLeaf>::Desc(),
+                                                               &ComponentTraits<SkinnedMeshInstanceLeaf>::Desc() };
+            static const LeafTypeDesc s_Desc{ nvrhi::uuid_of<MeshTagsLeaf>(), s_Tags, uint32_t(std::size(s_Tags)),
+                                              nullptr, 0 };
+            return s_Desc;
+        }
+        nvrhi::AutoPtr<SceneGraphLeaf> Clone() override { return MAKE_RC_OBJ_PTR(MeshTagsLeaf); }
+    };
+}
+
+// The graph refuses the mesh-instance columns (MeshRef, RenderFlags, GpuInstanceSlot) of a leaf class that is no
+// MeshInstance (one warning per class and graph, when the class is first attached): its rows get none, so no instance
+// query takes them and nothing casts their leaf to MeshInstance (InvalidateContent included). A MeshInstance's rows
+// keep all three.
+void test_e72_r4_mesh_columns_of_other_classes()
+{
+    nvrhi::AutoPtr<MeshInfo> mesh = MakeMesh();
+    Graph g(false);
+    SceneGraphNode* root = g.graph->GetRootNode();
+    auto first = MAKE_RC_OBJ_PTR(SceneGraphNode);
+    first->SetLeaf(MAKE_RC_OBJ_PTR(e7_fixes::MeshColumnsLeaf));
+    SceneGraphNode* a = g.graph->Attach(root, first);
+    CHECK(TakeWarnings() == 1);
+    auto second = MAKE_RC_OBJ_PTR(SceneGraphNode);
+    second->SetLeaf(MAKE_RC_OBJ_PTR(e7_fixes::MeshColumnsLeaf));
+    SceneGraphNode* b = g.graph->Attach(root, second);
+    CHECK(TakeWarnings() == 0);   // the class is known: no second warning
+    SceneGraphNode* m = g.Add(root, dm::double3(0.0), mesh, false);
+    g.Frame();
+    const ComponentId meshRef = FindComponent<MeshRef>(g.world);
+    const ComponentId slot = FindComponent<GpuInstanceSlot>(g.world);
+    const ComponentId flags = FindComponent<RenderFlags>(g.world);
+    for (SceneGraphNode* node : { a, b })
+    {
+        const Entity entity = g.graph->GetEntity(node);
+        CHECK(!g.world->HasComponent(entity, meshRef) && !g.world->HasComponent(entity, slot));
+        CHECK(!g.world->HasComponent(entity, flags));
+    }
+    a->InvalidateContent();   // reads no mesh-instance column of the row
+    g.Frame();
+    const Entity instance = g.graph->GetEntity(m);
+    CHECK(g.world->HasComponent(instance, meshRef) && g.world->HasComponent(instance, slot) &&
+          g.world->HasComponent(instance, flags));
+    CHECK(TakeWarnings() == 0);
+}
+
+// The tags MeshInstanceLeaf and SkinnedMeshInstanceLeaf are refused to a class that is not of their class (one
+// warning per class and graph): the skinned query of the render service never takes such a row.
+void test_e72_r4_mesh_tags_of_other_classes()
+{
+    Graph g(false);
+    SceneGraphNode* root = g.graph->GetRootNode();
+    SceneGraphNode* nodes[2] = {};
+    for (SceneGraphNode*& node : nodes)
+    {
+        auto made = MAKE_RC_OBJ_PTR(SceneGraphNode);
+        made->SetLeaf(MAKE_RC_OBJ_PTR(e7_fixes::MeshTagsLeaf));
+        node = g.graph->Attach(root, made);
+    }
+    CHECK(TakeWarnings() == 1);
+    g.Frame();
+    const ComponentId meshTag = FindComponent<MeshInstanceLeaf>(g.world);
+    const ComponentId skinnedTag = FindComponent<SkinnedMeshInstanceLeaf>(g.world);
+    for (SceneGraphNode* node : nodes)
+    {
+        const Entity entity = g.graph->GetEntity(node);
+        CHECK(meshTag == ComponentId::Invalid || !g.world->HasComponent(entity, meshTag));
+        CHECK(skinnedTag == ComponentId::Invalid || !g.world->HasComponent(entity, skinnedTag));
+    }
+    CHECK(TakeWarnings() == 0);
+}
+
+// -------------------------------------------------------------------------------------------------- I3-N4
+
+// A system ordered against a name that matches no system: the scheduler warns once while the name stays missing,
+// not at every rebuild (another system added, a listing for an inspector that rebuilds the order); the diagnostics
+// report it at every build. When the name comes to name a system of another phase, that is a new mismatch: one
+// warning. Once the ordering is gone (its system removed) and comes back, it warns again.
+void test_i3_n4_missing_name_warned_once()
+{
+    Graph g(false);
+    IScheduler* scheduler = g.graph->GetScheduler();
+    auto add = [&](const char* name, const char* before, Phase phase = Phase::EndFrame)
+    {
+        const char* const list[1] = { before };
+        SystemDesc desc{};
+        desc.name = name;
+        desc.phase = phase;
+        desc.runBefore = before ? list : nullptr;
+        desc.runBeforeCount = before ? 1 : 0;
+        nvrhi::AutoPtr<ISystem> system;
+        CHECK(CreateLambdaSystem(desc, [](ISystemContext*) noexcept { return nvrhi::FS_OK; }, &system) ==
+              nvrhi::FS_OK);
+        SystemId id = SystemId::Invalid;
+        CHECK(scheduler->AddSystem(system, id) == nvrhi::FS_OK);
+        return id;
+    };
+    const SystemId lost = add("lost", "nobody");
+    CHECK(scheduler->Build() == nvrhi::FS_OK);
+    CHECK(TakeWarnings() == 1);
+    add("other", nullptr);
+    CHECK(scheduler->Build() == nvrhi::FS_OK);
+    SystemInfo info{};
+    CHECK(scheduler->GetSystemInfo(0, info) == nvrhi::FS_OK);
+    g.Frame();
+    CHECK(TakeWarnings() == 0);
+    nvrhi::string text;
+    scheduler->GetDiagnostics(text);
+    CHECK(std::string(text.c_str()).find("'lost' runs before 'nobody', which matches no system") != std::string::npos);
+    add("listed", nullptr);
+    CHECK(scheduler->GetSystemInfo(0, info) == nvrhi::FS_OK);   // rebuilds the order, without Build
+    CHECK(TakeWarnings() == 0);
+
+    // 'nobody' is a system now, of another phase: another mismatch, warned once
+    const SystemId nobody = add("nobody", nullptr, Phase::BeginFrame);
+    CHECK(scheduler->Build() == nvrhi::FS_OK);
+    CHECK(TakeWarnings() == 1);
+    add("more", nullptr);
+    CHECK(scheduler->Build() == nvrhi::FS_OK);
+    CHECK(TakeWarnings() == 0);
+    CHECK(scheduler->RemoveSystem(nobody) == nvrhi::FS_OK);
+    CHECK(scheduler->Build() == nvrhi::FS_OK);
+    CHECK(TakeWarnings() == 1);   // matches no system again
+
+    CHECK(scheduler->RemoveSystem(lost) == nvrhi::FS_OK);
+    CHECK(scheduler->Build() == nvrhi::FS_OK);
+    add("lost", "nobody");
+    CHECK(scheduler->Build() == nvrhi::FS_OK);
+    CHECK(TakeWarnings() == 1);
+}
+
 // ---------------------------------------------------------------------------------------------- I3-R1, I3-R2
 
 // The domain's columns that an edit through the world would bypass: SimTeleport (RequestTeleport's normalising and
@@ -467,6 +648,9 @@ int main(int argc, char** argv)
         { "i5_r3_static_rows_join_late", test_i5_r3_static_rows_join_late },
         { "i5_r4_compose_through_static", test_i5_r4_compose_through_static },
         { "i3_r1_r2_read_only_list", test_i3_r1_r2_read_only_list },
+        { "e72_r4_mesh_columns_of_other_classes", test_e72_r4_mesh_columns_of_other_classes },
+        { "e72_r4_mesh_tags_of_other_classes", test_e72_r4_mesh_tags_of_other_classes },
+        { "i3_n4_missing_name_warned_once", test_i3_n4_missing_name_warned_once },
     };
     log::SetCallback([](log::Severity severity, const char* message)
     {

@@ -1413,7 +1413,9 @@ namespace donut::render::visibility
         // changed without SceneGraphNode::InvalidateContent (E3: those columns follow the leaf only at attach, SetLeaf
         // and InvalidateContent; a leaf class with LeafTypeDesc::dynamicBounds keeps its box current by itself), so
         // culling used a stale box or pass selection stale flags. The warning names the node (by name: GetPath
-        // allocates).
+        // allocates). A runtime-only row has no leaf: its columns are compared with its mesh, as the graph wrote them
+        // when the row joined (the mesh's box and MeshInstance::GetMeshContentFlags); a difference means the mesh was
+        // edited in place since (backlog E72-R5), and the warning names the entity.
         void CheckLeaves(const InstanceQuery& query, const VisibilityFrame& frame) noexcept
         {
             if (m_Runs % c_LeafCheckInterval != 0)
@@ -1423,6 +1425,7 @@ namespace donut::render::visibility
             if (chunkCount == 0)
                 return;
             const engine::ChunkRequest request = engine::MakeChunkRequest(frame.context);
+            const engine::MeshTable& meshes = frame.graph->GetMeshes();
             uint32_t warnings = 0;
             for (uint32_t k = 0; k < std::min(c_LeafCheckChunks, chunkCount); ++k)
             {
@@ -1430,13 +1433,38 @@ namespace donut::render::visibility
                 engine::ChunkView chunk;
                 if (iquery->GetChunks(index, request, 1, &chunk) != 1)
                     continue;
-                // Runtime-only rows have no leaf: the store writes their columns from the mesh when they join.
                 const auto* leaves = static_cast<const engine::LeafObject*>(chunk.columns[ColumnLeaf]);
-                if (!leaves)
-                    continue;
                 const auto* locals = static_cast<const engine::LocalBounds*>(chunk.columns[ColumnLocalBounds]);
                 const auto* flags = static_cast<const engine::RenderFlags*>(chunk.columns[ColumnRenderFlags]);
                 const auto* nodes = static_cast<const engine::SceneNode*>(chunk.columns[ColumnNode]);
+                if (!leaves)
+                {
+                    // Runtime-only rows: the store wrote their columns from the mesh when they joined.
+                    const auto* refs = static_cast<const engine::MeshRef*>(chunk.columns[ColumnMeshRef]);
+                    const auto* slots = static_cast<const engine::GpuInstanceSlot*>(chunk.columns[ColumnSlot]);
+                    for (uint32_t row = 0; refs && slots && row < chunk.count && warnings < c_LeafCheckWarnings; ++row)
+                    {
+                        // a row without slots (no mesh of the graph, a reference count that would overflow) is never
+                        // drawn, and its columns were not written from the mesh
+                        const engine::MeshInfo* mesh = meshes.Get(refs[row].mesh);
+                        if (!mesh || slots[row].instance == engine::c_NoInstanceSlot)
+                            continue;
+                        const bool staleBox =
+                            std::memcmp(&mesh->objectSpaceBounds, &locals[row].bounds, sizeof(dm::box3)) != 0;
+                        const bool staleFlags = uint32_t(engine::MeshInstance::GetMeshContentFlags(mesh)) !=
+                                                flags[row].contentFlags;
+                        if (!staleBox && !staleFlags)
+                            continue;
+                        log::warning("RenderService: the %s of the mesh of runtime-only mesh instance #%u:%u changed "
+                                     "after it joined (an in-place mesh edit); it is culled and sorted with the old one "
+                                     "until the row is made again",
+                                     staleBox ? "bounding box" : "content (material domains)",
+                                     engine::GetEntityIndex(chunk.entities[row]),
+                                     engine::GetEntityGeneration(chunk.entities[row]));
+                        ++warnings;
+                    }
+                    continue;
+                }
                 for (uint32_t row = 0; row < chunk.count && warnings < c_LeafCheckWarnings; ++row)
                 {
                     engine::SceneGraphLeaf* leaf = leaves[row].object;

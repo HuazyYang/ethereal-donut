@@ -31,14 +31,16 @@
 // scene graph's store registers in its world (SceneComponents.h): the hierarchy, derived, slot, reference and hooked
 // columns and the simulation's SimPosePrevious and SimTeleport, whose free edit corrupts the graph or bypasses its
 // setters; it applies to every inspector, not by the application's choice. Fields of type Opaque or Entity are shown,
-// never edited. A commit records the whole value with ICommandBuffer::SetComponents into the inspector's buffer; Apply
-// plays the buffer back.
+// never edited. A commit keeps the whole value as the pending one of its (entity, component), at most 64 of them;
+// Apply records one ICommandBuffer::SetComponents per pending value into the inspector's buffer and plays it back.
 //
 // Module-private C++ of donut_app, not on the ABI surface. It names no scene type: entity names come from the
 // application (SetEntityNames). Between calls the inspector holds no scheduler, and a world only through pending edits:
-// the command buffer that Draw records them into comes from IWorld::CreateCommandBuffer and holds a reference to its
-// world, from the first edit until Apply plays it back, the edits are dropped, or the inspector is destroyed. Nothing
-// allocates while its panels are closed; while they are open, only ImGui does.
+// the command buffer of the edits comes from IWorld::CreateCommandBuffer at the first edit and holds a reference to
+// its world until Apply plays it back, the edits are dropped, or the inspector is destroyed. Nothing allocates while
+// its panels are closed and nothing is edited. Otherwise ImGui does, and so do the first edit after an Apply (the
+// command buffer), Apply (the commands), and the Systems panel when the scheduler's order is built again
+// (IScheduler::GetSystemInfo, after a change of its systems).
 
 #pragma once
 
@@ -60,8 +62,9 @@ namespace donut::app
 
         // Draws the inspector's window into the current ImGui frame (ImGui::NewFrame has run; ImGuiLayer::buildUI is
         // the place). Outside phases: inside one (IWorld::IsInPhase), a warning and nothing drawn. `scheduler` may be
-        // null (no systems panel); otherwise it must be a scheduler of `world`. Pending edits belong to the world of
-        // their buffer (which holds it): a Draw of another world drops them, with a warning, before it records new ones.
+        // null (no systems panel); a scheduler of another world is not listed (a warning at each Draw that shows the
+        // window, no systems panel). Pending edits belong to the world of their buffer (which holds it): a Draw of
+        // another world drops them, with a warning, before it records new ones.
         void Draw(engine::IWorld* world, engine::IScheduler* scheduler);
 
         // Plays the pending edits back (IWorld::Playback), then IWorld::AdvanceVersion, so that SceneGraph::Refresh sees

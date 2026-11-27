@@ -358,9 +358,16 @@ namespace donut::engine
     struct LeafTypeDesc
     {
         nvrhi::GUID classId;                            // NVRHI_CLASS_CLSID of the leaf class
-        const ComponentTypeDesc* const* tags;           // this class and its base classes (4.11)
+        // This class and its base classes (4.11). MeshInstanceLeaf and SkinnedMeshInstanceLeaf are given only to rows
+        // whose leaf is a MeshInstance or a SkinnedMeshInstance respectively (the render service casts such leaves); a
+        // class that is not one does not get them (below).
+        const ComponentTypeDesc* const* tags;
         uint32_t tagCount;
-        const ComponentTypeDesc* const* columns;        // state that lives in columns; empty for object-only leaves
+        // State that lives in columns; empty for object-only leaves. MeshRef, RenderFlags and GpuInstanceSlot are the
+        // mesh instance's (MeshInstance and its subclasses): the graph and the render service take the leaf of a row
+        // with them as a MeshInstance, so the graph never gives them to the rows of another class. Such a class gets
+        // none of these tags and columns, with one warning per class and graph when it is first attached.
+        const ComponentTypeDesc* const* columns;
         uint32_t columnCount;
         // The leaf's GetLocalBoundingBox changes by itself (a simulation's extent): at every Refresh that runs the
         // phases, the Bounds system reads it again for every such leaf (LocalBounds, then WorldBounds), so that culling
