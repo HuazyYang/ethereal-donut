@@ -90,6 +90,15 @@ add_test(NAME test_world_inspector_backlog COMMAND test_world_inspector --backlo
 add_test(NAME test_gpu_scene_backlog COMMAND test_gpu_scene --backlog)
 # The exit test runs ~130 child processes; a child that hangs is killed after 30 s (Windows), this bounds the rest.
 set_tests_properties(test_job_system_exit PROPERTIES TIMEOUT 300)
+# With one or two workers a job scheduled right before exit was left unfinished when the workers took the stop
+# without a last look for its ticket (stage F, T7-3): the modes that exit with a job in flight, 100 children each.
+foreach(workers 1 2)
+    foreach(mode in_flight quick_exit)
+        add_test(NAME test_job_system_exit_${mode}_workers_${workers} COMMAND test_job_system_exit ${mode} 100)
+        set_tests_properties(test_job_system_exit_${mode}_workers_${workers} PROPERTIES
+                             ENVIRONMENT "DONUT_JOB_WORKERS=${workers}" TIMEOUT 300)
+    endforeach()
+endforeach()
 
 # Baseline timings of the scene graph (aggregate docs/plans/2026-11-21-donut-ecs.md, step E0.4). The glob above skips
 # it; ctest runs it only in its short smoke mode, the Release numbers come from `bench_scene_graph`.

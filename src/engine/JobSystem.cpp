@@ -747,7 +747,8 @@ namespace donut::engine::jobs
             parkedCount = m_StartedThreads;
             return false;
         }
-        // A worker leaves only when it finds no ticket, so the jobs in flight finish first.
+        // A worker leaves only when it finds no ticket after it has seen the stop (WorkerMain), so the jobs in flight,
+        // and those scheduled before this call, finish first.
         m_Shared->stop.store(c_StopLeave, std::memory_order_seq_cst);
         m_Shared->events.WakeAll();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
@@ -1345,6 +1346,17 @@ namespace donut::engine::jobs
             const uint32_t stop = shared.stop.load(std::memory_order_acquire);
             if (stop != c_StopNone)
             {
+                // The look above may have come before a ticket that was published just before the stop (a job
+                // scheduled right before exit). This acquire load makes every such ticket visible, so a worker that is
+                // to leave looks once more. Without that look, when every worker missed the ticket (likely with one or
+                // two workers), they all left and the job never ran (T7-3).
+                if (stop == c_StopLeave && FindWork(self, ticket, fromShared))
+                {
+                    RunTicket(ticket, self, fromShared);
+                    idle = 0;
+                    retries = 0;
+                    continue;
+                }
                 uint32_t expected = c_WorkerRunning;
                 if (stop == c_StopLeave &&
                     m_WorkerStates[self - m_ExternalCount].compare_exchange_strong(expected, c_WorkerLeaving,
