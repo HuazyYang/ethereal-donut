@@ -1072,6 +1072,67 @@ namespace
         g_Warnings = warnings;
     }
 
+    // Mutants of F4 (scopes by identity; F4-09, F4-10, F4-12): a Defer scope opened 64th (the last with an identity) is
+    // found by its identity and keeps its mode; after a scope below it closes, it moves down and the scope that comes
+    // to the 64th place (one opened beyond 64) has no identity, so closing the Defer one by its identity closes it, not
+    // that one.
+    void test_defer_scope_at_64()
+    {
+        auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+        graph->SetRootNode(MAKE_RC_OBJ_PTR(SceneGraphNode));
+        const auto deferredDetach = [&graph]()
+        {
+            nvrhi::AutoPtr<SceneGraphNode> node = graph->AttachLeafNode(graph->GetRootNode(),
+                                                                        MAKE_RC_OBJ_PTR(PointLight));
+            auto weak = WeakOf(node);
+            graph->Refresh(0);
+            return std::make_pair(node, weak);
+        };
+        const auto closeAll = [&graph]()
+        {
+            while (graph->IsInRenderRead())
+                graph->EndRenderRead();
+        };
+        const uint32_t warnings = g_Warnings.load();
+
+        // the 64th, closed by its identity: its mode is Defer
+        auto [node, weak] = deferredDetach();
+        uint32_t ids[66] = {};
+        for (uint32_t i = 0; i < 63; ++i)
+            ids[i] = graph->BeginRenderRead();
+        ids[63] = graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+        CHECK(ids[63] != 0 && graph->IsRenderReadDeferring());
+        (void)graph->Detach(node);
+        node = nullptr;
+        CHECK(weak->IsExpired() == 0);
+        graph->EndRenderRead(ids[63]);
+        CHECK(!graph->IsRenderReadDeferring() && !SceneGraph::IsAnyRenderReadDeferring());
+        CHECK(weak->IsExpired() != 0);
+        closeAll();
+
+        // with two more beyond 64 and one below closed: the Defer one is the 63rd now, the 64th has no identity
+        auto [other, otherWeak] = deferredDetach();
+        for (uint32_t i = 0; i < 63; ++i)
+            ids[i] = graph->BeginRenderRead();
+        ids[63] = graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+        ids[64] = graph->BeginRenderRead();
+        ids[65] = graph->BeginRenderRead();
+        CHECK(ids[64] == 0 && ids[65] == 0);
+        (void)graph->Detach(other);
+        other = nullptr;
+        graph->EndRenderRead(ids[10]);
+        graph->EndRenderRead(ids[63]);
+        CHECK(!graph->IsRenderReadDeferring() && otherWeak->IsExpired() != 0);
+        uint32_t left = 0;
+        while (graph->IsInRenderRead())
+        {
+            graph->EndRenderRead();
+            ++left;
+        }
+        CHECK(left == 64);
+        CHECK(g_Warnings.load() == warnings);
+    }
+
     // Stage T8 (part I7): BeginPipelinedRecording is refused once the frame has ended (EndFrame) as before the first
     // Extract; IsPipelinedRecording follows the hand-off and the EndFrame; a refused frame keeps no recording.
     void test_service_recording_states()
@@ -1140,6 +1201,7 @@ int main(int argc, char** argv)
         { "service_recording_states", test_service_recording_states, nullptr },
         { "defer_retire_material", test_defer_retire_material, nullptr },
         { "walking_refusal_partial", test_walking_refusal_partial, nullptr },
+        { "defer_scope_at_64", test_defer_scope_at_64, nullptr },
     };
     // No argument: every case not marked with a backlog item. --backlog: the marked ones. A name: that case.
     const bool backlog = argc > 1 && std::strcmp(argv[1], "--backlog") == 0;
