@@ -430,6 +430,11 @@ namespace donut::engine::ecs
                 ReportValidation("RegisterComponent", "%s: the GUID is registered with another layout", NameOf(desc));
                 return nvrhi::FE_INVALID_ARGS;
             }
+            // The flag is not part of the layout: the type keeps what it was registered with (backlog I4-R4).
+            if (Has(desc.flags, ComponentFlags::RowTracked) &&
+                !Has(m_Types[existing]->desc.flags, ComponentFlags::RowTracked))
+                log::warning("IWorld::RegisterComponent: %s is registered already without RowTracked; its rows get no "
+                             "row versions (ChunkView::rowVersions null)", NameOf(desc));
             outId = ComponentId(existing);
             return nvrhi::FS_OK;
         }
@@ -2000,6 +2005,8 @@ namespace donut::engine::ecs
             retVal.chunkCount += archetype->GetChunkCount();
             retVal.chunkBytes += uint64_t(archetype->GetChunkCount()) * archetype->chunkSize;
             retVal.rowBytes += uint64_t(archetype->entityCount) * archetype->rowSize;
+            retVal.rowVersionBytes += uint64_t(archetype->rowVersionBlocks.size()) * archetype->rowVersionSlots *
+                                      (uint64_t(archetype->rowsPerChunk) + 1) * sizeof(uint64_t);
         }
         retVal.bufferHeapBytes = m_BufferHeapBytes.load(std::memory_order_relaxed);
         retVal.commandsPlayedBack = m_CommandsPlayedBack;

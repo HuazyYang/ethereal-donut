@@ -192,15 +192,13 @@ namespace donut::engine::ecs
 
         // The chunk list, rebuilt by Rebuild. Chunk i's arrays start at i * GetDataTermCount() in m_Columns and at
         // i * GetTermCount() in m_EnabledMasks, m_PresenceMasks and m_RowVersions; queries without Enableable or
-        // Sparse terms, and chunk lists without RowTracked data terms, point every view at m_NullMasks or
-        // m_NullRowVersions instead.
+        // Sparse terms, and chunk lists without RowTracked data terms, point every view at one process-wide array of
+        // nulls instead (EcsQuery.cpp).
         Vector<ChunkEntry> m_Chunks;
         Vector<void*> m_Columns;
         Vector<const uint64_t*> m_EnabledMasks;
         Vector<const uint64_t*> m_PresenceMasks;
         Vector<uint64_t*> m_RowVersions;
-        Vector<const uint64_t*> m_NullMasks;
-        Vector<uint64_t*> m_NullRowVersions;
         bool m_HasRowVersions = false;  // some matched archetype has a RowTracked data term: per-chunk row versions
         uint32_t m_EntityCount = 0;
 

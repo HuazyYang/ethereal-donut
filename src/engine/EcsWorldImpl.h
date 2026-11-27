@@ -137,7 +137,9 @@ namespace donut::engine::ecs
     // Change versions and enabled bits may be written from parallel systems for different rows of one chunk
     // (GetComponentForWrite, ResizeBuffer, SetEnabled), so they are updated atomically.
 
-    // *slot = max(*slot, version).
+    // *slot = max(*slot, version), a release when it writes: a reader that acquires the newest row version of a column
+    // (LoadVersionWord) sees the row versions stamped before it (backlog I4-R7). On x86 and x64 the same instruction as
+    // a relaxed one; MSVC's _InterlockedCompareExchange64 is a full barrier on every target.
     inline void StampVersion(uint64_t* slot, uint64_t version) noexcept
     {
 #if defined(_MSC_VER)
@@ -153,7 +155,7 @@ namespace donut::engine::ecs
 #else
         uint64_t current = __atomic_load_n(slot, __ATOMIC_RELAXED);
         while (current < version &&
-               !__atomic_compare_exchange_n(slot, &current, version, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+               !__atomic_compare_exchange_n(slot, &current, version, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED))
         {
         }
 #endif
@@ -367,7 +369,10 @@ namespace donut::engine::ecs
         // RowTracked columns (D9; plan step E7, item E7.5): their row versions live outside the chunk, so that they do
         // not lower rowsPerChunk. Per chunk one block of rowVersionSlots arrays, each the column's newest row version
         // followed by rowsPerChunk row versions. Blocks are kept by chunk index: a released chunk's block waits for
-        // the next chunk at that index, and the world frees them when it dies (steady state allocates nothing).
+        // the next chunk at that index, and the world frees them when it dies (steady state allocates nothing). They
+        // are the world's own heap blocks (HeapAllocate), one per chunk index, not shared through the process-wide
+        // slab cache of the chunk pages (ShareChunkPages): their size is per archetype. WorldStats::rowVersionBytes
+        // counts them (backlog I4-R5).
         uint32_t rowVersionSlots = 0;
         Vector<uint64_t*> rowVersionBlocks;
         Vector<ComponentId> components; // sorted
@@ -410,13 +415,18 @@ namespace donut::engine::ecs
 
     // ------------------------------------------------------------------------------- row versions (D9, E7.5)
 
-    // A version slot or row version written by other threads (StampVersion), read as a whole.
+    // A version slot or row version written by other threads (StampVersion), read as a whole, with acquire: after a
+    // load of a column's newest row version ([-1]) the rows stamped before it are seen (the spread of the chunk-only
+    // writer rule writes the rows, then [-1]; backlog I4-R7). On x86 and x64 a plain load (the fence only stops the
+    // compiler); on weakly ordered CPUs a load and a barrier.
     inline uint64_t LoadVersionWord(const uint64_t* slot) noexcept
     {
 #if defined(_MSC_VER)
-        return uint64_t(*reinterpret_cast<const volatile long long*>(slot));
+        const uint64_t value = uint64_t(*reinterpret_cast<const volatile long long*>(slot));
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return value;
 #else
-        return __atomic_load_n(slot, __ATOMIC_RELAXED);
+        return __atomic_load_n(slot, __ATOMIC_ACQUIRE);
 #endif
     }
 

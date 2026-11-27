@@ -968,7 +968,10 @@ namespace donut::engine
         // structure, counts like any other phase (the next Refresh runs); Debug builds warn about such a system.
         // FE_INVALID_ARGS without a scheduler; otherwise what IScheduler::RunPhase returns. Only declared accesses,
         // commands and structural changes are seen: a system that declares reads only but writes through
-        // IWorld::GetComponentForWrite is not (the world's validation mode reports such writes in Debug builds).
+        // IWorld::GetComponentForWrite is not (the world's validation mode reports such writes in Debug builds). A
+        // read hand-out of a RowTracked column may write that column's row versions (the chunk-only writer rule of
+        // ChunkView: rows stamped with the chunk's version, which they lacked); that records a change already made,
+        // changes no value and no chunk version, and is not counted as a write (backlog I4-N4).
         nvrhi::FRESULT RunReadOnlyPhase(Phase phase) noexcept;
         // The render service's registration (one service per graph, plan step E5.1): ClaimRenderService returns false
         // when a service has claimed the graph already; ReleaseRenderService gives the claim back.
@@ -984,7 +987,9 @@ namespace donut::engine
         // and the interpolation stamp the rows they write, propagation composes only the rows whose local transform
         // or parent changed, and GpuScene takes only the changed rows of a chunk. A graph keeps what it was made
         // with; the switch changes no output (snapshots, hashes, rows per chunk, uploaded rows), only the work. Set
-        // it between graphs, on any thread; an A/B run makes one graph with it off and one with it on.
+        // it between graphs, on any thread; an A/B run makes one graph with it off and one with it on. It is a relaxed
+        // atomic, read once by the graph's constructor: a graph made on another thread while it is set takes either
+        // value, and keeps that one (backlog I4-N5).
         static void SetRowTrackedTransforms(bool enabled) noexcept;
         [[nodiscard]] static bool GetRowTrackedTransforms() noexcept;
 

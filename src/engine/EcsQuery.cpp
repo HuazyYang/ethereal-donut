@@ -34,6 +34,9 @@ namespace donut::engine::ecs
     {
         // The ChunkView::columns of a query without data terms: never indexed, but not null.
         void* const g_NoColumns[1] = { nullptr };
+        // The masks and row versions of views without them (no Enableable, Sparse or RowTracked term in the chunk
+        // list): one null per term, shared by every query, so that no query keeps an array of nulls (backlog I4-R2).
+        uint64_t* const g_NoPointers[c_MaxQueryTerms] = {};
 
         // Version slots and enabled-mask words may be written by other threads (StampVersion, SetMaskBit); read them
         // as a whole.
@@ -180,8 +183,6 @@ namespace donut::engine::ecs
                 m_RowFilters.push_back(filter);
             }
         }
-        m_NullMasks.resize(desc.termCount, nullptr);
-        m_NullRowVersions.resize(desc.termCount, nullptr);
         return nvrhi::FS_OK;
     }
 
@@ -557,12 +558,11 @@ namespace donut::engine::ecs
             ChunkView& view = views[written++];
             view.entities = entry.entities;
             view.columns = m_DataTermCount != 0 ? m_Columns.data() + size_t(i) * m_DataTermCount : g_NoColumns;
-            view.enabledMasks = m_HasEnableable ? m_EnabledMasks.data() + size_t(i) * termCount : m_NullMasks.data();
-            view.presenceMasks = m_HasSparse ? m_PresenceMasks.data() + size_t(i) * termCount : m_NullMasks.data();
+            view.enabledMasks = m_HasEnableable ? m_EnabledMasks.data() + size_t(i) * termCount : g_NoPointers;
+            view.presenceMasks = m_HasSparse ? m_PresenceMasks.data() + size_t(i) * termCount : g_NoPointers;
             view.count = entry.count;
             view.chunkIndex = uint32_t(i);
-            view.rowVersions = m_HasRowVersions ? m_RowVersions.data() + size_t(i) * termCount
-                                                : m_NullRowVersions.data();
+            view.rowVersions = m_HasRowVersions ? m_RowVersions.data() + size_t(i) * termCount : g_NoPointers;
         }
         return written;
     }

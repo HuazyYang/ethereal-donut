@@ -32,10 +32,14 @@
 //   e72_r4_mesh_columns_of_other_classes  no mesh-instance columns for a leaf class that is no MeshInstance
 //   e72_r4_mesh_tags_of_other_classes     no mesh-instance tags for a leaf class that is not of their class
 //   i3_n4_missing_name_warned_once  an ordering against a missing name warns once while it stays missing
+//   i4_r2_shared_null_views         views without masks or row versions share one process-wide null array
+//   i4_r4_row_tracked_reregistered  RowTracked asked of a type registered without it: a warning
+//   i4_r5_row_version_bytes         WorldStats::rowVersionBytes counts the row-version blocks
 
 #include <donut/app/WorldInspector.h>
 #include <donut/core/log.h>
 #include <donut/core/math/math.h>
+#include <donut/engine/EcsQuery.h>
 #include <donut/engine/EcsScheduler.h>
 #include <donut/engine/EcsWorld.h>
 #include <donut/engine/JobSystem.h>
@@ -616,6 +620,123 @@ void test_i3_n4_missing_name_warned_once()
     CHECK(TakeWarnings() == 1);
 }
 
+// ------------------------------------------------------------------------------------------- I4 (RowTracked)
+
+namespace e7_fixes
+{
+    struct Plain
+    {
+        float value;
+    };
+    DONUT_ECS_COMPONENT(Plain, "5e0c7a2b-91d4-4c3f-8b6e-2a7d1f9c4e83", DONUT_ECS_FIELDS(value))
+    struct Marker { };
+    DONUT_ECS_TAG(Marker, "b3a91f7e-6d28-4e05-9c4a-1f8e2d7b6c59")
+    struct Tracked
+    {
+        float value;
+    };
+    DONUT_ECS_COMPONENT_EX(Tracked, "0d6f3b8a-2c41-47e9-a5d2-9e1b7c3f8a64",
+                           ::donut::engine::ComponentFlags::RowTracked, 0, DONUT_ECS_FIELDS(value))
+}
+
+// A query whose chunks have no Enableable, Sparse or RowTracked term hands out views whose masks and row versions are
+// one null array, the same for every query (backlog I4-R2: no block per query for it).
+void test_i4_r2_shared_null_views()
+{
+    Graph g(false);
+    const ComponentId plain = RegisterComponent<e7_fixes::Plain>(g.world);
+    const ComponentId ids[1] = { plain };
+    EntityCreateDesc desc{};
+    desc.components = ids;
+    desc.componentCount = 1;
+    desc.entityCount = 3;
+    Entity made[3];
+    CHECK(g.world->CreateEntities(desc, made) == nvrhi::FS_OK);
+    Query<Read<e7_fixes::Plain>> first(g.world, "first");
+    Query<Write<e7_fixes::Plain>> second(g.world, "second");
+    const void* arrays[2][3] = {};
+    uint32_t chunks[2] = {};
+    first.ForEachChunk(ChunkRequest{}, [&](const ChunkView& view, const e7_fixes::Plain*)
+    {
+        arrays[0][0] = view.enabledMasks;
+        arrays[0][1] = view.presenceMasks;
+        arrays[0][2] = view.rowVersions;
+        CHECK(!view.enabledMasks[0] && !view.presenceMasks[0] && !view.rowVersions[0]);
+        ++chunks[0];
+    });
+    second.ForEachChunk(ChunkRequest{}, [&](const ChunkView& view, e7_fixes::Plain*)
+    {
+        arrays[1][0] = view.enabledMasks;
+        arrays[1][1] = view.presenceMasks;
+        arrays[1][2] = view.rowVersions;
+        ++chunks[1];
+    });
+    CHECK(chunks[0] == 1 && chunks[1] == 1);
+    for (int q = 0; q < 2; ++q)
+        for (int a = 0; a < 3; ++a)
+            CHECK(arrays[q][a] == arrays[0][0]);
+}
+
+// Registering a GUID again with RowTracked when it was registered without it: FS_OK and the existing id, but the rows
+// get no row versions, so a warning says so; also for a tag. The same flags again: no warning.
+void test_i4_r4_row_tracked_reregistered()
+{
+    Graph g(false);
+    const ComponentId plain = RegisterComponent<e7_fixes::Plain>(g.world);
+    const ComponentId marker = RegisterComponent<e7_fixes::Marker>(g.world);
+    CHECK(plain != ComponentId::Invalid && marker != ComponentId::Invalid);
+    CHECK(TakeWarnings() == 0);
+    ComponentTypeDesc tracked = ComponentTraits<e7_fixes::Plain>::Desc();
+    tracked.flags = tracked.flags | ComponentFlags::RowTracked;
+    ComponentId id = ComponentId::Invalid;
+    CHECK(g.world->RegisterComponent(tracked, id) == nvrhi::FS_OK && id == plain);
+    CHECK(TakeWarnings() == 1);
+    ComponentTypeDesc trackedTag = ComponentTraits<e7_fixes::Marker>::Desc();
+    trackedTag.flags = trackedTag.flags | ComponentFlags::RowTracked;
+    CHECK(g.world->RegisterComponent(trackedTag, id) == nvrhi::FS_OK && id == marker);
+    CHECK(TakeWarnings() == 1);
+    CHECK(g.world->RegisterComponent(ComponentTraits<e7_fixes::Plain>::Desc(), id) == nvrhi::FS_OK && id == plain);
+    // registered with it, asked without it: the rows keep their row versions; no warning
+    const ComponentId rowTracked = RegisterComponent<e7_fixes::Tracked>(g.world);
+    ComponentTypeDesc untracked = ComponentTraits<e7_fixes::Tracked>::Desc();
+    untracked.flags = ComponentFlags(uint32_t(untracked.flags) & ~uint32_t(ComponentFlags::RowTracked));
+    CHECK(g.world->RegisterComponent(untracked, id) == nvrhi::FS_OK && id == rowTracked);
+    CHECK(TakeWarnings() == 0);
+}
+
+// WorldStats::rowVersionBytes: the row-version blocks of the RowTracked columns, one per chunk index an archetype
+// made, (rowsPerChunk + 1) versions per RowTracked column; zero without RowTracked components. chunkBytes stays the
+// chunks' pages alone.
+void test_i4_r5_row_version_bytes()
+{
+    Graph g(false);
+    WorldStats before{};
+    g.world->GetStats(before);
+    const ComponentId tracked = RegisterComponent<e7_fixes::Tracked>(g.world);
+    const ComponentId ids[1] = { tracked };
+    EntityCreateDesc desc{};
+    desc.components = ids;
+    desc.componentCount = 1;
+    desc.entityCount = 5000;
+    std::vector<Entity> made(5000);
+    CHECK(g.world->CreateEntities(desc, made.data()) == nvrhi::FS_OK);
+    WorldStats after{};
+    g.world->GetStats(after);
+    uint64_t expected = 0;
+    uint64_t chunkBytes = 0;
+    for (uint32_t a = 0; a < after.archetypeCount; ++a)
+    {
+        ArchetypeInfo info{};
+        CHECK(g.world->GetArchetypeInfo(a, info) == nvrhi::FS_OK);
+        chunkBytes += uint64_t(info.chunkCount) * info.chunkSize;
+        if (std::find(info.components, info.components + info.componentCount, tracked) !=
+            info.components + info.componentCount)
+            expected += uint64_t(info.chunkCount) * (uint64_t(info.rowsPerChunk) + 1) * sizeof(uint64_t);
+    }
+    CHECK(expected > 0 && after.rowVersionBytes - before.rowVersionBytes == expected);
+    CHECK(after.chunkBytes == chunkBytes);
+}
+
 // ---------------------------------------------------------------------------------------------- I3-R1, I3-R2
 
 // The domain's columns that an edit through the world would bypass: SimTeleport (RequestTeleport's normalising and
@@ -651,6 +772,9 @@ int main(int argc, char** argv)
         { "e72_r4_mesh_columns_of_other_classes", test_e72_r4_mesh_columns_of_other_classes },
         { "e72_r4_mesh_tags_of_other_classes", test_e72_r4_mesh_tags_of_other_classes },
         { "i3_n4_missing_name_warned_once", test_i3_n4_missing_name_warned_once },
+        { "i4_r2_shared_null_views", test_i4_r2_shared_null_views },
+        { "i4_r4_row_tracked_reregistered", test_i4_r4_row_tracked_reregistered },
+        { "i4_r5_row_version_bytes", test_i4_r5_row_version_bytes },
     };
     log::SetCallback([](log::Severity severity, const char* message)
     {

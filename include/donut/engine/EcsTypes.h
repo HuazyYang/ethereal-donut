@@ -298,15 +298,24 @@ namespace donut::engine
             const uint64_t* mask = presenceMasks[term];
             return !mask || ((mask[row >> 6] >> (row & 63)) & 1) != 0;
         }
-        // Whether the row was written after sinceVersion; true for a term without row versions.
+        // Whether the row was written after sinceVersion; true for a term without row versions. The hand-out of the
+        // chunk (IQuery::GetChunks) brought its row versions up to date on this thread first (the chunk-only writer
+        // rule, with an acquire of the newest row version; backlog I4-R7), so a plain read sees them.
         bool IsRowChanged(uint32_t term, uint32_t row, uint64_t sinceVersion) const noexcept
         {
             const uint64_t* versions = rowVersions[term];
             return !versions || versions[row] > sinceVersion;
         }
-        // For the writer of a Write term: stamps the row it wrote with its version (the request's writeVersion; a
-        // c_WorldVersion request passes IWorld::GetVersion()). Nothing for a term without row versions. One thread
-        // per chunk and column, as the scheduler runs writers.
+        // For the writer of a Write term: stamps the row it wrote with its version, a resolved one (the request's
+        // writeVersion; a c_WorldVersion request passes IWorld::GetVersion()). Only for Write terms: the views of Read
+        // terms carry the row versions too, for IsRowChanged, and a stamp there is a write the system did not declare.
+        // Version 0 (c_WorldVersion itself) stamps nothing; the chunk-only rule then counts every row changed
+        // (backlog I4-R6). Nothing for a term without row versions. All or none: a writer that stamps some of the
+        // rows it wrote loses the others (their versions stay older than the chunk's, which the stamps keep level),
+        // and the world cannot see which rows were written, so this is not checked (backlog I4-N1). Not atomic, for
+        // the cost of a loop over rows: one thread per chunk and column while it runs, as the scheduler runs writers;
+        // no other thread of the system writes that column of the chunk meanwhile, through another view or through
+        // IWorld::GetComponentForWrite and the other per-entity writes, whose stamps are atomic (backlog I4-N2).
         void StampRow(uint32_t term, uint32_t row, uint64_t version) const noexcept
         {
             uint64_t* versions = rowVersions[term];
