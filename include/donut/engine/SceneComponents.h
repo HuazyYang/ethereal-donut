@@ -335,9 +335,11 @@ namespace donut::engine
     // that a generic editor (app::WorldInspector) shows but never edits, because an edit of one through the world
     // corrupts the graph. They are the hierarchy columns (SceneLinks, Parent, HierarchyDepth), the derived ones that
     // systems overwrite (LocalMatrix, WorldTransform, LocalBounds, WorldBounds, ChunkWorldBounds), the slot and
-    // reference columns (GpuInstanceSlot, MeshRef, RenderFlags, SimBodyRef) and the hooked ones (SceneNode,
-    // LeafObject). A fixed list in the world, so that it outlives the graph with the world and the inspector finds it
-    // by GUID through IWorld alone. NoSerialize: snapshots and world hashes leave it out.
+    // reference columns (GpuInstanceSlot, MeshRef, RenderFlags, SimBodyRef), the hooked ones (SceneNode,
+    // LeafObject) and the simulation's that only the graph and its domains write (SimPosePrevious, which the domain
+    // derives; SimTeleport, a request that SceneGraphNode::SetTransform makes: normalised, checked, its space and
+    // enabled bit set). A fixed list in the world, so that it outlives the graph with the world and the inspector finds
+    // it by GUID through IWorld alone. NoSerialize: snapshots and world hashes leave it out.
     constexpr uint32_t c_MaxInspectorReadOnlyComponents = 31;
     struct InspectorReadOnlyComponents
     {

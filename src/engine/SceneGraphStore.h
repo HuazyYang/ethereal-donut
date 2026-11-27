@@ -612,10 +612,12 @@ namespace donut::engine
             bool driven;               // the interpolation writes its rows' worlds, not propagation
             bool runtime;              // runtime-only mesh instances: roots (parent c_Absent), in no node's subgraph
             // E7.4 remedy 3: carries Static in a graph that honours it (SceneGraph::SetStaticTag), not driven, not in
-            // the deep bucket; and its entityCount and rowMoves at the run that last took it (RunPropagation)
+            // the deep bucket; its entityCount and rowMoves at the run that last took it, and the runs that took it,
+            // which its Bounds entry follows (RunPropagation; backlog I5-R3)
             bool staticRows = false;
             uint32_t settledCount = ~0u;
             uint64_t settledMoves = ~0ull;
+            uint64_t takes = 0;
         };
 
         // Rows that the interpolation writes: driven, with the columns that SetSimulationDriven adds.
@@ -646,12 +648,14 @@ namespace donut::engine
             uint8_t worldBounds;
             uint8_t chunkBounds;
             uint8_t leaf;              // LeafObject, for leaves with dynamic bounds (c_Absent otherwise)
-            // E7.4 remedy 3: carries Static in a graph that honours it, not driven, no dynamic bounds; and its
-            // entityCount, rowMoves and m_ContentChanges at the run that last took it (RunBounds)
+            // E7.4 remedy 3: its level entry is Static (backlog I5-R1: not in the deep bucket), no dynamic bounds; and
+            // its entityCount, rowMoves, m_ContentChanges and the level entry's takes at the run that last took it
+            // (RunBounds)
             bool staticRows = false;
             uint32_t settledCount = ~0u;
             uint64_t settledMoves = ~0ull;
             uint64_t settledContent = ~0ull;
+            uint64_t settledTakes = ~0ull;
         };
 
         struct JointArchetype
@@ -804,10 +808,13 @@ namespace donut::engine
         static void RunPropagationTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
         static void RunBoundsTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
         // E7.4 remedy 3 (SceneGraph::SetStaticTag): the Static tag's id once registered (looked up, never registered by
-        // the graph), whether a row carries it, the propagation tasks of a Static archetype, and in Debug builds the
-        // warning about writes of its LocalTransform.
+        // the graph), the level entry of an archetype (null before its first classification or without one), whether
+        // propagation leaves a row out (a Static level entry, and the row's chunk taken by the last run: backlog I5-R2,
+        // I5-R4), the propagation tasks of a Static archetype, and in Debug builds the warning about writes of its
+        // LocalTransform.
         ComponentId ResolveStaticTag() noexcept;
-        bool IsStaticRow(const RowRef& row) noexcept;
+        const LevelArchetype* LevelOf(uint32_t archetypeIndex) const noexcept;
+        bool IsSettledStaticRow(const RowRef& row) const noexcept;
         void QueueStaticLevel(LevelArchetype& level, uint32_t index, const ecs::Archetype& archetype,
                               uint64_t since);
         void WarnStaticWrites(const LevelArchetype& level, const ecs::Archetype& archetype, uint64_t since) const;
@@ -829,12 +836,14 @@ namespace donut::engine
         LocalTransform InParentOf(const RowRef& row, const LocalTransform& world) const noexcept;
         // The simulated world transform of an entity: composed from the local transforms as they are now, propagated or
         // not, from the simulated pose of the nearest driven ancestor (or of the entity itself) down, else from the root.
-        // Where nothing is driven it is what propagation gives, bit for bit. It only reads, allocates nothing and does
-        // not recurse: getters on several threads and the jobs of the teleport system call it. O(depth): the rows are
-        // read once, or (more than 64 rows with a local transform) once per cut of the chain into 64 pieces and twice
-        // more: 200,000 rows four times.
+        // A settled Static row (IsSettledStaticRow) ends the walk too, with its world as propagation left it (backlog
+        // I5-R4). Where nothing is driven it is what propagation gives, bit for bit. It only reads, allocates nothing and
+        // does not recurse: getters on several threads and the jobs of the teleport system call it. O(depth): the rows
+        // are read once, or (more than 64 rows with a local transform) once per cut of the chain into 64 pieces and
+        // twice more: 200,000 rows four times.
         dm::daffine3 ComposeWorld(Entity entity) const noexcept;
         dm::daffine3 ComposeLongChain(Entity entity) const noexcept;
+        bool EndsComposition(const RowRef& row, dm::daffine3& outWorld) const noexcept;
         // The local transform that a driven row gets when it is not driven any more: what the local getters give (the
         // parts of its simulated pose in the space of its parent, at its simulated world, so that both are of the same
         // time). Warns when its matrix does not give the pose (a parent whose scale shears it or has no inverse);
@@ -874,6 +883,7 @@ namespace donut::engine
         bool m_StaticTagHonoured = false;
         ComponentId m_StaticTag = ComponentId::Invalid;
         uint64_t m_ContentChanges = 0;   // InvalidateContent calls that changed a row: Static bounds read them again
+        uint64_t m_PropagatedVersion = 0;   // the version of the last propagation run: a chunk added since is not taken
 
         // Column indices per archetype, for the accessors; synchronised after structural changes.
         std::vector<std::array<uint8_t, SlotCount>> m_ArchetypeColumns;

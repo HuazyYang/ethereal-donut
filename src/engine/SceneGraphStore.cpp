@@ -1021,6 +1021,9 @@ namespace donut::engine
             m_Ids[SlotInstance], m_Ids[SlotMeshRef], m_Ids[SlotRenderFlags],     // slots and references
             m_SimBodyId,
             m_Ids[SlotNode], m_Ids[SlotLeaf],                                     // hooked
+            // the simulation's: the domain derives SimPosePrevious; a SimTeleport request goes through RequestTeleport
+            // (normalised, checked, its space and enabled bit set; backlog I3-R1, I3-R2)
+            m_SimPreviousId, m_SimTeleportId,
         };
         static_assert(std::size(readOnlyIds) <= c_MaxInspectorReadOnlyComponents, "the read-only list");
         for (const ComponentId component : readOnlyIds)
@@ -2714,20 +2717,23 @@ namespace donut::engine
         if (!LocateNode(node, row))
             return;
         RememberRow(node, row);
-#ifndef NDEBUG
-        // E7.4 remedy 3: a Static row does not move (refused in Debug builds; Release builds write, and propagation
-        // does not take it)
-        if (m_StaticTagHonoured && IsStaticRow(row) && !IsDriven(row))
-        {
-            log::warning("SceneGraph: SetTransform of node '%s' is refused: its row is Static (SceneComponents.h)",
-                         node->GetName().c_str());
-            return;
-        }
-#endif
         // the hot path of the API (design 10.1): one column lookup, the write, the stamp
         const uint8_t column = ColumnIndex(*row.archetype, row.archetypeIndex, SlotLocal);
         if (column != c_Absent)
         {
+#ifndef NDEBUG
+            // E7.4 remedy 3: a Static row does not move (refused in Debug builds; Release builds write, and propagation
+            // does not take it). Only where propagation leaves the row out (backlog I5-R2): not in the deep bucket,
+            // which ignores the tag, nor before the run that takes the row, whose write is its initial value. A row
+            // without a LocalTransform is not refused: its first transform adds the column, a structural change that
+            // the next propagation takes as a row that joined, in both builds.
+            if (IsSettledStaticRow(row))
+            {
+                log::warning("SceneGraph: SetTransform of node '%s' is refused: its row is Static (SceneComponents.h)",
+                             node->GetName().c_str());
+                return;
+            }
+#endif
             const ArchetypeColumn& c = row.archetype->columns[column];
             uint8_t* memory = row.archetype->chunks[row.chunk].memory;
             LocalTransform* local = reinterpret_cast<LocalTransform*>(memory + c.offset + size_t(row.row) * c.stride);
@@ -3395,7 +3401,8 @@ namespace donut::engine
                 {
                     BoundsArchetype boundsEntry{ a, world, localBounds, worldBounds, chunkBounds,
                                                  dynamicBounds ? column(m_Ids[SlotLeaf]) : c_Absent };
-                    boundsEntry.staticRows = staticRows && !dynamicBounds;
+                    // the level entry's rule (not in the deep bucket, which follows every move: backlog I5-R1)
+                    boundsEntry.staticRows = entry.staticRows && !dynamicBounds;
                     m_BoundsArchetypes.push_back(boundsEntry);
                 }
             }
@@ -3425,15 +3432,31 @@ namespace donut::engine
         return m_StaticTag;
     }
 
-    bool SceneGraphStore::IsStaticRow(const RowRef& row) noexcept
+    const SceneGraphStore::LevelArchetype* SceneGraphStore::LevelOf(uint32_t archetypeIndex) const noexcept
     {
-        const ComponentId tag = ResolveStaticTag();
-        return tag != ComponentId::Invalid && row.archetype->FindColumn(tag) != c_NoColumn;
+        if (archetypeIndex >= m_ArchetypeLevel.size() || m_ArchetypeLevel[archetypeIndex] == c_Absent)
+            return nullptr;
+        return &m_Levels[m_ArchetypeLevel[archetypeIndex]][m_ArchetypeLevelSlot[archetypeIndex]];
+    }
+
+    // A row that propagation leaves out: its archetype's level entry is Static (honoured, not driven, not in the deep
+    // bucket) and the last propagation run took its chunk (its Added version is not newer). Such a row keeps the world
+    // that run gave it. A row whose chunk rows joined since, or whose archetype is not classified yet (no propagation
+    // ran since it was made), is taken whole by the next run, from its LocalTransform.
+    bool SceneGraphStore::IsSettledStaticRow(const RowRef& row) const noexcept
+    {
+        if (!m_StaticTagHonoured)
+            return false;
+        const LevelArchetype* level = LevelOf(row.archetypeIndex);
+        return level && level->staticRows &&
+               row.archetype->Versions(row.chunk)[row.archetype->AddedVersionSlot()] <= m_PropagatedVersion;
     }
 
     // A Static archetype gets tasks only when rows joined or left it since the run that last took it: then the chunks
     // that rows joined (their Added version), whole, from their parents' worlds as they are. Its LocalTransform and its
-    // parents are not followed; in Debug builds a write of its LocalTransform is reported.
+    // parents are not followed; in Debug builds a write of its LocalTransform is reported. A run that takes it counts
+    // in `takes`, so that Bounds takes it again too (rows that joined after propagation and before Bounds got boxes of
+    // worlds that were not propagated yet: backlog I5-R3).
     void SceneGraphStore::QueueStaticLevel(LevelArchetype& level, uint32_t index, const Archetype& archetype,
                                            uint64_t since)
     {
@@ -3447,6 +3470,7 @@ namespace donut::engine
         }
         level.settledCount = archetype.entityCount;
         level.settledMoves = archetype.rowMoves;
+        ++level.takes;
         for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
         {
             if (archetype.chunks[c].count != 0 && archetype.Versions(c)[archetype.AddedVersionSlot()] > since)
@@ -3665,6 +3689,7 @@ namespace donut::engine
             m_Counters.propagatedRows += ctx.rows.load(std::memory_order_relaxed);
         }
         PropagateDeepBucket(jobs, since, version, levelAboveWrote);
+        m_PropagatedVersion = version;    // the chunks added before this run are taken (IsSettledStaticRow)
         m_StaleWorldTransforms = false;   // every edit so far is in the world transforms
         if (m_MarkJoints)
         {
@@ -3995,9 +4020,27 @@ namespace donut::engine
         return Decompose(SimulatedPose(row)).transform;
     }
 
+    // A settled Static row (E7.4 remedy 3) ends the walk like a driven one: propagation keeps its world, whatever its
+    // ancestors did since, and composes the rows below it from that world (backlog I5-R4).
+    bool SceneGraphStore::EndsComposition(const RowRef& row, dm::daffine3& outWorld) const noexcept
+    {
+        if (IsDriven(row))
+        {
+            outWorld = SimulatedPose(row);
+            return true;
+        }
+        if (IsSettledStaticRow(row))
+        {
+            const WorldTransform* world = static_cast<const WorldTransform*>(Column(row, SlotWorld));
+            outWorld = world ? world->transform : dm::daffine3::identity();
+            return true;
+        }
+        return false;
+    }
+
     dm::daffine3 SceneGraphStore::ComposeWorld(Entity entity) const noexcept
     {
-        // the local transforms from the entity up, without the driven ancestor that ends the walk
+        // the local transforms from the entity up, without the driven (or settled Static) row that ends the walk
         const LocalTransform* locals[c_ComposeBlock];
         uint32_t count = 0;
         dm::daffine3 world = dm::daffine3::identity();
@@ -4006,9 +4049,8 @@ namespace donut::engine
         RowRef row;
         while (Locate(entity, row))
         {
-            if (IsDriven(row))
+            if (EndsComposition(row, world))
             {
-                world = SimulatedPose(row);
                 hasParent = true;
                 break;
             }
@@ -4057,9 +4099,8 @@ namespace donut::engine
         uint32_t rows = 0;
         for (Entity at = entity; Locate(at, row);)
         {
-            if (IsDriven(row))
+            if (EndsComposition(row, world))
             {
-                world = SimulatedPose(row);
                 hasParent = true;
                 break;
             }
@@ -4592,10 +4633,13 @@ namespace donut::engine
             const Archetype& archetype = m_Impl->GetArchetypeStorage(bounds.archetype);
             if (bounds.staticRows)
             {
-                // E7.4 remedy 3: a Static archetype is read again only when rows joined or left it, or a leaf's content
-                // was invalidated; then by the rule below
+                // E7.4 remedy 3: a Static archetype is read again only when rows joined or left it, a leaf's content
+                // was invalidated, or propagation took it since (rows that joined between the two systems: backlog
+                // I5-R3); then by the rule below
+                const LevelArchetype* level = LevelOf(bounds.archetype);
+                const uint64_t takes = level ? level->takes : 0;
                 if (archetype.entityCount == bounds.settledCount && archetype.rowMoves == bounds.settledMoves &&
-                    m_ContentChanges == bounds.settledContent)
+                    m_ContentChanges == bounds.settledContent && takes == bounds.settledTakes)
                 {
                     ++m_Counters.staticSkips;
                     continue;
@@ -4603,6 +4647,7 @@ namespace donut::engine
                 bounds.settledCount = archetype.entityCount;
                 bounds.settledMoves = archetype.rowMoves;
                 bounds.settledContent = m_ContentChanges;
+                bounds.settledTakes = takes;
             }
             for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
             {

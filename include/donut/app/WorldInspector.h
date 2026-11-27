@@ -29,9 +29,10 @@
 // Editing: fields of Relocatable, serialisable components (not NoSerialize) that are on neither donut's read-only list
 // nor the application's (SetReadOnly). Donut's list is the world resource InspectorReadOnlyComponents that every
 // scene graph's store registers in its world (SceneComponents.h): the hierarchy, derived, slot, reference and hooked
-// columns, whose free edit corrupts the graph; it applies to every inspector, not by the application's choice. Fields of
-// type Opaque or Entity are shown, never edited. A commit records the whole value with ICommandBuffer::SetComponents
-// into the inspector's buffer; Apply plays the buffer back.
+// columns and the simulation's SimPosePrevious and SimTeleport, whose free edit corrupts the graph or bypasses its
+// setters; it applies to every inspector, not by the application's choice. Fields of type Opaque or Entity are shown,
+// never edited. A commit records the whole value with ICommandBuffer::SetComponents into the inspector's buffer; Apply
+// plays the buffer back.
 //
 // Module-private C++ of donut_app, not on the ABI surface. It names no scene type: entity names come from the
 // application (SetEntityNames). Between calls the inspector holds no scheduler, and a world only through pending edits:

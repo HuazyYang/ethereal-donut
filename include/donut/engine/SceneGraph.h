@@ -990,11 +990,19 @@ namespace donut::engine
         // of depth below c_MaxHierarchyDepth that carries Static, and that is not simulation-driven, leaves the
         // TransformPropagation work after a run that took it, and so does one that has no dynamic-bounds leaves the
         // Bounds work: a later run takes it again only when rows joined or left it (Bounds also after a structural
-        // change through the API, SetLeaf or InvalidateContent), and then computes the chunks that rows joined, from
-        // their local transforms and their parents' worlds at that time. Their world transforms do not follow later
-        // writes of their LocalTransform, nor moves of their parents. Such a write is refused in Debug builds, with a
-        // warning: SceneGraphNode::SetTransform does not write; a write through the world is found by the next
-        // propagation, which does not propagate it. Release builds do not check, and do not propagate it either.
+        // change through the API, SetLeaf or InvalidateContent, and after a propagation run that took it), and then
+        // computes the chunks that rows joined, whole, from their local transforms and their parents' worlds at that
+        // time. So every row that shares a chunk with a row that joined, or that a row's leaving moved (the swap-remove
+        // of its hole), is composed again then, from its LocalTransform and its parent's current world, and a write of
+        // its LocalTransform since the last run is taken. Otherwise their world transforms do not follow later writes
+        // of their LocalTransform, nor moves of their parents; the rows below them are composed from those worlds, by
+        // propagation and where the graph composes a world itself (SetSimulationDriven, teleports in parent space, the
+        // local getters of driven nodes). A write after the run that took the row's chunk is refused in Debug builds,
+        // with a warning: SceneGraphNode::SetTransform does not write; a write through the world is found by the next
+        // propagation, which does not propagate it. Release builds do not check, and do not propagate it either. A
+        // write before that run (the row joined since) is its initial value. The first transform of a Static node that
+        // has none adds its LocalTransform, a structural change: the row joins another archetype and is taken as above,
+        // in both builds.
         static void SetStaticTag(bool enabled) noexcept;
         [[nodiscard]] static bool GetStaticTag() noexcept;
 

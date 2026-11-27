@@ -346,7 +346,7 @@ void test_refusals_inside_phase()
     g_Warnings = warnings;
 }
 
-// Donut's read-only list in a scene graph's world: the 14 ids, registered after the store's types; none elsewhere.
+// Donut's read-only list in a scene graph's world: the 16 ids, registered after the store's types; none elsewhere.
 void test_read_only_list()
 {
     Graph g;
@@ -357,17 +357,18 @@ void test_read_only_list()
         FindComponent<WorldBounds>(world), FindComponent<ChunkWorldBounds>(world),
         FindComponent<GpuInstanceSlot>(world), FindComponent<MeshRef>(world), FindComponent<RenderFlags>(world),
         FindComponent<SimBodyRef>(world), FindComponent<SceneNode>(world), FindComponent<LeafObject>(world),
+        FindComponent<SimPosePrevious>(world), FindComponent<SimTeleport>(world),   // backlog I3-R1, I3-R2
     };
     for (ComponentId id : expected)
         CHECK(id != ComponentId::Invalid);
     ComponentId ids[c_MaxInspectorReadOnlyComponents] = {};
-    CHECK(app::GetDonutReadOnlyComponents(world, nullptr, 0) == 14);
-    CHECK(app::GetDonutReadOnlyComponents(world, ids, c_MaxInspectorReadOnlyComponents) == 14);
+    CHECK(app::GetDonutReadOnlyComponents(world, nullptr, 0) == 16);
+    CHECK(app::GetDonutReadOnlyComponents(world, ids, c_MaxInspectorReadOnlyComponents) == 16);
     CHECK(std::equal(std::begin(expected), std::end(expected), ids));
-    CHECK(std::find(ids, ids + 14, FindComponent<LocalTransform>(world)) == ids + 14);
+    CHECK(std::find(ids, ids + 16, FindComponent<LocalTransform>(world)) == ids + 16);
 
     ComponentId two[3] = { ComponentId::Invalid, ComponentId::Invalid, ComponentId::Invalid };
-    CHECK(app::GetDonutReadOnlyComponents(world, two, 2) == 14);
+    CHECK(app::GetDonutReadOnlyComponents(world, two, 2) == 16);
     CHECK(two[0] == expected[0] && two[1] == expected[1] && two[2] == ComponentId::Invalid);
 
     const ComponentId resource = FindComponent<InspectorReadOnlyComponents>(world);
