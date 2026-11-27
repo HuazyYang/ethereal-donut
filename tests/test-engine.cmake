@@ -76,8 +76,13 @@ endforeach()
 # src/app (WorldInspectorDetail.h), and its stage T3 cases the world's allocation counter (EcsWorldImpl.h, src/engine).
 target_include_directories(test_world_inspector PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/app"
                            "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
+# The shared job system's worker count from DONUT_JOB_WORKERS (stage F, T7-2), at 2 workers: the case is given the
+# count it expects, apart from the variable that the function under test reads.
+add_test(NAME test_e7_fixes_job_workers COMMAND test_e7_fixes t7_2_shared_job_workers 2)
+set_tests_properties(test_e7_fixes_job_workers PROPERTIES ENVIRONMENT "DONUT_JOB_WORKERS=2")
 # The fix track's engine regressions type into the inspector through the same seam (stage F, T3-N1).
-target_include_directories(test_e7_fixes PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/app")
+target_include_directories(test_e7_fixes PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/app"
+                           "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
 # Its cases that fail on an open backlog item (aggregate docs/plans/2026-11-26-donut-ecs-e7-rev2.md) run apart, so
 # that test_world_inspector itself stays the pass rule's.
 add_test(NAME test_world_inspector_backlog COMMAND test_world_inspector --backlog)

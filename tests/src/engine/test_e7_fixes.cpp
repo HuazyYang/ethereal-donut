@@ -37,6 +37,10 @@
 //                                   for a kind without a value per row (F3-N1)
 //   i6_r5_gpu_scene_stats_checked   GpuScene::GetStats is an owner-checked call while a pipelined frame records
 //   i3_r5_editor_precision          the inspector's number editors round-trip every digit (typed through the seam)
+//   t8_1_deferred_reconcile_retried a deferred mesh reconciliation that fails at EndRenderRead runs at the next Refresh
+//   t7_2_shared_job_workers         DONUT_JOB_WORKERS sets the shared job system's workers (ctest runs it at 2 and
+//                                   passes the 2 it expects after the case's name)
+//   t7_2_invalid_workers            a DONUT_JOB_WORKERS that is no count from 1 to 256 gives the default and a warning
 //   i4_r5_row_version_bytes         WorldStats::rowVersionBytes counts the row-version blocks
 
 #include <donut/app/WorldInspector.h>
@@ -52,6 +56,8 @@
 #include <donut/tests/utils.h>
 
 #include "WorldInspectorDetail.h"   // the inspector's test seam (src/app)
+#include "SceneGraphStore.h"        // its test seams (src/engine)
+#include "SharedJobSystem.h"        // GetSharedJobSystem, GetSharedJobWorkersOverride (src/engine)
 
 #include <imgui.h>
 
@@ -60,6 +66,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -79,6 +86,37 @@ namespace
 #endif
     std::atomic<uint32_t> g_Warnings{ 0 };   // log::warning calls; a case that provokes some takes them back
     uint32_t TakeWarnings() { return g_Warnings.exchange(0); }
+    uint32_t g_ExpectedWorkers = 0;   // t7_2_shared_job_workers: the count given after the case's name, 0 if none
+
+    // DONUT_JOB_WORKERS: read into value (false when unset), and set (nullptr unsets).
+    bool GetWorkersVariable(std::string& value)
+    {
+#if defined(_MSC_VER)
+        char* found = nullptr;
+        size_t length = 0;
+        if (_dupenv_s(&found, &length, "DONUT_JOB_WORKERS") != 0 || !found)
+            return false;
+        value = found;
+        std::free(found);
+#else
+        const char* found = std::getenv("DONUT_JOB_WORKERS");
+        if (!found)
+            return false;
+        value = found;
+#endif
+        return true;
+    }
+    void SetWorkersVariable(const char* value)
+    {
+#if defined(_MSC_VER)
+        _putenv_s("DONUT_JOB_WORKERS", value ? value : "");
+#else
+        if (value)
+            setenv("DONUT_JOB_WORKERS", value, 1);
+        else
+            unsetenv("DONUT_JOB_WORKERS");
+#endif
+    }
 
     bool SameBits(const void* a, const void* b, size_t size) { return std::memcmp(a, b, size) == 0; }
     template <typename T> bool SameValue(const T& a, const T& b) { return SameBits(&a, &b, sizeof(T)); }
@@ -850,6 +888,105 @@ void test_i3_r5_editor_precision()
     CHECK(TakeWarnings() == 0);
 }
 
+// ------------------------------------------------------------------------------------------------- T8-1
+
+// A mesh edited in place inside a Defer scope: its reconciliation waits for the last EndRenderRead, and when it fails
+// there (out of memory: the store's test seam), one warning, the mesh table keeps its old ranges, and the next Refresh
+// runs it, also with nothing else changed (SceneGraph::Refresh's retry).
+void test_t8_1_deferred_reconcile_retried()
+{
+    nvrhi::AutoPtr<MeshInfo> mesh = MakeMesh();
+    Graph g(false);
+    g.Add(g.graph->GetRootNode(), dm::double3(0.0), mesh, false);
+    g.graph->Refresh(0);
+    const uint32_t slot = MeshTable::SlotOf(g.graph->GetMeshes().Find(mesh));
+    CHECK(g.graph->GetMeshes().GetMeshRow(slot).geometryCount == 1);
+
+    const uint32_t scope = g.graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+    auto geometry = MAKE_RC_OBJ_PTR(MeshGeometry);   // an in-place edit, then a structural change
+    geometry->material = mesh->geometries[0]->material;
+    geometry->numIndices = 3;
+    geometry->numVertices = 3;
+    mesh->geometries.push_back(geometry);
+    g.Add(g.graph->GetRootNode(), dm::double3(1.0), nullptr, false);
+    g.graph->Refresh(1);
+    CHECK(g.graph->GetMeshes().GetMeshRow(slot).geometryCount == 1);   // deferred
+    SceneGraphStore::FailReconcileAfter(0);
+    g.graph->EndRenderRead(scope);
+    SceneGraphStore::FailReconcileAfter(-1);
+    CHECK(TakeWarnings() == 1);   // "the deferred mesh reconciliation failed"
+    CHECK(g.graph->GetMeshes().GetMeshRow(slot).geometryCount == 1);
+
+    g.graph->Refresh(2);   // nothing else changed: the retry
+    CHECK(g.graph->GetMeshes().GetMeshRow(slot).geometryCount == 2);
+    CHECK(TakeWarnings() == 0);
+}
+
+// ------------------------------------------------------------------------------------------------- T7-2
+
+// The shared job system takes its worker count from DONUT_JOB_WORKERS when it is set (ctest test_e7_fixes_job_workers
+// runs this case with 2): GetThreadCount is its 64 external slots and those workers. Unset: the default.
+// The expected count comes from the command line (ctest: the count it sets DONUT_JOB_WORKERS to), not from the
+// function under test. Without it (a run of every case) the case only checks that the shared system is made.
+void test_t7_2_shared_job_workers()
+{
+    const uint32_t workers = GetSharedJobWorkersOverride();
+    IJobSystem* shared = GetSharedJobSystem();
+    CHECK(shared);
+    if (g_ExpectedWorkers != 0)
+    {
+        CHECK(workers == g_ExpectedWorkers);
+        CHECK(shared->GetThreadCount() == 64 + g_ExpectedWorkers);   // 64 external slots
+    }
+    else
+    {
+        CHECK(shared->GetThreadCount() > 64);
+    }
+    std::printf("  shared job system: %u threads (DONUT_JOB_WORKERS %u)\n", shared->GetThreadCount(), workers);
+    CHECK(TakeWarnings() == 0);
+}
+
+// Each value that is no count from 1 to 256 gives the default (0) and one warning; the bounds are accepted. The case
+// sets the variable and restores it after, and never makes the shared system (it reads the variable once, when made).
+void test_t7_2_invalid_workers()
+{
+    std::string previous;
+    const bool wasSet = GetWorkersVariable(previous);
+    struct Restore
+    {
+        const std::string& value;
+        bool set;
+        ~Restore() { SetWorkersVariable(set ? value.c_str() : nullptr); }
+    } restore{ previous, wasSet };
+
+    struct Value { const char* text; uint32_t workers; };
+    const Value values[] = { { "1", 1 }, { "8", 8 }, { "256", 256 } };
+    for (const Value& v : values)
+    {
+        SetWorkersVariable(v.text);
+        CHECK(GetSharedJobWorkersOverride() == v.workers);
+        CHECK(TakeWarnings() == 0);
+    }
+    const char* const invalid[] = { "0", "257", "abc", "2x", "-1", "99999999999999999999" };
+    for (const char* text : invalid)
+    {
+        SetWorkersVariable(text);
+        CHECK(GetSharedJobWorkersOverride() == 0);
+        CHECK(TakeWarnings() == 1);
+    }
+    // An empty value: Windows removes the variable (unset: no warning); elsewhere it is set and empty (a warning).
+    SetWorkersVariable("");
+    CHECK(GetSharedJobWorkersOverride() == 0);
+#if defined(_WIN32)
+    CHECK(TakeWarnings() == 0);
+#else
+    CHECK(TakeWarnings() == 1);
+#endif
+    SetWorkersVariable(nullptr);
+    CHECK(GetSharedJobWorkersOverride() == 0);
+    CHECK(TakeWarnings() == 0);
+}
+
 // ------------------------------------------------------------------------------------------------- I6-R5
 
 // GpuScene::GetStats reads the statistics the recording's upload writes: while a pipelined frame records, a call on
@@ -933,6 +1070,9 @@ int main(int argc, char** argv)
         { "i4_r5_row_version_bytes", test_i4_r5_row_version_bytes },
         { "i6_r5_gpu_scene_stats_checked", test_i6_r5_gpu_scene_stats_checked },
         { "i3_r5_editor_precision", test_i3_r5_editor_precision },
+        { "t8_1_deferred_reconcile_retried", test_t8_1_deferred_reconcile_retried },
+        { "t7_2_shared_job_workers", test_t7_2_shared_job_workers },
+        { "t7_2_invalid_workers", test_t7_2_invalid_workers },
     };
     log::SetCallback([](log::Severity severity, const char* message)
     {
@@ -943,6 +1083,8 @@ int main(int argc, char** argv)
         }
     });
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc > 2)
+        g_ExpectedWorkers = uint32_t(std::strtoul(argv[2], nullptr, 10));
     int failed = 0;
     for (const Case& c : cases)
     {

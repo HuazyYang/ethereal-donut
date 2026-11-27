@@ -893,6 +893,7 @@ namespace donut::engine
     SceneGraphStore::SceneGraphStore(SceneGraph* graph) noexcept
         : m_Graph(graph)
     {
+        m_LastRenderReadScope = s_FirstRenderReadScope.load(std::memory_order_relaxed);   // test seam (T8-4)
         WorldDesc desc;
         desc.debugName = "SceneGraph";
 #ifndef NDEBUG
@@ -3264,8 +3265,14 @@ namespace donut::engine
             commands->AddComponents(batch.entities, batch.count, m_Ids[SlotInstance], nullptr, 0);
     }
 
+    std::atomic<int32_t> SceneGraphStore::s_FailReconcileCountdown{ -1 };
+    std::atomic<uint32_t> SceneGraphStore::s_FirstRenderReadScope{ 0 };
+
     void SceneGraphStore::ReconcileMeshes()
     {
+        if (s_FailReconcileCountdown.load(std::memory_order_relaxed) >= 0 &&
+            s_FailReconcileCountdown.fetch_sub(1, std::memory_order_relaxed) == 0)
+            throw std::bad_alloc();   // test seam (FailReconcileAfter)
         SceneGraph& graph = *m_Graph;
         MeshTable& meshes = graph.m_Meshes;
         ChangesScope scope(*this);   // a callback may change the tables again (AcquireRuntimeMesh): a level of its own

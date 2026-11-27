@@ -58,12 +58,17 @@ namespace donut::engine
     //   DLL_PROCESS_DETACH, under the loader lock, where a join deadlocks (FreeLibrary) or finds the threads already
     //   ended (ExitProcess). So a DLL that links donut_engine and is unloaded still gives its graphs a job system of
     //   its own (SetJobSystem) and releases it before it unloads. Creating a job system under the loader lock (DllMain,
-    //   a DLL's static constructors or destructors) is not supported: no worker can start there, and CreateJobSystem
-    //   stops waiting for them after 2 s.
+    //   a DLL's static constructors or destructors) is not supported: no worker can start there; CreateJobSystem notes
+    //   the wait after 2 s (log::info) and stops waiting for them after 30 s (log::warning).
     // - Elsewhere the handlers are registered in a shared object too: they run at its dlclose (glibc runs a shared
     //   object's atexit handlers then, through its __dso_handle). A dlclose from inside a job is not supported.
     // - ExitProcess and TerminateProcess called directly uninitialize nothing before the threads end.
     IJobSystem* GetSharedJobSystem() noexcept;
+    // The shared job system's worker count from the environment variable DONUT_JOB_WORKERS (1 to 256; read once, when
+    // the system is made), so that a test run can take 1, 2 or 8 workers (stage T7); 0, the default (hardware threads
+    // minus one), when it is unset, and also with a warning when it is not such a count. Only the shared system:
+    // job systems made with CreateJobSystem keep their desc.
+    uint32_t GetSharedJobWorkersOverride() noexcept;
 
     // Tests: what the exit handler did.
     enum class SharedJobSystemExit : uint32_t

@@ -29,6 +29,8 @@
 //   i6_n3_scopes_by_identity     render-read scopes closed by identity, under the deferring rules
 //   f4_n1_identity_beyond_64     beyond 64 open scopes: no identity; EndRenderRead(0) closes the innermost
 //   f4_n1_zero_closes_only_without_identity  0 closes only a scope without identity; a pipelined Extract needs one
+//   t5_n1_compact_geometry_cap   with compact records, a mesh's geometries past the cap get no packets (one warning)
+//   t8_4_scope_identity_wrap     the scope identities skip 0 at the wrap past 2^32 - 1
 //   i7_n1_service_destroyed_while_recording  the service's state is kept, with a warning (last: the process defers)
 
 #include <donut/core/log.h>
@@ -42,6 +44,9 @@
 #include <donut/render/RenderGraph.h>
 #include <donut/render/RenderGraphFrameData.h>
 #include <donut/tests/utils.h>
+
+#include "RenderVisibility.h"   // its test seam for the compact geometry cap (src/render)
+#include "SceneGraphStore.h"    // its test seam for the scope identities (src/engine)
 
 #include <atomic>
 #include <cstdint>
@@ -418,6 +423,80 @@ void test_f4_n1_zero_closes_only_without_identity()
     CHECK(TakeWarnings() == 0);
 }
 
+// ------------------------------------------------------------------------------------------------ T5-N1
+
+// Compact packet records hold a geometry index of 26 bits: with the switch on, a mesh's geometries from the cap on
+// get no packets, with one warning per process. The cap lowered to 2 through the module's test seam: a mesh of four
+// opaque geometries gives half the packets it gives with the default cap; the switch off ignores the cap.
+void test_t5_n1_compact_geometry_cap()
+{
+    nvrhi::AutoPtr<Material> material;
+    nvrhi::AutoPtr<MeshInfo> mesh = MakeMesh(material);
+    for (int i = 0; i < 3; ++i)
+    {
+        auto geometry = MAKE_RC_OBJ_PTR(MeshGeometry);
+        geometry->material = material;
+        geometry->numIndices = 3;
+        geometry->numVertices = 3;
+        geometry->objectSpaceBounds = mesh->objectSpaceBounds;
+        mesh->geometries.push_back(geometry);
+    }
+    Rig rig;
+    auto node = MAKE_RC_OBJ_PTR(SceneGraphNode);
+    node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, mesh));
+    rig.graph->Attach(rig.graph->GetRootNode(), node);
+    auto packets = [&]()
+    {
+        rig.graph->Refresh(rig.frame);
+        rig.renderGraph->Reset();
+        rig.data.Clear();
+        ExtractDesc desc;
+        desc.views = rig.views;
+        desc.viewCount = 1;
+        desc.frameIndex = rig.frame++;
+        SceneFrame* sceneFrame = nullptr;
+        CHECK(rig.service->Extract(rig.renderGraph, &rig.data, desc, &sceneFrame) == nvrhi::FS_OK);
+        CHECK(sceneFrame && sceneFrame->snapshot);
+        const uint32_t count = sceneFrame->snapshot->packets.count;
+        rig.service->EndFrame(true);
+        return count;
+    };
+    const bool compact = RenderService::GetCompactPacketRecords();
+    RenderService::SetCompactPacketRecords(true);
+    const uint32_t full = packets();
+    CHECK(full >= 4 && full % 4 == 0);
+    CHECK(TakeWarnings() == 0);
+    visibility::InstanceVisibility::SetCompactGeometryLimit(2);
+    CHECK(packets() == full / 2);
+    CHECK(TakeWarnings() == 1);
+    CHECK(packets() == full / 2);
+    CHECK(TakeWarnings() == 0);   // once per process
+    RenderService::SetCompactPacketRecords(false);
+    CHECK(packets() == full);     // the cap is the compact records'
+    visibility::InstanceVisibility::SetCompactGeometryLimit(visibility::InstanceVisibility::c_CompactGeometryLimit);
+    RenderService::SetCompactPacketRecords(compact);
+    CHECK(TakeWarnings() == 0);
+}
+
+// ------------------------------------------------------------------------------------------------ T8-4
+
+// A graph whose identities start near the wrap (the store's test seam): 2^32 - 1, then 1, never 0 (0 means "no
+// identity"); both close by identity.
+void test_t8_4_scope_identity_wrap()
+{
+    SceneGraphStore::SetFirstRenderReadScope(0xfffffffeu);
+    Rig rig;
+    SceneGraphStore::SetFirstRenderReadScope(0);
+    const uint32_t last = rig.graph->BeginRenderRead();
+    const uint32_t wrapped = rig.graph->BeginRenderRead();
+    CHECK(last == 0xffffffffu && wrapped == 1);
+    rig.graph->EndRenderRead(last);
+    CHECK(rig.graph->IsInRenderRead());
+    rig.graph->EndRenderRead(wrapped);
+    CHECK(!rig.graph->IsInRenderRead());
+    CHECK(TakeWarnings() == 0);
+}
+
 // ------------------------------------------------------------------------------------------------ I7-N1
 
 // A pipelined service destroyed while its frame records (BeginPipelinedRecording without the EndFrame after the
@@ -460,6 +539,8 @@ int main(int argc, char** argv)
         { "i6_n3_scopes_by_identity", test_i6_n3_scopes_by_identity },
         { "f4_n1_identity_beyond_64", test_f4_n1_identity_beyond_64 },
         { "f4_n1_zero_closes_only_without_identity", test_f4_n1_zero_closes_only_without_identity },
+        { "t5_n1_compact_geometry_cap", test_t5_n1_compact_geometry_cap },
+        { "t8_4_scope_identity_wrap", test_t8_4_scope_identity_wrap },
         { "i7_n1_service_destroyed_while_recording", test_i7_n1_service_destroyed_while_recording },   // last
     };
     log::SetCallback([](log::Severity severity, const char* message)

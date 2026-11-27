@@ -796,6 +796,13 @@ namespace donut::render::visibility
         // Compact packet records hold the geometry index in 26 bits: a mesh's geometries from this one on get no packet
         // with them (a warning, once per process).
         static constexpr uint32_t c_CompactGeometryLimit = 1u << 26;
+        // Test seam (T5-N1): the cap the compact path applies, at most c_CompactGeometryLimit (default), so that a test
+        // reaches it with a few geometries. Per module, as SetSerialLimits.
+        static void SetCompactGeometryLimit(uint32_t limit) noexcept
+        {
+            s_CompactGeometryLimit.store(std::min(std::max(limit, 1u), c_CompactGeometryLimit),
+                                         std::memory_order_relaxed);
+        }
 
     private:
         // One visible instance as a range lists it (the snapshot's VisibleInstances, one record).
@@ -1076,10 +1083,11 @@ namespace donut::render::visibility
                 const bool multiple = geometryCount > 1;
                 if constexpr (Compact)
                 {
-                    if (geometryCount > c_CompactGeometryLimit)
+                    const uint32_t limit = s_CompactGeometryLimit.load(std::memory_order_relaxed);
+                    if (geometryCount > limit)
                     {
-                        geometryCount = c_CompactGeometryLimit;
-                        WarnGeometryLimit();
+                        geometryCount = limit;
+                        WarnGeometryLimit(limit);
                     }
                 }
                 const bool skinned = mesh->skinPrototype != nullptr;
@@ -1341,12 +1349,12 @@ namespace donut::render::visibility
             return true;
         }
 
-        static void WarnGeometryLimit() noexcept
+        static void WarnGeometryLimit(uint32_t limit) noexcept
         {
             static std::atomic<bool> s_Warned{ false };
             if (!s_Warned.exchange(true, std::memory_order_relaxed))
                 log::warning("RenderService: a mesh has more than %u geometries; with compact packet records the ones "
-                             "beyond get no packets", c_CompactGeometryLimit);
+                             "beyond get no packets", limit);
         }
 
         static void ClearRanges(const VisibilityFrame& frame) noexcept
@@ -1503,5 +1511,6 @@ namespace donut::render::visibility
         inline static std::atomic<uint32_t> s_SerialRowTests{ c_SerialRowTests };
         inline static std::atomic<uint32_t> s_SerialRecords{ c_SerialRecords };
         inline static std::atomic<uint32_t> s_SerialRecordsAlone{ c_SerialRecordsAlone };
+        inline static std::atomic<uint32_t> s_CompactGeometryLimit{ c_CompactGeometryLimit };   // the test seam
     };
 }

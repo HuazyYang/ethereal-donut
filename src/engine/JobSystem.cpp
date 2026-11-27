@@ -82,7 +82,11 @@ namespace donut::engine::jobs
     constexpr uint32_t c_None = ~0u;
     constexpr uint32_t c_PauseRounds = 64;                    // idle rounds that pause; the later ones yield
     constexpr uint32_t c_PausesPerRound = 8;
-    constexpr uint32_t c_StartupTimeoutMs = 2000;             // see Initialize
+    // See Initialize: after c_StartupNoticeMs a slow start is noted (log::info), after c_StartupTimeoutMs the wait
+    // gives up (log::warning). A loaded machine can take seconds to start a thread (T1-N1): only the give-up, which
+    // ends the start-up guarantee, is a warning.
+    constexpr uint32_t c_StartupNoticeMs = 2000;
+    constexpr uint32_t c_StartupTimeoutMs = 30000;
 
     // Shared::stop: what an idle worker does. Leave: it leaves its loop (when its state goes from Running to
     // Leaving). Park: it sleeps until the process ends, and never runs thread-exit code (StopWorkers).
@@ -665,12 +669,25 @@ namespace donut::engine::jobs
         // uninitialize a static CRT before ExitProcess ends the threads (SharedJobSystem.h). Once started, an idle
         // worker touches no C runtime state (it spins, yields, or sleeps on an SRW-based condition variable).
         // Under the loader lock (DllMain, a DLL's static constructors and destructors) no thread can start: creation
-        // there is not supported, and the wait gives up after c_StartupTimeoutMs.
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(c_StartupTimeoutMs);
+        // there is not supported, and the wait gives up after c_StartupTimeoutMs (a note after c_StartupNoticeMs).
+        const auto start = std::chrono::steady_clock::now();
+        const auto notice = start + std::chrono::milliseconds(c_StartupNoticeMs);
+        const auto deadline = start + std::chrono::milliseconds(c_StartupTimeoutMs);
+        bool noted = false;
         for (uint32_t round = 0; m_Shared->runningWorkers.load(std::memory_order_acquire) < m_StartedThreads; ++round)
         {
             Relax(round);
-            if (round >= c_PauseRounds && std::chrono::steady_clock::now() >= deadline)
+            if (round < c_PauseRounds)
+                continue;
+            const auto now = std::chrono::steady_clock::now();
+            if (!noted && now >= notice)
+            {
+                noted = true;
+                log::info("CreateJobSystem('%s'): %u of %u workers have not started after %u ms; still waiting",
+                          m_Name, m_StartedThreads - m_Shared->runningWorkers.load(), m_StartedThreads,
+                          c_StartupNoticeMs);
+            }
+            if (now >= deadline)
             {
                 log::warning("CreateJobSystem('%s'): %u of %u workers have not started after %u ms (created under the "
                              "loader lock?); it returns without waiting for them", m_Name,
@@ -1447,6 +1464,31 @@ namespace donut::engine
         }
     }
 
+    uint32_t GetSharedJobWorkersOverride() noexcept
+    {
+        char* value = nullptr;
+#if defined(_MSC_VER)
+        size_t length = 0;
+        if (_dupenv_s(&value, &length, "DONUT_JOB_WORKERS") != 0 || !value)
+            return 0;
+#else
+        const char* found = std::getenv("DONUT_JOB_WORKERS");
+        if (!found)
+            return 0;
+        value = const_cast<char*>(found);
+#endif
+        char* end = nullptr;
+        const unsigned long workers = std::strtoul(value, &end, 10);
+        const bool valid = end != value && *end == 0 && workers >= 1 && workers <= jobs::c_MaxWorkerThreads;
+        if (!valid)
+            log::warning("DONUT_JOB_WORKERS='%s' is not a worker count from 1 to %u; the shared job system takes its "
+                         "default", value, jobs::c_MaxWorkerThreads);
+#if defined(_MSC_VER)
+        std::free(value);
+#endif
+        return valid ? uint32_t(workers) : 0u;
+    }
+
     IJobSystem* GetSharedJobSystem() noexcept
     {
         static IJobSystem* const s_Jobs = []() noexcept
@@ -1454,6 +1496,7 @@ namespace donut::engine
             JobSystemDesc desc;
             desc.debugName = "SceneGraph";
             desc.maxExternalThreads = 64;   // every thread that may refresh a graph at the same time
+            desc.workerThreadCount = GetSharedJobWorkersOverride();   // T7-2: 0 (unset) is the default
             IJobSystem* system = nullptr;
             if (NVRHI_FAILED(CreateJobSystem(desc, &system)))
             {

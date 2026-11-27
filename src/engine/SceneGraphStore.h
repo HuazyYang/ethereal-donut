@@ -567,6 +567,13 @@ namespace donut::engine
         // Test seam: the subgraph pass's storage fails to allocate `calls` passes from now (0: the next); negative
         // disarms it. The getters then fall back to the on-demand caches until a pass succeeds.
         static void FailSubgraphAfter(int32_t calls) noexcept { s_FailSubgraphCountdown.store(calls); }
+        // Test seam: the mesh reconciliation number `calls` from now (0: the next; ReconcileMeshes, deferred or not)
+        // throws std::bad_alloc before it changes anything, as its tables would out of memory (T8-1). Negative disarms
+        // it.
+        static void FailReconcileAfter(int32_t calls) noexcept { s_FailReconcileCountdown.store(calls); }
+        // Test seam: the last render-read scope identity a store made from now on starts with (default 0: the first
+        // scope gets 1), so that a test reaches the wrap past 2^32 - 1, which skips 0 (T8-4).
+        static void SetFirstRenderReadScope(uint32_t last) noexcept { s_FirstRenderReadScope.store(last); }
         // Test seam: the number of rows from which the subgraph pass runs a bucket on the job system (default 4096).
         static void SetSerialSubgraphRows(uint32_t rows) noexcept { s_SerialSubgraphRows.store(rows); }
         // Test seam: the subgraph passes (all stores) redone as full passes because a phase of their Refresh changed the
@@ -854,6 +861,8 @@ namespace donut::engine
 
         static std::atomic<int32_t> s_FailCreateCountdown;
         static std::atomic<int32_t> s_FailAcquireCountdown;
+        static std::atomic<int32_t> s_FailReconcileCountdown;   // FailReconcileAfter
+        static std::atomic<uint32_t> s_FirstRenderReadScope;     // SetFirstRenderReadScope
         static std::atomic<int32_t> s_FailSubgraphCountdown;
         static std::atomic<uint32_t> s_SerialSubgraphRows;
         static std::atomic<uint64_t> s_SubgraphRedos;

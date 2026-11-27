@@ -64,6 +64,9 @@ set_property(TARGET test_render_pipelining PROPERTY FOLDER "Donut/donut_tests/do
 # F), device-free.
 add_executable(test_e7_render_fixes src/render/test_e7_render_fixes.cpp)
 target_link_libraries(test_e7_render_fixes donut_render donut_engine donut_core donut_tests_utils)
+# Its compact-records case sets the geometry cap through RenderVisibility.h's test seam (src/render).
+target_include_directories(test_e7_render_fixes PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/render"
+                           "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
 add_dependencies(donut_all_tests test_e7_render_fixes)
 add_test(NAME test_e7_render_fixes COMMAND test_e7_render_fixes)
 set_property(TARGET test_e7_render_fixes PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
