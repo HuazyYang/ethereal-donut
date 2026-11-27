@@ -1098,6 +1098,7 @@ namespace donut::engine
 
     void PipelinedRecordingCheck::End() noexcept
     {
+        m_HandedOver.store(false, std::memory_order_release);
         m_MainThread.store(0, std::memory_order_release);
     }
 
@@ -1108,8 +1109,9 @@ namespace donut::engine
         if (main == 0 || main != CurrentThreadKey() || t_RecordingWork != 0 ||
             m_Warned.exchange(true, std::memory_order_relaxed))
             return;
-        log::warning("%s on the main thread while a pipelined frame records (between BeginPipelinedRecording and "
-                     "EndPipelinedRecording): the recording owns it until the join; the call runs", operation);
+        log::warning("%s on the main thread while a pipelined frame is built or records (between "
+                     "BeginPipelinedRecording and EndPipelinedRecording): the recording owns it until the join; the call "
+                     "runs", operation);
     }
 
     nvrhi::FRESULT GpuScene::Update(SceneGraph* graph) noexcept
@@ -1382,7 +1384,7 @@ namespace donut::engine
 
     bool GpuScene::HasPendingAssets() const noexcept
     {
-        m_Recording.Check("GpuScene::HasPendingAssets");
+        m_Recording.CheckRead("GpuScene::HasPendingAssets");
         if (!m_Impl)
             return false;
         const Impl& impl = *m_Impl;
@@ -1401,7 +1403,7 @@ namespace donut::engine
 
     void GpuScene::GetScatterRecords(GpuSceneScatterRecords& out) const noexcept
     {
-        m_Recording.Check("GpuScene::GetScatterRecords");
+        m_Recording.CheckRead("GpuScene::GetScatterRecords");
         out = GpuSceneScatterRecords();
         if (!m_Impl || m_Desc.uploadMode != GpuSceneUploadMode::Scatter)
             return;
@@ -1425,7 +1427,7 @@ namespace donut::engine
 
     bool GpuScene::IsScatterPending() const noexcept
     {
-        m_Recording.Check("GpuScene::IsScatterPending");
+        m_Recording.CheckRead("GpuScene::IsScatterPending");
         return m_Impl && m_Impl->scatterSerial != m_Impl->ackedSerial;
     }
 
@@ -1463,7 +1465,7 @@ namespace donut::engine
 
     const GpuSceneStats& GpuScene::GetStats() const noexcept
     {
-        m_Recording.Check("GpuScene::GetStats");   // the recording's upload writes them (backlog I6-R5)
+        m_Recording.CheckRead("GpuScene::GetStats");   // the recording's upload writes them (backlog I6-R5)
         static const GpuSceneStats s_None;
         return m_Impl ? m_Impl->stats : s_None;
     }

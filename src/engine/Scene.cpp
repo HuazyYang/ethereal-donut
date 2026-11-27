@@ -1242,6 +1242,13 @@ void Scene::BeginPipelinedRecording() noexcept
         m_GpuScene->BeginPipelinedRecording();
 }
 
+void Scene::HandOverPipelinedRecording() noexcept
+{
+    m_PipelinedRecording.HandOver();
+    if (m_GpuScene)
+        m_GpuScene->HandOverPipelinedRecording();
+}
+
 void Scene::EndPipelinedRecording() noexcept
 {
     if (m_GpuScene)

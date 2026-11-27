@@ -47,6 +47,11 @@ namespace donut::app::detail
         // Called by Draw for each editable component value of the selected entity (`size` bytes at `value`, the copy
         // the widgets edit). Returning true commits the value as an edit, as a widget would; false leaves it.
         bool (*edit)(void* context, engine::ComponentId component, void* value, uint32_t size) = nullptr;
+        // Called by Draw for each scalar of a number field it edits (field `field` of `component`, scalar `scalar`),
+        // with the text the field shows (the editor's format) in `text` (`capacity` bytes): returning true takes the
+        // text as typed into the field and committed, parsed as the widget parses it (T3-N1). Null: no typing.
+        bool (*type)(void* context, engine::ComponentId component, uint32_t field, uint32_t scalar, char* text,
+                     uint32_t capacity) = nullptr;
         void* context = nullptr;
     };
 

@@ -420,27 +420,25 @@ namespace donut::engine::ecs
     }
 
     // A registration of an existing GUID that asks for RowTracked: the flag is not part of the layout, so the type
-    // keeps what it was registered with (backlog I4-R4), with one warning per type. A kind without a value per row
-    // (Tag, Sparse, Shared, Chunk, Buffer, Resource) is refused, as a fresh registration of it is (ValidateTypeDesc;
-    // F3-N1). The once-only flag is a plain bool: registrations run where structure may change (or are refused), so a
-    // race on it needs a registration that is itself misuse (F4 review N6).
+    // keeps what it was registered with (backlog I4-R4), with one log::warning per type (an atomic flag: a registration
+    // of an existing GUID runs on any thread, with no structure gate). A kind without a value per row (Tag, Sparse,
+    // Shared, Chunk, Buffer, Resource) is refused as a fresh registration of it is: FE_INVALID_ARGS, reported through
+    // the world's validation at every call (ValidateTypeDesc; F3-N1, F4-N3).
     nvrhi::FRESULT WorldImpl::CheckRowTrackedAgain(ComponentType& type, const ComponentTypeDesc& desc,
                                                    const char* operation) noexcept
     {
         if (!Has(desc.flags, ComponentFlags::RowTracked) || Has(type.desc.flags, ComponentFlags::RowTracked))
             return nvrhi::FS_OK;
-        const bool perRow = type.kind == StorageKind::Data;
-        if (!type.warnedRowTracked)
+        if (type.kind != StorageKind::Data)
         {
-            type.warnedRowTracked = true;
-            if (perRow)
-                log::warning("IWorld::%s: %s is registered already without RowTracked; its rows get no row versions "
-                             "(ChunkView::rowVersions null)", operation, NameOf(desc));
-            else
-                log::warning("IWorld::%s: %s: RowTracked needs a value per row: not a Tag, Sparse, Shared, Chunk, "
-                             "Buffer or Resource; refused (the type is registered without it)", operation, NameOf(desc));
+            ReportValidation(operation, "%s: RowTracked needs a value per row: not a Tag, Sparse, Shared, Chunk, Buffer "
+                             "or Resource (the type is registered without it)", NameOf(desc));
+            return nvrhi::FE_INVALID_ARGS;
         }
-        return perRow ? nvrhi::FS_OK : nvrhi::FE_INVALID_ARGS;
+        if (!type.warnedRowTracked.exchange(true, std::memory_order_relaxed))
+            log::warning("IWorld::%s: %s is registered already without RowTracked; its rows get no row versions "
+                         "(ChunkView::rowVersions null)", operation, NameOf(desc));
+        return nvrhi::FS_OK;
     }
 
     nvrhi::FRESULT WorldImpl::RegisterComponent(const ComponentTypeDesc& desc, ComponentId& outId) noexcept

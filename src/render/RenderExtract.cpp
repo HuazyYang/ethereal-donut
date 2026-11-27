@@ -996,7 +996,18 @@ namespace donut::render
     {
     }
 
-    RenderService::~RenderService() = default;
+    RenderService::~RenderService()
+    {
+        if (m_Impl && m_Impl->recording)
+        {
+            log::warning("RenderService: destroyed while its frame records (BeginPipelinedRecording without the "
+                         "EndFrame after the join); its state, the graph's Defer scope and the graph are kept for good "
+                         "(leaked: the graph stays claimed and deferring, its retire list grows, walking strategies "
+                         "draw nothing) so that the recording reads nothing freed; join the recording and call "
+                         "EndFrame first");
+            (void)m_Impl.release();
+        }
+    }
 
     nvrhi::FRESULT RenderService::Extract(IRenderGraph* graph, FrameData* frameData, const ExtractDesc& desc,
                                           SceneFrame** outFrame) noexcept
@@ -1079,6 +1090,18 @@ namespace donut::render
         s.scopeId = s.graph->BeginRenderRead(m_Desc.pipelined ? SceneGraph::RenderReadMode::Defer
                                                               : SceneGraph::RenderReadMode::Warn);
         s.scopeOpen = true;
+        if (m_Desc.pipelined && s.scopeId == 0)
+        {
+            // Nested beyond 64 scopes, the Defer request acts as Warn: no retire list would keep what the main thread
+            // drops while the frame records (F5 review, F4-N1). The scope is the innermost now: it closes.
+            log::warning("RenderService::Extract: the graph has 64 render-read scopes open; a pipelined frame's scope "
+                         "would not defer; the frame is not extracted");
+            s.CloseScope();
+            s.renderGraph = nullptr;
+            s.desc = nullptr;
+            s.snapshot = nullptr;
+            return nvrhi::FE_INVALID_ARGS;
+        }
         // Through the graph, which accounts for the read-only phase: the next Refresh may still skip.
         result = s.graph->RunReadOnlyPhase(Phase::RenderExtract);
         if (NVRHI_SUCCEEDED(result))
@@ -1534,6 +1557,12 @@ namespace donut::render
             s.scene->BeginPipelinedRecording();
         s.recording = true;
         return nvrhi::FS_OK;
+    }
+
+    void RenderService::HandOverPipelinedRecording() noexcept
+    {
+        if (m_Impl && m_Impl->recording && m_Impl->scene)
+            m_Impl->scene->HandOverPipelinedRecording();
     }
 
     bool RenderService::IsPipelinedRecording() const noexcept

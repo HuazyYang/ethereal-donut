@@ -35,6 +35,9 @@
 #include <nvrhi/core/autoptr.h>
 
 #include <imgui.h>
+// DataTypeFormatString, DataTypeApplyFromText: only the test seam's typing (T3-N1) uses them; ImGui's internal API
+// as of 1.92.2, which a newer ImGui may change.
+#include <imgui_internal.h>
 
 #include <algorithm>
 #include <cstdarg>
@@ -439,7 +442,7 @@ namespace donut::app
         void DrawBrowser(IWorld* world) noexcept;
         void DrawSelected(IWorld* world) noexcept;
         void DrawComponent(IWorld* world, ComponentId component, const ComponentTypeDesc& desc) noexcept;
-        bool DrawFieldEditor(const FieldDesc& field, bool& active) noexcept;
+        bool DrawFieldEditor(ComponentId component, uint32_t fieldIndex, const FieldDesc& field, bool& active) noexcept;
         void DrawFieldView(const FieldDesc& field, const void* value) noexcept;
     };
 
@@ -728,7 +731,7 @@ namespace donut::app
                 for (uint32_t f = 0; f < desc.fieldCount; ++f)
                 {
                     ImGui::PushID(int(f));
-                    commit = DrawFieldEditor(desc.fields[f], active) || commit;
+                    commit = DrawFieldEditor(component, f, desc.fields[f], active) || commit;
                     ImGui::PopID();
                 }
                 if (active)
@@ -772,7 +775,8 @@ namespace donut::app
 
     // Widgets over the scratch copy, one per scalar; true when one committed: a checkbox clicked, or a number field let
     // go after an edit (Enter, Tab or a click elsewhere). `active` is set while a number field has the keyboard.
-    bool WorldInspector::State::DrawFieldEditor(const FieldDesc& field, bool& active) noexcept
+    bool WorldInspector::State::DrawFieldEditor(ComponentId component, uint32_t fieldIndex, const FieldDesc& field,
+                                                bool& active) noexcept
     {
         if (field.type == FieldType::Opaque || field.type == FieldType::Entity)
         {
@@ -812,9 +816,24 @@ namespace donut::app
             ImGui::SameLine();
             ImGui::SetNextItemWidth(96.f);
             ImGui::PushID(int(i));
-            ImGui::InputScalar("##value", type, source + size_t(i) * size, nullptr, nullptr, format);
+            void* scalar = source + size_t(i) * size;
+            ImGui::InputScalar("##value", type, scalar, nullptr, nullptr, format);
             active = active || ImGui::IsItemActive();
             commit = commit || ImGui::IsItemDeactivatedAfterEdit();   // the value as typed when the widget let go
+            // The test seam types into the field: the text it shows, parsed back as the widget parses it (T3-N1).
+            const detail::WorldInspectorTestHook* hook = g_TestHook;
+            if (hook && hook->type)
+            {
+                char typed[64];
+                const char* shown = format ? format : ImGui::DataTypeGetInfo(type)->PrintFmt;
+                ImGui::DataTypeFormatString(typed, int(sizeof(typed)), type, scalar, shown);
+                if (hook->type(hook->context, component, fieldIndex, i, typed, uint32_t(sizeof(typed))))
+                {
+                    typed[sizeof(typed) - 1] = 0;
+                    ImGui::DataTypeApplyFromText(typed, type, scalar, shown);
+                    commit = true;
+                }
+            }
             ImGui::PopID();
         }
         return commit;

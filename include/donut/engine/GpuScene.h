@@ -201,15 +201,19 @@ namespace donut::engine
     // Pipelined rendering (design 7.5; plan step E7, item E7.8): while a pipelined frame records on another thread, the
     // objects its passes write on that thread (the GpuScene; the Scene's mesh-buffer data) belong to the recording, and
     // the main thread touches them only after the join (model 3 of the E7 sub-plan: GpuScene::Update runs in the next
-    // Extract). Begin, called on the main thread when it hands the frame to the recording thread, names that thread;
-    // End, after the join, ends the recording. Check, at the guarded calls: in Debug builds a call made on the named
-    // thread in between, outside a PipelinedRecordingWork scope (below), logs one warning per recording (log::warning;
-    // the call still runs); Release builds check
-    // nothing. Never begun (serial frames), nothing is checked. Module-private.
+    // Extract). Begin, called on the main thread once the frame is built (the frame helper calls it at the end of the
+    // frame's Build, at the latest at the hand-off), names that thread; HandOver, when the frame goes to the recording
+    // thread; End, after the join, ends the recording. Check, at the guarded calls that change the objects: in Debug
+    // builds a call made on the named thread from Begin to End, outside a PipelinedRecordingWork scope (below), logs
+    // one warning per recording (log::warning; the call still runs). CheckRead, at the read-only ones: likewise, but
+    // only from HandOver to End, while a recording runs (before the hand-off the reads race with nothing; the F5
+    // review's split of backlog I7-R4). Release builds check nothing. Never begun (serial frames), nothing is
+    // checked. Module-private.
     class PipelinedRecordingCheck
     {
     public:
         void Begin() noexcept;
+        void HandOver() noexcept { m_HandedOver.store(true, std::memory_order_release); }
         void End() noexcept;
         [[nodiscard]] bool IsRecording() const noexcept { return m_MainThread.load(std::memory_order_acquire) != 0; }
         void Check(const char* operation) const noexcept
@@ -221,10 +225,20 @@ namespace donut::engine
             (void)operation;
 #endif
         }
+        void CheckRead(const char* operation) const noexcept
+        {
+#ifndef NDEBUG
+            if (m_HandedOver.load(std::memory_order_relaxed))
+                OnCheck(operation);
+#else
+            (void)operation;
+#endif
+        }
 
     private:
         void OnCheck(const char* operation) const noexcept;
         std::atomic<uint64_t> m_MainThread{ 0 };   // the thread that began the recording; 0 while none records
+        std::atomic<bool> m_HandedOver{ false };   // from HandOver to End: the recording runs
         mutable std::atomic<bool> m_Warned{ false };
     };
 
@@ -317,13 +331,16 @@ namespace donut::engine
 
         // Pipelined rendering (E7.8; PipelinedRecordingCheck): while a pipelined frame records, its upload pass owns
         // this object (Prepare: UploadAssets; Execute: the records and CommitScatter). BeginPipelinedRecording on the
-        // main thread when it hands the frame over, EndPipelinedRecording after the join. In between, Debug builds warn
-        // once about a call of Update, InvalidateAssets, Upload, UploadTo, CreateBuffers, UploadAssets, UploadAssetsTo,
-        // HasPendingAssets, GetScatterRecords, CommitScatter, IsScatterPending or GetStats made on the main thread.
+        // main thread once the frame is built, HandOverPipelinedRecording when it goes to the recording thread,
+        // EndPipelinedRecording after the join. From the begin, Debug builds warn once about a call of Update,
+        // InvalidateAssets, Upload, UploadTo, CreateBuffers, UploadAssets, UploadAssetsTo or CommitScatter made on the
+        // main thread; from the hand-off, also of the reads HasPendingAssets, GetScatterRecords, IsScatterPending and
+        // GetStats.
         // UploadAssets clears Material::dirty of the materials it uploads, on the recording thread: an application
         // that sets dirty (or edits a material) while a pipelined frame records races with it; it edits its materials
         // after the join, before the next Extract (backlog I6-N4).
         void BeginPipelinedRecording() noexcept { m_Recording.Begin(); }
+        void HandOverPipelinedRecording() noexcept { m_Recording.HandOver(); }
         void EndPipelinedRecording() noexcept { m_Recording.End(); }
         [[nodiscard]] bool IsPipelinedRecording() const noexcept { return m_Recording.IsRecording(); }
 

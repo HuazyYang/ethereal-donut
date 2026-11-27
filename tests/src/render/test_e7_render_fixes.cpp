@@ -27,6 +27,9 @@
 //   i6_n2_walk_prepared_again    a walking strategy prepared again mid-drain hands out the new view's items only
 //   i6_n3_service_closes_its_scope  EndFrame closes the service's own render-read scope, not the innermost one
 //   i6_n3_scopes_by_identity     render-read scopes closed by identity, under the deferring rules
+//   f4_n1_identity_beyond_64     beyond 64 open scopes: no identity; EndRenderRead(0) closes the innermost
+//   f4_n1_zero_closes_only_without_identity  0 closes only a scope without identity; a pipelined Extract needs one
+//   i7_n1_service_destroyed_while_recording  the service's state is kept, with a warning (last: the process defers)
 
 #include <donut/core/log.h>
 #include <donut/engine/EcsWorld.h>
@@ -347,6 +350,106 @@ void test_i6_n3_scopes_by_identity()
     CHECK(TakeWarnings() == 0);
 }
 
+// More than 64 scopes open: closing one in the middle by identity moves the scopes above it down, and the one that
+// comes to the 64th place has no identity (0), as it had none; EndRenderRead(0) closes the innermost scope whatever
+// its identity (F4-N1). 66 open, one closed in the middle, one by 0: 64 left.
+void test_f4_n1_identity_beyond_64()
+{
+    Rig rig;
+    uint32_t ids[66] = {};
+    for (uint32_t i = 0; i < 66; ++i)
+        ids[i] = rig.graph->BeginRenderRead();
+    CHECK(ids[63] != 0 && ids[64] == 0 && ids[65] == 0);
+    rig.graph->EndRenderRead(ids[10]);
+    rig.graph->EndRenderRead(ids[10]);   // closed already: a warning, nothing closes
+    CHECK(TakeWarnings() == 1);
+    rig.graph->EndRenderRead(0);
+    uint32_t left = 0;
+    while (rig.graph->IsInRenderRead())
+    {
+        rig.graph->EndRenderRead();
+        ++left;
+    }
+    CHECK(left == 64);
+    CHECK(TakeWarnings() == 0);
+}
+
+// EndRenderRead(0) closes the innermost scope only when it has no identity (the F5 review): a caller that got 0
+// closes its own scope, or nothing (a warning). And a pipelined service whose scope gets no identity (64 scopes open:
+// its Defer request acts as Warn, with no retire list) fails its Extract with a warning, closing that scope; its
+// BeginPipelinedRecording then has no frame to hand over.
+void test_f4_n1_zero_closes_only_without_identity()
+{
+    Rig rig;
+    const uint32_t first = rig.graph->BeginRenderRead();
+    CHECK(first != 0);
+    rig.graph->EndRenderRead(0);   // the innermost has an identity: nothing closes
+    CHECK(TakeWarnings() == 1);
+    CHECK(rig.graph->IsInRenderRead());
+    rig.graph->EndRenderRead(first);
+    CHECK(!rig.graph->IsInRenderRead());
+
+    RenderServiceDesc desc;
+    desc.sceneGraph = rig.graph;
+    desc.pipelined = true;
+    rig.service = nullptr;
+    rig.service = MAKE_RC_OBJ_PTR(RenderService, nullptr, desc);
+    rig.graph->Refresh(0);
+    for (int i = 0; i < 64; ++i)
+        rig.graph->BeginRenderRead();
+    ExtractDesc extract;
+    extract.views = rig.views;
+    extract.viewCount = 1;
+    SceneFrame* sceneFrame = nullptr;
+    CHECK(rig.service->Extract(rig.renderGraph, &rig.data, extract, &sceneFrame) == nvrhi::FE_INVALID_ARGS);
+    CHECK(sceneFrame == nullptr);
+    CHECK(TakeWarnings() == 2);   // the graph's (a Defer scope that deep acts as Warn) and the service's
+    CHECK(!rig.graph->IsRenderReadDeferring() && !SceneGraph::IsAnyRenderReadDeferring());
+    CHECK(rig.service->BeginPipelinedRecording() == nvrhi::FE_INVALID_ARGS);   // no frame open
+    CHECK(TakeWarnings() == 1);
+    uint32_t left = 0;
+    while (rig.graph->IsInRenderRead())
+    {
+        rig.graph->EndRenderRead();
+        ++left;
+    }
+    CHECK(left == 64);   // the service's scope was closed
+    rig.service->EndFrame(false);
+    CHECK(TakeWarnings() == 0);
+}
+
+// ------------------------------------------------------------------------------------------------ I7-N1
+
+// A pipelined service destroyed while its frame records (BeginPipelinedRecording without the EndFrame after the
+// join): one warning, and its state is kept (leaked) so that the recording reads nothing freed: the graph's Defer
+// scope stays open and the graph alive. Last of the cases: the process defers from then on.
+void test_i7_n1_service_destroyed_while_recording()
+{
+    nvrhi::AutoPtr<nvrhi::IWeakReference> weakGraph;
+    {
+        Rig rig;
+        RenderServiceDesc desc;
+        desc.sceneGraph = rig.graph;
+        desc.pipelined = true;
+        rig.service = nullptr;
+        rig.service = MAKE_RC_OBJ_PTR(RenderService, nullptr, desc);
+        rig.graph->Refresh(0);
+        ExtractDesc extract;
+        extract.views = rig.views;
+        extract.viewCount = 1;
+        SceneFrame* sceneFrame = nullptr;
+        CHECK(rig.service->Extract(rig.renderGraph, &rig.data, extract, &sceneFrame) == nvrhi::FS_OK);
+        CHECK(rig.service->BeginPipelinedRecording() == nvrhi::FS_OK);
+        rig.graph->GetWeakReference(weakGraph.GetAddressOf());
+        CHECK(weakGraph);
+        rig.service = nullptr;   // the frame still records
+        CHECK(TakeWarnings() == 1);
+        CHECK(rig.graph->IsRenderReadDeferring());
+    }
+    CHECK(!weakGraph->IsExpired());   // the leaked service holds it
+    CHECK(SceneGraph::IsAnyRenderReadDeferring());
+}
+
 int main(int argc, char** argv)
 {
     struct Case { const char* name; void (*run)(); };
@@ -355,6 +458,9 @@ int main(int argc, char** argv)
         { "i6_n2_walk_prepared_again", test_i6_n2_walk_prepared_again },
         { "i6_n3_service_closes_its_scope", test_i6_n3_service_closes_its_scope },
         { "i6_n3_scopes_by_identity", test_i6_n3_scopes_by_identity },
+        { "f4_n1_identity_beyond_64", test_f4_n1_identity_beyond_64 },
+        { "f4_n1_zero_closes_only_without_identity", test_f4_n1_zero_closes_only_without_identity },
+        { "i7_n1_service_destroyed_while_recording", test_i7_n1_service_destroyed_while_recording },   // last
     };
     log::SetCallback([](log::Severity severity, const char* message)
     {

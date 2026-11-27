@@ -76,6 +76,8 @@ endforeach()
 # src/app (WorldInspectorDetail.h), and its stage T3 cases the world's allocation counter (EcsWorldImpl.h, src/engine).
 target_include_directories(test_world_inspector PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/app"
                            "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
+# The fix track's engine regressions type into the inspector through the same seam (stage F, T3-N1).
+target_include_directories(test_e7_fixes PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/app")
 # Its cases that fail on an open backlog item (aggregate docs/plans/2026-11-26-donut-ecs-e7-rev2.md) run apart, so
 # that test_world_inspector itself stays the pass rule's.
 add_test(NAME test_world_inspector_backlog COMMAND test_world_inspector --backlog)

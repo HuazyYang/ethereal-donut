@@ -36,6 +36,7 @@
 //   i4_r4_row_tracked_reregistered  RowTracked asked of a type registered without it: a warning, flags kept; refused
 //                                   for a kind without a value per row (F3-N1)
 //   i6_r5_gpu_scene_stats_checked   GpuScene::GetStats is an owner-checked call while a pipelined frame records
+//   i3_r5_editor_precision          the inspector's number editors round-trip every digit (typed through the seam)
 //   i4_r5_row_version_bytes         WorldStats::rowVersionBytes counts the row-version blocks
 
 #include <donut/app/WorldInspector.h>
@@ -49,6 +50,10 @@
 #include <donut/engine/SceneComponents.h>
 #include <donut/engine/SceneGraph.h>
 #include <donut/tests/utils.h>
+
+#include "WorldInspectorDetail.h"   // the inspector's test seam (src/app)
+
+#include <imgui.h>
 
 #include <algorithm>
 #include <atomic>
@@ -67,6 +72,11 @@ using namespace donut::engine;
 
 namespace
 {
+#ifndef NDEBUG
+    constexpr uint32_t c_ValidationWarnings = 1;   // a scene graph's world validates in Debug builds
+#else
+    constexpr uint32_t c_ValidationWarnings = 0;
+#endif
     std::atomic<uint32_t> g_Warnings{ 0 };   // log::warning calls; a case that provokes some takes them back
     uint32_t TakeWarnings() { return g_Warnings.exchange(0); }
 
@@ -707,10 +717,12 @@ void test_i4_r4_row_tracked_reregistered()
     CHECK(!(g.world->GetComponentTypeDesc(plain)->flags & ComponentFlags::RowTracked));   // kept
     ComponentTypeDesc trackedTag = ComponentTraits<e7_fixes::Marker>::Desc();
     trackedTag.flags = trackedTag.flags | ComponentFlags::RowTracked;
+    // the refusal is reported as a fresh registration's is: through the world's validation (Debug for a graph's
+    // world), at every call (F4-N3)
     CHECK(g.world->RegisterComponent(trackedTag, id) == nvrhi::FE_INVALID_ARGS && id == ComponentId::Invalid);
-    CHECK(TakeWarnings() == 1);
+    CHECK(TakeWarnings() == c_ValidationWarnings);
     CHECK(g.world->RegisterComponent(trackedTag, id) == nvrhi::FE_INVALID_ARGS);
-    CHECK(TakeWarnings() == 0);
+    CHECK(TakeWarnings() == c_ValidationWarnings);
     CHECK(!(g.world->GetComponentTypeDesc(marker)->flags & ComponentFlags::RowTracked));
     CHECK(g.world->RegisterComponent(ComponentTraits<e7_fixes::Marker>::Desc(), id) == nvrhi::FS_OK && id == marker);
     // a Resource, through RegisterResource (F4 review N4): refused as a fresh one is
@@ -720,7 +732,7 @@ void test_i4_r4_row_tracked_reregistered()
     ComponentTypeDesc trackedResource = ComponentTraits<e7_fixes::Setting>::Desc();
     trackedResource.flags = trackedResource.flags | ComponentFlags::RowTracked;
     CHECK(g.world->RegisterResource(trackedResource, &setting, id) == nvrhi::FE_INVALID_ARGS);
-    CHECK(TakeWarnings() == 1);
+    CHECK(TakeWarnings() == c_ValidationWarnings);
     CHECK(g.world->RegisterResource(ComponentTraits<e7_fixes::Setting>::Desc(), &setting, id) == nvrhi::FS_OK &&
           id == resource);
     CHECK(g.world->RegisterComponent(ComponentTraits<e7_fixes::Plain>::Desc(), id) == nvrhi::FS_OK && id == plain);
@@ -765,6 +777,79 @@ void test_i4_r5_row_version_bytes()
     CHECK(after.chunkBytes == chunkBytes);
 }
 
+// ------------------------------------------------------------------------------------------------- I3-R5
+
+namespace e7_fixes
+{
+    struct Precise
+    {
+        double wide;
+        float narrow;
+        uint32_t pad;
+    };
+    DONUT_ECS_COMPONENT(Precise, "3c8e1f74-9a2b-4d65-b0e7-5f1a2c9d8e46", DONUT_ECS_FIELDS(wide, narrow))
+
+    // Types the editor's text back unchanged (the field shown, then committed as typed), as a user who edits a digit
+    // of a value commits the digits shown.
+    bool TypeAsShown(void* context, engine::ComponentId, uint32_t, uint32_t, char* text, uint32_t)
+    {
+        ++*static_cast<uint32_t*>(context);
+        return text[0] != 0;
+    }
+}
+
+// The number editors show every digit their type holds (%.17g for Double, %.9g for Float; backlog I3-R5): a value
+// typed back as shown is the same value, bit for bit. With %.6g, 123456789.123456789 came back as 123457000.
+void test_i3_r5_editor_precision()
+{
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    io.DisplaySize = ImVec2(1280.f, 1024.f);
+    io.DeltaTime = 1.f / 60.f;
+    unsigned char* pixels = nullptr;
+    int width = 0;
+    int height = 0;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    {
+        Graph g(false);
+        const ComponentId precise = RegisterComponent<e7_fixes::Precise>(g.world);
+        const e7_fixes::Precise value{ 123456789.123456789, 0.1f + 1e-7f, 0 };
+        const ComponentId ids[1] = { precise };
+        const void* values[1] = { &value };
+        EntityCreateDesc desc{};
+        desc.components = ids;
+        desc.values = values;
+        desc.componentCount = 1;
+        desc.entityCount = 1;
+        Entity entity = Entity::Null;
+        CHECK(g.world->CreateEntities(desc, &entity) == nvrhi::FS_OK);
+
+        uint32_t typed = 0;
+        app::detail::WorldInspectorTestHook hook;
+        hook.select = entity;
+        hook.openAll = true;
+        hook.type = &e7_fixes::TypeAsShown;
+        hook.context = &typed;
+        app::detail::SetWorldInspectorTestHook(&hook);
+        app::WorldInspector inspector;
+        for (int f = 0; f < 2; ++f)
+        {
+            ImGui::NewFrame();
+            inspector.Draw(g.world, nullptr);
+            ImGui::Render();
+        }
+        app::detail::SetWorldInspectorTestHook(nullptr);
+        CHECK(typed >= 2);   // both fields were typed
+        CHECK(inspector.Apply(g.world) == nvrhi::FS_OK);
+        const e7_fixes::Precise* after = GetComponent<e7_fixes::Precise>(g.world, entity);
+        CHECK(after && SameValue(after->wide, value.wide) && SameValue(after->narrow, value.narrow));
+    }
+    ImGui::DestroyContext();
+    CHECK(TakeWarnings() == 0);
+}
+
 // ------------------------------------------------------------------------------------------------- I6-R5
 
 // GpuScene::GetStats reads the statistics the recording's upload writes: while a pipelined frame records, a call on
@@ -783,6 +868,11 @@ void test_i6_r5_gpu_scene_stats_checked()
     (void)gpu.GetStats();
     CHECK(TakeWarnings() == 0);   // serial: nothing checked
     gpu.BeginPipelinedRecording();
+    (void)gpu.GetStats();
+    (void)gpu.HasPendingAssets();
+    (void)gpu.IsScatterPending();
+    CHECK(TakeWarnings() == 0);   // reads before the hand-off: no recording runs (the I7-R4 split)
+    gpu.HandOverPipelinedRecording();
     {
         PipelinedRecordingWork work;
         (void)gpu.GetStats();
@@ -793,6 +883,13 @@ void test_i6_r5_gpu_scene_stats_checked()
     CHECK(TakeWarnings() == expected);   // once per recording
     gpu.EndPipelinedRecording();
     (void)gpu.GetStats();
+    CHECK(TakeWarnings() == 0);
+
+    // a mutating call is checked from the begin (the end of the frame's Build), before the hand-off
+    gpu.BeginPipelinedRecording();
+    gpu.InvalidateAssets();
+    CHECK(TakeWarnings() == expected);
+    gpu.EndPipelinedRecording();
     CHECK(TakeWarnings() == 0);
 }
 
@@ -835,6 +932,7 @@ int main(int argc, char** argv)
         { "i4_r4_row_tracked_reregistered", test_i4_r4_row_tracked_reregistered },
         { "i4_r5_row_version_bytes", test_i4_r5_row_version_bytes },
         { "i6_r5_gpu_scene_stats_checked", test_i6_r5_gpu_scene_stats_checked },
+        { "i3_r5_editor_precision", test_i3_r5_editor_precision },
     };
     log::SetCallback([](log::Severity severity, const char* message)
     {

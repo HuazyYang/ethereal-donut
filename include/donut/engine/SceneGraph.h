@@ -957,11 +957,15 @@ namespace donut::engine
             Defer,   // the pipelined frame's: deferred releases
         };
         // Calls of the API thread (the one that calls Refresh): the EndRenderRead that closes the last Defer scope runs
-        // the deferred reconciliation and the releases there. BeginRenderRead returns the scope's identity (0 for a
-        // scope nested deeper than 64, which has none). EndRenderRead() closes the innermost scope; EndRenderRead(scope)
-        // closes that scope wherever it is, the scopes opened after it staying open with their modes (RenderService's
-        // EndFrame closes its own so; backlog I6-N3); one that is not open (closed already) gets a warning, 0 closes
-        // the innermost.
+        // the deferred reconciliation and the releases there. BeginRenderRead returns the scope's identity, one of this
+        // graph's (a counter per graph: another graph's identities mean nothing here; F4-N2), or 0 for a scope nested
+        // deeper than 64, which has none. EndRenderRead() closes the innermost scope; EndRenderRead(scope) closes that
+        // scope wherever it is, the scopes opened after it staying open with their modes and identities (RenderService's
+        // EndFrame closes its own so; backlog I6-N3); one that is not open (closed already) gets a warning. 0 closes the
+        // innermost scope when it has no identity (F4-N1: a scope that had none may have moved below the 64th by then,
+        // still without one), else nothing, with a warning: a caller that got 0 closes its scope while it is the
+        // innermost. A pipelined RenderService refuses an Extract whose scope would get 0 (its Defer request would act
+        // as Warn).
         uint32_t BeginRenderRead(RenderReadMode mode = RenderReadMode::Warn) noexcept;
         void EndRenderRead() noexcept;
         void EndRenderRead(uint32_t scope) noexcept;

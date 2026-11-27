@@ -232,7 +232,7 @@ namespace donut::engine
         // a use for it).
         [[nodiscard]] bool HasMeshBufferDataPending() const noexcept
         {
-            m_PipelinedRecording.Check("Scene::HasMeshBufferDataPending");
+            m_PipelinedRecording.CheckRead("Scene::HasMeshBufferDataPending");
             return !m_PendingMeshBufferData.empty();
         }
         // Points every mesh's BufferGroup::instanceBuffer at the GpuScene's instance buffer (after it was made or
@@ -242,12 +242,15 @@ namespace donut::engine
         // Pipelined rendering (design 7.5; plan step E7, item E7.8; PipelinedRecordingCheck, GpuScene.h): while a
         // pipelined frame records on another thread, the upload pass writes the mesh data there (WriteMeshBufferData in
         // its Prepare, ConfirmMeshBufferData in its Execute) and the main thread touches neither the pending mesh writes
-        // nor the GpuScene until the join. BeginPipelinedRecording, on the main thread when it hands the frame over,
-        // also begins the GpuScene's; EndPipelinedRecording, after the join, ends both. In between, Debug builds warn
-        // once about a call of CreateMeshBufferObjects, CreateMeshBuffers, WriteMeshBufferData, ConfirmMeshBufferData,
-        // HasMeshBufferDataPending, BindMeshInstanceBuffers or EnsureGpuScene made on the main thread (and the GpuScene
-        // about its own). Never begun (serial frames), nothing is checked.
+        // nor the GpuScene until the join. BeginPipelinedRecording, on the main thread once the frame is built (at the
+        // latest when it is handed over), also begins the GpuScene's; HandOverPipelinedRecording, when the frame goes to
+        // the recording thread, hands over both; EndPipelinedRecording, after the join, ends both. From the begin, Debug
+        // builds warn once about a call of CreateMeshBufferObjects, CreateMeshBuffers, WriteMeshBufferData,
+        // ConfirmMeshBufferData, BindMeshInstanceBuffers or EnsureGpuScene made on the main thread, from the hand-off
+        // also of HasMeshBufferDataPending (and the GpuScene about its own). Never begun (serial frames), nothing is
+        // checked.
         void BeginPipelinedRecording() noexcept;
+        void HandOverPipelinedRecording() noexcept;
         void EndPipelinedRecording() noexcept;
         [[nodiscard]] bool IsPipelinedRecording() const noexcept { return m_PipelinedRecording.IsRecording(); }
 

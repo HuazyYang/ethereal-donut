@@ -402,10 +402,11 @@ namespace donut::render
         // Pipelined rendering (design 7.5; plan step E7, items E7.8 and E7.9): the graph records frame N on another
         // thread while the world runs frame N+1. Extract then opens the graph's render-read scope in its deferring mode
         // (SceneGraph::RenderReadMode::Defer: the retire list, the deferred mesh reconciliation; the walking strategies
-        // refuse while it is open), BeginPipelinedRecording brackets the hand-off to the recording thread with the
-        // scene's owner-thread checks (Scene::BeginPipelinedRecording), and EndFrame, after the join, ends them and
-        // closes the scope. The frame helper of the samples drives it (sample_harness/PipelinedFrame.h). Off by
-        // default, enabled only after the A/B steps of E7.9 pass; off, every behaviour and output is the serial one.
+        // refuse while it is open), BeginPipelinedRecording (once the frame is built) and HandOverPipelinedRecording (at
+        // the hand-off to the recording thread) begin the scene's owner-thread checks (Scene::BeginPipelinedRecording),
+        // and EndFrame, after the join, ends them and closes the scope. The frame helper of the samples drives it
+        // (sample_harness/PipelinedFrame.h). Off by default, enabled only after the A/B steps of E7.9 pass; off, every
+        // behaviour and output is the serial one.
         bool pipelined = false;
     };
 
@@ -448,6 +449,15 @@ namespace donut::render
         // is registered on the same scene graph (one per graph) or the scene is not on the graph path. The registration
         // is released with the service.
         RenderService(nvrhi::IDevice* device, const RenderServiceDesc& desc) noexcept;
+        // Destroyed while its frame records (BeginPipelinedRecording without the EndFrame after the join, which with the
+        // frame helper includes the time from the end of a frame's Build to its hand-off; backlog I7-N1): the service
+        // cannot join a thread it does not own, so it keeps its state (leaked, with a warning): the frame's references,
+        // the graph's Defer scope and the graph stay, and the recording reads nothing freed. For good: the graph stays
+        // claimed (no other service can register on it); the Defer scope never closes, so its retire list and the
+        // deferred mesh reconciliation grow, IsAnyRenderReadDeferring stays true and the walking draw strategies of the
+        // process draw nothing; the Scene's owner-thread checks stay begun; the device's live-object report at its
+        // destruction lists what the state holds. Join the recording and call EndFrame first
+        // (sample_harness/PipelinedFrame.h's Shutdown does).
         ~RenderService();
 
         RenderService(const RenderService&) = delete;
@@ -500,15 +510,24 @@ namespace donut::render
         // next Reset.
         void EndFrame(bool executed) noexcept;
 
-        // Pipelined rendering (RenderServiceDesc::pipelined; plan step E7, item E7.9, part I7), on the main thread when
-        // it hands the open frame's graph to a recording thread: begins the scene's owner-thread checks
+        // Pipelined rendering (RenderServiceDesc::pipelined; plan step E7, item E7.9, part I7), on the main thread once
+        // the open frame's graph is built (the frame helper calls it at the end of the frame's Build), at the latest
+        // when it hands the graph to a recording thread: begins the scene's owner-thread checks
         // (Scene::BeginPipelinedRecording, which also begins its GpuScene's) until the EndFrame after the join. Until
         // then the main thread may run the next frame's Simulate and Refresh, but not Extract (refused) and not the
         // Scene's or GpuScene's mesh-buffer and upload calls (Debug builds warn). FE_INVALID_ARGS with a warning for
         // a service that is not pipelined (record serially then) or without an open frame; FS_OK again for a frame
-        // already handed over.
+        // already begun.
         nvrhi::FRESULT BeginPipelinedRecording() noexcept;
+        // At the hand-off to the recording thread, after BeginPipelinedRecording: from here to the join the read-only
+        // guarded calls are checked too (GpuScene::GetStats, HasPendingAssets, GetScatterRecords, IsScatterPending;
+        // Scene::HasMeshBufferDataPending), which race with the recording only while it runs. Nothing without a
+        // recording begun.
+        void HandOverPipelinedRecording() noexcept;
         [[nodiscard]] bool IsPipelinedRecording() const noexcept;
+        // RenderServiceDesc::pipelined as the service was made (a refused BeginPipelinedRecording of a pipelined
+        // service is a frame that is not open, not a serial service).
+        [[nodiscard]] bool IsPipelined() const noexcept { return m_Desc.pipelined; }
 
         [[nodiscard]] const RenderServiceStats& GetStats() const noexcept;
         // The service shadows, keyed by light entity; null before the first Extract.

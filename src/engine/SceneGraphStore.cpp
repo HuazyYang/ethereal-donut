@@ -1782,12 +1782,17 @@ namespace donut::engine
     }
 
     // The scope BeginRenderRead returned, wherever it is: the scopes opened after it stay open, with their modes and
-    // identities (backlog I6-N3). 0 (a scope beyond the 64th has no identity) closes the innermost.
+    // identities (backlog I6-N3). 0 (a scope beyond the 64th has no identity) closes the innermost scope when it has
+    // none, else nothing (a warning; the F5 review of F4-N1).
     void SceneGraphStore::EndRenderRead(uint32_t scope) noexcept
     {
         if (scope == 0)
         {
-            EndRenderRead();
+            const uint32_t innermost = m_RenderReads - 1;
+            if (m_RenderReads != 0 && (innermost >= 64 || m_RenderReadScopes[innermost] == 0))
+                CloseRenderRead(innermost);
+            else
+                log::warning("SceneGraph::EndRenderRead: no scope without an identity is the innermost; nothing closed");
             return;
         }
         for (uint32_t i = std::min(m_RenderReads, 64u); i-- > 0;)
