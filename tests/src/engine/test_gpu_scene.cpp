@@ -31,6 +31,7 @@
 // frame of the scripts, growth and settles included; records, settles, the resend after an unacknowledged frame,
 // CommitScatter, the growth bookkeeping, the records at 1, 2 and 8 workers, and no allocation in steady state.
 
+#include <donut/engine/EcsQuery.h>
 #include <donut/engine/GpuScene.h>
 #include <donut/engine/JobSystem.h>
 #include <donut/engine/SceneGraph.h>
@@ -2153,6 +2154,87 @@ void test_row_tracked_equals_untracked(bool exact)
     CHECK(missingTotals[0] == 0 && missingTotals[1] == 0);   // stale boxes are larger, never too small
 }
 
+// RowTracked cases that the T8 mutants of I4 showed missing (stage T8): with the switch on, (1) a chunk-only write of
+// WorldTransform (a Write query that stamps no row) followed by one node's move in the same chunk: propagation spreads
+// the chunk-only write before it stamps the moved row, so GpuScene still rebuilds every row; (2) a chunk whose head
+// columns changed (RenderFlags rewritten by InvalidateContent after a mesh type edit) while its WorldTransform did not:
+// GpuScene rebuilds it whole, not by row; (3) the deep bucket by row: one node of a chain moves at depth 66, and
+// GpuScene rebuilds the 5 rows written (66..70) of the deep bucket's chunk, not all of them. verify_frame after each.
+void test_row_tracked_killers()
+{
+    const bool found = SceneGraph::GetRowTrackedTransforms();
+    SceneGraph::SetRowTrackedTransforms(true);
+    auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+    SceneGraph::SetRowTrackedTransforms(found);
+    auto material = make_material("m", MaterialDomain::Opaque);
+    auto mesh = make_mesh("mesh", { material });
+    auto curve = make_mesh("curve", { material });
+    graph->SetRootNode(make_node("root"));
+    std::vector<SceneGraphNode*> nodes;
+    for (int i = 0; i < 64; ++i)
+    {
+        auto node = make_node("n");
+        node->SetTranslation(dm::double3(double(i), 0.0, 0.0));
+        node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, i == 20 ? curve.Get() : mesh.Get()));
+        nodes.push_back(graph->Attach(graph->GetRootNode(), node));
+    }
+    SceneGraphNode* parent = graph->GetRootNode();
+    std::vector<SceneGraphNode*> chain;
+    for (int d = 1; d <= 70; ++d)
+    {
+        auto node = make_node("c");
+        node->SetTranslation(dm::double3(0.0, 0.5, 0.0));
+        node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, mesh.Get()));
+        parent = graph->Attach(parent, node);
+        chain.push_back(parent);
+    }
+    GpuScene gpu(nullptr, test_desc());
+    Mirror mirror;
+    PrevModel model;
+    uint32_t frame = 0;
+    auto step = [&](const char* where)
+    {
+        graph->Refresh(++frame);
+        CHECK(NVRHI_SUCCEEDED(gpu.Update(graph)));
+        CHECK(NVRHI_SUCCEEDED(gpu.UploadTo(&mirror)));
+        verify_frame(graph, gpu, mirror, model, where);
+        return gpu.GetStats();
+    };
+    step("load");
+    step("settle");
+
+    // (1) a chunk-only write of WorldTransform, then one move in the chunk
+    IWorld* world = graph->GetWorld();
+    world->AdvanceVersion();
+    Query<Write<WorldTransform>, With<MeshInstanceLeaf>> worlds(world, "chunk-only world writer");
+    uint32_t written = 0;
+    worlds.ForEachChunk(ChunkRequest{}, [&](const ChunkView& view, WorldTransform* w)
+    {
+        for (uint32_t r = 0; r < view.count; ++r)
+            w[r].transform.m_translation.z += 1.0;
+        written += view.count;
+    });
+    CHECK(written == 64 + 70);
+    nodes[10]->SetTranslation(dm::double3(10.0, 2.0, 0.0));
+    GpuSceneStats stats = step("chunk-only write");
+    CHECK(stats.rowsChanged >= 64);
+    step("settle");
+
+    // (2) the head columns: RenderFlags of one row rewritten by InvalidateContent, its world unchanged
+    curve->type = MeshType::CurveLinearSweptSpheres;
+    nodes[20]->InvalidateContent();
+    stats = step("render flags");
+    CHECK(stats.rowsChanged >= 1);
+    step("settle");
+
+    // (3) the deep bucket by row
+    chain[65]->SetTranslation(dm::double3(0.0, 0.5, 1.0));   // depth 66
+    stats = step("deep row");
+    CHECK(stats.rowsBuilt == 5 && stats.rowsChanged == 5);
+    std::printf("row tracked killers: chunk-only world write, head columns, deep rows by row (%u built)\n",
+                stats.rowsBuilt);
+}
+
 int main(int argc, char** argv)
 {
 #if defined(_MSC_VER)
@@ -2218,6 +2300,8 @@ int main(int argc, char** argv)
         test_row_tracked_transforms();
         std::printf("%s\n", "test_row_tracked_equals_untracked");
         test_row_tracked_equals_untracked(false);
+        std::printf("%s\n", "test_row_tracked_killers");
+        test_row_tracked_killers();
     }
     catch (const std::runtime_error& err)
     {

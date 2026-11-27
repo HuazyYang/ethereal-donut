@@ -2385,6 +2385,79 @@ void test_static_tag()
     CHECK(TakeWarnings() == 0);
 }
 
+// Static on simulation-driven rows (stage T8; backlog T5-N2): the tag does not take driven archetypes out (SceneGraph.h,
+// SetStaticTag). Driven runtime rows carrying Static, in a graph made with the switch on, follow their domain's poses
+// frame by frame, and their boxes follow their worlds, as test_driven_rows checks without the tag.
+void test_static_driven_rows()
+{
+    const bool staticFound = SceneGraph::GetStaticTag();
+    SceneGraph::SetStaticTag(true);
+    Rig rig;
+    SceneGraph::SetStaticTag(staticFound);
+    Assets assets;
+    const ComponentId staticId = RegisterComponent<Static>(rig.world);
+    nvrhi::AutoPtr<DriftDomain> domain = MAKE_RC_OBJ_PTR(DriftDomain, rig.world);
+    SimulationDomainId domainId = SimulationDomainId::Invalid;
+    CHECK(rig.graph->GetScheduler()->AddSimulationDomain(domain, domainId) == nvrhi::FS_OK);
+    const MeshId mesh = rig.graph->AcquireRuntimeMesh(assets.two);
+    Rng rng(5);
+    const uint32_t count = 60;
+    std::vector<LocalTransform> locals;
+    std::vector<SimPose> poses;
+    std::vector<SimPosePrevious> previous;
+    std::vector<SimScale> scales;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        locals.push_back(MakeLocal(dm::double3(-999.0)));
+        const LocalTransform spawn = RandomLocal(rng);
+        poses.push_back(SimPose{ spawn.translation, spawn.rotation });
+        previous.push_back(SimPosePrevious{ spawn.translation, spawn.rotation });
+        scales.push_back(SimScale{ spawn.scaling });
+    }
+    std::vector<ComponentId> ids = rig.driven;
+    std::vector<MeshRef> refs(count, MeshRef{ mesh });
+    std::vector<const void*> values(ids.size(), nullptr);
+    values[1] = locals.data();
+    values[6] = refs.data();
+    values[10] = poses.data();
+    values[11] = previous.data();
+    values[12] = scales.data();
+    ids.push_back(staticId);
+    values.push_back(nullptr);
+    EntityCreateDesc desc{};
+    desc.components = ids.data();
+    desc.values = values.data();
+    desc.componentCount = uint32_t(ids.size());
+    desc.entityCount = count;
+    std::vector<Entity> rows(count);
+    CHECK(rig.world->CreateEntities(desc, rows.data()) == nvrhi::FS_OK);
+    auto alpha = [&]()
+    {
+        const FixedStepEntry& entry = GetResource<FixedStepState>(rig.world)->domains[uint32_t(domainId)];
+        return std::min(entry.accumulator / entry.fixedTimeStep, 1.0);
+    };
+    uint32_t moved = 0;
+    for (int frame = 0; frame < 12; ++frame)
+    {
+        rig.SimulateGraph(0.25 * (0.6 + 0.1 * double(frame % 5)));
+        rig.Refresh();
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const dm::daffine3 expected =
+                DirectWorld(*rig.Get<SimPosePrevious>(rows[i]), *rig.Get<SimPose>(rows[i]), *rig.Get<SimScale>(rows[i]),
+                            alpha());
+            CHECK(SameValue(rig.Get<WorldTransform>(rows[i])->transform, expected));
+            const dm::box3 box = assets.two->objectSpaceBounds * dm::affine3(expected);
+            CHECK(SameValue(rig.Get<WorldBounds>(rows[i])->bounds, box));
+            moved += SameValue(poses[i].translation, rig.Get<SimPose>(rows[i])->translation) ? 0 : 1;
+        }
+        rig.EndFrame();
+    }
+    CHECK(domain->steps > 0 && moved > 0);
+    std::printf("  %u Static driven rows followed their domain over 12 frames (%u steps)\n", count, domain->steps);
+    rig.graph->ReleaseRuntimeMesh(mesh);
+}
+
 // ----------------------------------------------------------------------------------------------- allocations
 
 // Steady state: runtime rows moved every frame by a system (parallel by chunk), Simulate, Refresh, GpuScene update,
@@ -2535,6 +2608,7 @@ int main(int argc, char** argv)
         { "parent_is_root", test_parent_is_root },
         { "script_golden", test_script_golden },
         { "static_tag", test_static_tag },
+        { "static_driven_rows", test_static_driven_rows },
         { "steady_state_allocations", test_steady_state_allocations },
         { "spawn_allocations", test_spawn_allocations },
     };

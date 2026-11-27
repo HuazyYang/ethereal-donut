@@ -3155,6 +3155,48 @@ void test_row_versions_chunk_only_rule()
     printf("  deviation 1 through 5 kinds of stamp, deviation 2 through 3 kinds of row version\n");
 }
 
+// Snapshots leave row versions out (I4 as built; stage T8, the killer of a mutant that records RowTracked in the
+// component table): two worlds made and edited alike, one with Position and Velocity RowTracked, give the same snapshot
+// bytes and hash; each snapshot loads into the other world, and the loaded tracked world's rows are stamped.
+void test_row_versions_snapshot_bytes()
+{
+    nvrhi::AutoPtr<IWorld> worlds[2] = { MakeWorld(true, 4096), MakeWorld(true, 4096) };
+    std::vector<uint8_t> bytes[2];
+    for (uint32_t tracked = 0; tracked < 2; ++tracked)
+    {
+        IWorld* world = worlds[tracked];
+        const ComponentId position = tracked ? RegisterTracked(world, ComponentTraits<Position>::Desc())
+                                             : RegisterComponent<Position>(world);
+        const ComponentId velocity = tracked ? RegisterTracked(world, ComponentTraits<Velocity>::Desc())
+                                             : RegisterComponent<Velocity>(world);
+        const ComponentId id = RegisterComponent<Id>(world);
+        std::vector<Entity> e(300);
+        std::vector<Position> positions(300);
+        for (uint32_t i = 0; i < 300; ++i)
+            positions[i] = Position{ float(i), 1, 2 };
+        CreateMany(world, { position, velocity, id }, 300, e.data(), { positions.data(), nullptr, nullptr });
+        world->AdvanceVersion();
+        for (uint32_t i = 0; i < 300; i += 7)
+            static_cast<Position*>(world->GetComponentForWrite(e[i], position, c_WorldVersion))->y = 5;
+        CHECK(world->DestroyEntities(e.data() + 100, 20) == nvrhi::FS_OK);
+        RowMemoryWriter writer;
+        CHECK(world->SaveSnapshot(&writer) == nvrhi::FS_OK);
+        bytes[tracked] = writer.bytes;
+    }
+    CHECK(bytes[0] == bytes[1] && !bytes[0].empty());
+    CHECK(worlds[0]->ComputeHash() == worlds[1]->ComputeHash());
+    for (uint32_t into = 0; into < 2; ++into)
+    {
+        RowMemoryReader reader(bytes[1 - into]);
+        CHECK(worlds[into]->LoadSnapshot(&reader) == nvrhi::FS_OK);
+    }
+    CHECK(worlds[0]->ComputeHash() == worlds[1]->ComputeHash());
+    CheckRowVersionStorage(worlds[1]);
+    CHECK(Impl(worlds[0]).GetValidationErrorCount() == 0 && Impl(worlds[1]).GetValidationErrorCount() == 0);
+    printf("  snapshots of a tracked and an untracked world: %zu bytes, equal; loaded into each other\n",
+           bytes[0].size());
+}
+
 // --------------------------------------------------------------------- chunk prefetch (E7.4 remedy 1, part I5)
 
 // SetQueryChunkPrefetch: off by default; every typed form visits the same chunks, rows and values, in the same order,
@@ -3313,6 +3355,7 @@ int main(int, char**)
         { "row_versions_chunk_only_writer", &test_row_versions_chunk_only_writer },
         { "row_versions_model", &test_row_versions_model },
         { "row_versions_chunk_only_rule", &test_row_versions_chunk_only_rule },
+        { "row_versions_snapshot_bytes", &test_row_versions_snapshot_bytes },
         { "chunk_prefetch", &test_chunk_prefetch },
         { "chunk_prefetch_sizes", &test_chunk_prefetch_sizes },
         { "steady_state_allocations", &test_steady_state_allocations },

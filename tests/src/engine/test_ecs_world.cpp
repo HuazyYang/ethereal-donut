@@ -2916,6 +2916,20 @@ void test_row_versions_steady_state()
            "released and made again in %u of 8 rounds (sink %llu)\n", (unsigned long long)newCalls,
            (unsigned long long)blocks, released, (unsigned long long)(sink & 1));
     CHECK(released == 8);
+
+    // WorldStats::rowVersionBytes counts the blocks kept, also those of released chunks (backlog I4-R5; stage T8, the
+    // killer of a mutant that counts the chunks in use): here the archetype keeps more blocks than it has chunks.
+    WorldStats stats{};
+    world->GetStats(stats);
+    uint64_t kept = 0, inUse = 0;
+    for (uint32_t a = 0; a < impl.GetArchetypeStorageCount(); ++a)
+    {
+        const ecs::Archetype& archetype = impl.GetArchetypeStorage(a);
+        const uint64_t blockBytes = uint64_t(archetype.rowVersionSlots) * (uint64_t(archetype.rowsPerChunk) + 1) * 8;
+        kept += uint64_t(archetype.rowVersionBlocks.size()) * blockBytes;
+        inUse += uint64_t(archetype.GetChunkCount()) * blockBytes;
+    }
+    CHECK(stats.rowVersionBytes == kept && kept > inUse);
     CHECK(newCalls == 0 && blocks == 0);
 }
 

@@ -1771,6 +1771,119 @@ namespace
         RenderService::SetCompactPacketRecords(compactFound);
     }
 
+    // Compact records are taken when the switch is on (stage T8, the killer of a mutant that ignores the switch: the
+    // snapshot is the same either way, so only the work tells). After warm-up with the switch off, the first extraction
+    // with it on makes the compact buffers (operator new), and the next ones allocate nothing; off again, nothing.
+    void test_compact_records_taken()
+    {
+        const bool compactFound = RenderService::GetCompactPacketRecords();
+        TestViews views;
+        PacketScene scene(0xc0de);
+        scene.Build(150);
+        RenderFrame frame;
+        auto service = MakeService(scene.graph);
+        uint32_t f = 0;
+        auto extract = [&](bool compact)
+        {
+            RenderService::SetCompactPacketRecords(compact);
+            ++f;
+            scene.graph->Refresh(f);
+            const RenderSnapshot& s = ExtractFrame(service, frame, views.Desc(f % 2 + 1));
+            CHECK(s.packets.count > 100);
+            service->EndFrame(true);
+        };
+        for (int i = 0; i < 6; ++i)
+            extract(false);
+        uint64_t before = g_NewCount.load();
+        extract(true);
+        const uint64_t first = g_NewCount.load() - before;
+        extract(true);
+        extract(true);
+        before = g_NewCount.load();
+        extract(true);
+        extract(true);
+        const uint64_t steady = g_NewCount.load() - before;
+        before = g_NewCount.load();
+        extract(false);
+        const uint64_t back = g_NewCount.load() - before;
+        RenderService::SetCompactPacketRecords(compactFound);
+        std::printf("  operator new: %llu at the first compact extraction, %llu in two more, %llu back off\n",
+                    (unsigned long long)first, (unsigned long long)steady, (unsigned long long)back);
+        CHECK(first > 0 && steady == 0 && back == 0);
+    }
+
+    // Compact records of meshes with many geometries (stage T8, the killer of a mutant that cuts the geometry index
+    // short): five instances of a 300-geometry mesh beside the scene's meshes; each extraction's packets (keys, geometry
+    // indices and slots, order) equal with compact records off and on, serially.
+    void test_compact_many_geometries()
+    {
+        const bool compactFound = RenderService::GetCompactPacketRecords();
+        TestViews views;
+        PacketScene scene(0x6e0);
+        scene.Build(60);
+        auto big = MAKE_RC_OBJ_PTR(MeshInfo);
+        big->name = "big";
+        dm::box3 bounds = dm::box3::empty();
+        for (int g = 0; g < 300; ++g)
+        {
+            auto geometry = MAKE_RC_OBJ_PTR(MeshGeometry);
+            geometry->material = scene.materials[g % 3 == 0 ? 2 : 0];   // opaque, and blended every third
+            geometry->numIndices = 3;
+            geometry->numVertices = 3;
+            const float x = -1.f + 0.01f * float(g);
+            geometry->objectSpaceBounds = dm::box3(dm::float3(x, -1.f, -1.f), dm::float3(x + 0.01f, 1.f, 1.f));
+            bounds |= geometry->objectSpaceBounds;
+            big->geometries.push_back(geometry);
+        }
+        big->objectSpaceBounds = bounds;
+        for (int i = 0; i < 5; ++i)
+        {
+            auto node = MakeNode("big");
+            node->SetTranslation(dm::double3(-4.0 + 2.0 * double(i), 0.0, 10.0));
+            node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, big.Get()));
+            scene.graph->Attach(scene.graph->GetRootNode(), node);
+        }
+        RenderFrame frame;
+        auto service = MakeService(scene.graph);
+        uint32_t beyond = 0;
+        for (uint32_t f = 1; f <= 3; ++f)
+        {
+            scene.graph->Refresh(f);
+            uint64_t hashes[2] = {};
+            for (uint32_t compact = 0; compact < 2; ++compact)
+            {
+                RenderService::SetCompactPacketRecords(compact != 0);
+                const RenderSnapshot& s = ExtractFrame(service, frame, views.Desc(f));
+                hashes[compact] = HashPackets(s);
+                for (uint32_t i = 0; i < s.packets.count; ++i)
+                    beyond += s.packets.geometryIndices[i] > 255 ? 1 : 0;
+                service->EndFrame(true);
+            }
+            CHECK(hashes[0] == hashes[1]);
+        }
+        // the cap at its boundary (the T5-N1 seam): with a cap of 299 the compact records keep geometries 0..298
+        visibility::InstanceVisibility::SetCompactGeometryLimit(299);
+        const uint32_t warnings = g_Warnings.load();
+        uint32_t last[2] = {};
+        for (uint32_t compact = 0; compact < 2; ++compact)
+        {
+            RenderService::SetCompactPacketRecords(compact != 0);
+            scene.graph->Refresh(4);
+            const RenderSnapshot& s = ExtractFrame(service, frame, views.Desc(4));
+            for (uint32_t i = 0; i < s.packets.count; ++i)
+                last[compact] += s.packets.geometryIndices[i] == 299 ? 1 : 0;
+            service->EndFrame(true);
+        }
+        visibility::InstanceVisibility::SetCompactGeometryLimit(visibility::InstanceVisibility::c_CompactGeometryLimit);
+        CHECK(last[0] > 0 && last[1] == 0);
+        CHECK(g_Warnings.load() <= warnings + 1);   // the cap's warning, once per process
+        g_Warnings = warnings;
+        RenderService::SetCompactPacketRecords(compactFound);
+        std::printf("  packets of a 300-geometry mesh equal with compact records (%u of geometry index 256 or more); "
+                    "a cap of 299 drops geometry 299 (%u packets) from the compact ones only\n", beyond, last[0]);
+        CHECK(beyond > 0);
+    }
+
     // Ten frames of runtime rows moving beside nodes after warm-up, five views: no operator new, no ECS heap block. A
     // tenth of the rows swing between two places every frame through the world, so that the views' sets change. Three
     // runs of warm-up and ten frames each (backlog E72-R7): serial; on 8 workers with every extraction step on the job
@@ -1935,6 +2048,8 @@ int main(int argc, char** argv)
         { "runtime_rows", test_runtime_rows },
         { "runtime_steady_state", test_runtime_steady_state },
         { "compact_packet_records", test_compact_packet_records },
+        { "compact_records_taken", test_compact_records_taken },
+        { "compact_many_geometries", test_compact_many_geometries },
     };
     try
     {

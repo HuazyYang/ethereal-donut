@@ -2648,11 +2648,11 @@ void test_static_tag_contract()
                 }
                 ++followed;
             }
-            // the rows' boxes follow their stored worlds (runtime rows here; nodes in the brute force below)
+            // the rows' boxes follow their stored worlds (every row's WorldBounds here; the subgraph boxes in the brute
+            // force below)
             const LocalBounds* local = GetComponent<LocalBounds>(world, entity);
             const WorldBounds* box = GetComponent<WorldBounds>(world, entity);
-            if (local && box && !local->bounds.isempty() &&
-                !world->HasComponent(entity, FindComponent<LeafObject>(world)))
+            if (local && box && !local->bounds.isempty())
             {
                 const dm::box3 expectedBox = local->bounds * dm::affine3(stored);
                 CHECK(SameBox(box->bounds, expectedBox));
@@ -2675,6 +2675,171 @@ void test_static_tag_contract()
                 "their parents\n", (unsigned long long)frozen, (unsigned long long)diverged,
                 (unsigned long long)recomposed, (unsigned long long)followed);
     CHECK(frozen > 1000 && diverged > 100 && recomposed > 100 && followed > 1000);
+}
+
+// Propagation by row with RowTracked transforms (stage T8, the killer of the work-only mutants of I4): 64 parents
+// under the root in one chunk, each with a child (another chunk), a graph made with SceneGraph::SetRowTrackedTransforms
+// on and one with it off. One parent moves: by row, propagation composes that parent and its child (2 rows); by chunk,
+// the parents' chunk whole and every child (128 rows). The worlds are equal.
+void test_row_tracked_by_row()
+{
+    const bool found = SceneGraph::GetRowTrackedTransforms();
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    auto mesh = MakeMesh(factory, 1.f);
+    struct Built
+    {
+        nvrhi::AutoPtr<SceneGraph> graph;
+        std::vector<SceneGraphNode*> parents, children;
+    };
+    Built built[2];
+    for (uint32_t tracked = 0; tracked < 2; ++tracked)
+    {
+        Built& b = built[tracked];
+        SceneGraph::SetRowTrackedTransforms(tracked != 0);
+        b.graph = MAKE_RC_OBJ_PTR(SceneGraph);
+        SceneGraph::SetRowTrackedTransforms(found);
+        b.graph->SetRootNode(MakeNode("root"));
+        for (uint32_t i = 0; i < 64; ++i)
+        {
+            auto parent = MakeNode("parent");
+            parent->SetTranslation(dm::double3(double(i), 0.0, 0.0));
+            parent->SetLeaf(factory->CreateMeshInstance(mesh));
+            b.parents.push_back(b.graph->Attach(b.graph->GetRootNode(), parent));
+        }
+        for (SceneGraphNode* parent : b.parents)
+        {
+            auto child = MakeNode("child");
+            child->SetTranslation(dm::double3(0.0, 1.0, 0.0));
+            child->SetLeaf(factory->CreateMeshInstance(mesh));
+            b.children.push_back(b.graph->Attach(parent, child));
+        }
+        b.graph->Refresh(1);
+        b.graph->Refresh(2);
+    }
+    uint64_t moved[2] = {};
+    for (uint32_t frame = 3; frame <= 6; ++frame)
+    {
+        for (uint32_t tracked = 0; tracked < 2; ++tracked)
+        {
+            Built& b = built[tracked];
+            const uint64_t rows = CountersOf(b.graph).propagatedRows;
+            b.parents[frame * 7 % 64]->SetTranslation(dm::double3(double(frame), 5.0, 0.0));
+            b.graph->Refresh(frame);
+            moved[tracked] = CountersOf(b.graph).propagatedRows - rows;
+            CHECK(moved[tracked] == (tracked ? 2u : 128u));
+        }
+        for (size_t i = 0; i < 64; ++i)
+        {
+            const dm::daffine3 a = built[0].children[i]->GetLocalToWorldTransform();
+            const dm::daffine3 b = built[1].children[i]->GetLocalToWorldTransform();
+            CHECK(SameBits(&a, &b, sizeof(a)));
+        }
+    }
+    std::printf("  one parent of 64 moved: %llu rows composed by row, %llu by chunk\n", (unsigned long long)moved[1],
+                (unsigned long long)moved[0]);
+}
+
+// The childless Bounds path where it alone marks the parent (stage T8, the killer of mutants of the path's mark and
+// keys): two graphs of 600 leaves directly under the root (every chunk childless, one parent) and nothing else, the
+// second refreshed with the path on; 20 frames of moves of a few leaves each (incremental passes only): the root's box
+// and every leaf's equal the brute force and the other graph's, and the path was taken by every chunk the Bounds
+// system wrote.
+void test_childless_root_only()
+{
+    const bool found = SceneGraph::GetChildlessBoundsPath();
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    auto mesh = MakeMesh(factory, 0.5f);
+    nvrhi::AutoPtr<SceneGraph> graphs[2];
+    std::vector<SceneGraphNode*> leaves[2];
+    for (uint32_t g = 0; g < 2; ++g)
+    {
+        graphs[g] = MAKE_RC_OBJ_PTR(SceneGraph);
+        graphs[g]->SetRootNode(MakeNode("root"));
+        Rng rng(0x600);
+        for (uint32_t i = 0; i < 600; ++i)
+        {
+            auto node = MakeNode("leaf");
+            RandomMove(rng, node);
+            node->SetLeaf(factory->CreateMeshInstance(mesh));
+            leaves[g].push_back(graphs[g]->Attach(graphs[g]->GetRootNode(), node));
+        }
+    }
+    auto refresh = [&](uint32_t frame)
+    {
+        SceneGraph::SetChildlessBoundsPath(false);
+        graphs[0]->Refresh(frame);
+        SceneGraph::SetChildlessBoundsPath(true);
+        graphs[1]->Refresh(frame);
+        SceneGraph::SetChildlessBoundsPath(found);
+    };
+    refresh(1);
+    for (uint32_t frame = 2; frame <= 21; ++frame)
+    {
+        for (uint32_t g = 0; g < 2; ++g)
+        {
+            Rng rng(frame);
+            for (uint32_t k = 0; k < 3; ++k)
+            {
+                // far out, so that the root's box changes with them
+                SceneGraphNode* node = leaves[g][rng.Below(600)];
+                node->SetTranslation(dm::double3(rng.Range(-50.0, 50.0) * double(frame), 0.0, 0.0));
+            }
+        }
+        refresh(frame);
+        CheckAgainstBruteForce(graphs[0]);
+        CheckAgainstBruteForce(graphs[1]);
+        const dm::box3 a = graphs[0]->GetRootNode()->GetGlobalBoundingBox();
+        const dm::box3 b = graphs[1]->GetRootNode()->GetGlobalBoundingBox();
+        CHECK(SameBits(&a, &b, sizeof(a)));
+    }
+    const SceneGraphStore::Counters& on = CountersOf(graphs[1]);
+    CHECK(on.childlessChunks > 0 && on.subgraphPasses > on.fullSubgraphPasses);
+    std::printf("  600 leaves under the root, 20 frames: the root's box equal to the brute force (%llu chunks took the "
+                "path)\n", (unsigned long long)on.childlessChunks);
+}
+
+// A Static row's writes before and after the run that takes it (stage T8; SceneGraph.h, SetStaticTag): in a graph made
+// with the switch on, a node attached and tagged Static, then moved before any Refresh, takes that move (its initial
+// value, in both builds, no warning); once a propagation run took it, SetTranslation is refused with one warning in
+// Debug builds and written but not propagated in Release builds; in both its world stays.
+void test_static_initial_writes()
+{
+    const bool found = SceneGraph::GetStaticTag();
+    SceneGraph::SetStaticTag(true);
+    auto graph = MAKE_RC_OBJ_PTR(SceneGraph);
+    SceneGraph::SetStaticTag(found);
+    IWorld* world = graph->GetWorld();
+    const ComponentId staticId = RegisterComponent<Static>(world);
+    auto factory = MAKE_RC_OBJ_PTR(SceneTypeFactory);
+    auto mesh = MakeMesh(factory, 1.f);
+    graph->SetRootNode(MakeNode("root"));
+    graph->Refresh(1);
+    auto made = MakeNode("static");
+    made->SetTranslation(dm::double3(1.0, 0.0, 0.0));
+    made->SetLeaf(factory->CreateMeshInstance(mesh));
+    SceneGraphNode* node = graph->Attach(graph->GetRootNode(), made);
+    CHECK(world->AddComponent(graph->GetEntity(node), staticId, nullptr) == nvrhi::FS_OK);
+    const uint32_t warnings = g_Warnings.load();
+    node->SetTranslation(dm::double3(2.0, 0.0, 0.0));   // before the run that takes the row: its initial value
+    CHECK(g_Warnings.load() == warnings && node->GetTranslation().x == 2.0);
+    graph->Refresh(2);
+    CHECK(node->GetLocalToWorldTransform().m_translation.x == 2.0);
+    node->SetTranslation(dm::double3(3.0, 0.0, 0.0));   // settled: refused in Debug, not propagated in Release
+#ifndef NDEBUG
+    CHECK(g_Warnings.load() == warnings + 1 && node->GetTranslation().x == 2.0);
+#else
+    CHECK(g_Warnings.load() == warnings && node->GetTranslation().x == 3.0);
+#endif
+    graph->Refresh(3);
+    CHECK(node->GetLocalToWorldTransform().m_translation.x == 2.0);
+    g_Warnings = warnings;
+    std::printf("  a Static row's initial value taken; a later write %s\n",
+#ifndef NDEBUG
+                "refused with one warning"
+#else
+                "written, not propagated"
+#endif
+    );
 }
 
 int main(int argc, char** argv)
@@ -2701,6 +2866,9 @@ int main(int argc, char** argv)
         { "childless_bounds_churn", test_childless_bounds_churn },
         { "static_tag_promised", test_static_tag_promised },
         { "static_tag_contract", test_static_tag_contract },
+        { "row_tracked_by_row", test_row_tracked_by_row },
+        { "childless_root_only", test_childless_root_only },
+        { "static_initial_writes", test_static_initial_writes },
         { "steady_state", test_steady_state_allocations },
     };
     log::SetCallback([](log::Severity severity, const char* message)
