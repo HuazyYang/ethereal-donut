@@ -1565,7 +1565,7 @@ void test_panels_show_storage()
 }
 
 // The Systems panel lists only `world`'s systems: Draw with another world's scheduler warns and skips the panel.
-// backlog: I3-R6 (WorldInspector.cpp:874-875, Draw does not check that the scheduler belongs to the world).
+// The regression test of backlog I3-R6 (Draw did not check that the scheduler belongs to the world; fixed in F2).
 void test_systems_panel_other_world()
 {
     ImGuiContextScope context;
@@ -1576,12 +1576,13 @@ void test_systems_panel_other_world()
     Create(mine.world.Get(), { a }, 1);
     app::WorldInspector inspector;
     OfferLog offers;
-    DrawSelecting(inspector, mine.world.Get(), other.scheduler.Get(), Entity::Null, offers, true);
+    const uint32_t before = g_Warnings.load();
+    DrawSelecting(inspector, mine.world.Get(), other.scheduler.Get(), Entity::Null, offers, true);   // warns too
     const uint32_t warnings = g_Warnings.load();
     std::string text;
     DrawSelecting(inspector, mine.world.Get(), other.scheduler.Get(), Entity::Null, offers, true, &text);
     const uint32_t seen = g_Warnings.load() - warnings;
-    g_Warnings = warnings;
+    g_Warnings = before;   // the first Draw's warning too
     CHECK(text.find("other_world_system") == std::string::npos);
     CHECK(seen == 1);
 }
@@ -1991,7 +1992,7 @@ void test_pending_edits()
 }
 
 // Re-edits of a pending value record no further command: Apply plays back one command per pending value.
-// backlog: I3-R4 (WorldInspector.cpp:429-430, every commit appends a SetComponent).
+// The regression test of backlog I3-R4 (every commit appended a SetComponent; fixed in F2).
 void test_pending_commands_bounded()
 {
     ImGuiContextScope context;
@@ -2013,7 +2014,7 @@ void test_pending_commands_bounded()
 }
 
 // The "edited" mark shows only for a value that is pending: not in the frame whose commit was refused (65th value).
-// backlog: I3-R3 (WorldInspector.cpp:745-748, shown when RecordEdit dropped the edit).
+// The regression test of backlog I3-R3 (the mark showed when RecordEdit dropped the edit; fixed in F2).
 void test_edited_mark_only_when_pending()
 {
     ImGuiContextScope context;
@@ -2281,7 +2282,7 @@ int main(int argc, char** argv)
         { "system_info_storage", test_system_info_storage, nullptr },
         { "system_info_cycle", test_system_info_cycle, nullptr },
         { "panels_show_storage", test_panels_show_storage, nullptr },
-        { "systems_panel_other_world", test_systems_panel_other_world, "I3-R6" },
+        { "systems_panel_other_world", test_systems_panel_other_world, nullptr },
         { "offers_scene_rows", test_offers_scene_rows, nullptr },
         { "offers_simulation_inputs", test_offers_simulation_inputs, nullptr },
         { "offers_without_list", test_offers_without_list, nullptr },
@@ -2290,8 +2291,8 @@ int main(int argc, char** argv)
         { "edit_runtime_reaches_world", test_edit_runtime_reaches_world, nullptr },
         { "edits_deterministic", test_edits_deterministic, nullptr },
         { "pending_edits", test_pending_edits, nullptr },
-        { "pending_commands_bounded", test_pending_commands_bounded, "I3-R4" },
-        { "edited_mark_only_when_pending", test_edited_mark_only_when_pending, "I3-R3" },
+        { "pending_commands_bounded", test_pending_commands_bounded, nullptr },
+        { "edited_mark_only_when_pending", test_edited_mark_only_when_pending, nullptr },
         { "refusals", test_refusals, nullptr },
         { "world_reference", test_world_reference, nullptr },
         { "allocations", test_allocations, nullptr },
