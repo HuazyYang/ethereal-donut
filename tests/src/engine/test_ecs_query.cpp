@@ -45,6 +45,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <new>
 #include <thread>
@@ -2624,6 +2625,536 @@ void test_row_versions_chunk_only_writer()
     CHECK(Impl(world).GetValidationErrorCount() == 0);
 }
 
+// ------------------------------------------------------------ row versions through every path (stage T4, part I4)
+
+namespace
+{
+    // An IStateWriter / IStateReader over memory, for the snapshot path.
+    struct RowMemoryWriter final : IStateWriter
+    {
+        std::vector<uint8_t> bytes;
+        nvrhi::FRESULT QueryInterface(nvrhi::FREFIID, void** ppInterface) noexcept override
+        {
+            if (ppInterface)
+                *ppInterface = nullptr;
+            return nvrhi::FE_NOINTERFACE;
+        }
+        nvrhi::FLONG AddRef() noexcept override { return 1; }
+        nvrhi::FLONG Release() noexcept override { return 1; }
+        nvrhi::FRESULT Write(const void* data, uint64_t size) noexcept override
+        {
+            const uint8_t* p = static_cast<const uint8_t*>(data);
+            bytes.insert(bytes.end(), p, p + size);
+            return nvrhi::FS_OK;
+        }
+    };
+    struct RowMemoryReader final : IStateReader
+    {
+        const std::vector<uint8_t>& bytes;
+        size_t position = 0;
+        explicit RowMemoryReader(const std::vector<uint8_t>& b) : bytes(b) { }
+        nvrhi::FRESULT QueryInterface(nvrhi::FREFIID, void** ppInterface) noexcept override
+        {
+            if (ppInterface)
+                *ppInterface = nullptr;
+            return nvrhi::FE_NOINTERFACE;
+        }
+        nvrhi::FLONG AddRef() noexcept override { return 1; }
+        nvrhi::FLONG Release() noexcept override { return 1; }
+        nvrhi::FRESULT Read(uint64_t size, void* data) noexcept override
+        {
+            if (size > bytes.size() - position)
+                return nvrhi::FE_INVALID_ARGS;
+            std::memcpy(data, bytes.data() + position, size_t(size));
+            position += size_t(size);
+            return nvrhi::FS_OK;
+        }
+    };
+
+    ComponentId RegisterTracked(IWorld* world, ComponentTypeDesc desc)
+    {
+        desc.flags |= ComponentFlags::RowTracked;
+        ComponentId id = ComponentId::Invalid;
+        CHECK(world->RegisterComponent(desc, id) == nvrhi::FS_OK);
+        return id;
+    }
+
+    // The version a reader of changed rows sees for a row (the ChunkView rule): its row version, or the chunk's column
+    // version while a chunk-only write is pending (ChangedRowVersions null).
+    uint64_t EffectiveRowVersion(IWorld* world, Entity entity, ComponentId component)
+    {
+        const ecs::EntityRecord& record = Record(world, entity);
+        const ecs::Archetype& archetype = Impl(world).GetArchetypeStorage(record.archetype);
+        const uint32_t column = archetype.FindColumn(component);
+        CHECK(column != ecs::c_NoColumn && archetype.RowVersions(record.chunk, column) != nullptr);
+        const uint64_t* rows = ecs::ChangedRowVersions(archetype, record.chunk, column);
+        return rows ? rows[record.row] : archetype.Versions(record.chunk)[column];
+    }
+
+    // Every RowTracked column in use: no row newer than the column's newest row version, which is not newer than the
+    // chunk's column version; columns without the flag have no row versions; rowsPerChunk rows fit each block.
+    uint64_t CheckRowVersionStorage(IWorld* world)
+    {
+        ecs::WorldImpl& impl = Impl(world);
+        uint64_t rowsChecked = 0;
+        for (uint32_t a = 0; a < impl.GetArchetypeStorageCount(); ++a)
+        {
+            const ecs::Archetype& archetype = impl.GetArchetypeStorage(a);
+            for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
+            {
+                const uint32_t count = archetype.chunks[c].count;
+                CHECK(count <= archetype.rowsPerChunk);
+                for (uint32_t k = 0; k < uint32_t(archetype.columns.size()); ++k)
+                {
+                    const uint64_t* rows = archetype.RowVersions(c, k);
+                    const ComponentTypeDesc* desc = world->GetComponentTypeDesc(archetype.components[k]);
+                    CHECK((rows != nullptr) == (desc->size != 0 && !!(desc->flags & ComponentFlags::RowTracked)));
+                    if (!rows || count == 0)
+                        continue;
+                    CHECK(rows[-1] <= archetype.Versions(c)[k]);
+                    for (uint32_t r = 0; r < count; ++r)
+                        CHECK(rows[r] <= rows[-1]);
+                    rowsChecked += count;
+                }
+            }
+        }
+        return rowsChecked;
+    }
+}
+
+// Row versions through every structural path, against a model of each live row's last write (stage T4; revision 1,
+// E7.5's tests; I4 as built, deviations 1 and 2). A world of small chunks with two RowTracked columns (Position in
+// every archetype, Velocity in some) and an untracked one, a tag that moves rows between archetypes. A seeded script
+// of 600 steps, each after a new version or (one in four) at the same one: creates, destroys (swap-removes; chunks
+// released and their blocks taken again), moves (a component or the tag added and removed), Instantiate, copies from
+// another world, row writes (GetComponentForWrite), chunk-only writes (a Write hand-out that stamps nothing, at the
+// world's version or a later one), writers that stamp the rows they wrote through the view, Changed readers, and
+// snapshot save and load. The model: a row created, moved into another archetype or into a hole (its place changed),
+// copied or loaded gets the version of the change; a row write its version; a chunk-only write every row of its
+// chunks. After every step each live row's effective version (ChangedRowVersions, or the chunk's while a chunk-only
+// write is pending) equals the model's, the storage invariants hold, and every few steps a Changed reader at several
+// `since` versions takes exactly the rows the model says changed.
+void test_row_versions_model()
+{
+    auto world = MakeWorld(true, 4096, 16 * 1024, 1024);
+    const ComponentId position = RegisterTracked(world, ComponentTraits<Position>::Desc());
+    const ComponentId velocity = RegisterTracked(world, ComponentTraits<Velocity>::Desc());
+    const ComponentId id = RegisterComponent<Id>(world);
+    const ComponentId frozen = RegisterComponent<Frozen>(world);
+    const ComponentId tracked[2] = { position, velocity };
+
+    // Another world for CopyEntitiesFrom: the same types (its Position RowTracked, its Velocity not).
+    auto other = MakeWorld(false, 4096, 16 * 1024, 1024);
+    const ComponentId otherPosition = RegisterTracked(other, ComponentTraits<Position>::Desc());
+    RegisterComponent<Velocity>(other);
+    const ComponentId otherId = RegisterComponent<Id>(other);
+    std::vector<Entity> sources(40);
+    CreateMany(other, { otherPosition, otherId }, 40, sources.data());
+
+    nvrhi::AutoPtr<IQuery> writers[2] = { MakeQuery(world, { Term(position, TermOp::All, Access::Write) }, "w pos"),
+                                          MakeQuery(world, { Term(velocity, TermOp::All, Access::Write) }, "w vel") };
+    nvrhi::AutoPtr<IQuery> readers[2] = { MakeQuery(world, { Term(position, TermOp::Changed, Access::Read) }, "r pos"),
+                                          MakeQuery(world, { Term(velocity, TermOp::Changed, Access::Read) }, "r vel") };
+
+    std::map<Entity, uint64_t> model[2];   // per tracked component: each live row's last write
+    std::vector<Entity> alive;
+    struct Place
+    {
+        uint32_t archetype, chunk, row;
+        bool operator==(const Place& o) const { return archetype == o.archetype && chunk == o.chunk && row == o.row; }
+    };
+    auto placeOf = [&](Entity e)
+    {
+        const ecs::EntityRecord& record = Record(world, e);
+        return Place{ record.archetype, record.chunk, record.row };
+    };
+    // Around a structural call: rows whose place changed were moved (into a hole or another archetype) and get the
+    // version of the change; rows that left a component leave the model.
+    auto structural = [&](auto&& call)
+    {
+        std::map<Entity, Place> before;
+        for (Entity e : alive)
+            before[e] = placeOf(e);
+        call();
+        const uint64_t v = world->GetVersion();
+        for (Entity e : alive)
+        {
+            const auto it = before.find(e);
+            if (it == before.end() || !(it->second == placeOf(e)))
+                for (uint32_t t = 0; t < 2; ++t)
+                    if (world->HasComponent(e, tracked[t]))
+                        model[t][e] = v;
+            for (uint32_t t = 0; t < 2; ++t)
+                if (!world->HasComponent(e, tracked[t]))
+                    model[t].erase(e);
+        }
+    };
+    auto checkModel = [&]()
+    {
+        for (uint32_t t = 0; t < 2; ++t)
+        {
+            uint32_t present = 0;
+            for (Entity e : alive)
+            {
+                if (!world->HasComponent(e, tracked[t]))
+                    continue;
+                ++present;
+                const auto it = model[t].find(e);
+                CHECK(it != model[t].end());
+                if (EffectiveRowVersion(world, e, tracked[t]) != it->second)
+                {
+                    printf("  row version of %llu (component %u): %llu, the model's %llu\n", (unsigned long long)e,
+                           t, (unsigned long long)EffectiveRowVersion(world, e, tracked[t]),
+                           (unsigned long long)it->second);
+                    CHECK(false);
+                }
+            }
+            CHECK(present == model[t].size());
+        }
+        CheckRowVersionStorage(world);
+    };
+    // A Changed reader at `since`: the rows it takes are exactly the model's rows newer than `since`.
+    uint64_t readerRows = 0;
+    auto checkReaders = [&](uint64_t since)
+    {
+        for (uint32_t t = 0; t < 2; ++t)
+        {
+            std::vector<Entity> seen, expected;
+            ChunkView views[16];
+            const uint32_t chunks = readers[t]->GetChunkCount();
+            for (uint32_t first = 0; first < chunks; first += 16)
+            {
+                const uint32_t n = readers[t]->GetChunks(first, ChunkRequest{ since, c_WorldVersion, nullptr }, 16,
+                                                         views);
+                for (uint32_t i = 0; i < n; ++i)
+                    for (uint32_t r = 0; r < views[i].count; ++r)
+                        if (views[i].IsRowChanged(0, r, since))
+                            seen.push_back(views[i].entities[r]);
+            }
+            for (const auto& [e, v] : model[t])
+                if (v > since)
+                    expected.push_back(e);
+            std::sort(seen.begin(), seen.end());
+            CHECK(seen == expected);
+            readerRows += seen.size();
+        }
+    };
+
+    Xorshift rng{ 0x7ab1e5eedull };
+    uint32_t counts[12] = {};
+    std::vector<uint64_t> versions;
+    for (uint32_t step = 0; step < 600; ++step)
+    {
+        if (rng.Below(4) != 0)
+            world->AdvanceVersion();
+        const uint64_t v = world->GetVersion();
+        versions.push_back(v);
+        const uint32_t op = alive.size() < 50 ? 0 : rng.Below(12);
+        ++counts[op];
+        switch (op)
+        {
+        case 0:   // create, with or without Velocity, some frozen
+        case 1:
+        {
+            const uint32_t n = 1 + rng.Below(60);
+            std::vector<Entity> made(n);
+            const uint32_t shape = rng.Below(3);
+            structural([&]()
+            {
+                if (shape == 0)
+                    CreateMany(world, { position, id }, n, made.data());
+                else if (shape == 1)
+                    CreateMany(world, { position, velocity, id }, n, made.data());
+                else
+                    CreateMany(world, { position, velocity, id, frozen }, n, made.data());
+                alive.insert(alive.end(), made.begin(), made.end());
+            });
+            break;
+        }
+        case 2:   // destroy: swap-removes; emptied chunks are released, their blocks kept for the next chunk there
+        case 3:
+        {
+            const uint32_t n = 1 + rng.Below(alive.size() > 400 ? 120 : 30);
+            std::vector<Entity> victims;
+            for (uint32_t k = 0; k < n && !alive.empty(); ++k)
+            {
+                const uint32_t i = rng.Below(uint32_t(alive.size()));
+                victims.push_back(alive[i]);
+                alive[i] = alive.back();
+                alive.pop_back();
+            }
+            structural([&]()
+            {
+                CHECK(world->DestroyEntities(victims.data(), uint32_t(victims.size())) == nvrhi::FS_OK);
+            });
+            for (Entity e : victims)
+                for (uint32_t t = 0; t < 2; ++t)
+                    model[t].erase(e);
+            break;
+        }
+        case 4:   // moves: Velocity or the tag added or removed
+        {
+            for (uint32_t k = 0, n = 1 + rng.Below(20); k < n; ++k)
+            {
+                const Entity e = alive[rng.Below(uint32_t(alive.size()))];
+                const ComponentId c = rng.Below(2) ? velocity : frozen;
+                structural([&]()
+                {
+                    const bool had = world->HasComponent(e, c);
+                    CHECK((had ? world->RemoveComponent(e, c) : world->AddComponent(e, c, nullptr)) == nvrhi::FS_OK);
+                });
+            }
+            break;
+        }
+        case 5:   // Instantiate
+        {
+            const Entity prefab = alive[rng.Below(uint32_t(alive.size()))];
+            const uint32_t n = 1 + rng.Below(30);
+            std::vector<Entity> made(n);
+            structural([&]()
+            {
+                CHECK(world->Instantiate(prefab, n, made.data()) == nvrhi::FS_OK);
+                alive.insert(alive.end(), made.begin(), made.end());
+            });
+            break;
+        }
+        case 6:   // copies from another world
+        {
+            const uint32_t n = 1 + rng.Below(uint32_t(sources.size()));
+            std::vector<Entity> made(n);
+            structural([&]()
+            {
+                CHECK(world->CopyEntitiesFrom(other, sources.data(), n, made.data()) == nvrhi::FS_OK);
+                alive.insert(alive.end(), made.begin(), made.end());
+            });
+            break;
+        }
+        case 7:   // row writes
+        case 8:
+        {
+            for (uint32_t k = 0, n = 1 + rng.Below(40); k < n; ++k)
+            {
+                const Entity e = alive[rng.Below(uint32_t(alive.size()))];
+                const uint32_t t = rng.Below(2);
+                if (!world->HasComponent(e, tracked[t]))
+                    continue;
+                CHECK(world->GetComponentForWrite(e, tracked[t], c_WorldVersion) != nullptr);
+                model[t][e] = v;
+            }
+            break;
+        }
+        case 9:   // a chunk-only write of a range of chunks: c_WorldVersion, or a new version named explicitly
+        {
+            const uint32_t t = rng.Below(2);
+            const uint64_t writeVersion = rng.Below(2) ? c_WorldVersion : world->AdvanceVersion();
+            const uint64_t stamp = writeVersion == c_WorldVersion ? v : writeVersion;
+            const uint32_t chunks = writers[t]->GetChunkCount();
+            if (chunks == 0)
+                break;
+            const uint32_t first = rng.Below(chunks);
+            ChunkView views[16];
+            const uint32_t n = writers[t]->GetChunks(first, ChunkRequest{ c_AllVersions, writeVersion, nullptr },
+                                                     1 + rng.Below(16), views);
+            for (uint32_t i = 0; i < n; ++i)
+                for (uint32_t r = 0; r < views[i].count; ++r)
+                    model[t][views[i].entities[r]] = stamp;
+            break;
+        }
+        case 10:   // a writer that stamps the rows it wrote, at a new version (not the same one: deviation 2 there)
+        {
+            const uint32_t t = rng.Below(2);
+            const uint64_t writeVersion = world->AdvanceVersion();
+            const uint32_t chunks = writers[t]->GetChunkCount();
+            if (chunks == 0)
+                break;
+            ChunkView view{};
+            if (writers[t]->GetChunks(rng.Below(chunks), ChunkRequest{ c_AllVersions, writeVersion, nullptr }, 1,
+                                      &view) != 1)
+                break;
+            CHECK(view.rowVersions[0] != nullptr);
+            uint32_t stamped = 0;
+            for (uint32_t r = 0; r < view.count; ++r)
+            {
+                if (rng.Below(3) != 0)
+                    continue;
+                view.StampRow(0, r, writeVersion);
+                model[t][view.entities[r]] = writeVersion;
+                ++stamped;
+            }
+            if (stamped == 0)   // a hand-out that stamps no row is a chunk-only write
+                for (uint32_t r = 0; r < view.count; ++r)
+                    model[t][view.entities[r]] = writeVersion;
+            break;
+        }
+        case 11:   // snapshot: save, then load; every row loaded gets the load's version
+        {
+            if (rng.Below(4) != 0)
+            {
+                checkReaders(versions[rng.Below(uint32_t(versions.size()))]);
+                break;
+            }
+            RowMemoryWriter writer;
+            CHECK(world->SaveSnapshot(&writer) == nvrhi::FS_OK);
+            RowMemoryReader reader(writer.bytes);
+            CHECK(world->LoadSnapshot(&reader) == nvrhi::FS_OK);
+            const uint64_t loaded = EffectiveRowVersion(world, alive.front(), position);
+            CHECK(loaded >= v);
+            for (uint32_t t = 0; t < 2; ++t)
+                for (auto& [e, version] : model[t])
+                    version = loaded;
+            break;
+        }
+        }
+        checkModel();
+        if (step % 25 == 24)
+        {
+            checkReaders(c_AllVersions);
+            checkReaders(versions[versions.size() / 2]);
+            checkReaders(versions[versions.size() - 2]);
+        }
+    }
+    const uint64_t rows = CheckRowVersionStorage(world);
+    printf("  600 steps (creates %u, destroys %u, moves %u, instantiates %u, copies %u, row writes %u, chunk-only "
+           "writes %u, stamping writers %u, snapshot or reader steps %u): %zu live rows, %llu tracked rows checked, "
+           "%llu rows taken by readers\n", counts[0] + counts[1], counts[2] + counts[3], counts[4], counts[5], counts[6],
+           counts[7] + counts[8], counts[9], counts[10], counts[11], alive.size(), (unsigned long long)rows,
+           (unsigned long long)readerRows);
+    CHECK(Impl(world).GetValidationErrorCount() == 0);
+}
+
+// The chunk-only writer rule's two deviations (I4 as built, deviations 1 and 2), step by step on one chunk, for both
+// orders of each pair and through every kind of stamp: a pending chunk-only write is spread before a row write, a
+// create into the chunk, a swap-remove and a move out of it stamp anything (deviation 1); a chunk-only write of a
+// version some row already has stamps every row at once (deviation 2), whether that row got it from a row write, a
+// create or a move.
+void test_row_versions_chunk_only_rule()
+{
+    auto world = MakeWorld(true);
+    const ComponentId position = RegisterTracked(world, ComponentTraits<Position>::Desc());
+    const ComponentId id = RegisterComponent<Id>(world);
+    const ComponentId frozen = RegisterComponent<Frozen>(world);
+    nvrhi::AutoPtr<IQuery> writer = MakeQuery(world, { Term(position, TermOp::All, Access::Write),
+                                                       Term(frozen, TermOp::Without, Access::Filter) }, "writer");
+    // A Changed reader's rows since `since` in the unfrozen archetype, by entity.
+    nvrhi::AutoPtr<IQuery> reader = MakeQuery(world, { Term(position, TermOp::Changed, Access::Read),
+                                                       Term(frozen, TermOp::Without, Access::Filter) }, "reader");
+    auto changed = [&](uint64_t since)
+    {
+        std::vector<Entity> rows;
+        ChunkView view{};
+        if (reader->GetChunkCount() && reader->GetChunks(0, ChunkRequest{ since, c_WorldVersion, nullptr }, 1, &view))
+            for (uint32_t r = 0; r < view.count; ++r)
+                if (view.IsRowChanged(0, r, since))
+                    rows.push_back(view.entities[r]);
+        std::sort(rows.begin(), rows.end());
+        return rows;
+    };
+    auto sorted = [](std::vector<Entity> list)
+    {
+        std::sort(list.begin(), list.end());
+        return list;
+    };
+    auto chunkOnly = [&](uint64_t writeVersion)
+    {
+        ChunkView view{};
+        CHECK(writer->GetChunkCount() == 1);
+        CHECK(writer->GetChunks(0, ChunkRequest{ c_AllVersions, writeVersion, nullptr }, 1, &view) == 1);
+    };
+
+    std::vector<Entity> e(6);
+    CreateMany(world, { position, id }, 6, e.data());
+    const uint32_t cases = 5;
+    for (uint32_t k = 0; k < cases; ++k)
+    {
+        // Deviation 1: a chunk-only write at u, then (before any reader) a stamp at w > u of one kind.
+        const uint64_t before = world->GetVersion();
+        const uint64_t u = world->AdvanceVersion();
+        chunkOnly(c_WorldVersion);
+        const uint64_t w = world->AdvanceVersion();
+        std::map<Entity, uint64_t> placesBefore;   // chunk and row: a row whose place changes was moved at w
+        for (Entity x : e)
+            placesBefore[x] = (uint64_t(Record(world, x).chunk) << 32) | Record(world, x).row;
+        std::vector<Entity> rowsAtW;
+        switch (k)
+        {
+        case 0:   // a row write
+            CHECK(world->GetComponentForWrite(e[1], position, c_WorldVersion) != nullptr);
+            rowsAtW = { e[1] };
+            break;
+        case 1:   // a create into the chunk
+        {
+            Entity made{};
+            CreateMany(world, { position, id }, 1, &made);
+            e.push_back(made);
+            rowsAtW = { made };
+            break;
+        }
+        case 2:   // a swap-remove: the chunk's last row moves into the hole
+            CHECK(world->DestroyEntities(&e[0], 1) == nvrhi::FS_OK);
+            e.erase(e.begin());
+            break;
+        case 3:   // a move out of the archetype (the last row fills the hole) and back (appended as the last row)
+            CHECK(world->AddComponent(e[2], frozen, nullptr) == nvrhi::FS_OK);
+            CHECK(world->RemoveComponent(e[2], frozen) == nvrhi::FS_OK);
+            rowsAtW = { e[2] };
+            break;
+        case 4:   // a writer that stamps one row through its view
+        {
+            ChunkView view{};
+            CHECK(writer->GetChunks(0, ChunkRequest{ c_AllVersions, w, nullptr }, 1, &view) == 1);
+            view.StampRow(0, 3, w);
+            rowsAtW = { view.entities[3] };
+            break;
+        }
+        }
+        for (Entity x : e)
+        {
+            const auto it = placesBefore.find(x);
+            const uint64_t place = (uint64_t(Record(world, x).chunk) << 32) | Record(world, x).row;
+            if (it != placesBefore.end() && it->second != place &&
+                std::find(rowsAtW.begin(), rowsAtW.end(), x) == rowsAtW.end())
+                rowsAtW.push_back(x);
+        }
+        CHECK(k == 0 || k == 1 || k == 4 || rowsAtW.size() >= 1);
+        CHECK(changed(before) == sorted(e));      // the chunk-only write at u is still seen by every row
+        CHECK(changed(u) == sorted(rowsAtW));     // and only the stamped rows are newer
+        for (Entity x : e)
+            CHECK(EffectiveRowVersion(world, x, position) ==
+                  (std::find(rowsAtW.begin(), rowsAtW.end(), x) != rowsAtW.end() ? w : u));
+    }
+    for (uint32_t k = 0; k < 3; ++k)
+    {
+        // Deviation 2: a row gets version v (a row write, a create, a move into the chunk), then a chunk-only write of
+        // the same version v (c_WorldVersion, no new version between): every row is stamped v at once.
+        const uint64_t before = world->GetVersion();
+        const uint64_t v = world->AdvanceVersion();
+        switch (k)
+        {
+        case 0:
+            CHECK(world->GetComponentForWrite(e[0], position, c_WorldVersion) != nullptr);
+            break;
+        case 1:
+        {
+            Entity made{};
+            CreateMany(world, { position, id }, 1, &made);
+            e.push_back(made);
+            break;
+        }
+        case 2:
+            CHECK(world->DestroyEntities(&e[1], 1) == nvrhi::FS_OK);   // the last row moves into the hole at v
+            e.erase(e.begin() + 1);
+            break;
+        }
+        chunkOnly(c_WorldVersion);
+        CHECK(changed(before) == sorted(e));
+        for (Entity x : e)
+            CHECK(EffectiveRowVersion(world, x, position) == v);
+    }
+    CheckRowVersionStorage(world);
+    CHECK(Impl(world).GetValidationErrorCount() == 0);
+    printf("  deviation 1 through 5 kinds of stamp, deviation 2 through 3 kinds of row version\n");
+}
+
 // --------------------------------------------------------------------- chunk prefetch (E7.4 remedy 1, part I5)
 
 // SetQueryChunkPrefetch: off by default; every typed form visits the same chunks, rows and values, in the same order,
@@ -2740,6 +3271,8 @@ int main(int, char**)
         { "typed_forms", &test_typed_forms },
         { "determinism", &test_determinism },
         { "row_versions_chunk_only_writer", &test_row_versions_chunk_only_writer },
+        { "row_versions_model", &test_row_versions_model },
+        { "row_versions_chunk_only_rule", &test_row_versions_chunk_only_rule },
         { "chunk_prefetch", &test_chunk_prefetch },
         { "steady_state_allocations", &test_steady_state_allocations },
         { "performance_smoke", &test_performance_smoke },

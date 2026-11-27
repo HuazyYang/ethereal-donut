@@ -1859,7 +1859,301 @@ void test_row_tracked_transforms()
     SceneGraph::SetRowTrackedTransforms(rowTrackedFound);
 }
 
-int main(int, char**)
+namespace
+{
+    uint64_t fnv_bytes(uint64_t hash, const void* data, size_t size)
+    {
+        const uint8_t* bytes = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < size; ++i)
+        {
+            hash ^= bytes[i];
+            hash *= 0x100000001b3ull;
+        }
+        return hash;
+    }
+
+    // One frame of a run of the edit script, as the A/B of RowTracked compares it.
+    struct TrackedFrame
+    {
+        uint64_t worlds = 0;        // every attached node's world transform and box, walker order, bit for bit
+        uint64_t worldHash = 0;     // IWorld::ComputeHash (row versions are not part of it)
+        uint64_t buffers[3] = {};   // the CPU mode mirror's instance, geometry and material buffers
+        uint32_t rowsSent = 0;      // rowsChanged + rowsSettled (backlog I4-R1: the split may differ)
+        uint32_t rowsBuilt = 0;
+        uint32_t scatterRecords = 0;
+        std::vector<uint64_t> components;   // per component id: its values over every entity, archetype and row order
+        std::pair<uint32_t, uint32_t> staleChunks;   // stale_chunk_bounds
+        std::string staleReport;
+
+        // Equal outputs; `exact`: ChunkWorldBounds and the world hash too (backlog T4-1: with the switch on, a chunk
+        // box left larger than its rows' union by a removal is not recomputed where the untracked build recomposes the
+        // chunk by chance, so the box, and the hash and snapshots that hold it, differ).
+        bool Equals(const TrackedFrame& o, bool exact, size_t chunkBoundsId) const
+        {
+            if (worlds != o.worlds || buffers[0] != o.buffers[0] || buffers[1] != o.buffers[1] ||
+                buffers[2] != o.buffers[2] || rowsSent != o.rowsSent || components.size() != o.components.size())
+                return false;
+            for (size_t c = 0; c < components.size(); ++c)
+                if (components[c] != o.components[c] && (exact || c != chunkBoundsId))
+                    return false;
+            return !exact || (worldHash == o.worldHash && staleChunks == o.staleChunks);
+        }
+    };
+
+    // Per component id: the bytes of every entity's value (GetComponent: a Chunk component's chunk value, a Shared
+    // one's value) and enabled bit, entities in archetype, chunk and row order; for telling which component makes
+    // ComputeHash differ.
+    std::vector<uint64_t> component_hashes(IWorld* world)
+    {
+        std::vector<uint64_t> hashes(world->GetComponentTypeCount(), 0xcbf29ce484222325ull);
+        for (uint32_t a = 0; a < world->GetArchetypeCount(); ++a)
+        {
+            ArchetypeInfo info{};
+            CHECK(world->GetArchetypeInfo(a, info) == nvrhi::FS_OK);
+            const std::vector<ComponentId> components(info.components, info.components + info.componentCount);
+            for (uint32_t c = 0; c < info.chunkCount; ++c)
+            {
+                ChunkInfo chunk{};
+                CHECK(world->GetChunkInfo(a, c, chunk) == nvrhi::FS_OK);
+                const std::vector<Entity> entities(chunk.entities, chunk.entities + chunk.count);
+                for (const Entity entity : entities)
+                {
+                    for (const ComponentId component : components)
+                    {
+                        const ComponentTypeDesc* desc = world->GetComponentTypeDesc(component);
+                        uint64_t& hash = hashes[uint32_t(component)];
+                        hash = fnv_bytes(hash, &entity, sizeof(entity));
+                        // the field bytes only: components without fields hold pointers (SceneNode, LeafObject)
+                        if (const void* value = desc->size && desc->fieldCount ? world->GetComponent(entity, component)
+                                                                               : nullptr)
+                            hash = fnv_bytes(hash, value, desc->size);
+                        if (!!(desc->flags & ComponentFlags::Enableable))
+                        {
+                            const bool enabled = world->IsEnabled(entity, component);
+                            hash = fnv_bytes(hash, &enabled, sizeof(enabled));
+                        }
+                    }
+                }
+            }
+        }
+        return hashes;
+    }
+
+    // The chunks whose ChunkWorldBounds is not the union of their rows' WorldBounds (stale), and of those the ones whose
+    // box does not even contain the union (it would cull a visible row).
+    std::pair<uint32_t, uint32_t> stale_chunk_bounds(IWorld* world, std::string* report = nullptr)
+    {
+        const ComponentId chunkBoundsId = FindComponent<ChunkWorldBounds>(world);
+        const ComponentId worldBoundsId = FindComponent<WorldBounds>(world);
+        uint32_t stale = 0, missing = 0;
+        for (uint32_t a = 0; a < world->GetArchetypeCount(); ++a)
+        {
+            ArchetypeInfo info{};
+            CHECK(world->GetArchetypeInfo(a, info) == nvrhi::FS_OK);
+            if (std::find(info.components, info.components + info.componentCount, chunkBoundsId) ==
+                info.components + info.componentCount)
+                continue;
+            for (uint32_t c = 0; c < info.chunkCount; ++c)
+            {
+                ChunkInfo chunk{};
+                CHECK(world->GetChunkInfo(a, c, chunk) == nvrhi::FS_OK);
+                if (chunk.count == 0)
+                    continue;
+                dm::box3 rows = dm::box3::empty();
+                for (uint32_t r = 0; r < chunk.count; ++r)
+                    rows |= static_cast<const WorldBounds*>(
+                        world->GetComponent(chunk.entities[r], worldBoundsId))->bounds;
+                const dm::box3 box =
+                    static_cast<const ChunkWorldBounds*>(world->GetComponent(chunk.entities[0], chunkBoundsId))->bounds;
+                if (std::memcmp(&box, &rows, sizeof(box)) != 0)
+                {
+                    if (report)
+                    {
+                        char line[512];
+                        std::snprintf(line, sizeof(line), "    archetype %u chunk %u: %u of %u rows; box (%g %g %g)-"
+                                      "(%g %g %g), rows (%g %g %g)-(%g %g %g); versions", a, c, chunk.count,
+                                      chunk.capacity,
+                                      box.m_mins.x, box.m_mins.y, box.m_mins.z, box.m_maxs.x, box.m_maxs.y, box.m_maxs.z,
+                                      rows.m_mins.x, rows.m_mins.y, rows.m_mins.z, rows.m_maxs.x, rows.m_maxs.y,
+                                      rows.m_maxs.z);
+                        *report += line;
+                        for (uint32_t k = 0; k < info.componentCount; ++k)
+                        {
+                            const char* name = world->GetComponentTypeDesc(info.components[k])->name;
+                            std::snprintf(line, sizeof(line), " %s=%llu", name ? name : "?",
+                                          (unsigned long long)chunk.versions[k]);
+                            *report += line;
+                        }
+                        std::snprintf(line, sizeof(line), " added=%llu world=%llu\n",
+                                      (unsigned long long)chunk.addedVersion, (unsigned long long)world->GetVersion());
+                        *report += line;
+                    }
+                    ++stale;
+                    missing += !rows.isempty() && !(box.contains(rows.m_mins) && box.contains(rows.m_maxs)) ? 1 : 0;
+                }
+            }
+        }
+        return { stale, missing };
+    }
+
+    struct ArchetypeLayout
+    {
+        uint32_t componentCount, entityCount, chunkCount, chunkSize, rowSize, rowsPerChunk;
+        uint64_t components;
+        bool operator==(const ArchetypeLayout& o) const
+        {
+            return componentCount == o.componentCount && entityCount == o.entityCount && chunkCount == o.chunkCount &&
+                   chunkSize == o.chunkSize && rowSize == o.rowSize && rowsPerChunk == o.rowsPerChunk &&
+                   components == o.components;
+        }
+    };
+
+    std::vector<ArchetypeLayout> layouts_of(IWorld* world)
+    {
+        std::vector<ArchetypeLayout> result;
+        for (uint32_t a = 0; a < world->GetArchetypeCount(); ++a)
+        {
+            ArchetypeInfo info{};
+            CHECK(world->GetArchetypeInfo(a, info) == nvrhi::FS_OK);
+            result.push_back(ArchetypeLayout{ info.componentCount, info.entityCount, info.chunkCount, info.chunkSize,
+                                              info.rowSize, info.rowsPerChunk,
+                                              fnv_bytes(0xcbf29ce484222325ull, info.components,
+                                                        sizeof(ComponentId) * info.componentCount) });
+        }
+        return result;
+    }
+}
+
+// RowTracked against the untracked build (stage T4; revision 1, E7.5's tests): the seeded edit script (moves of nodes
+// and parents, attaches, detaches, re-attaches, SetLeaf, InvalidateContent, material and mesh edits, skinned
+// instances, lights, curves) run twice per seed, the graph made with SceneGraph::SetRowTrackedTransforms off, then on.
+// Every frame: every node's world transform and box bit-equal, every component's field bytes over every entity equal
+// (but ChunkWorldBounds), GpuScene's CPU-mode buffers (instance, geometry, material) byte-equal, and rowsChanged +
+// rowsSettled equal (I4-R1: a row moved in the last frame may settle instead of being rebuilt with the switch on, so
+// the split may differ); verify_frame holds in both. In the tracked run a scatter-mode GpuScene beside it equals CPU
+// mode every frame (its records are per changed row there). At the end every archetype's layout (components, rows,
+// chunks, chunk and row sizes, rows per chunk) is equal. `exact` (--backlog, backlog T4-1): ChunkWorldBounds, the
+// chunks whose box is not their rows' union, and IWorld::ComputeHash equal as well; fails now.
+void test_row_tracked_equals_untracked(bool exact)
+{
+    const bool rowTrackedFound = SceneGraph::GetRowTrackedTransforms();
+    uint64_t builtTotals[2] = {}, sentTotals[2] = {}, frames = 0, staleTotals[2] = {}, missingTotals[2] = {};
+    for (uint64_t seed : { 11ull, 23ull, 0x5bd1e995ull })
+    {
+        std::vector<TrackedFrame> runs[2];
+        std::vector<ArchetypeLayout> layouts[2];
+        std::vector<std::string> names;   // component names by id (both worlds register the same types)
+        for (uint32_t tracked = 0; tracked < 2; ++tracked)
+        {
+            SceneGraph::SetRowTrackedTransforms(tracked != 0);   // read once, when run_edit_script makes its graph
+            GpuScene gpu(nullptr, test_desc());
+            Mirror mirror;
+            PrevModel model;
+            ScatterScene scatter(scatter_desc());
+            bool checkedFlags = false;
+            run_edit_script(seed, 40, [&](SceneGraph* graph, uint32_t)
+            {
+                IWorld* world = graph->GetWorld();
+                if (!checkedFlags)
+                {
+                    for (const ComponentId c : { FindComponent<LocalTransform>(world),
+                                                 FindComponent<WorldTransform>(world) })
+                        CHECK(!!(world->GetComponentTypeDesc(c)->flags & ComponentFlags::RowTracked) == (tracked != 0));
+                    checkedFlags = true;
+                }
+                TrackedFrame frame;
+                uint64_t worlds = 0xcbf29ce484222325ull;
+                for (SceneGraphWalker walker(graph->GetRootNode()); walker; walker.Next(true))
+                {
+                    const dm::daffine3 transform = walker->GetLocalToWorldTransform();
+                    const dm::box3 box = walker->GetGlobalBoundingBox();
+                    worlds = fnv_bytes(worlds, &transform, sizeof(transform));
+                    worlds = fnv_bytes(worlds, &box, sizeof(box));
+                }
+                frame.worlds = worlds;
+                frame.worldHash = world->ComputeHash();
+                frame.components = component_hashes(world);
+                frame.staleChunks = stale_chunk_bounds(world, &frame.staleReport);
+                for (uint32_t c = uint32_t(names.size()); c < world->GetComponentTypeCount(); ++c)
+                {
+                    const char* name = world->GetComponentTypeDesc(ComponentId(c))->name;
+                    names.push_back(name ? name : "");
+                }
+                CHECK(NVRHI_SUCCEEDED(gpu.Update(graph)));
+                if (tracked)
+                    scatter.Update(graph);   // before either upload: they share the materials' dirty flags
+                const GpuSceneStats stats = gpu.GetStats();
+                frame.rowsSent = stats.rowsChanged + stats.rowsSettled;
+                frame.rowsBuilt = stats.rowsBuilt;
+                CHECK(NVRHI_SUCCEEDED(gpu.UploadTo(&mirror)));
+                for (uint32_t b = 0; b < 3; ++b)
+                    frame.buffers[b] = fnv_bytes(0xcbf29ce484222325ull, mirror.buffers[b].data(),
+                                                 mirror.buffers[b].size());
+                verify_frame(graph, gpu, mirror, model, tracked ? "row tracked" : "untracked");
+                if (tracked)
+                {
+                    GpuSceneScatterRecords records;
+                    scatter.gpu.GetScatterRecords(records);
+                    frame.scatterRecords = records.rowCount + records.transformCount + records.settleCount;
+                    scatter.Execute();
+                    compare_with_cpu_mode(graph, mirror, scatter, RowsCompared::All, "row tracked scatter");
+                }
+                runs[tracked].push_back(frame);
+                layouts[tracked] = layouts_of(world);
+            });
+            CHECK(checkedFlags);
+        }
+        CHECK(runs[0].size() == runs[1].size() && runs[0].size() == 40);
+        const size_t chunkBoundsId = size_t(std::find(names.begin(), names.end(), "ChunkWorldBounds") - names.begin());
+        CHECK(chunkBoundsId < names.size());
+        for (size_t f = 0; f < runs[0].size(); ++f)
+        {
+            if (!runs[0][f].Equals(runs[1][f], exact, chunkBoundsId))
+            {
+                const TrackedFrame& x = runs[0][f];
+                const TrackedFrame& y = runs[1][f];
+                std::fprintf(stderr, "seed %llx frame %zu: worlds %d, hash %d, buffers %d %d %d, rows sent %u / %u\n",
+                             (unsigned long long)seed, f + 1, x.worlds == y.worlds, x.worldHash == y.worldHash,
+                             x.buffers[0] == y.buffers[0], x.buffers[1] == y.buffers[1], x.buffers[2] == y.buffers[2],
+                             x.rowsSent, y.rowsSent);
+                std::fprintf(stderr, "  chunks with stale bounds %u / %u, of them not containing their rows %u / %u\n",
+                             x.staleChunks.first, y.staleChunks.first, x.staleChunks.second, y.staleChunks.second);
+                std::fprintf(stderr, "  untracked:\n%s  tracked:\n%s", x.staleReport.c_str(), y.staleReport.c_str());
+                if (f > 0)
+                    std::fprintf(stderr, "  the frame before, tracked:\n%s", runs[1][f - 1].staleReport.c_str());
+                for (size_t c = 0; c < std::min(x.components.size(), y.components.size()); ++c)
+                    if (x.components[c] != y.components[c])
+                        std::fprintf(stderr, "  component %zu (%s) differs\n", c,
+                                     c < names.size() ? names[c].c_str() : "?");
+                CHECK(false);
+            }
+            for (uint32_t t = 0; t < 2; ++t)
+            {
+                builtTotals[t] += runs[t][f].rowsBuilt;
+                sentTotals[t] += runs[t][f].rowsSent;
+                staleTotals[t] += runs[t][f].staleChunks.first;
+                missingTotals[t] += runs[t][f].staleChunks.second;
+            }
+            ++frames;
+        }
+        CHECK(layouts[0].size() == layouts[1].size() && layouts[0].size() > 4);
+        for (size_t a = 0; a < layouts[0].size(); ++a)
+            CHECK(layouts[0][a] == layouts[1][a]);
+    }
+    SceneGraph::SetRowTrackedTransforms(rowTrackedFound);
+    std::printf("row tracked against untracked%s: %llu frames equal (worlds, components, buffers, rows sent %llu); "
+                "rows built %llu untracked, %llu tracked\n", exact ? " (exact)" : "", (unsigned long long)frames,
+                (unsigned long long)sentTotals[1], (unsigned long long)builtTotals[0],
+                (unsigned long long)builtTotals[1]);
+    std::printf("  chunk boxes larger than their rows' union, summed over the frames: %llu untracked, %llu tracked; "
+                "boxes missing a row: %llu, %llu\n", (unsigned long long)staleTotals[0],
+                (unsigned long long)staleTotals[1], (unsigned long long)missingTotals[0],
+                (unsigned long long)missingTotals[1]);
+    CHECK(builtTotals[1] <= builtTotals[0] && sentTotals[0] == sentTotals[1]);
+    CHECK(missingTotals[0] == 0 && missingTotals[1] == 0);   // stale boxes are larger, never too small
+}
+
+int main(int argc, char** argv)
 {
 #if defined(_MSC_VER)
     // A failed assert reports on stderr and ends the run instead of opening a dialog.
@@ -1871,6 +2165,23 @@ int main(int, char**)
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // a run that dies still shows how far it got
+    // `--backlog`: only the cases that fail on an open backlog item (aggregate
+    // docs/plans/2026-11-26-donut-ecs-e7-rev2.md), apart from the default run (ctest test_gpu_scene_backlog).
+    if (argc > 1 && std::strcmp(argv[1], "--backlog") == 0)
+    {
+        try
+        {
+            std::printf("%s\n", "test_row_tracked_equals_untracked (exact; backlog T4-1)");
+            test_row_tracked_equals_untracked(true);
+        }
+        catch (const std::runtime_error& err)
+        {
+            fprintf(stderr, "%s", err.what());
+            return 1;
+        }
+        std::printf("gpu scene backlog: ok\n");
+        return 0;
+    }
     try
     {
         std::printf("%s\n", "test_instance_slots_are_stable");
@@ -1905,6 +2216,8 @@ int main(int, char**)
         test_scatter_lost_prepare();
         std::printf("%s\n", "test_row_tracked_transforms");
         test_row_tracked_transforms();
+        std::printf("%s\n", "test_row_tracked_equals_untracked");
+        test_row_tracked_equals_untracked(false);
     }
     catch (const std::runtime_error& err)
     {

@@ -183,6 +183,11 @@ namespace ecs_test
     struct Link { Entity other; Entity outside; };
     DONUT_ECS_COMPONENT(Link, "6ccb8140-7b66-4dfc-b026-c061c63f74f9", DONUT_ECS_FIELDS(other, outside));
 
+    // A world resource (4.9): one value per world, never on an entity (the RowTracked refusals, backlog I4-R3).
+    struct Gauge { float level; };
+    DONUT_ECS_COMPONENT_EX(Gauge, "28d31c19-49a3-459d-9e68-a6f46f9895da", ComponentFlags::Resource, 0,
+                           DONUT_ECS_FIELDS(level));
+
     // A non-trivial component that holds a reference to a counted payload; every hook call is counted.
     struct HookCounts
     {
@@ -2750,17 +2755,36 @@ void test_row_versions()
     // A storage option, not a layout: registering the GUID again without it gives the same id, and the flag stays.
     CHECK(RegisterComponent<Position>(world) == position);
     CHECK(!!(world->GetComponentTypeDesc(position)->flags & ComponentFlags::RowTracked));
-    // Only for a value per row.
+    // Only for a value per row: refused on a tag (Frozen; and Selected, a Sparse tag, refused as a tag), a Shared, a
+    // Chunk, a Buffer, a Sparse data component (DebugColor: the storage branch, backlog I4-R3) and a Resource (Gauge),
+    // both through RegisterComponent and RegisterResource. None of these GUIDs was registered before.
     const uint64_t errors = impl.GetValidationErrorCount();
     for (ComponentTypeDesc desc : { ComponentTraits<Frozen>::Desc(), ComponentTraits<Layer>::Desc(),
                                     ComponentTraits<ChunkBounds>::Desc(), ComponentTraits<Selected>::Desc(),
-                                    ComponentTraits<Joint>::Desc() })
+                                    ComponentTraits<Joint>::Desc(), ComponentTraits<DebugColor>::Desc(),
+                                    ComponentTraits<Gauge>::Desc() })
     {
         desc.flags |= ComponentFlags::RowTracked;
         ComponentId refused = ComponentId(0);
         CHECK(world->RegisterComponent(desc, refused) == nvrhi::FE_INVALID_ARGS && refused == ComponentId::Invalid);
     }
-    CHECK(impl.GetValidationErrorCount() == errors + 5);
+    {
+        ComponentTypeDesc desc = ComponentTraits<Gauge>::Desc();
+        desc.flags |= ComponentFlags::RowTracked;
+        const Gauge initial{ 1.f };
+        ComponentId refused = ComponentId(0);
+        CHECK(world->RegisterResource(desc, &initial, refused) == nvrhi::FE_INVALID_ARGS &&
+              refused == ComponentId::Invalid);
+    }
+    CHECK(impl.GetValidationErrorCount() == errors + 8);
+    // Without the flag both still register (the refusals left nothing behind under their GUIDs).
+    CHECK(RegisterComponent<DebugColor>(world) != ComponentId::Invalid);
+    {
+        const Gauge initial{ 2.f };
+        ComponentId gauge = ComponentId::Invalid;
+        CHECK(world->RegisterResource(ComponentTraits<Gauge>::Desc(), &initial, gauge) == nvrhi::FS_OK);
+        CHECK(static_cast<const Gauge*>(world->GetResource(gauge))->level == 2.f);
+    }
 
     // Create: every row at the creation's version; a column that is not RowTracked has no row versions.
     Entity e[3];
@@ -2791,7 +2815,7 @@ void test_row_versions()
     CHECK(world->AddComponent(e[1], velocity, nullptr) == nvrhi::FS_OK);
     CHECK(ArchetypeOf(world, e[1]) != archetype.index);
     CHECK(RowVersionOf(world, e[1], position) == v4 && RowVersionOf(world, e[2], position) == v3);
-    CHECK(impl.GetValidationErrorCount() == errors + 5);
+    CHECK(impl.GetValidationErrorCount() == errors + 8);
 }
 
 // The row versions live outside the chunk: rows per chunk, chunk and row sizes and chunk counts are those of a world
@@ -2818,6 +2842,81 @@ void test_row_versions_rows_per_chunk()
         CHECK(x.rowsPerChunk == y.rowsPerChunk && x.chunkSize == y.chunkSize && x.rowSize == y.rowSize);
         CHECK(x.chunkCount == y.chunkCount && x.chunkCount > 1 && x.chunkSize == (large ? 64u : 16u) * 1024);
     }
+}
+
+// Steady state with RowTracked columns (stage T4; revision 1, E7.5): no operator new and no storage block (the row
+// versions' blocks included) over rounds of the structural paths that stamp rows. Small chunks, so that each round
+// empties whole chunks (released; the next chunk at that index takes the block kept for it) and makes them again:
+// creation and destruction of 600 rows, moves of 100 to another archetype and back, Instantiate and copies from another
+// world destroyed again, row writes and SetEnabled of a RowTracked Enableable column.
+void test_row_versions_steady_state()
+{
+    auto source = MakeWorld();
+    const ComponentId sourcePosition = RegisterRowTracked<Position>(source);
+    const ComponentId sourceId = RegisterComponent<Id>(source);
+    Entity sourceEntities[8];
+    CHECK(source->CreateEntities(CreateDesc({ sourceId, sourcePosition }, {}, 8), sourceEntities) == nvrhi::FS_OK);
+
+    WorldDesc desc;
+    desc.debugName = "test_ecs_world.row_versions_steady_state";
+    desc.chunkSize = 4096;
+    nvrhi::AutoPtr<IWorld> world;
+    CHECK(CreateWorld(desc, &world) == nvrhi::FS_OK);
+    const ComponentId position = RegisterRowTracked<Position>(world);
+    const ComponentId velocity = RegisterRowTracked<Velocity>(world);
+    const ComponentId toggle = RegisterRowTracked<Toggle>(world);
+    const ComponentId id = RegisterComponent<Id>(world);
+    const ecs::WorldImpl& impl = Impl(world);
+
+    std::vector<Entity> base(400);
+    CHECK(world->CreateEntities(CreateDesc({ id, position, toggle }, {}, 400), base.data()) == nvrhi::FS_OK);
+    std::vector<Entity> batch(600);
+    Entity instances[30];
+    Entity copies[8];
+    const Velocity v{ 1, 2, 3 };
+    uint64_t sink = 0;
+    uint32_t released = 0;
+
+    auto round = [&]()
+    {
+        // 600 rows made and destroyed: whole chunks of 4 KiB made, released and made again
+        const uint32_t chunksBefore = impl.GetArchetypeStorage(ArchetypeOf(world, base[0])).GetChunkCount();
+        CHECK(world->CreateEntities(CreateDesc({ id, position, toggle }, {}, 600), batch.data()) == nvrhi::FS_OK);
+        world->AdvanceVersion();
+        CHECK(world->DestroyEntities(batch.data(), 600) == nvrhi::FS_OK);
+        released += impl.GetArchetypeStorage(ArchetypeOf(world, base[0])).GetChunkCount() <= chunksBefore ? 1 : 0;
+        // moves to another archetype and back
+        for (uint32_t i = 0; i < 100; ++i)
+            CHECK(world->AddComponent(base[i * 3], velocity, &v) == nvrhi::FS_OK);
+        world->AdvanceVersion();
+        for (uint32_t i = 0; i < 100; ++i)
+            CHECK(world->RemoveComponent(base[i * 3], velocity) == nvrhi::FS_OK);
+        // row writes and enabled bits
+        for (uint32_t i = 0; i < 400; ++i)
+        {
+            static_cast<Position*>(world->GetComponentForWrite(base[i], position, c_WorldVersion))->x += 1;
+            CHECK(world->SetEnabled(base[i], toggle, (i & 1) != 0) == nvrhi::FS_OK);
+            sink += RowVersionOf(world, base[i], position);
+        }
+        world->AdvanceVersion();
+        CHECK(world->Instantiate(base[7], 30, instances) == nvrhi::FS_OK);
+        CHECK(world->DestroyEntities(instances, 30) == nvrhi::FS_OK);
+        CHECK(world->CopyEntitiesFrom(source, sourceEntities, 8, copies) == nvrhi::FS_OK);
+        CHECK(world->DestroyEntities(copies, 8) == nvrhi::FS_OK);
+    };
+    for (uint32_t i = 0; i < 3; ++i)
+        round();
+    const uint64_t news = g_NewCount.load();
+    const uint64_t heapBlocks = ecs::GetHeapAllocationCount();
+    for (uint32_t i = 0; i < 5; ++i)
+        round();
+    const uint64_t newCalls = g_NewCount.load() - news;
+    const uint64_t blocks = ecs::GetHeapAllocationCount() - heapBlocks;
+    printf("test_ecs_world: row versions steady state: %llu operator new, %llu storage blocks in 5 rounds, chunks "
+           "released and made again in %u of 8 rounds (sink %llu)\n", (unsigned long long)newCalls,
+           (unsigned long long)blocks, released, (unsigned long long)(sink & 1));
+    CHECK(released == 8);
+    CHECK(newCalls == 0 && blocks == 0);
 }
 
 // ------------------------------------------------------------------------------- steady-state allocations
@@ -2992,6 +3091,7 @@ int main(int, char**)
         { "determinism", &test_determinism },
         { "row_versions", &test_row_versions },
         { "row_versions_rows_per_chunk", &test_row_versions_rows_per_chunk },
+        { "row_versions_steady_state", &test_row_versions_steady_state },
         { "steady_state_allocations", &test_steady_state_allocations },
     };
     try
