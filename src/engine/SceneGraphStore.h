@@ -485,10 +485,12 @@ namespace donut::engine
         // SceneGraph::BeginRenderRead and EndRenderRead: the scopes the render service keeps open while a frame's
         // snapshot points at this graph's leaves and assets (open point 12). The count is kept in every build; only
         // Debug builds check it, in the API's write entry points (SceneGraph.cpp), so Release writes cost nothing.
-        // Scopes nest and close in reverse order; the mode of each of the first 64 is kept (m_RenderReadModes), a
-        // Defer scope deeper than that acts as Warn (a warning).
-        void BeginRenderRead(SceneGraph::RenderReadMode mode) noexcept;
+        // Scopes nest; EndRenderRead() closes the innermost, EndRenderRead(scope) the one BeginRenderRead returned
+        // (backlog I6-N3). The mode and identity of each of the first 64 are kept (m_RenderReadModes,
+        // m_RenderReadScopes); a scope deeper than that has none (0) and a Defer one acts as Warn (a warning).
+        uint32_t BeginRenderRead(SceneGraph::RenderReadMode mode) noexcept;
         void EndRenderRead() noexcept;
+        void EndRenderRead(uint32_t scope) noexcept;
         bool IsInRenderRead() const noexcept { return m_RenderReads != 0; }
         // Logs one warning for a write through the API while a scope is open (and the write is not part of another
         // one, RenderReadQuiet), unless a Defer scope is open. The write still applies.
@@ -952,6 +954,9 @@ namespace donut::engine
         uint32_t m_RenderReads = 0;
         uint32_t m_RenderReadQuiet = 0;
         uint64_t m_RenderReadModes = 0;            // bit d: the scope at depth d (< 64) is a Defer scope
+        uint32_t m_RenderReadScopes[64] = {};      // the identity of the scope at depth d (< 64): BeginRenderRead's
+        uint32_t m_LastRenderReadScope = 0;        // the last identity given; never 0
+        void CloseRenderRead(uint32_t index) noexcept;   // the scope at depth index (< m_RenderReads)
         std::atomic<uint32_t> m_DeferReads{ 0 };   // open Defer scopes
         bool m_ReconcileDeferred = false;          // ReconcileMeshes is due when the last Defer scope closes
         std::vector<nvrhi::IObject*> m_Retired;    // one reference each; capacity kept

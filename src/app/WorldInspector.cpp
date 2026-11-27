@@ -458,6 +458,8 @@ namespace donut::app
         ImGui::Text("buffer heap %.2f MB; commands played back %llu, observer batches %llu",
                     double(stats.bufferHeapBytes) / (1024.0 * 1024.0), (unsigned long long)stats.commandsPlayedBack,
                     (unsigned long long)stats.observerBatches);
+        if (stats.rowVersionBytes != 0)   // RowTracked columns (F3-N2)
+            ImGui::Text("row versions %.2f MB", double(stats.rowVersionBytes) / (1024.0 * 1024.0));
         ImGui::Text("version %llu, structural version %llu; pending edits %u", (unsigned long long)stats.version,
                     (unsigned long long)stats.structuralVersion, pendingCount);
     }

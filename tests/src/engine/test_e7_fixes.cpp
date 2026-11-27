@@ -33,7 +33,9 @@
 //   e72_r4_mesh_tags_of_other_classes     no mesh-instance tags for a leaf class that is not of their class
 //   i3_n4_missing_name_warned_once  an ordering against a missing name warns once while it stays missing
 //   i4_r2_shared_null_views         views without masks or row versions share one process-wide null array
-//   i4_r4_row_tracked_reregistered  RowTracked asked of a type registered without it: a warning
+//   i4_r4_row_tracked_reregistered  RowTracked asked of a type registered without it: a warning, flags kept; refused
+//                                   for a kind without a value per row (F3-N1)
+//   i6_r5_gpu_scene_stats_checked   GpuScene::GetStats is an owner-checked call while a pipelined frame records
 //   i4_r5_row_version_bytes         WorldStats::rowVersionBytes counts the row-version blocks
 
 #include <donut/app/WorldInspector.h>
@@ -41,6 +43,7 @@
 #include <donut/core/math/math.h>
 #include <donut/engine/EcsQuery.h>
 #include <donut/engine/EcsScheduler.h>
+#include <donut/engine/GpuScene.h>
 #include <donut/engine/EcsWorld.h>
 #include <donut/engine/JobSystem.h>
 #include <donut/engine/SceneComponents.h>
@@ -637,6 +640,12 @@ namespace e7_fixes
     };
     DONUT_ECS_COMPONENT_EX(Tracked, "0d6f3b8a-2c41-47e9-a5d2-9e1b7c3f8a64",
                            ::donut::engine::ComponentFlags::RowTracked, 0, DONUT_ECS_FIELDS(value))
+    struct Setting
+    {
+        float value;
+    };
+    DONUT_ECS_COMPONENT_EX(Setting, "7a3e9c15-4b6d-4f28-8e01-c5d2b9a7f364",
+                           ::donut::engine::ComponentFlags::Resource, 0, DONUT_ECS_FIELDS(value))
 }
 
 // A query whose chunks have no Enableable, Sparse or RowTracked term hands out views whose masks and row versions are
@@ -678,7 +687,9 @@ void test_i4_r2_shared_null_views()
 }
 
 // Registering a GUID again with RowTracked when it was registered without it: FS_OK and the existing id, but the rows
-// get no row versions, so a warning says so; also for a tag. The same flags again: no warning.
+// get no row versions, so a warning says so, once per type; the type keeps its flags. A kind without a value per row
+// (a tag here) is refused as a fresh registration of it is (FE_INVALID_ARGS), with one warning per type (F3-N1). The
+// same flags again: no warning.
 void test_i4_r4_row_tracked_reregistered()
 {
     Graph g(false);
@@ -691,10 +702,27 @@ void test_i4_r4_row_tracked_reregistered()
     ComponentId id = ComponentId::Invalid;
     CHECK(g.world->RegisterComponent(tracked, id) == nvrhi::FS_OK && id == plain);
     CHECK(TakeWarnings() == 1);
+    CHECK(g.world->RegisterComponent(tracked, id) == nvrhi::FS_OK && id == plain);
+    CHECK(TakeWarnings() == 0);   // once per type
+    CHECK(!(g.world->GetComponentTypeDesc(plain)->flags & ComponentFlags::RowTracked));   // kept
     ComponentTypeDesc trackedTag = ComponentTraits<e7_fixes::Marker>::Desc();
     trackedTag.flags = trackedTag.flags | ComponentFlags::RowTracked;
-    CHECK(g.world->RegisterComponent(trackedTag, id) == nvrhi::FS_OK && id == marker);
+    CHECK(g.world->RegisterComponent(trackedTag, id) == nvrhi::FE_INVALID_ARGS && id == ComponentId::Invalid);
     CHECK(TakeWarnings() == 1);
+    CHECK(g.world->RegisterComponent(trackedTag, id) == nvrhi::FE_INVALID_ARGS);
+    CHECK(TakeWarnings() == 0);
+    CHECK(!(g.world->GetComponentTypeDesc(marker)->flags & ComponentFlags::RowTracked));
+    CHECK(g.world->RegisterComponent(ComponentTraits<e7_fixes::Marker>::Desc(), id) == nvrhi::FS_OK && id == marker);
+    // a Resource, through RegisterResource (F4 review N4): refused as a fresh one is
+    const e7_fixes::Setting setting{ 2.f };
+    ComponentId resource = ComponentId::Invalid;
+    CHECK(g.world->RegisterResource(ComponentTraits<e7_fixes::Setting>::Desc(), &setting, resource) == nvrhi::FS_OK);
+    ComponentTypeDesc trackedResource = ComponentTraits<e7_fixes::Setting>::Desc();
+    trackedResource.flags = trackedResource.flags | ComponentFlags::RowTracked;
+    CHECK(g.world->RegisterResource(trackedResource, &setting, id) == nvrhi::FE_INVALID_ARGS);
+    CHECK(TakeWarnings() == 1);
+    CHECK(g.world->RegisterResource(ComponentTraits<e7_fixes::Setting>::Desc(), &setting, id) == nvrhi::FS_OK &&
+          id == resource);
     CHECK(g.world->RegisterComponent(ComponentTraits<e7_fixes::Plain>::Desc(), id) == nvrhi::FS_OK && id == plain);
     // registered with it, asked without it: the rows keep their row versions; no warning
     const ComponentId rowTracked = RegisterComponent<e7_fixes::Tracked>(g.world);
@@ -737,6 +765,37 @@ void test_i4_r5_row_version_bytes()
     CHECK(after.chunkBytes == chunkBytes);
 }
 
+// ------------------------------------------------------------------------------------------------- I6-R5
+
+// GpuScene::GetStats reads the statistics the recording's upload writes: while a pipelined frame records, a call on
+// the main thread outside recording work warns once in Debug builds, like the other owner-checked calls; inside a
+// PipelinedRecordingWork scope it does not.
+void test_i6_r5_gpu_scene_stats_checked()
+{
+#ifndef NDEBUG
+    const uint32_t expected = 1;
+#else
+    const uint32_t expected = 0;
+#endif
+    GpuSceneDesc desc;
+    desc.geometryAndMaterialBuffers = true;
+    GpuScene gpu(nullptr, desc);
+    (void)gpu.GetStats();
+    CHECK(TakeWarnings() == 0);   // serial: nothing checked
+    gpu.BeginPipelinedRecording();
+    {
+        PipelinedRecordingWork work;
+        (void)gpu.GetStats();
+    }
+    CHECK(TakeWarnings() == 0);
+    (void)gpu.GetStats();
+    (void)gpu.GetStats();
+    CHECK(TakeWarnings() == expected);   // once per recording
+    gpu.EndPipelinedRecording();
+    (void)gpu.GetStats();
+    CHECK(TakeWarnings() == 0);
+}
+
 // ---------------------------------------------------------------------------------------------- I3-R1, I3-R2
 
 // The domain's columns that an edit through the world would bypass: SimTeleport (RequestTeleport's normalising and
@@ -775,6 +834,7 @@ int main(int argc, char** argv)
         { "i4_r2_shared_null_views", test_i4_r2_shared_null_views },
         { "i4_r4_row_tracked_reregistered", test_i4_r4_row_tracked_reregistered },
         { "i4_r5_row_version_bytes", test_i4_r5_row_version_bytes },
+        { "i6_r5_gpu_scene_stats_checked", test_i6_r5_gpu_scene_stats_checked },
     };
     log::SetCallback([](log::Severity severity, const char* message)
     {

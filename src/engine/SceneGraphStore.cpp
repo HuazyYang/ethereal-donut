@@ -1753,31 +1753,73 @@ namespace donut::engine
 
     // ------------------------------------------------------------------- deferred releases (E7.8)
 
-    void SceneGraphStore::BeginRenderRead(SceneGraph::RenderReadMode mode) noexcept
+    uint32_t SceneGraphStore::BeginRenderRead(SceneGraph::RenderReadMode mode) noexcept
     {
         const uint32_t depth = m_RenderReads++;
-        if (mode != SceneGraph::RenderReadMode::Defer)
-            return;
         if (depth >= 64)
         {
-            log::warning("SceneGraph::BeginRenderRead: a Defer scope nested %u deep acts as a Warn scope", depth + 1);
-            return;
+            if (mode == SceneGraph::RenderReadMode::Defer)
+                log::warning("SceneGraph::BeginRenderRead: a Defer scope nested %u deep acts as a Warn scope",
+                             depth + 1);
+            return 0;
         }
-        m_RenderReadModes |= uint64_t(1) << depth;
-        if (m_DeferReads.fetch_add(1, std::memory_order_acq_rel) == 0)
-            EnterDeferring();
+        if (++m_LastRenderReadScope == 0)
+            m_LastRenderReadScope = 1;
+        m_RenderReadScopes[depth] = m_LastRenderReadScope;
+        if (mode == SceneGraph::RenderReadMode::Defer)
+        {
+            m_RenderReadModes |= uint64_t(1) << depth;
+            if (m_DeferReads.fetch_add(1, std::memory_order_acq_rel) == 0)
+                EnterDeferring();
+        }
+        return m_LastRenderReadScope;
     }
 
     void SceneGraphStore::EndRenderRead() noexcept
     {
-        if (m_RenderReads == 0)
+        if (m_RenderReads != 0)
+            CloseRenderRead(m_RenderReads - 1);
+    }
+
+    // The scope BeginRenderRead returned, wherever it is: the scopes opened after it stay open, with their modes and
+    // identities (backlog I6-N3). 0 (a scope beyond the 64th has no identity) closes the innermost.
+    void SceneGraphStore::EndRenderRead(uint32_t scope) noexcept
+    {
+        if (scope == 0)
+        {
+            EndRenderRead();
             return;
-        const uint32_t depth = --m_RenderReads;
-        if (depth >= 64 || !(m_RenderReadModes & (uint64_t(1) << depth)))
-            return;
-        m_RenderReadModes &= ~(uint64_t(1) << depth);
+        }
+        for (uint32_t i = std::min(m_RenderReads, 64u); i-- > 0;)
+        {
+            if (m_RenderReadScopes[i] == scope)
+            {
+                CloseRenderRead(i);
+                return;
+            }
+        }
+        log::warning("SceneGraph::EndRenderRead: the scope is not open (an EndRenderRead without its BeginRenderRead "
+                     "closed it already); nothing closed");
+    }
+
+    void SceneGraphStore::CloseRenderRead(uint32_t index) noexcept
+    {
+        bool defer = false;
+        if (index < 64)
+        {
+            defer = ((m_RenderReadModes >> index) & 1) != 0;
+            // the scopes above move one down; one beyond the 64th that comes to the 64th has no identity (0) and acts
+            // as Warn, as it did
+            const uint64_t below = m_RenderReadModes & ((uint64_t(1) << index) - 1);
+            const uint64_t above = index + 1 < 64 ? (m_RenderReadModes >> (index + 1)) << index : 0;
+            m_RenderReadModes = below | above;
+            for (uint32_t i = index; i + 1 < 64; ++i)
+                m_RenderReadScopes[i] = m_RenderReadScopes[i + 1];
+            m_RenderReadScopes[63] = 0;
+        }
+        --m_RenderReads;
         // The last Defer scope: what it deferred runs now, on this thread (after the pipelined frame's join).
-        if (m_DeferReads.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        if (defer && m_DeferReads.fetch_sub(1, std::memory_order_acq_rel) == 1)
         {
             LeaveDeferring();
             ReleaseDeferred();

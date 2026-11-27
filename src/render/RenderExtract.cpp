@@ -138,8 +138,10 @@ namespace donut::render
         // Between a successful Extract and its EndFrame.
         bool frameOpen = false;
         // The graph's render-read scope (a flag per service, not a count; the graph counts the scopes). A Defer scope
-        // for a pipelined service (RenderServiceDesc::pipelined), a Warn scope otherwise.
+        // for a pipelined service (RenderServiceDesc::pipelined), a Warn scope otherwise; `scopeId` is its identity
+        // (SceneGraph::BeginRenderRead's), by which EndFrame closes it.
         bool scopeOpen = false;
+        uint32_t scopeId = 0;
         // Pipelined rendering (part I7): between BeginPipelinedRecording (the hand-off of the open frame to a recording
         // thread) and the EndFrame after the join. The scene's owner-thread checks are begun meanwhile.
         bool recording = false;
@@ -872,13 +874,15 @@ namespace donut::render
 
         // ------------------------------------------------------------------------------- frame end
 
+        // Closes the service's own scope, by its identity (backlog I6-N3): a scope opened after Extract and still open
+        // stays open, and the mode that closes is the service's. One that an EndRenderRead without its BeginRenderRead
+        // closed already gets the graph's warning, and nothing else closes.
         void CloseScope() noexcept
         {
-            if (scopeOpen)
-            {
-                graph->EndRenderRead();
-                scopeOpen = false;
-            }
+            if (!scopeOpen)
+                return;
+            scopeOpen = false;
+            graph->EndRenderRead(scopeId);
         }
 
         // The contract for AddSkinningPasses (E5.5): for each ExtractedSkinnedInstance with firstFrame set whose
@@ -1072,7 +1076,8 @@ namespace donut::render
         s.bytes = sizeof(RenderSnapshot);
         // Pipelined (part I7): the deferring scope, whose retire list keeps what the main thread drops while the frame
         // records on another thread; serial: the warning scope, as before.
-        s.graph->BeginRenderRead(m_Desc.pipelined ? SceneGraph::RenderReadMode::Defer : SceneGraph::RenderReadMode::Warn);
+        s.scopeId = s.graph->BeginRenderRead(m_Desc.pipelined ? SceneGraph::RenderReadMode::Defer
+                                                              : SceneGraph::RenderReadMode::Warn);
         s.scopeOpen = true;
         // Through the graph, which accounts for the read-only phase: the next Refresh may still skip.
         result = s.graph->RunReadOnlyPhase(Phase::RenderExtract);

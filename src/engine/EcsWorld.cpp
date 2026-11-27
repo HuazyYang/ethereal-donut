@@ -419,6 +419,30 @@ namespace donut::engine::ecs
         return nvrhi::FS_OK;
     }
 
+    // A registration of an existing GUID that asks for RowTracked: the flag is not part of the layout, so the type
+    // keeps what it was registered with (backlog I4-R4), with one warning per type. A kind without a value per row
+    // (Tag, Sparse, Shared, Chunk, Buffer, Resource) is refused, as a fresh registration of it is (ValidateTypeDesc;
+    // F3-N1). The once-only flag is a plain bool: registrations run where structure may change (or are refused), so a
+    // race on it needs a registration that is itself misuse (F4 review N6).
+    nvrhi::FRESULT WorldImpl::CheckRowTrackedAgain(ComponentType& type, const ComponentTypeDesc& desc,
+                                                   const char* operation) noexcept
+    {
+        if (!Has(desc.flags, ComponentFlags::RowTracked) || Has(type.desc.flags, ComponentFlags::RowTracked))
+            return nvrhi::FS_OK;
+        const bool perRow = type.kind == StorageKind::Data;
+        if (!type.warnedRowTracked)
+        {
+            type.warnedRowTracked = true;
+            if (perRow)
+                log::warning("IWorld::%s: %s is registered already without RowTracked; its rows get no row versions "
+                             "(ChunkView::rowVersions null)", operation, NameOf(desc));
+            else
+                log::warning("IWorld::%s: %s: RowTracked needs a value per row: not a Tag, Sparse, Shared, Chunk, "
+                             "Buffer or Resource; refused (the type is registered without it)", operation, NameOf(desc));
+        }
+        return perRow ? nvrhi::FS_OK : nvrhi::FE_INVALID_ARGS;
+    }
+
     nvrhi::FRESULT WorldImpl::RegisterComponent(const ComponentTypeDesc& desc, ComponentId& outId) noexcept
     {
         outId = ComponentId::Invalid;
@@ -430,11 +454,8 @@ namespace donut::engine::ecs
                 ReportValidation("RegisterComponent", "%s: the GUID is registered with another layout", NameOf(desc));
                 return nvrhi::FE_INVALID_ARGS;
             }
-            // The flag is not part of the layout: the type keeps what it was registered with (backlog I4-R4).
-            if (Has(desc.flags, ComponentFlags::RowTracked) &&
-                !Has(m_Types[existing]->desc.flags, ComponentFlags::RowTracked))
-                log::warning("IWorld::RegisterComponent: %s is registered already without RowTracked; its rows get no "
-                             "row versions (ChunkView::rowVersions null)", NameOf(desc));
+            if (NVRHI_FAILED(CheckRowTrackedAgain(*m_Types[existing], desc, "RegisterComponent")))
+                return nvrhi::FE_INVALID_ARGS;
             outId = ComponentId(existing);
             return nvrhi::FS_OK;
         }
@@ -469,6 +490,8 @@ namespace donut::engine::ecs
                 ReportValidation("RegisterResource", "%s: the GUID is registered with another layout", NameOf(desc));
                 return nvrhi::FE_INVALID_ARGS;
             }
+            if (NVRHI_FAILED(CheckRowTrackedAgain(*m_Types[existing], desc, "RegisterResource")))
+                return nvrhi::FE_INVALID_ARGS;
             outId = ComponentId(existing);   // the value stays as it is
             return nvrhi::FS_OK;
         }

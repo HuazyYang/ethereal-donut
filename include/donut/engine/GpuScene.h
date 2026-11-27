@@ -319,7 +319,10 @@ namespace donut::engine
         // this object (Prepare: UploadAssets; Execute: the records and CommitScatter). BeginPipelinedRecording on the
         // main thread when it hands the frame over, EndPipelinedRecording after the join. In between, Debug builds warn
         // once about a call of Update, InvalidateAssets, Upload, UploadTo, CreateBuffers, UploadAssets, UploadAssetsTo,
-        // HasPendingAssets, GetScatterRecords, CommitScatter or IsScatterPending made on the main thread.
+        // HasPendingAssets, GetScatterRecords, CommitScatter, IsScatterPending or GetStats made on the main thread.
+        // UploadAssets clears Material::dirty of the materials it uploads, on the recording thread: an application
+        // that sets dirty (or edits a material) while a pipelined frame records races with it; it edits its materials
+        // after the join, before the next Extract (backlog I6-N4).
         void BeginPipelinedRecording() noexcept { m_Recording.Begin(); }
         void EndPipelinedRecording() noexcept { m_Recording.End(); }
         [[nodiscard]] bool IsPipelinedRecording() const noexcept { return m_Recording.IsRecording(); }

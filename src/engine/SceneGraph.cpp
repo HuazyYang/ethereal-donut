@@ -1200,14 +1200,19 @@ void SceneGraph::CompactLeafVectors()
     m_RemovalMarked.clear();
 }
 
-void SceneGraph::BeginRenderRead(RenderReadMode mode) noexcept
+uint32_t SceneGraph::BeginRenderRead(RenderReadMode mode) noexcept
 {
-    m_Store->BeginRenderRead(mode);
+    return m_Store->BeginRenderRead(mode);
 }
 
 void SceneGraph::EndRenderRead() noexcept
 {
     m_Store->EndRenderRead();
+}
+
+void SceneGraph::EndRenderRead(uint32_t scope) noexcept
+{
+    m_Store->EndRenderRead(scope);
 }
 
 bool SceneGraph::IsInRenderRead() const noexcept

@@ -940,9 +940,13 @@ namespace donut::engine
         // leaf, node, mesh or material while a scope of this mode is open goes to a retire list that EndRenderRead
         // releases, on the thread that calls it. Mixed scopes: while any Defer scope is open the graph defers, and writes
         // do not warn, also inside a Warn scope nested in it; the EndRenderRead that closes the last open Defer scope
-        // releases the list. Scopes close in reverse order of opening. What is kept: a leaf that leaves the world (the
-        // leaf observer's OnRemove: Detach, SetLeaf, a row destroyed through the world), each node of a detached
-        // subgraph, and every mesh and material the asset tables remove; each one reference, released in that order.
+        // releases the list. A scope closes by its identity or as the innermost (below), not necessarily in reverse
+        // order of opening. The asset tables' removal callbacks (OnMeshRemoved, OnMaterialRemoved) still run when the
+        // asset is removed, during the overlap, while the recording may still name the object: the object itself is
+        // kept (below), but a handler must not release what the recording uses with it (GPU buffers, descriptor
+        // slots) before the frame's join. What is kept: a leaf that leaves the world (the leaf observer's OnRemove:
+        // Detach, SetLeaf, a row destroyed through the world), each node of a detached subgraph, and every mesh and
+        // material the asset tables remove; each one reference, released in that order.
         // Refresh's reconciliation of meshes edited in place (their geometries' and materials' slot fields, the mesh
         // table's ranges) waits for that EndRenderRead too, which runs it first and raises its asset callbacks. The
         // application's own objects (views, its shadow maps) and its in-place edits of assets are its own: it keeps
@@ -952,8 +956,15 @@ namespace donut::engine
             Warn,    // the serial frame's isolation guard, as above
             Defer,   // the pipelined frame's: deferred releases
         };
-        void BeginRenderRead(RenderReadMode mode = RenderReadMode::Warn) noexcept;
+        // Calls of the API thread (the one that calls Refresh): the EndRenderRead that closes the last Defer scope runs
+        // the deferred reconciliation and the releases there. BeginRenderRead returns the scope's identity (0 for a
+        // scope nested deeper than 64, which has none). EndRenderRead() closes the innermost scope; EndRenderRead(scope)
+        // closes that scope wherever it is, the scopes opened after it staying open with their modes (RenderService's
+        // EndFrame closes its own so; backlog I6-N3); one that is not open (closed already) gets a warning, 0 closes
+        // the innermost.
+        uint32_t BeginRenderRead(RenderReadMode mode = RenderReadMode::Warn) noexcept;
         void EndRenderRead() noexcept;
+        void EndRenderRead(uint32_t scope) noexcept;
         [[nodiscard]] bool IsInRenderRead() const noexcept;
         // A Defer scope is open on this graph: a pipelined frame records. Any thread may ask.
         [[nodiscard]] bool IsRenderReadDeferring() const noexcept;
@@ -981,8 +992,9 @@ namespace donut::engine
         // caller that registered systems compares this instead of holding the scheduler.
         [[nodiscard]] uint64_t GetSchedulerGeneration() const noexcept;
 
-        // RowTracked scene columns (plan step E7, item E7.5; design D9): a process-wide switch, off by default, that
-        // stays off until measured (sub-plan revision 2, stage B). Graphs constructed while it is on register
+        // RowTracked scene columns (plan step E7, item E7.5; design D9): a process-wide switch (one per module that
+        // links donut_engine statically, as each of the switches below), off by default, that stays off until measured
+        // (sub-plan revision 2, stage B). Graphs constructed while it is on register
         // LocalTransform and WorldTransform with ComponentFlags::RowTracked: the node setters, transform propagation
         // and the interpolation stamp the rows they write, propagation composes only the rows whose local transform
         // or parent changed, and GpuScene takes only the changed rows of a chunk. A graph keeps what it was made
@@ -998,12 +1010,14 @@ namespace donut::engine
         // like SetRowTrackedTransforms; a graph keeps what it was made with. In a graph made while it is on, an archetype
         // of depth below c_MaxHierarchyDepth that carries Static, and that is not simulation-driven, leaves the
         // TransformPropagation work after a run that took it, and so does one that has no dynamic-bounds leaves the
-        // Bounds work: a later run takes it again only when rows joined or left it (Bounds also after a structural
-        // change through the API, SetLeaf or InvalidateContent, and after a propagation run that took it), and then
-        // computes the chunks that rows joined, whole, from their local transforms and their parents' worlds at that
-        // time. So every row that shares a chunk with a row that joined, or that a row's leaving moved (the swap-remove
-        // of its hole), is composed again then, from its LocalTransform and its parent's current world, and a write of
-        // its LocalTransform since the last run is taken. Otherwise their world transforms do not follow later writes
+        // Bounds work: a later run takes it again only when rows joined or left it (any structural change that moves
+        // a row in or out of it: an attach, a detach, SetLeaf, a node's first transform, a row made or destroyed
+        // through the world; Bounds also after an InvalidateContent that changed a row of the graph and after a
+        // propagation run that took it; nothing else, such as a structural change elsewhere), and then computes the
+        // chunks that rows joined, whole, from their local transforms and their parents' worlds at that time. So every
+        // row that shares a chunk with a row that joined, or that a row's leaving moved (the swap-remove of its hole),
+        // is composed again then, from its LocalTransform and its parent's current world, and a write of its
+        // LocalTransform since the last run is taken. Otherwise their world transforms do not follow later writes
         // of their LocalTransform, nor moves of their parents; the rows below them are composed from those worlds, by
         // propagation and where the graph composes a world itself (SetSimulationDriven, teleports in parent space, the
         // local getters of driven nodes). A write after the run that took the row's chunk is refused in Debug builds,

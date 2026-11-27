@@ -24,6 +24,9 @@
 // one case per backlog item, named after it, device-free. Each fails without its fix.
 //   e72_r5_runtime_rows_checked  Debug's leaf check compares runtime-only rows with their mesh (Debug only: Release
 //                                builds do not check)
+//   i6_n2_walk_prepared_again    a walking strategy prepared again mid-drain hands out the new view's items only
+//   i6_n3_service_closes_its_scope  EndFrame closes the service's own render-read scope, not the innermost one
+//   i6_n3_scopes_by_identity     render-read scopes closed by identity, under the deferring rules
 
 #include <donut/core/log.h>
 #include <donut/engine/EcsWorld.h>
@@ -31,6 +34,7 @@
 #include <donut/engine/SceneComponents.h>
 #include <donut/engine/SceneGraph.h>
 #include <donut/engine/View.h>
+#include <donut/render/DrawStrategy.h>
 #include <donut/render/RenderExtract.h>
 #include <donut/render/RenderGraph.h>
 #include <donut/render/RenderGraphFrameData.h>
@@ -178,11 +182,179 @@ void test_e72_r5_runtime_rows_checked()
     rig.graph->ReleaseRuntimeMesh(id);
 }
 
+// ------------------------------------------------------------------------------------------------ I6-N2
+
+// InstancedOpaqueDrawStrategy prepared for a view, drained in part, then prepared for a view that sees nothing: the
+// next item is null, not one of the first view's items (PrepareForView left the sorted item pointers of the last
+// chunk, which pointed into the cleared items).
+void test_i6_n2_walk_prepared_again()
+{
+    nvrhi::AutoPtr<Material> material;
+    nvrhi::AutoPtr<MeshInfo> mesh = MakeMesh(material);
+    Rig rig;
+    for (int i = 0; i < 4; ++i)
+    {
+        auto node = MAKE_RC_OBJ_PTR(SceneGraphNode);
+        node->SetTranslation(dm::double3(double(i) * 2.0 - 3.0, 0.0, 0.0));
+        node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, mesh));
+        rig.graph->Attach(rig.graph->GetRootNode(), node);
+    }
+    rig.graph->Refresh(0);
+    auto away = MAKE_RC_OBJ_PTR(PlanarView);   // behind the nodes, looking further away from them
+    away->SetViewport(nvrhi::Viewport(1280.f, 720.f));
+    away->SetMatrices(dm::inverse(dm::translation(dm::float3(0.f, 0.f, 100.f))),
+                      dm::perspProjD3DStyleReverse(dm::radians(60.f), 16.f / 9.f, 0.1f));
+    away->UpdateCache();
+
+    auto strategy = MAKE_RC_OBJ_PTR(InstancedOpaqueDrawStrategy);
+    strategy->PrepareForView(rig.graph->GetRootNode(), *rig.view);
+    uint32_t seen = 0;
+    while (strategy->GetNextItem())
+        ++seen;
+    CHECK(seen == 4);   // the rig's view sees the four
+    strategy->PrepareForView(rig.graph->GetRootNode(), *rig.view);
+    CHECK(strategy->GetNextItem() != nullptr);   // one taken, three left of this chunk
+    strategy->PrepareForView(rig.graph->GetRootNode(), *away);
+    CHECK(strategy->GetNextItem() == nullptr);
+    CHECK(TakeWarnings() == 0);
+}
+
+// ------------------------------------------------------------------------------------------------ I6-N3
+
+// The service closes its own scope by its identity (SceneGraph::BeginRenderRead's), wherever it is among the open
+// ones: a scope the application opened after Extract stays open; one the application opened before Extract and closes
+// in between (below the service's) does not move the service's out of reach. Closing the innermost instead closed the
+// application's scope and left the Defer one open; closing by depth left it open in the second case (the graph
+// deferred for good). An application EndRenderRead() that closes the service's scope before EndFrame: one warning.
+void test_i6_n3_service_closes_its_scope()
+{
+    Rig rig;
+    RenderServiceDesc desc;
+    desc.sceneGraph = rig.graph;
+    desc.pipelined = true;
+    rig.service = nullptr;
+    rig.service = MAKE_RC_OBJ_PTR(RenderService, nullptr, desc);
+    rig.graph->Refresh(0);
+    ExtractDesc extract;
+    extract.views = rig.views;
+    extract.viewCount = 1;
+    auto extractFrame = [&]()
+    {
+        rig.renderGraph->Reset();
+        rig.data.Clear();
+        SceneFrame* sceneFrame = nullptr;
+        CHECK(rig.service->Extract(rig.renderGraph, &rig.data, extract, &sceneFrame) == nvrhi::FS_OK);
+        CHECK(rig.graph->IsRenderReadDeferring());
+    };
+
+    // a scope opened after Extract: it stays open, the service's Defer scope closes
+    extractFrame();
+    const uint32_t after = rig.graph->BeginRenderRead(SceneGraph::RenderReadMode::Warn);
+    CHECK(after != 0);
+    rig.service->EndFrame(true);
+    CHECK(TakeWarnings() == 0);
+    CHECK(rig.graph->IsInRenderRead());   // the application's
+    CHECK(!rig.graph->IsRenderReadDeferring() && !SceneGraph::IsAnyRenderReadDeferring());
+    rig.graph->EndRenderRead(after);
+    CHECK(!rig.graph->IsInRenderRead());
+
+    // a scope opened before Extract and closed in between, below the service's
+    const uint32_t before = rig.graph->BeginRenderRead(SceneGraph::RenderReadMode::Warn);
+    extractFrame();
+    rig.graph->EndRenderRead(before);
+    CHECK(rig.graph->IsRenderReadDeferring());
+    rig.service->EndFrame(true);
+    CHECK(TakeWarnings() == 0);
+    CHECK(!rig.graph->IsInRenderRead() && !SceneGraph::IsAnyRenderReadDeferring());
+
+    // the application closes the service's scope (EndRenderRead without its BeginRenderRead): EndFrame warns once
+    extractFrame();
+    rig.graph->EndRenderRead();
+    CHECK(!rig.graph->IsInRenderRead());
+    rig.service->EndFrame(true);
+    CHECK(TakeWarnings() == 1);
+    CHECK(!rig.graph->IsInRenderRead());
+
+    // the usual order: no warning
+    extractFrame();
+    rig.service->EndFrame(true);
+    CHECK(TakeWarnings() == 0);
+    CHECK(!rig.graph->IsInRenderRead());
+}
+
+// Two Defer scopes, a drawn node detached inside them and a mesh edited in place: closing the lower one (by identity)
+// keeps the node alive and the reconciliation waiting; closing the last runs and releases them. A scope that is not
+// open: one warning, nothing closes. Beyond 64 nested scopes: no identity (0), a Defer scope acts as Warn (one
+// warning), and EndRenderRead(0) closes the innermost.
+void test_i6_n3_scopes_by_identity()
+{
+    nvrhi::AutoPtr<Material> material;
+    nvrhi::AutoPtr<MeshInfo> mesh = MakeMesh(material);
+    nvrhi::AutoPtr<MeshInfo> edited = MakeMesh(material);
+    Rig rig;
+    nvrhi::AutoPtr<SceneGraphNode> drawn = MAKE_RC_OBJ_PTR(SceneGraphNode);
+    drawn->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, mesh));
+    rig.graph->Attach(rig.graph->GetRootNode(), drawn);
+    auto other = MAKE_RC_OBJ_PTR(SceneGraphNode);
+    other->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, edited));
+    rig.graph->Attach(rig.graph->GetRootNode(), other);
+    rig.graph->Refresh(0);
+    const uint32_t editedSlot = MeshTable::SlotOf(rig.graph->GetMeshes().Find(edited));
+    CHECK(rig.graph->GetMeshes().GetMeshRow(editedSlot).geometryCount == 1);
+    nvrhi::AutoPtr<nvrhi::IWeakReference> weak;
+    drawn->GetWeakReference(weak.GetAddressOf());
+    CHECK(weak);
+
+    const uint32_t lower = rig.graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+    const uint32_t upper = rig.graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer);
+    CHECK(lower != 0 && upper != 0 && lower != upper);
+    (void)rig.graph->Detach(drawn);
+    drawn = nullptr;
+    auto geometry = MAKE_RC_OBJ_PTR(MeshGeometry);   // an in-place edit, then a structural change
+    geometry->material = material;
+    edited->geometries.push_back(geometry);
+    rig.graph->Attach(rig.graph->GetRootNode(), MAKE_RC_OBJ_PTR(SceneGraphNode));
+    rig.graph->Refresh(1);
+    CHECK(!weak->IsExpired());
+    CHECK(rig.graph->GetMeshes().GetMeshRow(editedSlot).geometryCount == 1);   // waits for the last Defer scope
+
+    rig.graph->EndRenderRead(lower);
+    CHECK(rig.graph->IsRenderReadDeferring());
+    CHECK(!weak->IsExpired());
+    CHECK(rig.graph->GetMeshes().GetMeshRow(editedSlot).geometryCount == 1);
+    rig.graph->EndRenderRead(lower);   // not open any more
+    CHECK(TakeWarnings() == 1);
+    CHECK(rig.graph->IsRenderReadDeferring());
+    rig.graph->EndRenderRead(upper);
+    CHECK(!rig.graph->IsInRenderRead() && !rig.graph->IsRenderReadDeferring());
+    CHECK(weak->IsExpired());
+    CHECK(rig.graph->GetMeshes().GetMeshRow(editedSlot).geometryCount == 2);
+    CHECK(TakeWarnings() == 0);
+
+    // deeper than 64
+    for (int i = 0; i < 64; ++i)
+        CHECK(rig.graph->BeginRenderRead() != 0);
+    CHECK(rig.graph->BeginRenderRead(SceneGraph::RenderReadMode::Defer) == 0);
+    CHECK(TakeWarnings() == 1);
+    CHECK(!rig.graph->IsRenderReadDeferring());
+    rig.graph->EndRenderRead(0);   // the innermost
+    for (int i = 0; i < 64; ++i)
+    {
+        CHECK(rig.graph->IsInRenderRead());
+        rig.graph->EndRenderRead();
+    }
+    CHECK(!rig.graph->IsInRenderRead());
+    CHECK(TakeWarnings() == 0);
+}
+
 int main(int argc, char** argv)
 {
     struct Case { const char* name; void (*run)(); };
     const Case cases[] = {
         { "e72_r5_runtime_rows_checked", test_e72_r5_runtime_rows_checked },
+        { "i6_n2_walk_prepared_again", test_i6_n2_walk_prepared_again },
+        { "i6_n3_service_closes_its_scope", test_i6_n3_service_closes_its_scope },
+        { "i6_n3_scopes_by_identity", test_i6_n3_scopes_by_identity },
     };
     log::SetCallback([](log::Severity severity, const char* message)
     {

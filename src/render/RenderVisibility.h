@@ -1492,7 +1492,8 @@ namespace donut::render::visibility
         PodBuffer<uint64_t> m_SortKeys;              // the packets' keys, segment by segment, unsorted
         PodBuffer<const PacketRecord*> m_SortRecords;
         PodBuffer<CompactPacketRecord> m_CompactRecords;   // with compact records: every packet, unsorted
-        PodBuffer<uint32_t> m_Order;                 // the sorted positions in m_SortKeys
+        PodBuffer<uint32_t> m_Order;                 // the sorted positions: in m_SortKeys, or (compact records) in
+                                                     // m_CompactRecords
         std::vector<RadixSorter> m_Sorters;          // one per segment, so that segments sort side by side
         uint32_t m_InstanceCapacity = 0;
         uint32_t m_PacketCapacity = 0;

@@ -187,10 +187,11 @@ namespace donut::engine
         NVRHI_DECLARE_UUID_TRAITS(IWorld)
 
         // Component types (4.2). Registering a GUID again returns its id when the layout matches, FE_INVALID_ARGS when
-        // it does not; the type keeps the flags it was first registered with (a log::warning when the second asks for
-        // RowTracked that the first did not have: those rows have no row versions). A new type (here and in
-        // RegisterResource) is refused with FE_OUT_OF_DATE inside a phase, unless an exclusive system runs, and while
-        // an observer runs: systems may be reading the registry. See ComponentTypeDesc for what must outlive the world.
+        // it does not; the type keeps the flags it was first registered with (a log::warning, once per type, when the
+        // second asks for RowTracked that the first did not have: those rows have no row versions; FE_INVALID_ARGS
+        // when the type has no value per row, as for a new one). A new type (here and in RegisterResource) is refused
+        // with FE_OUT_OF_DATE inside a phase, unless an exclusive system runs, and while an observer runs: systems may
+        // be reading the registry. See ComponentTypeDesc for what must outlive the world.
         virtual nvrhi::FRESULT RegisterComponent(const ComponentTypeDesc& desc, ComponentId& outId) noexcept = 0;
         virtual ComponentId FindComponent(const nvrhi::GUID& uuid) noexcept = 0;
         virtual const ComponentTypeDesc* GetComponentTypeDesc(ComponentId component) noexcept = 0;   // not owned

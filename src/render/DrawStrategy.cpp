@@ -331,6 +331,7 @@ void donut::render::InstancedOpaqueDrawStrategy::PrepareForView(engine::SceneGra
     m_Walker = SceneGraphWalker(rootNode);
     m_ViewFrustum = view.GetViewFrustum();
     m_InstanceChunk.clear();
+    m_InstancePtrChunk.clear();   // the last view's sorted pointers point into the items just cleared (backlog I6-N2)
     m_ReadPtr = 0;
 }
 

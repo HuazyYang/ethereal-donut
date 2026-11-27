@@ -486,15 +486,15 @@ namespace donut::render
         // for a second call in the frame. FE_INVALID_ARGS when no frame is open.
         nvrhi::FRESULT AddShadowPasses(IRenderGraph* graph, SceneFrame* frame) noexcept;
         // After the graph has executed (`executed`), or failed to compile or execute: ends a pipelined recording
-        // (Scene::EndPipelinedRecording) and closes the render-read scope (a flag per service, not a count; the
-        // innermost scope of the graph: no other scope may be left open inside it). Only an executed frame sets the
-        // leaves' skinningInitialized for its first-frame skinned instances; otherwise the next frame dispatches them
-        // as first frames again. Releases the shadow maps this frame's extraction retired (the frames that drew into
-        // them were submitted before it; nvrhi keeps a texture alive for the command lists that reference it). The
-        // service's references go; a retired texture can still be held by the binding caches of DeferredLightingPass
-        // and ForwardShadingPass, whose cached sets name the shadow texture, until the application calls their
-        // ResetBindingCache (RenderServiceStats::retiredShadowMaps non-zero is the signal; the service adds no
-        // mechanism for it). Idempotent per frame.
+        // (Scene::EndPipelinedRecording) and closes the service's render-read scope (a flag per service, not a count)
+        // by its identity: a scope the application opened after Extract stays open (SceneGraph::EndRenderRead). Only
+        // an executed frame sets the leaves' skinningInitialized for its first-frame skinned instances; otherwise the
+        // next frame dispatches them as first frames again. Releases the shadow maps this frame's extraction retired
+        // (the frames that drew into them were submitted before it; nvrhi keeps a texture alive for the command lists
+        // that reference it). The service's references go; a retired texture can still be held by the binding caches
+        // of DeferredLightingPass and ForwardShadingPass, whose cached sets name the shadow texture, until the
+        // application calls their ResetBindingCache (RenderServiceStats::retiredShadowMaps non-zero is the signal; the
+        // service adds no mechanism for it). Idempotent per frame.
         // app::RenderGraphLayer::OnGraphExecuted is the place to call it; without the layer, call it after
         // IRenderGraph::Execute. A frame whose EndFrame never came counts as not executed. The snapshot dies at the
         // next Reset.
@@ -516,10 +516,10 @@ namespace donut::render
 
         // Compact packet records (plan step E7, item E7.4, remedy 2; design 10.1, D11): extraction lists each packet in
         // a 24-byte record instead of a 32-byte one and writes the sort's words in its copy step, so that the sort
-        // reads no keys. A process-wide switch, off by default, which stays off until measured (sub-plan revision 2,
-        // stage B); every service reads it once per Extract. The snapshot is the same either way (instances, packets,
-        // keys and order), except for a mesh of more than 2^26 geometries, whose geometries from that one on get no
-        // packets with it (a warning). Set it on any thread.
+        // reads no keys. A process-wide switch (one per module that links donut_render statically), off by default,
+        // which stays off until measured (sub-plan revision 2, stage B); every service reads it once per Extract. The
+        // snapshot is the same either way (instances, packets, keys and order), except for a mesh of more than 2^26
+        // geometries, whose geometries from that one on get no packets with it (a warning). Set it on any thread.
         static void SetCompactPacketRecords(bool enabled) noexcept;
         [[nodiscard]] static bool GetCompactPacketRecords() noexcept;
 

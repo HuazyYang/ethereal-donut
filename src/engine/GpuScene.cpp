@@ -1463,6 +1463,7 @@ namespace donut::engine
 
     const GpuSceneStats& GpuScene::GetStats() const noexcept
     {
+        m_Recording.Check("GpuScene::GetStats");   // the recording's upload writes them (backlog I6-R5)
         static const GpuSceneStats s_None;
         return m_Impl ? m_Impl->stats : s_None;
     }

@@ -90,10 +90,10 @@ namespace donut::engine
 
     // Chunk prefetch in the typed loops (plan step E7, item E7.4, remedy 1; sub-plan revision 2, part I5): while the
     // callback runs on a chunk, the first bytes of the next chunk's data columns (and its entities, in the row forms) are
-    // fetched, the next chunk of the same IQuery::GetChunks batch. A process-wide switch, off by default, which stays off
-    // until measured (revision 2, stage B). ForEachChunk, ForEach, ParallelForChunks and ParallelForEach read it once
-    // per call; a call keeps what it read. It changes no result (the same chunks, rows, order and stamps), only memory
-    // traffic. Set it on any thread.
+    // fetched, the next chunk of the same IQuery::GetChunks batch. A process-wide switch (one per module that links
+    // donut_engine statically), off by default, which stays off until measured (revision 2, stage B). ForEachChunk,
+    // ForEach, ParallelForChunks and ParallelForEach read it once per call; a call keeps what it read. It changes no
+    // result (the same chunks, rows, order and stamps), only memory traffic. Set it on any thread.
     void SetQueryChunkPrefetch(bool enabled) noexcept;
     [[nodiscard]] bool GetQueryChunkPrefetch() noexcept;
 

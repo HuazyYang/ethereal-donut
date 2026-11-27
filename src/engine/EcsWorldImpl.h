@@ -267,7 +267,7 @@ namespace donut::engine::ecs
         StorageKind kind = StorageKind::Data;
         bool enableable = false;
         bool copyable = false;              // a copy hook, Relocatable (memcpy copies it), or a tag; else no copies
-        uint8_t reserved = 0;
+        bool warnedRowTracked = false;      // RegisterComponent warned once that RowTracked was asked again
         uint32_t sparseSet = 0xffffffffu;   // Sparse: index in WorldImpl::m_SparseSets
         void* value = nullptr;              // Resource: the world's value. Shared: the default value
         Vector<ByteRange> fieldBytes;       // bytes the fields cover, merged and ascending: compared and hashed (4.4)
@@ -879,6 +879,8 @@ namespace donut::engine::ecs
 
         // Registry (EcsWorld.cpp).
         nvrhi::FRESULT ValidateTypeDesc(const ComponentTypeDesc& desc) noexcept;
+        nvrhi::FRESULT CheckRowTrackedAgain(ComponentType& type, const ComponentTypeDesc& desc,
+                                            const char* operation) noexcept;
         nvrhi::FRESULT AddType(const ComponentTypeDesc& desc, const void* initialValue, ComponentId& outId) noexcept;
         uint32_t FindType(const nvrhi::GUID& uuid) const noexcept;
 
