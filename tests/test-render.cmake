@@ -52,6 +52,14 @@ add_dependencies(donut_all_tests test_render_extract)
 add_test(NAME test_render_extract COMMAND test_render_extract)
 set_property(TARGET test_render_extract PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
+# Pipelined recording against serial recording, device-free (aggregate docs/plans/2026-11-26-donut-ecs-e7-rev2.md,
+# stage T6; revision 1's E7.8 tests).
+add_executable(test_render_pipelining src/render/test_render_pipelining.cpp)
+target_link_libraries(test_render_pipelining donut_render donut_engine donut_core donut_tests_utils)
+add_dependencies(donut_all_tests test_render_pipelining)
+add_test(NAME test_render_pipelining COMMAND test_render_pipelining)
+set_property(TARGET test_render_pipelining PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
 # The regression tests of the E7 fix track, render side (aggregate docs/plans/2026-11-26-donut-ecs-e7-rev2.md, stage
 # F), device-free.
 add_executable(test_e7_render_fixes src/render/test_e7_render_fixes.cpp)

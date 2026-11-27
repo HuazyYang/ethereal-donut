@@ -2625,10 +2625,11 @@ namespace
     }
 
     // The retire list of a Defer scope: what the graph, its world and its tables drop while the scope is open (a
-    // detached subgraph nobody keeps, a leaf replaced by SetLeaf, a mesh and its material whose last instance went, a
-    // runtime mesh released) lives until the EndRenderRead that closes the last Defer scope, not before (a Warn scope
-    // nested in it closes first), and goes then, on that thread. Refresh's mesh reconciliation waits for it too. In a
-    // Warn scope the same drop releases at once.
+    // detached subgraph nobody keeps, a leaf replaced by SetLeaf, a mesh and the material only it uses, whose last
+    // instance went, a runtime mesh released) lives until the EndRenderRead that closes the last Defer scope, not before
+    // (a Warn scope nested in it closes first), and goes then, on that thread. Refresh's mesh reconciliation waits for
+    // it too. In a Warn scope the same drop releases at once. Stage T6 (backlog I6-R2): the dropped mesh's own material
+    // tests the material branch of the tables' retirement; the shared one stays, as the edited mesh still uses it.
     void test_defer_retire_list()
     {
         const uint32_t warningsBefore = g_Warnings.load();
@@ -2641,7 +2642,11 @@ namespace
         auto material = factory->CreateMaterial();
         material->domain = MaterialDomain::Opaque;
         auto weakMaterial = WeakOf(material);
-        nvrhi::AutoPtr<MeshInfo> mesh = NewCountedMesh(factory, material, 2);
+        auto ownMaterial = factory->CreateMaterial();   // used by `mesh` only: dropped with it
+        ownMaterial->domain = MaterialDomain::Opaque;
+        auto weakOwnMaterial = WeakOf(ownMaterial);
+        nvrhi::AutoPtr<MeshInfo> mesh = NewCountedMesh(factory, ownMaterial, 2);
+        ownMaterial = nullptr;
         nvrhi::AutoPtr<MeshInfo> runtimeMesh = NewCountedMesh(factory, material, 1);
         nvrhi::AutoPtr<MeshInfo> edited = factory->CreateMesh();   // kept by the test: edited in place below
         edited->geometries.push_back(factory->CreateMeshGeometry());
@@ -2680,12 +2685,14 @@ namespace
         graph->AttachLeafNode(root, MAKE_RC_OBJ_PTR(PointLight));
         graph->Refresh(1);
         CHECK(!Expired(weakNodeA) && !Expired(weakLeafA) && !Expired(weakLight) && !Expired(weakMaterial));
+        CHECK(!Expired(weakOwnMaterial));
         CHECK(g_CountedMeshesDestroyed.load() == destroyedBefore);
         CHECK(graph->GetMeshes().GetMeshRow(editedSlot).geometryCount == 1);   // reconciled after the scope
 
         graph->EndRenderRead();   // the Warn scope
         CHECK(graph->IsInRenderRead() && graph->IsRenderReadDeferring());
         CHECK(!Expired(weakNodeA) && !Expired(weakLeafA) && !Expired(weakLight) && !Expired(weakMaterial));
+        CHECK(!Expired(weakOwnMaterial));   // the tables' retirement holds the material, not only the mesh's geometry
         CHECK(g_CountedMeshesDestroyed.load() == destroyedBefore);
         CHECK(graph->GetMeshes().GetMeshRow(editedSlot).geometryCount == 1);
 
@@ -2693,7 +2700,8 @@ namespace
         CHECK(!graph->IsInRenderRead() && !graph->IsRenderReadDeferring());
         CHECK(Expired(weakNodeA) && Expired(weakLeafA) && Expired(weakLight));
         CHECK(g_CountedMeshesDestroyed.load() == destroyedBefore + 2);
-        CHECK(!Expired(weakMaterial));   // the edited mesh still uses it
+        CHECK(Expired(weakOwnMaterial));   // with its mesh
+        CHECK(!Expired(weakMaterial));     // the edited mesh still uses it
         CHECK(graph->GetMeshes().GetMeshRow(editedSlot).geometryCount == 2);
 
         // A Warn scope keeps nothing: a dropped subgraph goes at once (and Debug builds warn about the Detach).
@@ -2712,7 +2720,8 @@ namespace
         CHECK(warnings == 1);
 #endif
         g_Warnings.store(warningsBefore);
-        std::printf("  two meshes, a node, two leaves kept until the last EndRenderRead; reconciliation deferred\n");
+        std::printf("  two meshes, a material, a node, two leaves kept until the last EndRenderRead; reconciliation "
+                    "deferred\n");
     }
 
     // Writes through the API: the forms the isolation case lists. Returns how many.
