@@ -1583,7 +1583,7 @@ namespace donut::render
 
     namespace
     {
-        std::atomic<bool> g_CompactPacketRecords{ false };   // E7.4 remedy 2: off until measured
+        std::atomic<bool> g_CompactPacketRecords{ true };   // E7.4 remedy 2: on since stage B measured it (F10)
     }
 
     void RenderService::SetCompactPacketRecords(bool enabled) noexcept

@@ -31,6 +31,8 @@
 //   i3_r1_r2_read_only_list         SimTeleport, SimPosePrevious, SimPose and SimScale are on donut's read-only list
 //   i3_r2_driven_rows_read_only     a simulation-driven row offers no LocalTransform (nor SimPose, SimScale) for editing
 //   t4_1_chunk_bounds_after_removals a chunk that lost rows gets the union of its rows as its box again, tracked or not
+//   f10_find_column_aliases         a guard (no defect it fixes): components whose ids share FindColumn's bit
+//                                   (id % 64) are told apart
 //   e72_r4_mesh_columns_of_other_classes  no mesh-instance columns for a leaf class that is no MeshInstance
 //   e72_r4_mesh_tags_of_other_classes     no mesh-instance tags for a leaf class that is not of their class
 //   i3_n4_missing_name_warned_once  an ordering against a missing name warns once while it stays missing
@@ -1220,6 +1222,55 @@ void test_t4_1_chunk_bounds_after_removals()
     CHECK(hashes[0] == hashes[1]);
 }
 
+// ------------------------------------------------------------------------------------------------- F10
+
+// A guard of F10's change (backlog B-2), not a regression of a defect: Archetype::FindColumn rejects a component with
+// one bit test (bit id % 64 of each of the archetype's components); ids 64 and 128 apart share the bit, and the sorted
+// search still tells them apart.
+void test_f10_find_column_aliases()
+{
+    Graph g(false);
+    ComponentTypeDesc desc = ComponentTraits<e7_fixes::Marker>::Desc();
+    desc.name = "F10Alias";
+    std::vector<ComponentId> tags;
+    for (uint32_t i = 0; i < 130; ++i)
+    {
+        desc.uuid.Data1 = 0xf10a0000u + i;
+        ComponentId id = ComponentId::Invalid;
+        CHECK(g.world->RegisterComponent(desc, id) == nvrhi::FS_OK && id != ComponentId::Invalid);
+        tags.push_back(id);
+    }
+    const ComponentId a = tags[0];
+    ComponentId b = ComponentId::Invalid;
+    ComponentId c = ComponentId::Invalid;
+    for (const ComponentId t : tags)
+    {
+        if (uint32_t(t) == uint32_t(a) + 64)
+            b = t;
+        if (uint32_t(t) == uint32_t(a) + 128)
+            c = t;
+    }
+    CHECK(b != ComponentId::Invalid && c != ComponentId::Invalid);
+    auto make = [&](std::vector<ComponentId> ids)
+    {
+        std::sort(ids.begin(), ids.end());
+        EntityCreateDesc create{};
+        create.components = ids.data();
+        create.componentCount = uint32_t(ids.size());
+        create.entityCount = 1;
+        Entity entity = Entity::Null;
+        CHECK(g.world->CreateEntities(create, &entity) == nvrhi::FS_OK);
+        return entity;
+    };
+    const Entity ac = make({ a, c });
+    CHECK(g.world->HasComponent(ac, a) && !g.world->HasComponent(ac, b) && g.world->HasComponent(ac, c));
+    const Entity onlyB = make({ b });
+    CHECK(!g.world->HasComponent(onlyB, a) && g.world->HasComponent(onlyB, b) && !g.world->HasComponent(onlyB, c));
+    CHECK(g.world->AddComponent(onlyB, a, nullptr) == nvrhi::FS_OK);
+    CHECK(g.world->HasComponent(onlyB, a) && g.world->HasComponent(onlyB, b) && !g.world->HasComponent(onlyB, c));
+    CHECK(TakeWarnings() == 0);
+}
+
 int main(int argc, char** argv)
 {
     struct Case { const char* name; void (*run)(); };
@@ -1232,6 +1283,7 @@ int main(int argc, char** argv)
         { "i3_r1_r2_read_only_list", test_i3_r1_r2_read_only_list },
         { "i3_r2_driven_rows_read_only", test_i3_r2_driven_rows_read_only },
         { "t4_1_chunk_bounds_after_removals", test_t4_1_chunk_bounds_after_removals },
+        { "f10_find_column_aliases", test_f10_find_column_aliases },
         { "e72_r4_mesh_columns_of_other_classes", test_e72_r4_mesh_columns_of_other_classes },
         { "e72_r4_mesh_tags_of_other_classes", test_e72_r4_mesh_tags_of_other_classes },
         { "i3_n4_missing_name_warned_once", test_i3_n4_missing_name_warned_once },

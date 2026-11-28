@@ -140,7 +140,7 @@ namespace donut::engine::ecs
 
     // ------------------------------------------------------------------------------------------ archetype
 
-    uint32_t Archetype::FindColumn(ComponentId component) const noexcept
+    uint32_t Archetype::FindColumnSorted(ComponentId component) const noexcept
     {
         uint32_t lo = 0;
         uint32_t hi = uint32_t(components.size());
@@ -231,6 +231,9 @@ namespace donut::engine::ecs
         archetype.columns.clear();
         archetype.destructRows = false;
         archetype.rowVersionSlots = 0;
+        archetype.componentBits = 0;
+        for (uint32_t i = 0; i < count; ++i)
+            archetype.componentBits |= uint64_t(1) << (uint32_t(components[i]) & 63u);
         for (uint32_t i = 0; i < count; ++i)
         {
             const ComponentType& type = *m_Types[uint32_t(components[i])];
@@ -647,7 +650,9 @@ namespace donut::engine::ecs
         uint64_t* versions = reinterpret_cast<uint64_t*>(memory + archetype.versionsOffset);
         for (uint32_t i = 0; i <= archetype.columns.size(); ++i)
             versions[i] = version;
-        archetype.chunks.push_back(ChunkRecord{ memory, 0, 0, 0 });
+        archetype.chunks.push_back(ChunkRecord{ memory, 0, 0 });
+        archetype.shrunkVersions.push_back(0);
+        NVRHI_ASSERT(archetype.shrunkVersions.size() == archetype.chunks.size());
         return true;
     }
 
@@ -677,6 +682,8 @@ namespace donut::engine::ecs
                 DestructValues(*column.type, chunk.memory + column.offset, 1);
         PoolFor(archetype.chunkSize).Free(chunk.memory);
         archetype.chunks.pop_back();
+        archetype.shrunkVersions.pop_back();
+        NVRHI_ASSERT(archetype.shrunkVersions.size() == archetype.chunks.size());
         ++archetype.rowMoves;
     }
 
@@ -718,7 +725,7 @@ namespace donut::engine::ecs
         StampVersion(rows - 1, chunkVersion);
     }
 
-    void StampChunkWrite(const Archetype& archetype, uint32_t chunk, uint32_t column, uint64_t version) noexcept
+    void StampChunkWriteTracked(const Archetype& archetype, uint32_t chunk, uint32_t column, uint64_t version) noexcept
     {
         if (uint64_t* rows = archetype.RowVersions(chunk, column))
         {
@@ -733,8 +740,8 @@ namespace donut::engine::ecs
         StampVersion(archetype.Versions(chunk) + column, version);
     }
 
-    void StampRowWrites(const Archetype& archetype, uint32_t chunk, uint32_t column, uint32_t firstRow, uint32_t count,
-                        uint64_t version) noexcept
+    void StampRowWritesTracked(const Archetype& archetype, uint32_t chunk, uint32_t column, uint32_t firstRow,
+                               uint32_t count, uint64_t version) noexcept
     {
         if (uint64_t* rows = archetype.RowVersions(chunk, column))
         {
@@ -764,7 +771,7 @@ namespace donut::engine::ecs
         --archetype.chunks[lastChunk].count;
         // never lowered (a stamp of an older version can follow, e.g. an Exclusive step's after an observer's playback);
         // released below when it is empty now
-        archetype.chunks[lastChunk].shrunkVersion = std::max(archetype.chunks[lastChunk].shrunkVersion, version);
+        archetype.shrunkVersions[lastChunk] = std::max(archetype.shrunkVersions[lastChunk], version);
         --archetype.entityCount;
         ++archetype.rowMoves;
         if (archetype.chunks[lastChunk].count == 0)

@@ -665,6 +665,8 @@ namespace donut::engine
             uint64_t settledMoves = ~0ull;
             uint64_t settledContent = ~0ull;
             uint64_t settledTakes = ~0ull;
+            // the archetype's rowMoves at the last RunBounds that scanned it: no change, no chunk shrank since (B-2)
+            uint64_t scannedMoves = ~0ull;
         };
 
         struct JointArchetype
@@ -678,10 +680,10 @@ namespace donut::engine
         {
             uint32_t archetype;        // index in the level or bounds list
             uint32_t chunk;
-            bool whole;                // the chunk's own columns changed: every row
-            const uint64_t* localRows; // propagation, E7.5: a whole chunk that changed only in LocalTransform, whose
-                                       // row versions tell the rows to compose (LocalRowsChanged); null: every row
+            bool whole;                // the chunk's own columns changed: every row (with row versions of
+                                       // LocalTransform, E7.5: the rows LocalRowsChanged names; PropagateChunk)
         };
+        static_assert(sizeof(Task) == 12, "Task: the systems' task lists (B-2)");
 
         struct PropagationContext;
         struct BoundsContext;
@@ -816,6 +818,11 @@ namespace donut::engine
         static void RunDeepTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
         void MarkSkinnedJoints(uint64_t since);
         static void RunPropagationTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
+        // One propagation task; `RowVersions`: its archetype has RowTracked columns (E7.5), else the plain loop of
+        // E6 (backlog B-2). Returns the rows written.
+        template <bool RowVersions>
+        uint32_t PropagateChunk(const PropagationContext& ctx, const LevelArchetype& level,
+                                const ecs::Archetype& archetype, const Task& task) const noexcept;
         static void RunBoundsTasks(void* context, uint32_t begin, uint32_t end, uint32_t worker) noexcept;
         // E7.4 remedy 3 (SceneGraph::SetStaticTag): the Static tag's id once registered (looked up, never registered by
         // the graph), the level entry of an archetype (null before its first classification or without one), whether
@@ -824,7 +831,11 @@ namespace donut::engine
         // LocalTransform.
         ComponentId ResolveStaticTag() noexcept;
         const LevelArchetype* LevelOf(uint32_t archetypeIndex) const noexcept;
-        bool IsSettledStaticRow(const RowRef& row) const noexcept;
+        bool IsSettledStaticRow(const RowRef& row) const noexcept
+        {
+            return m_StaticTagHonoured && IsSettledStaticRowHonoured(row);   // one test while Static is off (B-2)
+        }
+        bool IsSettledStaticRowHonoured(const RowRef& row) const noexcept;
         void QueueStaticLevel(LevelArchetype& level, uint32_t index, const ecs::Archetype& archetype,
                               uint64_t since);
         void WarnStaticWrites(const LevelArchetype& level, const ecs::Archetype& archetype, uint64_t since) const;
@@ -853,7 +864,8 @@ namespace donut::engine
         // twice more: 200,000 rows four times.
         dm::daffine3 ComposeWorld(Entity entity) const noexcept;
         dm::daffine3 ComposeLongChain(Entity entity) const noexcept;
-        bool EndsComposition(const RowRef& row, dm::daffine3& outWorld) const noexcept;
+        bool EndsComposition(const RowRef& row) const noexcept { return IsDriven(row) || IsSettledStaticRow(row); }
+        dm::daffine3 EndingWorld(const RowRef& row) const noexcept;   // the world of a row that ends the walk
         // The local transform that a driven row gets when it is not driven any more: what the local getters give (the
         // parts of its simulated pose in the space of its parent, at its simulated world, so that both are of the same
         // time). Warns when its matrix does not give the pose (a parent whose scale shears it or has no inverse);

@@ -1653,15 +1653,16 @@ namespace
         }
     }
 
-    // Compact packet records (plan step E7, item E7.4, remedy 2; part I5): RenderService::SetCompactPacketRecords is off
-    // by default; with it on, each extraction's snapshot (the views' ranges, the instances, the packets with their keys
-    // and order) equals the one with it off, over a scene edited for eight frames, serially and with every step on the
-    // job system. The sorter's two-step form gives Sort's order, with the position in the word and in the index arrays.
+    // Compact packet records (plan step E7, item E7.4, remedy 2; part I5): RenderService::SetCompactPacketRecords is on
+    // by default (since F10); with it on, each extraction's snapshot (the views' ranges, the instances, the packets with
+    // their keys and order) equals the one with it off, over a scene edited for eight frames, serially and with every
+    // step on the job system. The sorter's two-step form gives Sort's order, with the position in the word and in the
+    // index arrays.
     void test_compact_packet_records()
     {
         // Stage T1: on in the switches-on runs (tests/src/e7_switches.cpp); the value found is put back at the end.
         const bool compactFound = RenderService::GetCompactPacketRecords();
-        CHECK(compactFound == donut::tests::E7SwitchRequested("compact"));
+        CHECK(compactFound == donut::tests::E7SwitchExpected("compact", true));   // on by default since F10
         JobSystemDesc jobDesc;
         jobDesc.debugName = "test_draw_packets.compact";
         jobDesc.workerThreadCount = 8;

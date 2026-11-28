@@ -535,10 +535,11 @@ namespace donut::render
 
         // Compact packet records (plan step E7, item E7.4, remedy 2; design 10.1, D11): extraction lists each packet in
         // a 24-byte record instead of a 32-byte one and writes the sort's words in its copy step, so that the sort
-        // reads no keys. A process-wide switch (one per module that links donut_render statically), off by default,
-        // which stays off until measured (sub-plan revision 2, stage B); every service reads it once per Extract. The
-        // snapshot is the same either way (instances, packets, keys and order), except for a mesh of more than 2^26
-        // geometries, whose geometries from that one on get no packets with it (a warning). Set it on any thread.
+        // reads no keys. A process-wide switch (one per module that links donut_render statically), on by default
+        // since it passed stage B's rule (sub-plan revision 2: extraction 9.5 % faster, nothing slower); every service
+        // reads it once per Extract. The snapshot is the same either way (instances, packets, keys and order), except
+        // for a mesh of more than 2^26 geometries, whose geometries from that one on get no packets with it (a
+        // warning). Set it on any thread.
         static void SetCompactPacketRecords(bool enabled) noexcept;
         [[nodiscard]] static bool GetCompactPacketRecords() noexcept;
 

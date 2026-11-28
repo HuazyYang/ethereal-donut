@@ -70,6 +70,17 @@ if (DONUT_WITH_NVRHI)
         add_test(NAME ${_bench}_smoke_switches_on COMMAND ${_bench} --smoke)
         set_tests_properties(${_bench}_smoke_switches_on PROPERTIES ENVIRONMENT "DONUT_E7_SWITCHES=all")
     endforeach()
+    # Compact packet records are on by default since F10: the render tests and the extraction smoke run once more with
+    # every switch off (`<name>_compact_off`), the former default (backlog F10-R1).
+    foreach(_test test_render_extract test_draw_packets test_light_shadows test_render_pipelining
+            test_draw_strategy_adapters)
+        if(TARGET ${_test})
+            add_test(NAME ${_test}_compact_off COMMAND ${_test})
+            set_tests_properties(${_test}_compact_off PROPERTIES ENVIRONMENT "DONUT_E7_SWITCHES=off")
+        endif()
+    endforeach()
+    add_test(NAME bench_render_extract_smoke_compact_off COMMAND bench_render_extract --smoke)
+    set_tests_properties(bench_render_extract_smoke_compact_off PROPERTIES ENVIRONMENT "DONUT_E7_SWITCHES=off")
     # The benches' runtime-only population (revision 2, stage M), smoke size; the default population's tests above.
     foreach(_bench bench_gpu_scene bench_render_extract)
         add_test(NAME ${_bench}_smoke_runtime COMMAND ${_bench} --smoke --population runtime)
@@ -84,4 +95,9 @@ if (DONUT_WITH_NVRHI)
                 ENVIRONMENT "DONUT_E7_SWITCHES=all" RUN_SERIAL TRUE LABELS gpu)
         endif()
     endforeach()
+    if(TEST test_render_extract_gpu_d3d12)
+        add_test(NAME test_render_extract_gpu_compact_off_d3d12 COMMAND test_render_extract_gpu d3d12)
+        set_tests_properties(test_render_extract_gpu_compact_off_d3d12 PROPERTIES
+            ENVIRONMENT "DONUT_E7_SWITCHES=off" RUN_SERIAL TRUE LABELS gpu)
+    endif()
 endif()

@@ -324,12 +324,8 @@ namespace donut::engine::ecs
         uint8_t* memory;
         uint32_t count;             // rows in use
         uint32_t reserved;
-        // The version at which the chunk last lost a row that was not replaced (RemoveRow: the archetype's last row,
-        // removed or moved into a hole elsewhere), 0 if never. No column version says so (the chunk's rows that stay
-        // are unchanged): a per-chunk aggregate of the rows (the scene graph's ChunkWorldBounds) reads it to know that
-        // it is stale (backlog T4-1).
-        uint64_t shrunkVersion;
     };
+    static_assert(sizeof(void*) != 8 || sizeof(ChunkRecord) == 16, "ChunkRecord: every chunk scan reads it (B-2)");
 
     struct ArchetypeEdge
     {
@@ -364,6 +360,9 @@ namespace donut::engine::ecs
         uint32_t entityCount = 0;
         uint32_t sharedSize = 0;
         uint64_t hash = 0;
+        // Bit (id % 64) of each of its components: FindColumn's one-test reject of a component it does not have (the
+        // observers test every structural report against several archetypes; backlog B-2). Set by DescribeColumns.
+        uint64_t componentBits = 0;
         uint8_t* sharedValues = nullptr;
         // Counts the removals of rows (a swap-remove moves the archetype's last row into the hole) and the chunks
         // released. A (chunk, row) of one of its entities, remembered with this count, is still that entity's place
@@ -383,12 +382,23 @@ namespace donut::engine::ecs
         Vector<ComponentId> components; // sorted
         Vector<ArchetypeColumn> columns;// one per component, in the same order
         Vector<ChunkRecord> chunks;
+        // Per chunk, the version at which it last lost a row that was not replaced (RemoveRow: the archetype's last
+        // row, removed or moved into a hole elsewhere), 0 if never. No column version says so (the chunk's rows that
+        // stay are unchanged): a per-chunk aggregate of the rows (the scene graph's ChunkWorldBounds) reads it to know
+        // that it is stale (backlog T4-1). Beside `chunks`, not in ChunkRecord, which every chunk scan reads (B-2).
+        Vector<uint64_t> shrunkVersions;
         Vector<ArchetypeEdge> addEdges;     // cached targets of adding a component (not for Shared: the value decides)
         Vector<ArchetypeEdge> removeEdges;  // cached targets of removing one
         Vector<ArchetypeTransition> transitions;   // cached targets of several changes at once; one per pair of lists
         Vector<ComponentId> transitionIds;         // that was asked for, and kept as the edges are
 
-        uint32_t FindColumn(ComponentId component) const noexcept;
+        uint32_t FindColumn(ComponentId component) const noexcept
+        {
+            if (((componentBits >> (uint32_t(component) & 63u)) & 1u) == 0)
+                return c_NoColumn;   // none of its components has this bit
+            return FindColumnSorted(component);
+        }
+        uint32_t FindColumnSorted(ComponentId component) const noexcept;   // the binary search
         uint32_t GetChunkCount() const noexcept { return uint32_t(chunks.size()); }
         uint32_t AddedVersionSlot() const noexcept { return uint32_t(columns.size()); }
 
@@ -446,19 +456,31 @@ namespace donut::engine::ecs
     // newest row version is this version or a later one (a row write of the same version came first, such as a node
     // setter and a c_WorldVersion query outside phases), the chunk version would not be newer than the rows, so the
     // rule above could not see the write: every row in use is stamped with the version at once.
-    void StampChunkWrite(const Archetype& archetype, uint32_t chunk, uint32_t column, uint64_t version) noexcept;
+    void StampChunkWriteTracked(const Archetype& archetype, uint32_t chunk, uint32_t column, uint64_t version) noexcept;
+    inline void StampChunkWrite(const Archetype& archetype, uint32_t chunk, uint32_t column, uint64_t version) noexcept
+    {
+        if (archetype.columns[column].rowVersionSlot != c_NoRowVersions)
+            StampChunkWriteTracked(archetype, chunk, column, version);
+        else
+            StampVersion(archetype.Versions(chunk) + column, version);   // no row versions: the chunk's (backlog B-2)
+    }
 
     // A write of rows [firstRow, firstRow + count) of a column: their row versions, the newest one, then the chunk's.
-    // For a column without row versions, the chunk's only.
-    void StampRowWrites(const Archetype& archetype, uint32_t chunk, uint32_t column, uint32_t firstRow, uint32_t count,
-                        uint64_t version) noexcept;
+    // For a column without row versions, the chunk's only (inline: the common case; backlog B-2).
+    void StampRowWritesTracked(const Archetype& archetype, uint32_t chunk, uint32_t column, uint32_t firstRow,
+                               uint32_t count, uint64_t version) noexcept;
+    inline void StampRowWrites(const Archetype& archetype, uint32_t chunk, uint32_t column, uint32_t firstRow,
+                               uint32_t count, uint64_t version) noexcept
+    {
+        if (archetype.columns[column].rowVersionSlot != c_NoRowVersions)
+            StampRowWritesTracked(archetype, chunk, column, firstRow, count, version);
+        else
+            StampVersion(archetype.Versions(chunk) + column, version);
+    }
     inline void StampRowWrite(const Archetype& archetype, uint32_t chunk, uint32_t column, uint32_t row,
                               uint64_t version) noexcept
     {
-        if (archetype.columns[column].rowVersionSlot != c_NoRowVersions)
-            StampRowWrites(archetype, chunk, column, row, 1, version);
-        else
-            StampVersion(archetype.Versions(chunk) + column, version);
+        StampRowWrites(archetype, chunk, column, row, 1, version);
     }
 
     // For readers that test chunk versions themselves (the scene graph's systems, GpuScene): the row versions of a

@@ -2823,11 +2823,17 @@ namespace donut::engine
 #endif
             const ArchetypeColumn& c = row.archetype->columns[column];
             uint8_t* memory = row.archetype->chunks[row.chunk].memory;
+            // read before the writes below, which may alias the column record for the compiler (backlog B-2)
+            const bool rowVersions = c.rowVersionSlot != ecs::c_NoRowVersions;
+            uint64_t* chunkVersion = row.archetype->Versions(row.chunk) + column;
             LocalTransform* local = reinterpret_cast<LocalTransform*>(memory + c.offset + size_t(row.row) * c.stride);
             if (scaling) local->scaling = *scaling;
             if (rotation) local->rotation = *rotation;
             if (translation) local->translation = *translation;
-            StampRowWrite(*row.archetype, row.chunk, column, row.row, m_Impl->GetStampVersion());
+            if (rowVersions)
+                ecs::StampRowWritesTracked(*row.archetype, row.chunk, column, row.row, 1, m_Impl->GetStampVersion());
+            else
+                StampVersion(chunkVersion, m_Impl->GetStampVersion());
         }
         else
         {
@@ -2898,7 +2904,7 @@ namespace donut::engine
         // The asset tables and slots change first, and SceneGraph's callbacks run after them (they may throw), then
         // the virtual RegisterLeaf or UnregisterLeaf: as RegisterLeaf raised OnMeshAdded before it added the leaf to
         // its vectors.
-        if (!added)
+        if (!added && IsDeferring())   // inline test first: no call per leaf while no Defer scope is open (B-2)
             Retire(leaf);   // while a Defer scope is open (E7.8): the open frame may name the leaf
         {
             ChangesScope scope(*this);
@@ -3536,10 +3542,8 @@ namespace donut::engine
     // bucket) and the last propagation run took its chunk (its Added version is not newer). Such a row keeps the world
     // that run gave it. A row whose chunk rows joined since, or whose archetype is not classified yet (no propagation
     // ran since it was made), is taken whole by the next run, from its LocalTransform.
-    bool SceneGraphStore::IsSettledStaticRow(const RowRef& row) const noexcept
+    bool SceneGraphStore::IsSettledStaticRowHonoured(const RowRef& row) const noexcept
     {
-        if (!m_StaticTagHonoured)
-            return false;
         const LevelArchetype* level = LevelOf(row.archetypeIndex);
         return level && level->staticRows &&
                row.archetype->Versions(row.chunk)[row.archetype->AddedVersionSlot()] <= m_PropagatedVersion;
@@ -3567,7 +3571,7 @@ namespace donut::engine
         for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
         {
             if (archetype.chunks[c].count != 0 && archetype.Versions(c)[archetype.AddedVersionSlot()] > since)
-                m_Tasks.push_back(Task{ index, c, true, nullptr });
+                m_Tasks.push_back(Task{ index, c, true });
         }
     }
 
@@ -3660,50 +3664,11 @@ namespace donut::engine
             const Task& task = store.m_Tasks[t];
             const LevelArchetype& level = levels[task.archetype];
             const Archetype& archetype = store.m_Impl->GetArchetypeStorage(level.archetype);
-            const uint32_t count = archetype.chunks[task.chunk].count;
-            const Parent* parents = level.parent != c_Absent
-                ? reinterpret_cast<const Parent*>(ColumnBase(archetype, task.chunk, level.parent)) : nullptr;
-
-            // E7.5: with row versions of WorldTransform, the rows written are stamped; a chunk-only write of it is
-            // spread first, so that it stays seen. With row versions of LocalTransform (task.localRows), a chunk that
-            // changed only there composes only its rows that changed.
-            uint64_t* worldRows = archetype.RowVersions(task.chunk, level.world);
-            if (worldRows)
-                SpreadChunkWrite(archetype, task.chunk, level.world);
-            uint32_t written = 0;
-            bool composed = false;
-            Entity cachedParent = Entity::Null;
-            const dm::daffine3* parentWorld = nullptr;
-            bool parentWritten = false;
-            for (uint32_t r = 0; r < count; ++r)
-            {
-                const bool compose = task.whole && (!task.localRows || task.localRows[r] > ctx.since);
-                if (parents)
-                {
-                    const Entity parent = parents[r].entity;
-                    if (parent != cachedParent)
-                    {
-                        cachedParent = parent;
-                        parentWritten = store.ParentWritten(parent, ctx.since, &parentWorld, true);
-                    }
-                    if (!parentWorld || (!compose && !parentWritten))
-                        continue;
-                }
-                else if (!compose)
-                    continue;
-                store.PropagateRow(level, archetype, task.chunk, r, parents ? parentWorld : nullptr, compose);
-                if (worldRows)
-                    StampVersion(worldRows + r, ctx.version);
-                composed = composed || compose;
-                ++written;
-            }
+            const uint32_t written = archetype.rowVersionSlots != 0
+                ? store.PropagateChunk<true>(ctx, level, archetype, task)
+                : store.PropagateChunk<false>(ctx, level, archetype, task);
             if (written)
             {
-                if (composed && level.matrix != c_Absent)
-                    StampVersion(archetype.Versions(task.chunk) + level.matrix, ctx.version);
-                if (worldRows)
-                    StampVersion(worldRows - 1, ctx.version);
-                StampVersion(archetype.Versions(task.chunk) + level.world, ctx.version);
                 ++chunks;
                 rows += written;
             }
@@ -3714,6 +3679,73 @@ namespace donut::engine
             ctx.chunks.fetch_add(chunks, std::memory_order_relaxed);
             ctx.rows.fetch_add(rows, std::memory_order_relaxed);
         }
+    }
+
+    template <bool RowVersions>
+    uint32_t SceneGraphStore::PropagateChunk(const PropagationContext& ctx, const LevelArchetype& level,
+                                             const Archetype& archetype, const Task& task) const noexcept
+    {
+        const uint32_t count = archetype.chunks[task.chunk].count;
+        const Parent* parents = level.parent != c_Absent
+            ? reinterpret_cast<const Parent*>(ColumnBase(archetype, task.chunk, level.parent)) : nullptr;
+
+        // E7.5: with row versions of WorldTransform, the rows written are stamped; a chunk-only write of it is spread
+        // first, so that it stays seen. With row versions of LocalTransform, a whole chunk that changed only there
+        // composes only its rows that changed (LocalRowsChanged). Without row versions: every row of a whole chunk.
+        [[maybe_unused]] uint64_t* worldRows = nullptr;          // read only with row versions (C4189 otherwise)
+        [[maybe_unused]] const uint64_t* localRows = nullptr;
+        if constexpr (RowVersions)
+        {
+            worldRows = archetype.RowVersions(task.chunk, level.world);
+            if (worldRows)
+                SpreadChunkWrite(archetype, task.chunk, level.world);
+            if (task.whole)
+                localRows = LocalRowsChanged(level, archetype, task.chunk, ctx.since);
+        }
+        uint32_t written = 0;
+        bool composed = false;
+        Entity cachedParent = Entity::Null;
+        const dm::daffine3* parentWorld = nullptr;
+        bool parentWritten = false;
+        for (uint32_t r = 0; r < count; ++r)
+        {
+            bool compose = task.whole;
+            if constexpr (RowVersions)
+                compose = compose && (!localRows || localRows[r] > ctx.since);
+            if (parents)
+            {
+                const Entity parent = parents[r].entity;
+                if (parent != cachedParent)
+                {
+                    cachedParent = parent;
+                    parentWritten = ParentWritten(parent, ctx.since, &parentWorld, true);
+                }
+                if (!parentWorld || (!compose && !parentWritten))
+                    continue;
+            }
+            else if (!compose)
+                continue;
+            PropagateRow(level, archetype, task.chunk, r, parents ? parentWorld : nullptr, compose);
+            if constexpr (RowVersions)
+            {
+                if (worldRows)
+                    StampVersion(worldRows + r, ctx.version);
+            }
+            composed = composed || compose;
+            ++written;
+        }
+        if (written)
+        {
+            if (composed && level.matrix != c_Absent)
+                StampVersion(archetype.Versions(task.chunk) + level.matrix, ctx.version);
+            if constexpr (RowVersions)
+            {
+                if (worldRows)
+                    StampVersion(worldRows - 1, ctx.version);
+            }
+            StampVersion(archetype.Versions(task.chunk) + level.world, ctx.version);
+        }
+        return written;
     }
 
     nvrhi::FRESULT SceneGraphStore::RunPropagation(ISystemContext* context) noexcept
@@ -3756,8 +3788,7 @@ namespace donut::engine
                                        (level.parent != c_Absent && versions[level.parent] > since) ||
                                        versions[archetype.AddedVersionSlot()] > since;
                     if (whole || levelAboveWrote)
-                        m_Tasks.push_back(Task{ i, c, whole, whole ? LocalRowsChanged(level, archetype, c, since)
-                                                                   : nullptr });
+                        m_Tasks.push_back(Task{ i, c, whole });
                 }
             }
             if (m_Tasks.empty())
@@ -3881,7 +3912,7 @@ namespace donut::engine
         if (parentInBucket)
             parentWritten = (m_DeepMarks[GetEntityIndex(parent)] & c_DeepWritten) != 0;
         bool dirty = DeepChunkDirty(*level, archetype, record.chunk, since);
-        if (dirty)
+        if (dirty && archetype.rowVersionSlots != 0)
         {
             // E7.5: a chunk that changed only in LocalTransform's row versions composes only its rows that changed
             const uint64_t* localRows = LocalRowsChanged(*level, archetype, record.chunk, since);
@@ -4115,20 +4146,12 @@ namespace donut::engine
 
     // A settled Static row (E7.4 remedy 3) ends the walk like a driven one: propagation keeps its world, whatever its
     // ancestors did since, and composes the rows below it from that world (backlog I5-R4).
-    bool SceneGraphStore::EndsComposition(const RowRef& row, dm::daffine3& outWorld) const noexcept
+    dm::daffine3 SceneGraphStore::EndingWorld(const RowRef& row) const noexcept
     {
         if (IsDriven(row))
-        {
-            outWorld = SimulatedPose(row);
-            return true;
-        }
-        if (IsSettledStaticRow(row))
-        {
-            const WorldTransform* world = static_cast<const WorldTransform*>(Column(row, SlotWorld));
-            outWorld = world ? world->transform : dm::daffine3::identity();
-            return true;
-        }
-        return false;
+            return SimulatedPose(row);
+        const WorldTransform* world = static_cast<const WorldTransform*>(Column(row, SlotWorld));
+        return world ? world->transform : dm::daffine3::identity();
     }
 
     dm::daffine3 SceneGraphStore::ComposeWorld(Entity entity) const noexcept
@@ -4142,8 +4165,9 @@ namespace donut::engine
         RowRef row;
         while (Locate(entity, row))
         {
-            if (EndsComposition(row, world))
+            if (EndsComposition(row))
             {
+                world = EndingWorld(row);
                 hasParent = true;
                 break;
             }
@@ -4192,8 +4216,9 @@ namespace donut::engine
         uint32_t rows = 0;
         for (Entity at = entity; Locate(at, row);)
         {
-            if (EndsComposition(row, world))
+            if (EndsComposition(row))
             {
+                world = EndingWorld(row);
                 hasParent = true;
                 break;
             }
@@ -4742,15 +4767,19 @@ namespace donut::engine
                 bounds.settledContent = m_ContentChanges;
                 bounds.settledTakes = takes;
             }
+            // A chunk that lost a row has a box that may still hold it (backlog T4-1): no column version says so, its
+            // shrunk version does. Every removal counts in rowMoves, so the shrunk versions are read only when the
+            // archetype's count moved since this system's last scan of it (backlog B-2: a read per chunk otherwise).
+            const bool rowsLeft = archetype.rowMoves != bounds.scannedMoves;
+            bounds.scannedMoves = archetype.rowMoves;
             for (uint32_t c = 0; c < archetype.GetChunkCount(); ++c)
             {
                 if (archetype.chunks[c].count == 0)
                     continue;
                 const uint64_t* versions = archetype.Versions(c);
-                // a chunk that lost a row has a box that may still hold it (backlog T4-1): no column version says so
                 const bool changed = versions[bounds.world] > since || versions[bounds.localBounds] > since ||
                                      versions[archetype.AddedVersionSlot()] > since ||
-                                     archetype.chunks[c].shrunkVersion > since;
+                                     (rowsLeft && archetype.shrunkVersions[c] > since);
                 // a chunk of leaves with dynamic bounds is read at every run
                 if (changed || bounds.leaf != c_Absent)
                     m_Tasks.push_back(Task{ i, c, changed });

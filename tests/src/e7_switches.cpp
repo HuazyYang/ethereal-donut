@@ -22,18 +22,21 @@
 
 // The process-wide switches of plan step E7 (sub-plan revision 2, parts I4 and I5; stage T1), set from the environment
 // before any test runs. Linked into the device-free tests and smoke benches that build scene graphs, run queries or
-// extract (tests/CMakeLists.txt, donut_tests_e7_switches); without the variable it does nothing, so the tests run as
-// before, every switch off.
+// extract (tests/CMakeLists.txt, donut_tests_e7_switches); without the variable it does nothing, so the tests run with
+// every switch at its default: compact records on (since F10), the others off. With it, every switch is set: on when
+// the list names it, off otherwise (so `off` turns compact records off too; backlog F10-R1).
 //
 //   DONUT_E7_SWITCHES=all                 every switch on
-//   DONUT_E7_SWITCHES=rowtracked,static   a list of: rowtracked (SceneGraph::SetRowTrackedTransforms, part I4),
-//                                         prefetch (engine::SetQueryChunkPrefetch, I5 remedy 1),
+//   DONUT_E7_SWITCHES=rowtracked,static   these on, the others off: rowtracked (SceneGraph::SetRowTrackedTransforms,
+//                                         part I4), prefetch (engine::SetQueryChunkPrefetch, I5 remedy 1),
 //                                         compact (RenderService::SetCompactPacketRecords, remedy 2),
 //                                         static (SceneGraph::SetStaticTag, remedy 3),
 //                                         childless (SceneGraph::SetChildlessBoundsPath, remedy 4)
-//   DONUT_E7_SWITCHES=off (or unset)      nothing
+//   DONUT_E7_SWITCHES=off                 every switch off
+//   unset or empty                        nothing: the defaults
 //
-// ctest runs each listed test a second time as `<test>_switches_on` with DONUT_E7_SWITCHES=all. The switches are
+// ctest runs each listed test a second time as `<test>_switches_on` with DONUT_E7_SWITCHES=all, and the render tests
+// as `<test>_compact_off` with DONUT_E7_SWITCHES=off (the compact records' former default). The switches are
 // relaxed atomics with constant initialisers, so setting them from a dynamic initialiser is safe. The I6 Defer mode is
 // per render-read scope, not a process switch; it is not set here. A test that toggles a switch for its own A/B sets
 // both sides explicitly and puts back the value it found (the switches-on runs depend on it).
@@ -58,10 +61,10 @@ namespace
             std::string on;
             auto set = [&](const char* name, void (*setter)(bool) noexcept)
             {
-                if (!donut::tests::E7SwitchRequested(name))
-                    return;
-                setter(true);
-                on += on.empty() ? std::string(name) : std::string(",") + name;
+                const bool requested = donut::tests::E7SwitchRequested(name);
+                setter(requested);
+                if (requested)
+                    on += on.empty() ? std::string(name) : std::string(",") + name;
             };
             set("rowtracked", &donut::engine::SceneGraph::SetRowTrackedTransforms);
             set("prefetch", &donut::engine::SetQueryChunkPrefetch);

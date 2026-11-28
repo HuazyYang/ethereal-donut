@@ -1415,6 +1415,7 @@ namespace donut::engine::ecs
                 Archetype& archetype = *world.m_Archetypes[a];
                 const uint64_t chunks = ChunksFor(image.archetypeRows[a], archetype.rowsPerChunk);
                 archetype.chunks.reserve(size_t(chunks));
+                archetype.shrunkVersions.reserve(size_t(chunks));
                 if (!world.ReserveRowVersionBlocks(archetype, uint32_t(chunks)))
                     return nvrhi::FE_OUT_OF_MEMORY;
             }

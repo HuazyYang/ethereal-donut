@@ -1911,7 +1911,10 @@ namespace
             CHECK(target->AddComponent(resident[1], t.color, &color) == nvrhi::FS_OK);
             ecs::WorldImpl& impl = Impl(target);
             for (uint32_t a = 0; a < impl.GetArchetypeStorageCount(); ++a)
+            {
                 impl.GetArchetypeStorage(a).chunks.reserve(64);
+                impl.GetArchetypeStorage(a).shrunkVersions.reserve(64);   // beside the chunks since F10 (B-2)
+            }
             ecs::SparseSet& colors = const_cast<ecs::SparseSet&>(*impl.GetSparseSet(t.color));
             colors.entities.reserve(256);
             colors.pages.resize(16, nullptr);

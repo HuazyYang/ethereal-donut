@@ -48,7 +48,7 @@
 //   4. per view and pass, a stable LSD radix sort of the keys, so equal keys keep chunk order: the views' and passes'
 //      sorts side by side, a large one on the job system inside too;
 //   5. in parallel: the packets gathered into the arena's arrays in key order.
-// With compact packet records (RenderService::SetCompactPacketRecords; plan step E7, item E7.4, remedy 2; off by
+// With compact packet records (RenderService::SetCompactPacketRecords; plan step E7, item E7.4, remedy 2; on by
 // default) a range lists 24-byte records (CompactPacketRecord) instead of 32-byte ones; step 2 also prepares each
 // segment's sort; step 3 copies the records into one array and writes the sort's words itself (the key's varying
 // bits and the position), so that the sort reads no keys; step 5 gathers from that array. The output is the same.

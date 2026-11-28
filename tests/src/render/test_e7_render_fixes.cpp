@@ -33,6 +33,7 @@
 //   t5_n1_compact_geometry_cap   with compact records, a mesh's geometries past the cap get no packets (one warning)
 //   t8_4_scope_identity_wrap     the scope identities skip 0 at the wrap past 2^32 - 1
 //   s2_first_packet_of_a_pass    a pass's first packet in a range that a view already sees grows no scratch
+//   f10_compact_records_default  compact packet records are on by default (stage B passed them; F10)
 //   i7_n1_service_destroyed_while_recording  the service's state is kept, with a warning (last: the process defers)
 // GPU:
 //   s1_permanent_state_from_prepare  a permanent state that a Prepare sets on the upload list holds in the frame's lists
@@ -56,6 +57,7 @@
 #include <donut/render/RenderGraph.h>
 #include <donut/render/RenderGraphFrameData.h>
 #include <donut/render/RenderGraphLambdaPass.h>
+#include <donut/tests/e7_switches.h>
 #include <donut/tests/utils.h>
 
 #include "RenderVisibility.h"   // its test seam for the compact geometry cap (src/render)
@@ -533,6 +535,15 @@ void test_s2_first_packet_of_a_pass()
     CHECK(TakeWarnings() == 0);
 }
 
+// ------------------------------------------------------------------------------------------------ F10
+
+// Compact packet records are on by default since stage B measured them (F10): a process that sets nothing extracts
+// with them (the switches-on runs set them on too, DONUT_E7_SWITCHES=off off).
+void test_f10_compact_records_default()
+{
+    CHECK(RenderService::GetCompactPacketRecords() == donut::tests::E7SwitchExpected("compact", true));
+}
+
 // ------------------------------------------------------------------------------------------------ T8-4
 
 // A graph whose identities start near the wrap (the store's test seam): 2^32 - 1, then 1, never 0 (0 means "no
@@ -899,6 +910,7 @@ int main(int argc, char** argv)
         { "t5_n1_compact_geometry_cap", test_t5_n1_compact_geometry_cap },
         { "t8_4_scope_identity_wrap", test_t8_4_scope_identity_wrap },
         { "s2_first_packet_of_a_pass", test_s2_first_packet_of_a_pass },
+        { "f10_compact_records_default", test_f10_compact_records_default },
         { "i7_n1_service_destroyed_while_recording", test_i7_n1_service_destroyed_while_recording },   // last
     };
     log::SetCallback([](log::Severity severity, const char* message)

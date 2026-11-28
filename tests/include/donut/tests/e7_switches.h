@@ -24,8 +24,9 @@
 
 // The switches of plan step E7 (sub-plan revision 2, parts I4 and I5) as the environment asks for them (stage T1):
 // DONUT_E7_SWITCHES=all, or a comma-separated list of rowtracked, prefetch, compact, static, childless; unset, empty
-// or "off" asks for none. tests/src/e7_switches.cpp sets the switches from it before main; a test that checks a
-// switch's default compares it with E7SwitchRequested instead of with false.
+// or "off" asks for none. tests/src/e7_switches.cpp sets every switch from it before main when it is set (on when asked
+// for, off otherwise); unset or empty leaves the defaults. A test that checks a switch's value compares it with
+// E7SwitchExpected (compact records are on by default since F10, the other switches off).
 
 #include <cstdlib>
 #include <cstring>
@@ -69,5 +70,12 @@ namespace donut::tests
             start = end + 1;
         }
         return false;
+    }
+
+    // The value a switch has in this process: the default when the variable is unset or empty, else whether it is asked
+    // for (e7_switches.cpp sets every switch then).
+    inline bool E7SwitchExpected(const char* name, bool byDefault)
+    {
+        return E7SwitchesVariable().empty() ? byDefault : E7SwitchRequested(name);
     }
 }
