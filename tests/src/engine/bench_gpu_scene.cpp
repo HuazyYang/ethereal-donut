@@ -43,6 +43,7 @@
 //                 into the staging array as the upload pass's writeBuffer copies them, then CommitScatter
 //   --workers N   the graph (its refresh, and the scatter gather) on a job system of N worker threads; the thread that
 //                 calls Refresh and Update works too. Without it, the process's shared job system.
+//   --stats       each case's last GpuSceneStats (chunks visited and changed, rows built, records) on stderr
 //
 // Plan step E7 (revision 2, stage M), default build only:
 //   --population runtime   the 100k instances are runtime-only mesh instances (RuntimeMeshInstance, SceneComponents.h)
@@ -89,6 +90,8 @@ namespace
         uint32_t workers = 0;   // 0: the shared job system
         bool runtime = false;   // --population runtime
     };
+
+    bool g_Stats = false;       // --stats: each case's last GpuSceneStats on stderr (default build)
 
 #if !BENCH_GPU_SCENE_E0
     // --population runtime: the rows, and the moves of a frame, which a PreSimulation system writes.
@@ -437,6 +440,17 @@ namespace
         }
         std::sort(upload.begin(), upload.end());
         std::sort(refresh.begin(), refresh.end());
+#if !BENCH_GPU_SCENE_E0
+        if (g_Stats)
+        {
+            // --stats: what the last frame's Update did (GpuSceneStats), on stderr
+            const GpuSceneStats& st = uploader.gpu->GetStats();
+            std::fprintf(stderr, "%s: chunks visited %u, changed %u; rows built %u, changed %u, settled %u; records: "
+                         "transform %u, row %u, settle %u\n", c_CaseNames[uint32_t(c)], st.chunksVisited,
+                         st.chunksChanged, st.rowsBuilt, st.rowsChanged, st.rowsSettled, st.transformRecords,
+                         st.rowRecords, st.settleRecords);
+        }
+#endif
         return Sample{ upload[upload.size() / 2], refresh[refresh.size() / 2], bytes, rows };
     }
 }
@@ -459,6 +473,8 @@ int main(int argc, char** argv)
             options.frames = uint32_t(std::stoul(argv[++i]));
         else if (arg == "--instances" && i + 1 < argc)
             options.instances = uint32_t(std::stoul(argv[++i]));
+        else if (arg == "--stats")
+            g_Stats = true;
         else if (arg == "--scatter")
             options.scatter = true;
         else if (arg == "--workers" && i + 1 < argc)

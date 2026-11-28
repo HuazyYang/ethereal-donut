@@ -24,13 +24,14 @@
 // SceneComponents.h) made through the public API (aggregate docs/plans/2026-11-26-donut-ecs-e7.md, item E7.3; revision 2,
 // stage B). Without a device.
 //
-//     bench_scale [--smoke] [--rounds N] [--frames N] [--workers N] [--case NAME] [--dynamic N]
+//     bench_scale [--smoke] [--rounds N] [--frames N] [--workers N] [--case NAME] [--dynamic N] [--stats]
 //
 // Worlds, each a scene graph of its own on the same job system (built when a selected case needs it):
 //   dyn      `--dynamic` rows (default 100k) on bench_render_extract's grid (400 a row, 2 m apart), 4 meshes of 1-3
 //            geometries, 4 materials (opaque, alpha-tested, blended, double-sided opaque)
 //   world    1M static rows (tag Static) on a 1000 x 1000 grid 2 m apart, 3 m below, and the 100k of `dyn` beside them
 //   static   the 1M static rows and one dynamic row
+//   moves    a copy of `dyn` for move_10k alone
 //   debris   10k simulation-driven runtime rows and a toy CPU domain (free fall and spin, as bench_simulation's)
 // Moves are written by a PreSimulation system (GetComponentForWrite per moved row with the system's version; untimed),
 // so that only the chunks (and, with the RowTracked switch, the rows) of moved rows change. Cases, ms per frame:
@@ -43,9 +44,11 @@
 //                             `dyn` moved (and Refresh, untimed); `_in_world`: the same in `world`
 //   extract_view, extract_all RenderService::Extract (no device) over `dyn`, every 10th row moved; the view inside the
 //                             grid, and the view above it that sees every row; extract_world_view: the view over `world`
-//   move_10k                  AddComponents or RemoveComponents of a tag on every 10th row of `dyn` (10k) through one
-//                             command buffer, played back at the sync point after PostSimulation (the PostSimulation
-//                             phase with its sync point); add and remove frames alternate, both counted
+//   move_10k                  AddComponents or RemoveComponents of a tag on every 10th row (10k) of `moves`, a copy of
+//                             `dyn` of its own (the round trip regroups the tagged rows at the archetype's end, which
+//                             would turn `dyn`'s strided moves into a block), through one command buffer, played back at
+//                             the sync point after PostSimulation (the phase with its sync point); add and remove frames
+//                             alternate, both counted
 //   spawn_10k, despawn_10k    CreateEntities and DestroyEntities of 10k runtime rows through a command buffer (slots,
 //                             the graph's observer), the phase with its sync point; spawn_100k the same with 100k
 //   debris                    SceneGraph::Simulate over `debris` (gather, one fixed step, scatter, interpolation);
@@ -53,6 +56,7 @@
 //   bytes_per_row             not timed: row bytes (ArchetypeInfo::rowSize) and chunk bytes per row (chunkSize /
 //                             rowsPerChunk) of the runtime archetype and of a node-backed mesh instance's
 //   bandwidth                 a memcpy of 64 MB: ms and GB/s, the floor each row's bytes per frame are read against
+// `--stats` prints each upload case's GpuSceneStats (chunks visited and changed, rows built, records) on stderr.
 // Breakdown columns: the TransformPropagation and Bounds systems' last run (SystemStats) for Refresh cases; for debris
 // the domain's step and scatter and the interpolation. `--smoke` divides the sizes by 100 (ctest bench_scale_smoke).
 // Protocol: every round runs every selected case once (the order alternates between rounds); a run keeps the median of
@@ -130,6 +134,7 @@ namespace
         uint32_t frames = 20;
         uint32_t workers = 0;   // 0: the shared job system
         std::string only;
+        bool stats = false;     // --stats: the upload cases' GpuSceneStats on stderr
     };
 
     dm::double3 GridPosition(uint32_t i)
@@ -766,7 +771,7 @@ namespace
     {
         Options options;
         nvrhi::AutoPtr<IJobSystem> jobs;
-        std::unique_ptr<World> dyn, world, statics, debris;
+        std::unique_ptr<World> dyn, world, statics, debris, moves;
 
         World& Dyn()
         {
@@ -777,6 +782,16 @@ namespace
                     std::abort();
             }
             return *dyn;
+        }
+        World& Moves()
+        {
+            if (!moves)
+            {
+                moves = std::make_unique<World>();
+                if (!BuildWorld(*moves, options.dynamic, 0, jobs))
+                    std::abort();
+            }
+            return *moves;
         }
         World& Full()
         {
@@ -851,6 +866,16 @@ namespace
                 const auto t1 = Clock::now();
                 if (f >= 2)
                     samples.push_back(Sample{ Milliseconds(t0, t1), 0.0, 0.0, 0.0, rows });
+            }
+            if (options.stats)
+            {
+                // --stats: what the last frame's Update did (GpuSceneStats), on stderr
+                const GpuSceneStats& s = w.gpu->GetStats();
+                std::fprintf(stderr, "upload stats (%u dynamic, %u static rows, mode %d): chunks visited %u, changed %u; "
+                             "rows built %u, changed %u, settled %u; records: transform %u, row %u, settle %u\n",
+                             uint32_t(w.dynamicRows.size()), uint32_t(w.staticRows.size()), int(mode), s.chunksVisited,
+                             s.chunksChanged, s.rowsBuilt, s.rowsChanged, s.rowsSettled, s.transformRecords,
+                             s.rowRecords, s.settleRecords);
             }
             return samples;
         }
@@ -1009,6 +1034,8 @@ int main(int argc, char** argv)
             options.workers = std::max(1u, uint32_t(std::stoul(argv[++i])));
         else if (arg == "--case" && i + 1 < argc)
             options.only = argv[++i];
+        else if (arg == "--stats")
+            options.stats = true;
         else if (arg == "--dynamic" && i + 1 < argc)
             options.dynamic = uint32_t(std::stoul(argv[++i]));
     }
@@ -1052,7 +1079,7 @@ int main(int argc, char** argv)
         { "extract_view", [](Bench& b) { return b.ExtractFrames(b.Dyn(), 0); }, "visible" },
         { "extract_all", [](Bench& b) { return b.ExtractFrames(b.Dyn(), 1); }, "visible" },
         { "extract_world_view", [](Bench& b) { return b.ExtractFrames(b.Full(), 0); }, "visible" },
-        { "move_10k", [](Bench& b) { return b.MoveFrames(b.Dyn()); }, "rows" },
+        { "move_10k", [](Bench& b) { return b.MoveFrames(b.Moves()); }, "rows" },
         { "spawn_10k", [](Bench& b) { return b.SpawnFrames(b.Dyn(), b.options.spawn, false); }, "rows" },
         { "despawn_10k", [](Bench& b) { return b.SpawnFrames(b.Dyn(), b.options.spawn, true); }, "rows" },
         { "spawn_100k", [](Bench& b) { return b.SpawnFrames(b.Dyn(), b.options.spawnLarge, false); }, "rows" },
