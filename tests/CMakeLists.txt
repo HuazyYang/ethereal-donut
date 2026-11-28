@@ -70,6 +70,10 @@ if (DONUT_WITH_NVRHI)
         add_test(NAME ${_bench}_smoke_switches_on COMMAND ${_bench} --smoke)
         set_tests_properties(${_bench}_smoke_switches_on PROPERTIES ENVIRONMENT "DONUT_E7_SWITCHES=all")
     endforeach()
+    # The benches' runtime-only population (revision 2, stage M), smoke size; the default population's tests above.
+    foreach(_bench bench_gpu_scene bench_render_extract)
+        add_test(NAME ${_bench}_smoke_runtime COMMAND ${_bench} --smoke --population runtime)
+    endforeach()
     # The GPU case of the extraction (stage T2), per backend with every switch on: named so that `_switches_on$` (the
     # device-free set) does not match them; GPU tests, run serially.
     target_link_libraries(test_render_extract_gpu donut_tests_e7_switches)

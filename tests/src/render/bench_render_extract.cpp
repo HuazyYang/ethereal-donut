@@ -42,13 +42,19 @@
 // Release: the median of the run medians over alternating rounds (`--rounds N`, `--frames N`); `--smoke` divides the
 // instances by 100; `--workers N`: the graph and the service on a job system of N worker threads (the thread that calls
 // Extract works too), default build only; without it, the process's shared job system; `--case NAME`: that case only.
+// `--population runtime` (plan step E7, revision 2, stage M; default build only): the instances are runtime-only mesh
+// instances (RuntimeMeshInstance, SceneComponents.h) made with one IWorld::CreateEntities instead of node-backed
+// MeshInstance leaves (`node`, the default); the moves are written by a PreSimulation system run by hand before the
+// frame's Refresh, untimed as the node setters are. The legacy walk sees no runtime row, so only `extract` is reported.
 
 #include <donut/engine/SceneGraph.h>
 #include <donut/engine/View.h>
 #include <donut/render/DrawStrategy.h>
 #include <donut/render/GeometryPasses.h>
 #if !BENCH_RENDER_EXTRACT_E0
+#include <donut/engine/EcsScheduler.h>
 #include <donut/engine/JobSystem.h>
+#include <donut/engine/SceneComponents.h>
 #include <donut/render/RenderExtract.h>
 #include <donut/render/RenderGraph.h>
 #include <donut/render/RenderGraphFrameData.h>
@@ -76,7 +82,102 @@ namespace
         uint32_t frames = 20;
         uint32_t workers = 0;   // 0: the shared job system
         std::string only;       // one case by name, or every case
+        bool runtime = false;   // --population runtime
     };
+
+#if !BENCH_RENDER_EXTRACT_E0
+    // --population runtime: the rows, and the moves of a frame, which a PreSimulation system writes.
+    struct RuntimeRows
+    {
+        std::vector<Entity> entities;      // in creation order: row i is instance i
+        ComponentId local = ComponentId::Invalid;
+        std::vector<uint32_t> moved;       // this frame's rows ...
+        std::vector<dm::double3> targets;  // ... and their translations
+        ComponentAccess access[1] = {};
+
+        bool Make(SceneGraph* graph, const std::vector<nvrhi::AutoPtr<MeshInfo>>& meshes, uint32_t count,
+                  dm::double3 (*position)(uint32_t))
+        {
+            IWorld* world = graph->GetWorld();
+            MeshId ids[4] = {};
+            for (uint32_t m = 0; m < 4; ++m)
+            {
+                ids[m] = graph->AcquireRuntimeMesh(meshes[m]);
+                if (ids[m] == MeshId::Invalid)
+                    return false;
+            }
+            std::vector<ComponentId> components(graph->GetRuntimeMeshInstanceComponents(nullptr, 0));
+            graph->GetRuntimeMeshInstanceComponents(components.data(), uint32_t(components.size()));
+            local = FindComponent<LocalTransform>(world);
+            const ComponentId meshRef = FindComponent<MeshRef>(world);
+            std::vector<LocalTransform> locals(count);
+            std::vector<MeshRef> refs(count);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                locals[i] = LocalTransform{ position(i), dm::dquat::identity(), dm::double3(1.0) };
+                refs[i] = MeshRef{ ids[i % 4] };
+            }
+            std::vector<const void*> values(components.size(), nullptr);
+            for (size_t c = 0; c < components.size(); ++c)
+            {
+                if (components[c] == local)
+                    values[c] = locals.data();
+                else if (components[c] == meshRef)
+                    values[c] = refs.data();
+            }
+            EntityCreateDesc desc{};
+            desc.components = components.data();
+            desc.values = values.data();
+            desc.componentCount = uint32_t(components.size());
+            desc.entityCount = count;
+            entities.assign(count, Entity::Null);
+            // the graph's observer holds a mesh reference per row; ours go once the rows exist
+            const bool made = NVRHI_SUCCEEDED(world->CreateEntities(desc, entities.data()));
+            for (MeshId id : ids)
+                graph->ReleaseRuntimeMesh(id);
+            moved.reserve(count);
+            targets.reserve(count);
+            return made;
+        }
+
+        // On the graph's current scheduler (after SetJobSystem, which drops the systems of the one before).
+        bool AddMover(SceneGraph* graph)
+        {
+            access[0] = ComponentAccess{ local, engine::Access::Write, {} };
+            SystemDesc desc{};
+            desc.name = "bench.runtime_moves";
+            desc.phase = engine::Phase::PreSimulation;
+            desc.flags = SystemFlags::MainThread;
+            desc.accesses = access;
+            desc.accessCount = 1;
+            RuntimeRows* self = this;
+            nvrhi::AutoPtr<ISystem> system;
+            if (NVRHI_FAILED(CreateLambdaSystem(desc, [self](ISystemContext* context) noexcept
+                {
+                    IWorld* world = context->GetWorld();
+                    for (size_t k = 0; k < self->moved.size(); ++k)
+                    {
+                        void* value = world->GetComponentForWrite(self->entities[self->moved[k]], self->local,
+                                                                  context->GetVersion());
+                        if (value)
+                            static_cast<LocalTransform*>(value)->translation = self->targets[k];
+                    }
+                }, system.ReleaseAndGetAddressOf())))
+                return false;
+            SystemId id = SystemId::Invalid;
+            return NVRHI_SUCCEEDED(graph->GetScheduler()->AddSystem(system, id));
+        }
+
+        // The queued moves, written by the system; outside the timed work.
+        void Apply(SceneGraph* graph)
+        {
+            if (!moved.empty())
+                graph->GetScheduler()->RunPhase(engine::Phase::PreSimulation);
+            moved.clear();
+            targets.clear();
+        }
+    };
+#endif
 
     struct BenchScene
     {
@@ -84,6 +185,10 @@ namespace
         std::vector<nvrhi::AutoPtr<Material>> materials;
         std::vector<nvrhi::AutoPtr<MeshInfo>> meshes;
         std::vector<SceneGraphNode*> nodes;
+#if !BENCH_RENDER_EXTRACT_E0
+        RuntimeRows* runtime = nullptr;   // --population runtime: the rows instead of `nodes`
+#endif
+        uint32_t count = 0;               // instances
         nvrhi::AutoPtr<PlanarView> views[6];
         const IView* list[6] = {};
         uint32_t frame = 0;
@@ -94,8 +199,9 @@ namespace
         return dm::double3(double(i % 400) * 2.0, 0.0, double(i / 400) * 2.0);
     }
 
-    void Build(BenchScene& s, uint32_t count)
+    void Build(BenchScene& s, uint32_t count, bool runtime)
     {
+        s.count = count;
         const MaterialDomain domains[4] = { MaterialDomain::Opaque, MaterialDomain::AlphaTested,
                                             MaterialDomain::AlphaBlended, MaterialDomain::Opaque };
         for (int i = 0; i < 4; ++i)
@@ -129,7 +235,7 @@ namespace
         auto root = MAKE_RC_OBJ_PTR(SceneGraphNode);
         root->SetName("root");
         s.graph->SetRootNode(root);
-        for (uint32_t i = 0; i < count; ++i)
+        for (uint32_t i = 0; i < count && !runtime; ++i)
         {
             auto node = MAKE_RC_OBJ_PTR(SceneGraphNode);
             node->SetTranslation(GridPosition(i));
@@ -173,12 +279,24 @@ namespace
     void Move(BenchScene& s)
     {
         const double offset = double(s.frame & 1) * 0.5;
-        for (size_t i = 0; i < s.nodes.size(); i += 10)
+        for (uint32_t i = 0; i < s.count; i += 10)
         {
-            dm::double3 position = GridPosition(uint32_t(i));
+            dm::double3 position = GridPosition(i);
             position.y = offset;
+#if !BENCH_RENDER_EXTRACT_E0
+            if (s.runtime)
+            {
+                s.runtime->moved.push_back(i);
+                s.runtime->targets.push_back(position);
+                continue;
+            }
+#endif
             s.nodes[i]->SetTranslation(position);
         }
+#if !BENCH_RENDER_EXTRACT_E0
+        if (s.runtime)
+            s.runtime->Apply(s.graph);
+#endif
     }
 
     enum class Case { View, Cascades, All, Count };
@@ -332,16 +450,26 @@ int main(int argc, char** argv)
             options.workers = std::max(1u, uint32_t(std::stoul(argv[++i])));
         else if (arg == "--case" && i + 1 < argc)
             options.only = argv[++i];
+        else if (arg == "--population" && i + 1 < argc)
+        {
+            const std::string population = argv[++i];
+            if (population != "node" && population != "runtime")
+            {
+                std::fprintf(stderr, "--population takes node or runtime\n");
+                return 2;
+            }
+            options.runtime = population == "runtime";
+        }
     }
 
     BenchScene scene;
 #if BENCH_RENDER_EXTRACT_E0
-    if (options.workers)
+    if (options.workers || options.runtime)
     {
-        std::fprintf(stderr, "--workers needs the default build\n");
+        std::fprintf(stderr, "--workers and --population runtime need the default build\n");
         return 2;
     }
-    Build(scene, options.instances);
+    Build(scene, options.instances, false);
 #else
     nvrhi::AutoPtr<IJobSystem> jobs;
     if (options.workers)
@@ -355,9 +483,20 @@ int main(int argc, char** argv)
             return 1;
         }
     }
-    Build(scene, options.instances);
+    Build(scene, options.instances, options.runtime);
     if (jobs)
         scene.graph->SetJobSystem(jobs);
+    RuntimeRows runtimeRows;
+    if (options.runtime)
+    {
+        if (!runtimeRows.Make(scene.graph, scene.meshes, options.instances, &GridPosition) ||
+            !runtimeRows.AddMover(scene.graph))
+        {
+            std::fprintf(stderr, "cannot make the runtime population\n");
+            return 1;
+        }
+        scene.runtime = &runtimeRows;
+    }
     Extraction extraction(scene.graph);
 #endif
     scene.graph->Refresh(++scene.frame);
@@ -377,7 +516,9 @@ int main(int argc, char** argv)
             if (!options.only.empty() && options.only != c_CaseNames[c])
                 continue;
 #if !BENCH_RENDER_EXTRACT_E0
-            if (round & 1)
+            if (options.runtime)
+                extractSamples[c].push_back(Run(scene, extraction, Case(c), options.frames));
+            else if (round & 1)
             {
                 legacySamples[c].push_back(Run(scene, legacy, Case(c), options.frames));
                 extractSamples[c].push_back(Run(scene, extraction, Case(c), options.frames));
@@ -394,13 +535,14 @@ int main(int argc, char** argv)
     }
 
     const std::string threads = options.workers ? std::to_string(options.workers) + " workers" : "shared job system";
-    std::printf("%s, %u instances, %u rounds of %u frames (median of run medians), %s\n",
+    std::printf("%s, %u %sinstances, %u rounds of %u frames (median of run medians), %s\n",
 #if BENCH_RENDER_EXTRACT_E0
                 "E0 legacy strategy walk",
 #else
                 "RenderService::Extract and the legacy strategy walk",
 #endif
-                options.instances, options.rounds, options.frames, threads.c_str());
+                options.instances, options.runtime ? "runtime-only " : "", options.rounds, options.frames,
+                threads.c_str());
     std::printf("%-10s %-10s %10s %12s %12s %12s\n", "path", "case", "ms", "refresh ms", "draws", "visible");
 #if BENCH_RENDER_EXTRACT_E0
     Report<LegacyWalk>("legacy_e0", legacySamples);

@@ -43,12 +43,21 @@
 //                 into the staging array as the upload pass's writeBuffer copies them, then CommitScatter
 //   --workers N   the graph (its refresh, and the scatter gather) on a job system of N worker threads; the thread that
 //                 calls Refresh and Update works too. Without it, the process's shared job system.
+//
+// Plan step E7 (revision 2, stage M), default build only:
+//   --population runtime   the 100k instances are runtime-only mesh instances (RuntimeMeshInstance, SceneComponents.h)
+//                 made with one IWorld::CreateEntities, not node-backed MeshInstance leaves (`node`, the default). A
+//                 case's moves are written by a PreSimulation system (LocalTransform through GetComponentForWrite with
+//                 the system's version), run by hand before the frame's Refresh and not timed, as the node setters
+//                 are not. Case names and the output's columns are the same.
 
 #include <donut/engine/SceneGraph.h>
 #include <nvrhi/common/misc.h>
 #if !BENCH_GPU_SCENE_E0
+#include <donut/engine/EcsScheduler.h>
 #include <donut/engine/GpuScene.h>
 #include <donut/engine/JobSystem.h>
+#include <donut/engine/SceneComponents.h>
 #endif
 
 using namespace donut::math;
@@ -78,7 +87,108 @@ namespace
         uint32_t frames = 20;
         bool scatter = false;
         uint32_t workers = 0;   // 0: the shared job system
+        bool runtime = false;   // --population runtime
     };
+
+#if !BENCH_GPU_SCENE_E0
+    // --population runtime: the rows, and the moves of a frame, which a PreSimulation system writes.
+    struct RuntimeRows
+    {
+        std::vector<Entity> entities;      // in creation order: row i is instance i
+        ComponentId local = ComponentId::Invalid;
+        std::vector<uint32_t> moved;       // this frame's rows ...
+        std::vector<dm::double3> targets;  // ... and their translations
+        ComponentAccess access[1] = {};
+
+        bool Make(SceneGraph* graph, const std::vector<nvrhi::AutoPtr<MeshInfo>>& meshes, uint32_t count,
+                  dm::double3 (*position)(uint32_t))
+        {
+            IWorld* world = graph->GetWorld();
+            MeshId ids[4] = {};
+            for (uint32_t m = 0; m < 4; ++m)
+            {
+                ids[m] = graph->AcquireRuntimeMesh(meshes[m]);
+                if (ids[m] == MeshId::Invalid)
+                    return false;
+            }
+            std::vector<ComponentId> components(graph->GetRuntimeMeshInstanceComponents(nullptr, 0));
+            graph->GetRuntimeMeshInstanceComponents(components.data(), uint32_t(components.size()));
+            local = FindComponent<LocalTransform>(world);
+            const ComponentId meshRef = FindComponent<MeshRef>(world);
+            std::vector<LocalTransform> locals(count);
+            std::vector<MeshRef> refs(count);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                locals[i] = LocalTransform{ position(i), dm::dquat::identity(), dm::double3(1.0) };
+                refs[i] = MeshRef{ ids[i % 4] };
+            }
+            std::vector<const void*> values(components.size(), nullptr);
+            for (size_t c = 0; c < components.size(); ++c)
+            {
+                if (components[c] == local)
+                    values[c] = locals.data();
+                else if (components[c] == meshRef)
+                    values[c] = refs.data();
+            }
+            EntityCreateDesc desc{};
+            desc.components = components.data();
+            desc.values = values.data();
+            desc.componentCount = uint32_t(components.size());
+            desc.entityCount = count;
+            entities.assign(count, Entity::Null);
+            // the graph's observer holds a mesh reference per row; ours go once the rows exist
+            const bool made = NVRHI_SUCCEEDED(world->CreateEntities(desc, entities.data()));
+            for (MeshId id : ids)
+                graph->ReleaseRuntimeMesh(id);
+            moved.reserve(count);
+            targets.reserve(count);
+            return made;
+        }
+
+        // On the graph's current scheduler (after SetJobSystem, which drops the systems of the one before).
+        bool AddMover(SceneGraph* graph)
+        {
+            access[0] = ComponentAccess{ local, Access::Write, {} };
+            SystemDesc desc{};
+            desc.name = "bench.runtime_moves";
+            desc.phase = Phase::PreSimulation;
+            desc.flags = SystemFlags::MainThread;
+            desc.accesses = access;
+            desc.accessCount = 1;
+            RuntimeRows* self = this;
+            nvrhi::AutoPtr<ISystem> system;
+            if (NVRHI_FAILED(CreateLambdaSystem(desc, [self](ISystemContext* context) noexcept
+                {
+                    IWorld* world = context->GetWorld();
+                    for (size_t k = 0; k < self->moved.size(); ++k)
+                    {
+                        void* value = world->GetComponentForWrite(self->entities[self->moved[k]], self->local,
+                                                                  context->GetVersion());
+                        if (value)
+                            static_cast<LocalTransform*>(value)->translation = self->targets[k];
+                    }
+                }, system.ReleaseAndGetAddressOf())))
+                return false;
+            SystemId id = SystemId::Invalid;
+            return NVRHI_SUCCEEDED(graph->GetScheduler()->AddSystem(system, id));
+        }
+
+        void Queue(uint32_t i, const dm::double3& translation)
+        {
+            moved.push_back(i);
+            targets.push_back(translation);
+        }
+
+        // The queued moves, written by the system; outside the timed work.
+        void Apply(SceneGraph* graph)
+        {
+            if (!moved.empty())
+                graph->GetScheduler()->RunPhase(Phase::PreSimulation);
+            moved.clear();
+            targets.clear();
+        }
+    };
+#endif
 
     struct Scene
     {
@@ -86,11 +196,19 @@ namespace
         std::vector<nvrhi::AutoPtr<Material>> materials;
         std::vector<nvrhi::AutoPtr<MeshInfo>> meshes;
         std::vector<SceneGraphNode*> nodes;   // in attach order: instance i has slot i in both builds
+#if !BENCH_GPU_SCENE_E0
+        RuntimeRows* runtime = nullptr;       // --population runtime: the rows instead of `nodes`
+#endif
         std::vector<uint8_t> staging;         // the upload heap
         uint32_t frame = 0;
     };
 
-    void Build(Scene& s, uint32_t count)
+    dm::double3 InstancePosition(uint32_t i)
+    {
+        return dm::double3(double(i % 1000), double(i / 1000), 0.0);
+    }
+
+    void Build(Scene& s, uint32_t count, bool runtime)
     {
         for (int i = 0; i < 4; ++i)
         {
@@ -117,10 +235,10 @@ namespace
         auto root = MAKE_RC_OBJ_PTR(SceneGraphNode);
         root->SetName("root");
         s.graph->SetRootNode(root);
-        for (uint32_t i = 0; i < count; ++i)
+        for (uint32_t i = 0; i < count && !runtime; ++i)
         {
             auto node = MAKE_RC_OBJ_PTR(SceneGraphNode);
-            node->SetTranslation(dm::double3(double(i % 1000), double(i / 1000), 0.0));
+            node->SetTranslation(InstancePosition(i));
             node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, s.meshes[i % 4].Get()));
             s.graph->Attach(s.graph->GetRootNode(), node);
             s.nodes.push_back(node);
@@ -134,9 +252,21 @@ namespace
 
     void Move(Scene& s, Case c)
     {
-        const uint32_t n = uint32_t(s.nodes.size());
         const double offset = double(s.frame & 1) * 0.5;
+#if !BENCH_GPU_SCENE_E0
+        const uint32_t n = s.runtime ? uint32_t(s.runtime->entities.size()) : uint32_t(s.nodes.size());
+        auto move = [&](uint32_t i)
+        {
+            const dm::double3 translation(double(i % 1000), double(i / 1000), offset);
+            if (s.runtime)
+                s.runtime->Queue(i, translation);
+            else
+                s.nodes[i]->SetTranslation(translation);
+        };
+#else
+        const uint32_t n = uint32_t(s.nodes.size());
         auto move = [&](uint32_t i) { s.nodes[i]->SetTranslation(dm::double3(double(i % 1000), double(i / 1000), offset)); };
+#endif
         switch (c)
         {
         case Case::OneMoved: move(n / 2); break;
@@ -145,6 +275,10 @@ namespace
         case Case::AllMoved: for (uint32_t i = 0; i < n; ++i) move(i); break;
         default: break;
         }
+#if !BENCH_GPU_SCENE_E0
+        if (s.runtime)
+            s.runtime->Apply(s.graph);
+#endif
     }
 
 #if BENCH_GPU_SCENE_E0
@@ -329,16 +463,26 @@ int main(int argc, char** argv)
             options.scatter = true;
         else if (arg == "--workers" && i + 1 < argc)
             options.workers = std::max(1u, uint32_t(std::stoul(argv[++i])));
+        else if (arg == "--population" && i + 1 < argc)
+        {
+            const std::string population = argv[++i];
+            if (population != "node" && population != "runtime")
+            {
+                std::fprintf(stderr, "--population takes node or runtime\n");
+                return 2;
+            }
+            options.runtime = population == "runtime";
+        }
     }
 
     Scene scene;
 #if BENCH_GPU_SCENE_E0
-    if (options.scatter || options.workers)
+    if (options.scatter || options.workers || options.runtime)
     {
-        std::fprintf(stderr, "--scatter and --workers need the default build\n");
+        std::fprintf(stderr, "--scatter, --workers and --population runtime need the default build\n");
         return 2;
     }
-    Build(scene, options.instances);
+    Build(scene, options.instances, false);
     Uploader uploader;
 #else
     // --workers: a job system of the graph's own (its phases and GpuScene's gather)
@@ -354,9 +498,20 @@ int main(int argc, char** argv)
             return 1;
         }
     }
-    Build(scene, options.instances);
+    Build(scene, options.instances, options.runtime);
     if (jobs)
         scene.graph->SetJobSystem(jobs);
+    RuntimeRows runtimeRows;
+    if (options.runtime)
+    {
+        if (!runtimeRows.Make(scene.graph, scene.meshes, options.instances, &InstancePosition) ||
+            !runtimeRows.AddMover(scene.graph))
+        {
+            std::fprintf(stderr, "cannot make the runtime population\n");
+            return 1;
+        }
+        scene.runtime = &runtimeRows;
+    }
     Uploader uploader(options.scatter);
 #endif
     uploader.BeforeRefresh(scene);
@@ -376,13 +531,14 @@ int main(int argc, char** argv)
     }
 
     const std::string threads = options.workers ? std::to_string(options.workers) + " workers" : "shared job system";
-    std::printf("%s, %u instances, %u rounds of %u frames (median of run medians), %s\n",
+    std::printf("%s, %u %sinstances, %u rounds of %u frames (median of run medians), %s\n",
 #if BENCH_GPU_SCENE_E0
                 "E0 RefreshBuffers instance path",
 #else
                 options.scatter ? "GpuScene scatter: Update + records" : "GpuScene Update + upload",
 #endif
-                options.instances, options.rounds, options.frames, threads.c_str());
+                options.instances, options.runtime ? "runtime-only " : "", options.rounds, options.frames,
+                threads.c_str());
     std::printf("%-14s %12s %12s %12s %12s\n", "case", "upload ms", "refresh ms", "rows", "bytes");
     for (uint32_t c = 0; c < caseCount; ++c)
     {
