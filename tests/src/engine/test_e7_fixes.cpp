@@ -28,7 +28,9 @@
 //   i5_r2_static_first_transform    the first transform of a Static node without one is written in Debug too
 //   i5_r3_static_rows_join_late     rows joining a Static archetype after propagation get boxes of their worlds
 //   i5_r4_compose_through_static    a pose composed below a Static row starts from its world (binding)
-//   i3_r1_r2_read_only_list         SimTeleport and SimPosePrevious are on donut's read-only list
+//   i3_r1_r2_read_only_list         SimTeleport, SimPosePrevious, SimPose and SimScale are on donut's read-only list
+//   i3_r2_driven_rows_read_only     a simulation-driven row offers no LocalTransform (nor SimPose, SimScale) for editing
+//   t4_1_chunk_bounds_after_removals a chunk that lost rows gets the union of its rows as its box again, tracked or not
 //   e72_r4_mesh_columns_of_other_classes  no mesh-instance columns for a leaf class that is no MeshInstance
 //   e72_r4_mesh_tags_of_other_classes     no mesh-instance tags for a leaf class that is not of their class
 //   i3_n4_missing_name_warned_once  an ordering against a missing name warns once while it stays missing
@@ -1033,14 +1035,14 @@ void test_i6_r5_gpu_scene_stats_checked()
 // ---------------------------------------------------------------------------------------------- I3-R1, I3-R2
 
 // The domain's columns that an edit through the world would bypass: SimTeleport (RequestTeleport's normalising and
-// space) and SimPosePrevious (the domain derives it) are on donut's read-only list; SimPose and SimScale are not
-// (open point 6).
+// space) and SimPosePrevious (the domain derives it) are on donut's read-only list; so are SimPose and SimScale
+// (decided by the user, 2026-11-27: the domain's engine never sees such an edit), 18 in all.
 void test_i3_r1_r2_read_only_list()
 {
     Graph g(false);
     ComponentId ids[c_MaxInspectorReadOnlyComponents] = {};
     const uint32_t count = app::GetDonutReadOnlyComponents(g.world, ids, c_MaxInspectorReadOnlyComponents);
-    CHECK(count == 16);
+    CHECK(count == 18);
     auto listed = [&](ComponentId id)
     {
         return id != ComponentId::Invalid && std::find(ids, ids + count, id) != ids + count;
@@ -1048,8 +1050,174 @@ void test_i3_r1_r2_read_only_list()
     CHECK(listed(FindComponent<SimTeleport>(g.world)));
     CHECK(listed(FindComponent<SimPosePrevious>(g.world)));
     CHECK(listed(FindComponent<SimBodyRef>(g.world)));
-    CHECK(!listed(FindComponent<SimPose>(g.world)) && !listed(FindComponent<SimScale>(g.world)));
+    CHECK(listed(FindComponent<SimPose>(g.world)) && listed(FindComponent<SimScale>(g.world)));
     CHECK(!listed(FindComponent<LocalTransform>(g.world)));
+}
+
+namespace e7_fixes
+{
+    // Records each component that Draw offers for editing; commits nothing.
+    bool RecordOffer(void* context, engine::ComponentId component, void*, uint32_t)
+    {
+        static_cast<std::vector<engine::ComponentId>*>(context)->push_back(component);
+        return false;
+    }
+}
+
+// The rest of I3-R2 (decided by the user, 2026-11-27): a simulation-driven row keeps its LocalTransform, which the graph
+// ignores there (the domain's pose is the row's), so the inspector shows it read-only instead of offering an edit that
+// would change nothing; SimPose and SimScale are read-only too. A plain node still offers its LocalTransform.
+void test_i3_r2_driven_rows_read_only()
+{
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    io.DisplaySize = ImVec2(1280.f, 1024.f);
+    io.DeltaTime = 1.f / 60.f;
+    unsigned char* pixels = nullptr;
+    int width = 0;
+    int height = 0;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    {
+        nvrhi::AutoPtr<MeshInfo> mesh = MakeMesh();
+        Graph g(false);
+        SceneGraphNode* plain = g.Add(g.graph->GetRootNode(), dm::double3(1.0, 0.0, 0.0), mesh, false);
+        SceneGraphNode* driven = g.Add(g.graph->GetRootNode(), dm::double3(2.0, 0.0, 0.0), mesh, false);
+        CHECK(g.graph->SetSimulationDriven(driven, true) == nvrhi::FS_OK);
+        g.Frame();
+        const ComponentId local = FindComponent<LocalTransform>(g.world);
+        CHECK(g.world->HasComponent(g.graph->GetEntity(driven), local));   // shown, read-only
+        CHECK(g.world->HasComponent(g.graph->GetEntity(driven), FindComponent<SimPose>(g.world)));
+        app::WorldInspector inspector;
+        auto offered = [&](SceneGraphNode* node)
+        {
+            std::vector<ComponentId> offers;
+            app::detail::WorldInspectorTestHook hook;
+            hook.select = g.graph->GetEntity(node);
+            hook.openAll = true;
+            hook.edit = &e7_fixes::RecordOffer;
+            hook.context = &offers;
+            app::detail::SetWorldInspectorTestHook(&hook);
+            for (int f = 0; f < 2; ++f)   // a new window is hidden for its first frame
+            {
+                ImGui::NewFrame();
+                inspector.Draw(g.world, nullptr);
+                ImGui::Render();
+            }
+            app::detail::SetWorldInspectorTestHook(nullptr);
+            std::sort(offers.begin(), offers.end());
+            offers.erase(std::unique(offers.begin(), offers.end()), offers.end());
+            return offers;
+        };
+        CHECK(offered(plain) == std::vector<ComponentId>{ local });
+        CHECK(offered(driven).empty());
+        CHECK(offered(plain) == std::vector<ComponentId>{ local });   // per row, not per world
+        CHECK(inspector.Apply(g.world) == nvrhi::FS_OK);
+    }
+    ImGui::DestroyContext();
+    CHECK(TakeWarnings() == 0);
+}
+
+// ------------------------------------------------------------------------------------------- T4-1, T4-N1
+
+namespace
+{
+    // The chunks of `world` whose ChunkWorldBounds is not their rows' WorldBounds union, bit for bit.
+    uint32_t StaleChunkBoxes(IWorld* world)
+    {
+        const ComponentId chunkBoundsId = FindComponent<ChunkWorldBounds>(world);
+        const ComponentId worldBoundsId = FindComponent<WorldBounds>(world);
+        uint32_t stale = 0;
+        for (uint32_t a = 0; a < world->GetArchetypeCount(); ++a)
+        {
+            ArchetypeInfo info{};
+            CHECK(world->GetArchetypeInfo(a, info) == nvrhi::FS_OK);
+            if (std::find(info.components, info.components + info.componentCount, chunkBoundsId) ==
+                info.components + info.componentCount)
+                continue;
+            for (uint32_t c = 0; c < info.chunkCount; ++c)
+            {
+                ChunkInfo chunk{};
+                CHECK(world->GetChunkInfo(a, c, chunk) == nvrhi::FS_OK);
+                if (chunk.count == 0)
+                    continue;
+                dm::box3 rows = dm::box3::empty();
+                for (uint32_t r = 0; r < chunk.count; ++r)
+                {
+                    const void* bounds = world->GetComponent(chunk.entities[r], worldBoundsId);
+                    rows |= static_cast<const WorldBounds*>(bounds)->bounds;
+                }
+                const dm::box3 box =
+                    static_cast<const ChunkWorldBounds*>(world->GetComponent(chunk.entities[0], chunkBoundsId))->bounds;
+                stale += SameValue(box, rows) ? 0 : 1;
+            }
+        }
+        return stale;
+    }
+}
+
+// Chunk boxes after removals (backlog T4-1, T4-N1; decided by the user, 2026-11-27): Bounds takes a chunk that lost
+// rows, so after the next frame its ChunkWorldBounds is its rows' union again, with RowTracked off and on alike (the
+// world hashes equal frame by frame). Removals of: the archetype's last row (no row moves); a row of the first chunk
+// (the last row moves into its hole, and the last chunk shrinks); a node moved far away the frame before; and a run of
+// rows from the end, one per frame, down into the chunk before.
+void test_t4_1_chunk_bounds_after_removals()
+{
+    nvrhi::AutoPtr<MeshInfo> mesh = MakeMesh();
+    const bool found = SceneGraph::GetRowTrackedTransforms();
+    std::vector<uint64_t> hashes[2];
+    uint32_t chunkCount = 0;
+    for (uint32_t tracked = 0; tracked < 2; ++tracked)
+    {
+        SceneGraph::SetRowTrackedTransforms(tracked != 0);   // read when the graph is made
+        Graph g(false);
+        SceneGraph::SetRowTrackedTransforms(found);
+        std::vector<SceneGraphNode*> nodes;
+        for (uint32_t i = 0; i < 600; ++i)
+            nodes.push_back(g.Add(g.graph->GetRootNode(), dm::double3(double(i) * 10.0, 0.0, 0.0), mesh, false));
+        auto frame = [&]()
+        {
+            g.Frame();
+            CHECK(StaleChunkBoxes(g.world) == 0);
+            hashes[tracked].push_back(g.world->ComputeHash());
+        };
+        auto detach = [&](size_t i)
+        {
+            CHECK(g.graph->Detach(nodes[i]));
+            nodes[i] = nullptr;
+        };
+        frame();
+        // the nodes' archetype: the one with boxes and the most chunks
+        const ComponentId chunkBoundsId = FindComponent<ChunkWorldBounds>(g.world);
+        ArchetypeInfo info{};
+        for (uint32_t a = 0; a < g.world->GetArchetypeCount(); ++a)
+        {
+            ArchetypeInfo candidate{};
+            CHECK(g.world->GetArchetypeInfo(a, candidate) == nvrhi::FS_OK);
+            if (std::find(candidate.components, candidate.components + candidate.componentCount, chunkBoundsId) !=
+                    candidate.components + candidate.componentCount &&
+                candidate.chunkCount > info.chunkCount)
+                info = candidate;
+        }
+        chunkCount = info.chunkCount;
+        detach(599);   // the last row
+        frame();
+        detach(0);     // the first chunk's first row: the last row fills it
+        frame();
+        nodes[300]->SetTranslation(dm::double3(1.0e6, 0.0, 0.0));
+        frame();
+        detach(300);
+        frame();
+        const size_t stop = 598 - std::min<size_t>(size_t(info.rowsPerChunk) + 2, 200);   // past a chunk's rows
+        for (size_t i = 598; i > stop; --i)
+        {
+            detach(i);
+            frame();
+        }
+    }
+    CHECK(chunkCount >= 3);
+    CHECK(hashes[0] == hashes[1]);
 }
 
 int main(int argc, char** argv)
@@ -1062,6 +1230,8 @@ int main(int argc, char** argv)
         { "i5_r3_static_rows_join_late", test_i5_r3_static_rows_join_late },
         { "i5_r4_compose_through_static", test_i5_r4_compose_through_static },
         { "i3_r1_r2_read_only_list", test_i3_r1_r2_read_only_list },
+        { "i3_r2_driven_rows_read_only", test_i3_r2_driven_rows_read_only },
+        { "t4_1_chunk_bounds_after_removals", test_t4_1_chunk_bounds_after_removals },
         { "e72_r4_mesh_columns_of_other_classes", test_e72_r4_mesh_columns_of_other_classes },
         { "e72_r4_mesh_tags_of_other_classes", test_e72_r4_mesh_tags_of_other_classes },
         { "i3_n4_missing_name_warned_once", test_i3_n4_missing_name_warned_once },

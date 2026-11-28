@@ -29,10 +29,12 @@
 // Editing: fields of Relocatable, serialisable components (not NoSerialize) that are on neither donut's read-only list
 // nor the application's (SetReadOnly). Donut's list is the world resource InspectorReadOnlyComponents that every
 // scene graph's store registers in its world (SceneComponents.h): the hierarchy, derived, slot, reference and hooked
-// columns and the simulation's SimPosePrevious and SimTeleport, whose free edit corrupts the graph or bypasses its
-// setters; it applies to every inspector, not by the application's choice. Fields of type Opaque or Entity are shown,
-// never edited. A commit keeps the whole value as the pending one of its (entity, component), at most 64 of them;
-// Apply records one ICommandBuffer::SetComponents per pending value into the inspector's buffer and plays it back.
+// columns and the simulation's SimPosePrevious, SimTeleport, SimPose and SimScale, whose free edit corrupts the graph,
+// bypasses its setters or never reaches the domain's engine; and, on a simulation-driven row only, LocalTransform,
+// which the graph ignores there (the list's per-row pairs). It applies to every inspector, not by the application's
+// choice. Fields of type Opaque or Entity are shown, never edited. A commit keeps the whole value as the pending one of
+// its (entity, component), at most 64 of them; Apply records one ICommandBuffer::SetComponents per pending value into
+// the inspector's buffer and plays it back.
 //
 // Module-private C++ of donut_app, not on the ABI surface. It names no scene type: entity names come from the
 // application (SetEntityNames). Between calls the inspector holds no scheduler, and a world only through pending edits:
@@ -92,6 +94,7 @@ namespace donut::app
     };
 
     // Donut's read-only list of `world` (the InspectorReadOnlyComponents resource; empty for a world of no scene graph):
-    // writes at most `capacity` ids to `out` (null with capacity 0 to ask) and returns how many there are.
+    // writes at most `capacity` ids to `out` (null with capacity 0 to ask) and returns how many there are. The list's
+    // per-row pairs are not among them: those components stay editable on other rows.
     uint32_t GetDonutReadOnlyComponents(engine::IWorld* world, engine::ComponentId* out, uint32_t capacity) noexcept;
 }

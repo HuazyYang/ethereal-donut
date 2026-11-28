@@ -37,6 +37,8 @@
 #include <donut/engine/EcsTypes.h>
 #include <donut/core/math/math.h>
 
+#include <cstddef>
+
 namespace donut::engine
 {
     class SceneGraphNode;
@@ -127,7 +129,8 @@ namespace donut::engine
     };
     DONUT_ECS_COMPONENT(WorldBounds, "6753835c-edcc-448c-b658-ccae15da15fc", DONUT_ECS_FIELDS(bounds))
 
-    // The union of a chunk's WorldBounds; written by the Bounds system.
+    // The union of a chunk's WorldBounds; written by the Bounds system, also after the chunk lost rows (backlog T4-1),
+    // so after each Refresh it is exactly the union of the rows the chunk holds (infinite when a row's box is NaN).
     struct ChunkWorldBounds
     {
         dm::box3 bounds;
@@ -338,18 +341,29 @@ namespace donut::engine
     // reference columns (GpuInstanceSlot, MeshRef, RenderFlags, SimBodyRef), the hooked ones (SceneNode,
     // LeafObject) and the simulation's that only the graph and its domains write (SimPosePrevious, which the domain
     // derives; SimTeleport, a request that SceneGraphNode::SetTransform makes: normalised, checked, its space and
-    // enabled bit set). A fixed list in the world, so that it outlives the graph with the world and the inspector finds
-    // it by GUID through IWorld alone. NoSerialize: snapshots and world hashes leave it out.
+    // enabled bit set; SimPose and SimScale, which the domain writes from its engine and which an edit would not reach:
+    // backlog I3-R2). The pairs after them are read-only only on the rows that have a second component: LocalTransform
+    // on a SimulationDriven row, whose pose comes from SimPose and SimScale (the graph ignores its LocalTransform, so an
+    // edit there would change nothing). A fixed list in the world, so that it outlives the graph with the world and the
+    // inspector finds it by GUID through IWorld alone. NoSerialize: snapshots and world hashes leave it out. The pairs
+    // were appended (plan stage F, F8): the first 128 bytes are laid out as before.
     constexpr uint32_t c_MaxInspectorReadOnlyComponents = 31;
+    constexpr uint32_t c_MaxInspectorReadOnlyOnRows = 7;
     struct InspectorReadOnlyComponents
     {
         ComponentId components[c_MaxInspectorReadOnlyComponents];
         uint32_t count;
+        ComponentId onRowsComponents[c_MaxInspectorReadOnlyOnRows];   // read-only on the rows that have
+        ComponentId onRowsWith[c_MaxInspectorReadOnlyOnRows];         // the component at the same index
+        uint32_t onRowsCount;
+        uint32_t reserved;
     };
-    static_assert(sizeof(InspectorReadOnlyComponents) == 128, "InspectorReadOnlyComponents layout");
+    static_assert(sizeof(InspectorReadOnlyComponents) == 192, "InspectorReadOnlyComponents layout");
+    static_assert(offsetof(InspectorReadOnlyComponents, onRowsComponents) == 128,
+                  "InspectorReadOnlyComponents: the pairs follow the first 128 bytes, laid out as before F8");
     DONUT_ECS_COMPONENT_EX(InspectorReadOnlyComponents, "9cd6c57b-4aab-46a8-94f3-be19a1b2ff18",
                            ::donut::engine::ComponentFlags::Resource | ::donut::engine::ComponentFlags::NoSerialize, 0,
-                           DONUT_ECS_FIELDS(components, count))
+                           DONUT_ECS_FIELDS(components, count, onRowsComponents, onRowsWith, onRowsCount, reserved))
 
     // ------------------------------------------------------------------------------------- leaf classes (4.11)
 

@@ -503,7 +503,7 @@ void test_refusals_inside_phase()
     g_Warnings = warnings;
 }
 
-// Donut's read-only list in a scene graph's world: the 16 ids, registered after the store's types; none elsewhere.
+// Donut's read-only list in a scene graph's world: the 18 ids, registered after the store's types; none elsewhere.
 void test_read_only_list()
 {
     Graph g;
@@ -515,17 +515,18 @@ void test_read_only_list()
         FindComponent<GpuInstanceSlot>(world), FindComponent<MeshRef>(world), FindComponent<RenderFlags>(world),
         FindComponent<SimBodyRef>(world), FindComponent<SceneNode>(world), FindComponent<LeafObject>(world),
         FindComponent<SimPosePrevious>(world), FindComponent<SimTeleport>(world),   // backlog I3-R1, I3-R2
+        FindComponent<SimPose>(world), FindComponent<SimScale>(world),              // I3-R2 (F8)
     };
     for (ComponentId id : expected)
         CHECK(id != ComponentId::Invalid);
     ComponentId ids[c_MaxInspectorReadOnlyComponents] = {};
-    CHECK(app::GetDonutReadOnlyComponents(world, nullptr, 0) == 16);
-    CHECK(app::GetDonutReadOnlyComponents(world, ids, c_MaxInspectorReadOnlyComponents) == 16);
+    CHECK(app::GetDonutReadOnlyComponents(world, nullptr, 0) == 18);
+    CHECK(app::GetDonutReadOnlyComponents(world, ids, c_MaxInspectorReadOnlyComponents) == 18);
     CHECK(std::equal(std::begin(expected), std::end(expected), ids));
-    CHECK(std::find(ids, ids + 16, FindComponent<LocalTransform>(world)) == ids + 16);
+    CHECK(std::find(ids, ids + 18, FindComponent<LocalTransform>(world)) == ids + 18);
 
     ComponentId two[3] = { ComponentId::Invalid, ComponentId::Invalid, ComponentId::Invalid };
-    CHECK(app::GetDonutReadOnlyComponents(world, two, 2) == 16);
+    CHECK(app::GetDonutReadOnlyComponents(world, two, 2) == 18);
     CHECK(two[0] == expected[0] && two[1] == expected[1] && two[2] == ComponentId::Invalid);
 
     const ComponentId resource = FindComponent<InspectorReadOnlyComponents>(world);
@@ -1616,9 +1617,9 @@ void test_systems_panel_other_world()
 // --------------------------------------------------------------------------------------- what is editable
 
 // In a graph's world the inspector offers, of donut's components, only the homes of authored state: LocalTransform of
-// nodes (plain and with a mesh) and runtime-only rows; SimPose and SimScale of driven nodes (open point 6). Every
-// component of donut's read-only list (each present on one of these rows) and the hooked ones are refused without
-// the application naming them.
+// nodes (plain and with a mesh) and runtime-only rows; nothing of driven nodes (I3-R2, F8: SimPose and SimScale are
+// read-only, and LocalTransform is on a driven row). Every component of donut's read-only list (each present on one
+// of these rows) and the hooked ones are refused without the application naming them.
 void test_offers_scene_rows()
 {
     ImGuiContextScope context;
@@ -1650,8 +1651,7 @@ void test_offers_scene_rows()
         }
         if (row == rig.nodeRows[2])
         {
-            CHECK(offers.Offered(FindComponent<SimPose>(world)) && offers.Offered(FindComponent<SimScale>(world)));
-            CHECK(!offers.Offered(FindComponent<SimBodyRef>(world)));
+            CHECK(offers.Set().empty());
         }
         else
             CHECK(offers.Set() == std::set<ComponentId>{ local });

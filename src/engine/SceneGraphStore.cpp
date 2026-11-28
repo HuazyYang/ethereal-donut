@@ -1023,13 +1023,20 @@ namespace donut::engine
             m_SimBodyId,
             m_Ids[SlotNode], m_Ids[SlotLeaf],                                     // hooked
             // the simulation's: the domain derives SimPosePrevious; a SimTeleport request goes through RequestTeleport
-            // (normalised, checked, its space and enabled bit set; backlog I3-R1, I3-R2)
-            m_SimPreviousId, m_SimTeleportId,
+            // (normalised, checked, its space and enabled bit set; backlog I3-R1, I3-R2); the domain writes SimPose and
+            // SimScale from its engine, which never sees an edit of them (I3-R2, decided by the user 2026-11-27)
+            m_SimPreviousId, m_SimTeleportId, m_Ids[SlotSimPose], m_Ids[SlotSimScale],
         };
         static_assert(std::size(readOnlyIds) <= c_MaxInspectorReadOnlyComponents, "the read-only list");
         for (const ComponentId component : readOnlyIds)
             if (component != ComponentId::Invalid)
                 readOnly.components[readOnly.count++] = component;
+        // a driven row's LocalTransform: LookUpColumn ignores it, so an edit would change nothing (I3-R2)
+        if (m_Ids[SlotLocal] != ComponentId::Invalid && m_Ids[SlotDriven] != ComponentId::Invalid)
+        {
+            readOnly.onRowsComponents[readOnly.onRowsCount] = m_Ids[SlotLocal];
+            readOnly.onRowsWith[readOnly.onRowsCount++] = m_Ids[SlotDriven];
+        }
         ComponentId readOnlyId = ComponentId::Invalid;
         if (NVRHI_FAILED(m_World->RegisterResource(ComponentTraits<InspectorReadOnlyComponents>::Desc(), &readOnly,
                                                    readOnlyId)))
@@ -4740,8 +4747,10 @@ namespace donut::engine
                 if (archetype.chunks[c].count == 0)
                     continue;
                 const uint64_t* versions = archetype.Versions(c);
+                // a chunk that lost a row has a box that may still hold it (backlog T4-1): no column version says so
                 const bool changed = versions[bounds.world] > since || versions[bounds.localBounds] > since ||
-                                     versions[archetype.AddedVersionSlot()] > since;
+                                     versions[archetype.AddedVersionSlot()] > since ||
+                                     archetype.chunks[c].shrunkVersion > since;
                 // a chunk of leaves with dynamic bounds is read at every run
                 if (changed || bounds.leaf != c_Absent)
                     m_Tasks.push_back(Task{ i, c, changed });

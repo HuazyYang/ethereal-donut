@@ -1887,8 +1887,9 @@ namespace
         std::string staleReport;
 
         // Equal outputs; `exact`: ChunkWorldBounds and the world hash too (backlog T4-1: with the switch on, a chunk
-        // box left larger than its rows' union by a removal is not recomputed where the untracked build recomposes the
-        // chunk by chance, so the box, and the hash and snapshots that hold it, differ).
+        // box left larger than its rows' union by a removal was not recomputed where the untracked build recomposed the
+        // chunk by chance, so the box, and the hash and snapshots that hold it, differed; fixed in F8: Bounds takes a
+        // chunk that lost rows in both builds).
         bool Equals(const TrackedFrame& o, bool exact, size_t chunkBoundsId) const
         {
             if (worlds != o.worlds || buffers[0] != o.buffers[0] || buffers[1] != o.buffers[1] ||
@@ -2033,8 +2034,8 @@ namespace
 // rowsSettled equal (I4-R1: a row moved in the last frame may settle instead of being rebuilt with the switch on, so
 // the split may differ); verify_frame holds in both. In the tracked run a scatter-mode GpuScene beside it equals CPU
 // mode every frame (its records are per changed row there). At the end every archetype's layout (components, rows,
-// chunks, chunk and row sizes, rows per chunk) is equal. `exact` (--backlog, backlog T4-1): ChunkWorldBounds, the
-// chunks whose box is not their rows' union, and IWorld::ComputeHash equal as well; fails now.
+// chunks, chunk and row sizes, rows per chunk) is equal. `exact` (backlog T4-1, fixed in F8; the default run):
+// ChunkWorldBounds, the chunks whose box is not their rows' union, and IWorld::ComputeHash equal as well.
 void test_row_tracked_equals_untracked(bool exact)
 {
     const bool rowTrackedFound = SceneGraph::GetRowTrackedTransforms();
@@ -2235,7 +2236,7 @@ void test_row_tracked_killers()
                 stats.rowsBuilt);
 }
 
-int main(int argc, char** argv)
+int main()
 {
 #if defined(_MSC_VER)
     // A failed assert reports on stderr and ends the run instead of opening a dialog.
@@ -2247,23 +2248,6 @@ int main(int argc, char** argv)
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // a run that dies still shows how far it got
-    // `--backlog`: only the cases that fail on an open backlog item (aggregate
-    // docs/plans/2026-11-26-donut-ecs-e7-rev2.md), apart from the default run (ctest test_gpu_scene_backlog).
-    if (argc > 1 && std::strcmp(argv[1], "--backlog") == 0)
-    {
-        try
-        {
-            std::printf("%s\n", "test_row_tracked_equals_untracked (exact; backlog T4-1)");
-            test_row_tracked_equals_untracked(true);
-        }
-        catch (const std::runtime_error& err)
-        {
-            fprintf(stderr, "%s", err.what());
-            return 1;
-        }
-        std::printf("gpu scene backlog: ok\n");
-        return 0;
-    }
     try
     {
         std::printf("%s\n", "test_instance_slots_are_stable");
@@ -2298,8 +2282,8 @@ int main(int argc, char** argv)
         test_scatter_lost_prepare();
         std::printf("%s\n", "test_row_tracked_transforms");
         test_row_tracked_transforms();
-        std::printf("%s\n", "test_row_tracked_equals_untracked");
-        test_row_tracked_equals_untracked(false);
+        std::printf("%s\n", "test_row_tracked_equals_untracked (exact; backlog T4-1, fixed in F8)");
+        test_row_tracked_equals_untracked(true);
         std::printf("%s\n", "test_row_tracked_killers");
         test_row_tracked_killers();
     }

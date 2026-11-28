@@ -86,8 +86,6 @@ target_include_directories(test_e7_fixes PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../s
 # Its cases that fail on an open backlog item (aggregate docs/plans/2026-11-26-donut-ecs-e7-rev2.md) run apart, so
 # that test_world_inspector itself stays the pass rule's.
 add_test(NAME test_world_inspector_backlog COMMAND test_world_inspector --backlog)
-# Likewise the GpuScene test's (stage T4: backlog T4-1).
-add_test(NAME test_gpu_scene_backlog COMMAND test_gpu_scene --backlog)
 # The exit test runs ~130 child processes; a child that hangs is killed after 30 s (Windows), this bounds the rest.
 set_tests_properties(test_job_system_exit PROPERTIES TIMEOUT 300)
 # With one or two workers a job scheduled right before exit was left unfinished when the workers took the stop

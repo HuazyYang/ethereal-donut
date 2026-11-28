@@ -322,6 +322,18 @@ namespace donut::app
                 ImGui::SetNextItemOpen(true);
             return ImGui::TreeNodeEx(id, flags, "%s", label);
         }
+
+        // Donut's read-only list of the world (the InspectorReadOnlyComponents resource), or null.
+        const engine::InspectorReadOnlyComponents* FindDonutReadOnlyList(IWorld* world) noexcept
+        {
+            if (!world)
+                return nullptr;
+            using ReadOnlyTraits = engine::ComponentTraits<engine::InspectorReadOnlyComponents>;
+            const ComponentId id = world->FindComponent(ReadOnlyTraits::Desc().uuid);
+            if (id == ComponentId::Invalid)
+                return nullptr;
+            return static_cast<const engine::InspectorReadOnlyComponents*>(world->GetResource(id));
+        }
     }
 
     struct WorldInspector::State
@@ -339,6 +351,10 @@ namespace donut::app
         std::vector<ComponentId> readOnly;   // the application's (SetReadOnly)
         ComponentId donutReadOnly[engine::c_MaxInspectorReadOnlyComponents] = {};
         uint32_t donutReadOnlyCount = 0;     // read at each Draw
+        // donut's list's pairs (read at each Draw): onRows[i] is read-only on the rows that have onRowsWith[i]
+        ComponentId donutOnRows[engine::c_MaxInspectorReadOnlyOnRows] = {};
+        ComponentId donutOnRowsWith[engine::c_MaxInspectorReadOnlyOnRows] = {};
+        uint32_t donutOnRowsCount = 0;
 
         Entity selected = Entity::Null;
         int browserArchetype = 0;
@@ -375,6 +391,15 @@ namespace donut::app
                 if (donutReadOnly[i] == component)
                     return true;
             return std::find(readOnly.begin(), readOnly.end(), component) != readOnly.end();
+        }
+
+        // Read-only on this row by a pair of donut's list (a driven row's LocalTransform; backlog I3-R2).
+        bool IsReadOnlyOnRow(IWorld* world, Entity entity, ComponentId component) const noexcept
+        {
+            for (uint32_t i = 0; i < donutOnRowsCount; ++i)
+                if (donutOnRows[i] == component && world->HasComponent(entity, donutOnRowsWith[i]))
+                    return true;
+            return false;
         }
 
         // Relocatable, serialisable values of a row (not tags, buffers, Shared or Chunk values, resources), small
@@ -700,7 +725,7 @@ namespace donut::app
     void WorldInspector::State::DrawComponent(IWorld* world, ComponentId component,
                                               const ComponentTypeDesc& desc) noexcept
     {
-        const bool editable = IsEditable(component, desc);
+        const bool editable = IsEditable(component, desc) && !IsReadOnlyOnRow(world, selected, component);
         const bool enableable = Has(desc.flags, ComponentFlags::Enableable);
         {
             Writer writer(text, sizeof(text));
@@ -893,6 +918,13 @@ namespace donut::app
             s.donutReadOnlyCount = std::min(GetDonutReadOnlyComponents(world, s.donutReadOnly,
                                                                         engine::c_MaxInspectorReadOnlyComponents),
                                             engine::c_MaxInspectorReadOnlyComponents);
+            s.donutOnRowsCount = 0;
+            if (const engine::InspectorReadOnlyComponents* list = FindDonutReadOnlyList(world))
+            {
+                s.donutOnRowsCount = std::min(list->onRowsCount, engine::c_MaxInspectorReadOnlyOnRows);
+                std::copy(list->onRowsComponents, list->onRowsComponents + s.donutOnRowsCount, s.donutOnRows);
+                std::copy(list->onRowsWith, list->onRowsWith + s.donutOnRowsCount, s.donutOnRowsWith);
+            }
             if (OpenHeader("World"))
                 s.DrawWorld(world);
             if (OpenHeader("Archetypes"))
@@ -962,13 +994,7 @@ namespace donut::app
 
     uint32_t GetDonutReadOnlyComponents(IWorld* world, ComponentId* out, uint32_t capacity) noexcept
     {
-        if (!world)
-            return 0;
-        using ReadOnlyTraits = engine::ComponentTraits<engine::InspectorReadOnlyComponents>;
-        const ComponentId id = world->FindComponent(ReadOnlyTraits::Desc().uuid);
-        if (id == ComponentId::Invalid)
-            return 0;
-        const auto* list = static_cast<const engine::InspectorReadOnlyComponents*>(world->GetResource(id));
+        const engine::InspectorReadOnlyComponents* list = FindDonutReadOnlyList(world);
         if (!list)
             return 0;
         const uint32_t count = std::min(list->count, engine::c_MaxInspectorReadOnlyComponents);

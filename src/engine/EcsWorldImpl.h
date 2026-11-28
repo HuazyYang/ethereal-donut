@@ -324,6 +324,11 @@ namespace donut::engine::ecs
         uint8_t* memory;
         uint32_t count;             // rows in use
         uint32_t reserved;
+        // The version at which the chunk last lost a row that was not replaced (RemoveRow: the archetype's last row,
+        // removed or moved into a hole elsewhere), 0 if never. No column version says so (the chunk's rows that stay
+        // are unchanged): a per-chunk aggregate of the rows (the scene graph's ChunkWorldBounds) reads it to know that
+        // it is stale (backlog T4-1).
+        uint64_t shrunkVersion;
     };
 
     struct ArchetypeEdge

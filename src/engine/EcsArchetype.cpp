@@ -24,6 +24,7 @@
 
 #include "EcsWorldImpl.h"
 
+#include <algorithm>
 #include <new>
 
 namespace donut::engine::ecs
@@ -646,7 +647,7 @@ namespace donut::engine::ecs
         uint64_t* versions = reinterpret_cast<uint64_t*>(memory + archetype.versionsOffset);
         for (uint32_t i = 0; i <= archetype.columns.size(); ++i)
             versions[i] = version;
-        archetype.chunks.push_back(ChunkRecord{ memory, 0, 0 });
+        archetype.chunks.push_back(ChunkRecord{ memory, 0, 0, 0 });
         return true;
     }
 
@@ -761,6 +762,9 @@ namespace donut::engine::ecs
             StampChunk(archetype, chunk, version);
         }
         --archetype.chunks[lastChunk].count;
+        // never lowered (a stamp of an older version can follow, e.g. an Exclusive step's after an observer's playback);
+        // released below when it is empty now
+        archetype.chunks[lastChunk].shrunkVersion = std::max(archetype.chunks[lastChunk].shrunkVersion, version);
         --archetype.entityCount;
         ++archetype.rowMoves;
         if (archetype.chunks[lastChunk].count == 0)
