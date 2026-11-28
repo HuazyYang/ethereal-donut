@@ -108,6 +108,14 @@ add_dependencies(donut_all_tests test_light_shadows)
 add_test(NAME test_light_shadows COMMAND test_light_shadows)
 set_property(TARGET test_light_shadows PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
+# Design 10.1's rows at the sizes of decision 1 over runtime-only mesh instances (plan step E7, item E7.3; revision 2,
+# stage B), device-free. ctest runs the smoke mode (sizes / 100); the Release numbers come from `bench_scale --workers N`.
+add_executable(bench_scale src/render/bench_scale.cpp)
+target_link_libraries(bench_scale donut_render donut_engine donut_core)
+add_dependencies(donut_all_tests bench_scale)
+add_test(NAME bench_scale_smoke COMMAND bench_scale --smoke)
+set_property(TARGET bench_scale PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
+
 # The CPU cost of visibility and packets against the legacy strategy walk (sub-plan item E5.2; design 10.1). The same
 # source measures the walk alone when compiled against the E0 tree with BENCH_RENDER_EXTRACT_E0=1. ctest runs the smoke
 # mode; the Release numbers come from `bench_render_extract --workers N`.
