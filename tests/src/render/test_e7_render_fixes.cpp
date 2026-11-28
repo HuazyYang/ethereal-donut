@@ -21,7 +21,8 @@
 */
 
 // Regression tests of the E7 fix track (aggregate docs/plans/2026-11-26-donut-ecs-e7-rev2.md, stage F), render side:
-// one case per backlog item, named after it, device-free. Each fails without its fix.
+// one case per backlog item, named after it. Each fails without its fix. Device-free, but with `--gpu d3d12|vulkan`
+// (ctest test_e7_render_gpu_<backend>, a GPU program: one at a time) the GPU cases on a headless device instead.
 //   e72_r5_runtime_rows_checked  Debug's leaf check compares runtime-only rows with their mesh (Debug only: Release
 //                                builds do not check)
 //   i6_n2_walk_prepared_again    a walking strategy prepared again mid-drain hands out the new view's items only
@@ -31,18 +32,30 @@
 //   f4_n1_zero_closes_only_without_identity  0 closes only a scope without identity; a pipelined Extract needs one
 //   t5_n1_compact_geometry_cap   with compact records, a mesh's geometries past the cap get no packets (one warning)
 //   t8_4_scope_identity_wrap     the scope identities skip 0 at the wrap past 2^32 - 1
+//   s2_first_packet_of_a_pass    a pass's first packet in a range that a view already sees grows no scratch
 //   i7_n1_service_destroyed_while_recording  the service's state is kept, with a warning (last: the process defers)
+// GPU:
+//   s1_permanent_state_from_prepare  a permanent state that a Prepare sets on the upload list holds in the frame's lists
+//   s1_mesh_after_load           a mesh acquired after Scene::FinishedLoading is usable in the frame that makes it
 
+#include <donut/app/ApplicationBase.h>
+#include <donut/app/DeviceManager.h>
 #include <donut/core/log.h>
+#include <donut/core/vfs/VFS.h>
 #include <donut/engine/EcsWorld.h>
+#include <donut/engine/GpuScene.h>
 #include <donut/engine/JobSystem.h>
 #include <donut/engine/SceneComponents.h>
 #include <donut/engine/SceneGraph.h>
+#include <donut/engine/Scene.h>
+#include <donut/engine/ShaderFactory.h>
+#include <donut/engine/TextureCache.h>
 #include <donut/engine/View.h>
 #include <donut/render/DrawStrategy.h>
 #include <donut/render/RenderExtract.h>
 #include <donut/render/RenderGraph.h>
 #include <donut/render/RenderGraphFrameData.h>
+#include <donut/render/RenderGraphLambdaPass.h>
 #include <donut/tests/utils.h>
 
 #include "RenderVisibility.h"   // its test seam for the compact geometry cap (src/render)
@@ -53,6 +66,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace donut;
@@ -478,6 +492,47 @@ void test_t5_n1_compact_geometry_cap()
     CHECK(TakeWarnings() == 0);
 }
 
+// ------------------------------------------------------------------------------------------------ S-2
+
+// A range's scratch for a view reserves every pass's packets when the view first sees rows there (backlog S-2: in
+// ecs_scale at a million rows, a pass's first packet in such a range was one of extraction's last allocations, at frames
+// 100 to 260). Opaque nodes for two frames; then a node of a blended mesh joins their chunk, so that the transparent
+// pass gets its first packet in that range: the ranges' scratch does not grow (InstanceVisibility's test seam), with
+// the compact records off and on.
+void test_s2_first_packet_of_a_pass()
+{
+    const bool compact = RenderService::GetCompactPacketRecords();
+    for (const bool records : { false, true })
+    {
+        RenderService::SetCompactPacketRecords(records);
+        nvrhi::AutoPtr<Material> opaque;
+        nvrhi::AutoPtr<MeshInfo> solid = MakeMesh(opaque);
+        nvrhi::AutoPtr<Material> blended;
+        nvrhi::AutoPtr<MeshInfo> glass = MakeMesh(blended);
+        blended->domain = MaterialDomain::AlphaBlended;
+        Rig rig;
+        auto attach = [&](MeshInfo* mesh, double x)
+        {
+            auto node = MAKE_RC_OBJ_PTR(SceneGraphNode);
+            node->SetTranslation(dm::double3(x, 0.0, 0.0));
+            node->SetLeaf(MAKE_RC_OBJ_PTR(MeshInstance, mesh));
+            CHECK(rig.graph->Attach(rig.graph->GetRootNode(), node));
+        };
+        for (int i = 0; i < 4; ++i)
+            attach(solid, double(i) - 2.0);
+        rig.Frame();
+        rig.Frame();
+        const uint64_t growths = visibility::InstanceVisibility::GetRangeScratchGrowths();
+        attach(glass, 0.5);
+        rig.Frame();
+        CHECK(visibility::InstanceVisibility::GetRangeScratchGrowths() == growths);
+        rig.Frame();
+        CHECK(visibility::InstanceVisibility::GetRangeScratchGrowths() == growths);
+    }
+    RenderService::SetCompactPacketRecords(compact);
+    CHECK(TakeWarnings() == 0);
+}
+
 // ------------------------------------------------------------------------------------------------ T8-4
 
 // A graph whose identities start near the wrap (the store's test seam): 2^32 - 1, then 1, never 0 (0 means "no
@@ -529,6 +584,308 @@ void test_i7_n1_service_destroyed_while_recording()
     CHECK(SceneGraph::IsAnyRenderReadDeferring());
 }
 
+// ------------------------------------------------------------------------------------------- S-1 (GPU)
+
+namespace
+{
+    std::atomic<uint32_t> g_Errors{ 0 };   // log::error calls (nvrhi's messages among them): the GPU cases
+
+    struct GpuNoData
+    {
+        uint32_t unused;
+    };
+
+    // A buffer the graph imports in CopyDest and leaves there; `cpuRead`: host-readable.
+    nvrhi::BufferHandle MakeTarget(nvrhi::IDevice* device, uint64_t bytes, bool cpuRead)
+    {
+        nvrhi::BufferDesc desc;
+        desc.byteSize = bytes;
+        desc.cpuAccess = cpuRead ? nvrhi::CpuAccessMode::Read : nvrhi::CpuAccessMode::None;
+        desc.initialState = nvrhi::ResourceStates::CopyDest;
+        desc.debugName = "S1Target";
+        nvrhi::BufferHandle buffer;
+        device->createBuffer(desc, &buffer);
+        CHECK(buffer);
+        return buffer;
+    }
+
+    std::vector<uint8_t> ReadHost(nvrhi::IDevice* device, nvrhi::IBuffer* buffer)
+    {
+        std::vector<uint8_t> bytes(size_t(buffer->getDesc().byteSize));
+        const void* data = device->mapBuffer(buffer, nvrhi::CpuAccessMode::Read);
+        CHECK(data != nullptr);
+        std::memcpy(bytes.data(), data, bytes.size());
+        device->unmapBuffer(buffer);
+        return bytes;
+    }
+
+    // A registry, a graph and the device's profile; Run compiles (no diagnostics) and executes, then waits.
+    struct GpuRig
+    {
+        nvrhi::IDevice* device;
+        nvrhi::AutoPtr<IResourceRegistry> registry;
+        nvrhi::AutoPtr<IRenderGraph> graph;
+        BackendProfile profile;
+
+        explicit GpuRig(nvrhi::IDevice* d) : device(d)
+        {
+            CHECK(CreateResourceRegistry(device, &registry) == nvrhi::FS_OK);
+            CHECK(CreateRenderGraph(registry, &graph) == nvrhi::FS_OK);
+            CHECK(ComputeBackendProfile(device, &profile) == nvrhi::FS_OK);
+        }
+
+        void Run()
+        {
+            nvrhi::AutoPtr<ICompiledRenderGraph> plan;
+            CHECK(graph->Compile(profile, CompileOptions(), &plan) == nvrhi::FS_OK);
+            nvrhi::string diagnostics;
+            graph->GetDiagnostics(diagnostics);
+            if (!diagnostics.empty())
+                std::fprintf(stderr, "%s\n", diagnostics.c_str());
+            CHECK(diagnostics.empty());
+            CHECK(graph->Execute(plan, ExecuteDesc()) == nvrhi::FS_OK);
+            device->waitForIdle();
+        }
+    };
+}
+
+// The executor's contract behind S-1: a permanent state that a Prepare sets on the upload list holds in the frame's
+// lists while they record (the executor submits the upload list before it records them; nvrhi applies a permanent
+// state only when its list is submitted). One pass: its Prepare writes a fresh buffer (no permanent state yet, no graph
+// resource) on the upload list and makes CopySource | ShaderResource its permanent state; its Execute copies it into a
+// graph buffer on a segment list, where the tracker must find that state. No error, and the bytes arrive (the upload
+// ran first on the GPU too). With the upload list submitted after the recording: "Unknown prior state of buffer".
+void test_s1_permanent_state_from_prepare(nvrhi::IDevice* device)
+{
+    const uint32_t errors = g_Errors.load();
+    constexpr uint32_t c_Bytes = 256;
+    nvrhi::BufferDesc desc;
+    desc.byteSize = c_Bytes;
+    desc.debugName = "S1Fresh";
+    nvrhi::BufferHandle fresh;
+    device->createBuffer(desc, &fresh);
+    CHECK(fresh);
+    nvrhi::BufferHandle target = MakeTarget(device, c_Bytes, true);
+    std::vector<uint8_t> bytes(c_Bytes);
+    for (uint32_t i = 0; i < c_Bytes; ++i)
+        bytes[i] = uint8_t(i * 7 + 3);
+    {
+        GpuRig rig(device);
+        ResourceId id = rig.graph->ImportBuffer(target, nvrhi::ResourceStates::CopyDest,
+                                                nvrhi::ResourceStates::CopyDest);
+        nvrhi::IBuffer* source = fresh;
+        AddLambdaPassWithPrepare<GpuNoData>(rig.graph,
+            PassDesc{ "S1PermanentState", PassType::Copy, PassFlags::Tracked, 0 },
+            [&](ISetupContext* setup, GpuNoData&)
+            {
+                id = setup->Write(id, render::Access::CopyDest, nvrhi::ShaderType::None, {}, AccessFlags::FullWrite);
+            },
+            [&](IPrepareContext* prepare, GpuNoData&)
+            {
+                nvrhi::ICommandList* upload = prepare->GetUploadCommandList();
+                upload->beginTrackingBufferState(source, nvrhi::ResourceStates::Common);
+                upload->writeBuffer(source, bytes.data(), bytes.size());
+                upload->setPermanentBufferState(source, nvrhi::ResourceStates::CopySource |
+                                                        nvrhi::ResourceStates::ShaderResource);
+                upload->commitBarriers();
+            },
+            [&](IPassContext* context, const GpuNoData&)
+            {
+                context->GetCommandList()->copyBuffer(context->GetBuffer(id), 0, source, 0, c_Bytes);
+            });
+        rig.Run();
+    }
+    CHECK(ReadHost(device, target) == bytes);
+    CHECK(g_Errors.load() == errors);
+}
+
+// S-1 as the sample met it: a graph-path scene loaded (Scene::FinishedLoading), then a mesh acquired for runtime-only
+// rows (SceneGraph::AcquireRuntimeMesh). Its buffers are made at the next RenderService::Extract
+// (Scene::CreateMeshBufferObjects) and written, with their permanent states, by the upload pass's Prepare; a later pass
+// of that frame uses them on its own list, as a draw does (here: their index and vertex buffer states required). No
+// error, and the vertex buffer holds the mesh's positions.
+void test_s1_mesh_after_load(nvrhi::IDevice* device, nvrhi::GraphicsAPI api)
+{
+    const uint32_t errors = g_Errors.load();
+    auto nativeFS = MAKE_RC_OBJ_PTR(vfs::NativeFileSystem);
+    auto rootFS = MAKE_RC_OBJ_PTR(vfs::RootFileSystem);
+    rootFS->mount("/shaders/donut", app::GetDirectoryWithExecutable() / "shaders/framework" /
+                                        app::GetShaderTypeName(api));
+    auto shaderFactory = MAKE_RC_OBJ_PTR(ShaderFactory, device, rootFS, "/shaders");
+    auto textureCache = MAKE_RC_OBJ_PTR(TextureCache, device, nativeFS, nullptr);
+    auto scene = MAKE_RC_OBJ_PTR(Scene, device, shaderFactory, nativeFS, textureCache, nullptr, nullptr);
+    CHECK(scene->SetGpuSceneUploadMode(GpuSceneUploadMode::Scatter) == nvrhi::FS_OK);
+    SceneGraph* graph = scene->CreateSceneGraph();
+    graph->SetRootNode(MAKE_RC_OBJ_PTR(SceneGraphNode));
+    RenderServiceDesc serviceDesc;
+    serviceDesc.scene = scene;
+    serviceDesc.shaderFactory = shaderFactory;
+    auto service = MAKE_RC_OBJ_PTR(RenderService, device, serviceDesc);
+    scene->FinishedLoading(0);
+
+    // the mesh, after the load: three vertices, one triangle
+    auto material = MAKE_RC_OBJ_PTR(Material);
+    material->name = "S1";
+    auto buffers = MAKE_RC_OBJ_PTR(BufferGroup);
+    buffers->positionData = { dm::float3(0.f, 0.f, 1.f), dm::float3(1.f, 2.f, 3.f), dm::float3(-4.f, 5.f, 6.f) };
+    buffers->indexData = { 0, 1, 2 };
+    const std::vector<dm::float3> positions = buffers->positionData;
+    auto geometry = MAKE_RC_OBJ_PTR(MeshGeometry);
+    geometry->material = material;
+    geometry->numIndices = 3;
+    geometry->numVertices = 3;
+    geometry->objectSpaceBounds = dm::box3(dm::float3(-4.f, 0.f, 1.f), dm::float3(1.f, 5.f, 6.f));
+    auto mesh = MAKE_RC_OBJ_PTR(MeshInfo);
+    mesh->name = "S1";
+    mesh->type = MeshType::Triangles;
+    mesh->buffers = buffers;
+    mesh->geometries.push_back(geometry);
+    mesh->totalIndices = 3;
+    mesh->totalVertices = 3;
+    mesh->objectSpaceBounds = geometry->objectSpaceBounds;
+    CHECK(graph->AcquireRuntimeMesh(mesh) != MeshId::Invalid);
+
+    nvrhi::BufferHandle target = MakeTarget(device, 16, false);
+    {
+        GpuRig rig(device);
+        scene->RefreshSceneGraph(1);
+        ExtractDesc extractDesc;
+        extractDesc.frameIndex = 1;
+        SceneFrame* frame = nullptr;
+        CHECK(service->Extract(rig.graph, nullptr, extractDesc, &frame) == nvrhi::FS_OK && frame);
+        CHECK(buffers->vertexBuffer && buffers->indexBuffer);   // made at this extraction
+        CHECK(service->AddUploadPasses(rig.graph, frame) == nvrhi::FS_OK);
+        ResourceId id = rig.graph->ImportBuffer(target, nvrhi::ResourceStates::CopyDest,
+                                                nvrhi::ResourceStates::CopyDest);
+        nvrhi::IBuffer* vertexBuffer = buffers->vertexBuffer;
+        nvrhi::IBuffer* indexBuffer = buffers->indexBuffer;
+        AddLambdaPass<GpuNoData>(rig.graph, PassDesc{ "S1UsesTheMesh", PassType::Copy, PassFlags::Tracked, 0 },
+            [&](ISetupContext* setup, GpuNoData&)
+            {
+                id = setup->Write(id, render::Access::CopyDest, nvrhi::ShaderType::None, {}, AccessFlags::FullWrite);
+            },
+            [&](IPassContext* context, const GpuNoData&)
+            {
+                nvrhi::ICommandList* list = context->GetCommandList();
+                list->setBufferState(vertexBuffer, nvrhi::ResourceStates::VertexBuffer);
+                list->setBufferState(indexBuffer, nvrhi::ResourceStates::IndexBuffer);
+                const uint32_t marker[4] = { 1, 2, 3, 4 };
+                list->writeBuffer(context->GetBuffer(id), marker, sizeof(marker));
+            });
+        rig.Run();
+        service->EndFrame(true);
+    }
+
+    // the positions, through a copy outside the graph (explicit transitions: the tracker cannot leave a permanent state)
+    nvrhi::BufferHandle readback = MakeTarget(device, buffers->vertexBuffer->getDesc().byteSize, true);
+    nvrhi::ResourceStates permanent = nvrhi::ResourceStates::VertexBuffer | nvrhi::ResourceStates::ShaderResource;
+    if (buffers->vertexBuffer->getDesc().isAccelStructBuildInput)
+        permanent = permanent | nvrhi::ResourceStates::AccelStructBuildInput;
+    nvrhi::CommandListHandle list;
+    device->createCommandList(nvrhi::CommandListParameters(), &list);
+    list->open();
+    list->setEnableAutomaticBarriers(false);
+    const nvrhi::ResourceBarrier before =
+        nvrhi::ResourceBarrier::Transition(buffers->vertexBuffer, permanent, nvrhi::ResourceStates::CopySource);
+    list->barriers(&before, 1);
+    list->copyBuffer(readback, 0, buffers->vertexBuffer, 0, readback->getDesc().byteSize);
+    const nvrhi::ResourceBarrier after =
+        nvrhi::ResourceBarrier::Transition(buffers->vertexBuffer, nvrhi::ResourceStates::CopySource, permanent);
+    list->barriers(&after, 1);
+    list->setEnableAutomaticBarriers(true);
+    list->close();
+    device->executeCommandList(list);
+    device->waitForIdle();
+    const std::vector<uint8_t> vertices = ReadHost(device, readback);
+    const nvrhi::BufferRange& range = buffers->getVertexBufferRange(VertexAttribute::Position);
+    CHECK(range.byteOffset + positions.size() * sizeof(dm::float3) <= vertices.size());
+    CHECK(std::memcmp(vertices.data() + range.byteOffset, positions.data(), positions.size() * sizeof(dm::float3)) == 0);
+    CHECK(g_Errors.load() == errors);
+    service = nullptr;
+    scene = nullptr;
+}
+
+// --gpu d3d12|vulkan: a headless device with the debug runtime and the nvrhi validation layer (an NVIDIA adapter when
+// there is one), then the GPU cases; every log::error (nvrhi's messages among them) fails the run.
+int RunGpuCases(const char* backend)
+{
+    const bool vulkan = std::strcmp(backend, "vulkan") == 0;
+    if (!vulkan && std::strcmp(backend, "d3d12") != 0)
+    {
+        std::fprintf(stderr, "--gpu d3d12 | vulkan\n");
+        return 1;
+    }
+    const nvrhi::GraphicsAPI api = vulkan ? nvrhi::GraphicsAPI::VULKAN : nvrhi::GraphicsAPI::D3D12;
+    log::SetCallback([](log::Severity severity, const char* message)
+    {
+        if (severity >= log::Severity::Error)
+            g_Errors.fetch_add(1);
+        else if (severity >= log::Severity::Warning)
+            g_Warnings.fetch_add(1);
+        if (severity >= log::Severity::Warning)
+            std::fprintf(stderr, "%s\n", message);
+    });
+    int failed = 0;
+    try
+    {
+        nvrhi::AutoPtr<app::DeviceManager> deviceManager = nvrhi::TakeOver(app::DeviceManager::Create(api));
+        CHECK(deviceManager != nullptr);
+        app::DeviceCreationParameters params;
+        params.headlessDevice = true;
+        params.enableDebugRuntime = true;
+        params.enableGPUValidation = false;
+        params.enableWarningsAsErrors = false;
+        params.enableNvrhiValidationLayer = true;
+        params.backBufferWidth = 64;
+        params.backBufferHeight = 64;
+        CHECK(deviceManager->CreateInstance(params));
+        {
+            std::vector<app::AdapterInfo> adapters;
+            if (deviceManager->EnumerateAdapters(adapters))
+                for (int i = 0; i < int(adapters.size()); ++i)
+                    if (adapters[i].name.find("NVIDIA") != std::string::npos)
+                    {
+                        params.adapterIndex = i;
+                        break;
+                    }
+        }
+        CHECK(deviceManager->CreateHeadlessDevice(params));
+        std::printf("device: %s\n", deviceManager->GetRendererString());
+        nvrhi::IDevice* device = deviceManager->GetDevice();
+        struct GpuCase { const char* name; void (*run)(nvrhi::IDevice*, nvrhi::GraphicsAPI); };
+        const GpuCase cases[] = {
+            { "s1_permanent_state_from_prepare",
+              [](nvrhi::IDevice* d, nvrhi::GraphicsAPI) { test_s1_permanent_state_from_prepare(d); } },
+            { "s1_mesh_after_load", test_s1_mesh_after_load },
+        };
+        for (const GpuCase& c : cases)
+        {
+            try
+            {
+                c.run(device, api);
+                std::printf("%s: passed\n", c.name);
+            }
+            catch (const std::runtime_error& err)
+            {
+                std::fprintf(stderr, "%s: FAILED at %s\n", c.name, err.what());
+                ++failed;
+            }
+        }
+        deviceManager->Shutdown();
+    }
+    catch (const std::runtime_error& err)
+    {
+        std::fprintf(stderr, "the device: FAILED at %s\n", err.what());
+        ++failed;
+    }
+    if (g_Errors.load() != 0)
+    {
+        std::fprintf(stderr, "%u errors were logged\n", g_Errors.load());
+        ++failed;
+    }
+    return failed ? 1 : 0;
+}
+
 int main(int argc, char** argv)
 {
     struct Case { const char* name; void (*run)(); };
@@ -541,6 +898,7 @@ int main(int argc, char** argv)
         { "f4_n1_zero_closes_only_without_identity", test_f4_n1_zero_closes_only_without_identity },
         { "t5_n1_compact_geometry_cap", test_t5_n1_compact_geometry_cap },
         { "t8_4_scope_identity_wrap", test_t8_4_scope_identity_wrap },
+        { "s2_first_packet_of_a_pass", test_s2_first_packet_of_a_pass },
         { "i7_n1_service_destroyed_while_recording", test_i7_n1_service_destroyed_while_recording },   // last
     };
     log::SetCallback([](log::Severity severity, const char* message)
@@ -552,6 +910,8 @@ int main(int argc, char** argv)
         }
     });
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc > 2 && std::strcmp(argv[1], "--gpu") == 0)
+        return RunGpuCases(argv[2]);
     int failed = 0;
     for (const Case& c : cases)
     {

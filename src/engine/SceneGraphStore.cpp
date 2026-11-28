@@ -5468,7 +5468,7 @@ namespace donut::engine
             return false;
         // E7.4 remedy 4: a chunk whose rows have one parent and no children, as its summary says (links, parents,
         // leaves and content flags change only with a full pass, which computes every summary): the loop below would
-        // find the same parent and content and mark the parent once; only the box and the version change.
+        // find the same parent and content and mark the parent once; only the box changes.
         if (childless && archetypeIndex < m_ChunkSummaries.size() && chunk < m_ChunkSummaries[archetypeIndex].size())
         {
             ChunkSummary& summary = m_ChunkSummaries[archetypeIndex][chunk];
@@ -5478,8 +5478,7 @@ namespace donut::engine
                     MarkPath(summary.parent, m_SubgraphPass);
                 uint32_t ignored;
                 KeysOf(chunkBounds, SceneContentFlags::None, summary.keys.keys, ignored);
-                summary.version = m_World->GetVersion();
-                return true;
+                return true;   // its version is only compared with 0 (T8-N5)
             }
         }
         const SceneLinks* links = reinterpret_cast<const SceneLinks*>(ColumnBase(archetype, chunk, linksColumn));

@@ -54,7 +54,11 @@
 // bits and the position), so that the sort reads no keys; step 5 gathers from that array. The output is the same.
 // The output does not depend on the worker count or the range size. Arena arrays are sized by high-water marks with a
 // quarter of headroom (the arena reuses its blocks only while a frame asks for no more than before), heap scratch keeps
-// its capacity and grows with the same headroom: once the marks have settled, no allocation.
+// its capacity and grows with the same headroom: once the marks have settled, no allocation. A range that gets a view's
+// rows for the first time reserves every pass's packets at once, so that a pass's first packet there takes no
+// allocation in a later frame (backlog S-2: at a million rows such first packets were among the last allocations of
+// extraction, at frames 100 and 253). A range's counts still wander with moving rows (which chunks of the range a view
+// sees), so a growth past a high-water mark can come late; a larger headroom does not prevent it (it moves the marks).
 
 #pragma once
 
@@ -804,6 +808,12 @@ namespace donut::render::visibility
                                          std::memory_order_relaxed);
         }
 
+        // Test seam (S-2): the growths of the ranges' scratch (instances and packets) so far, per module.
+        static uint64_t GetRangeScratchGrowths() noexcept
+        {
+            return s_RangeScratchGrowths.load(std::memory_order_relaxed);
+        }
+
     private:
         // One visible instance as a range lists it (the snapshot's VisibleInstances, one record).
         struct InstanceRecord
@@ -999,7 +1009,13 @@ namespace donut::render::visibility
                     if (!frustum.intersectsWith(chunkBounds->bounds))
                         continue;
                     RangeView& out = scratch[v];
-                    if (!out.instances.Reserve(size_t(out.instanceCount) + chunk.count, out.instanceCount))
+                    // the range's first rows of this view: every pass's arrays of the current record mode (S-2)
+                    if (out.instances.Capacity() == 0 && !ReservePasses<Compact>(out))
+                    {
+                        Fail();
+                        return;
+                    }
+                    if (!ReserveRange(out.instances, size_t(out.instanceCount) + chunk.count, out.instanceCount))
                     {
                         Fail();
                         return;
@@ -1015,6 +1031,32 @@ namespace donut::render::visibility
                 }
             }
 
+            // A range's scratch: at least `capacity` elements, the first `keep` kept; a growth is counted (the test
+            // seam).
+            template <typename T>
+            static bool ReserveRange(PodBuffer<T>& buffer, size_t capacity, size_t keep) noexcept
+            {
+                if (capacity <= buffer.Capacity())
+                    return true;
+                s_RangeScratchGrowths.fetch_add(1, std::memory_order_relaxed);
+                return buffer.Reserve(capacity, keep);
+            }
+
+            // A range's scratch for a view, the first time it gets rows of that view: every pass's packet array of the
+            // current record mode (compact or full records) at its minimum (backlog S-2).
+            template <bool Compact>
+            static bool ReservePasses(RangeView& out) noexcept
+            {
+                for (uint32_t pass = 0; pass < c_DrawPacketPassCount; ++pass)
+                {
+                    const bool reserved = Compact ? ReserveRange(out.compactPackets[pass], 1, 0)
+                                                  : ReserveRange(out.packets[pass], 1, 0);
+                    if (!reserved)
+                        return false;
+                }
+                return true;
+            }
+
             template <bool Compact>
             bool Push(RangeView& out, uint32_t pass, const PacketRecord& packet) noexcept
             {
@@ -1022,7 +1064,7 @@ namespace donut::render::visibility
                 if constexpr (Compact)
                 {
                     PodBuffer<CompactPacketRecord>& buffer = out.compactPackets[pass];
-                    if (!buffer.Reserve(size_t(count) + 1, count))
+                    if (!ReserveRange(buffer, size_t(count) + 1, count))
                     {
                         Fail();
                         return false;
@@ -1032,7 +1074,7 @@ namespace donut::render::visibility
                 else
                 {
                     PodBuffer<PacketRecord>& buffer = out.packets[pass];
-                    if (!buffer.Reserve(size_t(count) + 1, count))
+                    if (!ReserveRange(buffer, size_t(count) + 1, count))
                     {
                         Fail();
                         return false;
@@ -1512,5 +1554,6 @@ namespace donut::render::visibility
         inline static std::atomic<uint32_t> s_SerialRecords{ c_SerialRecords };
         inline static std::atomic<uint32_t> s_SerialRecordsAlone{ c_SerialRecordsAlone };
         inline static std::atomic<uint32_t> s_CompactGeometryLimit{ c_CompactGeometryLimit };   // the test seam
+        inline static std::atomic<uint64_t> s_RangeScratchGrowths{ 0 };   // the test seam
     };
 }

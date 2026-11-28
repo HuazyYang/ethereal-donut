@@ -495,7 +495,9 @@ namespace donut::render
     {
         NVRHI_DECLARE_UUID_TRAITS(IPrepareContext)
         virtual nvrhi::IDevice* GetDevice() noexcept = 0;
-        virtual nvrhi::ICommandList* GetUploadCommandList() noexcept = 0;   // first list of the first graphics submit
+        // The first list of the frame's first graphics submission, submitted before any segment records (9.1): the
+        // permanent states it sets (setPermanentBufferState) hold in every list of the frame.
+        virtual nvrhi::ICommandList* GetUploadCommandList() noexcept = 0;
         virtual const nvrhi::FramebufferInfoEx& GetFramebufferInfo() noexcept = 0;   // raster passes
         virtual const nvrhi::TextureDesc* GetTextureDesc(ResourceId id) noexcept = 0;   // nullptr for a buffer
         virtual const nvrhi::BufferDesc* GetBufferDesc(ResourceId id) noexcept = 0;     // nullptr for a texture

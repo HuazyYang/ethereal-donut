@@ -61,14 +61,21 @@ add_test(NAME test_render_pipelining COMMAND test_render_pipelining)
 set_property(TARGET test_render_pipelining PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
 # The regression tests of the E7 fix track, render side (aggregate docs/plans/2026-11-26-donut-ecs-e7-rev2.md, stage
-# F), device-free.
+# F), device-free; with --gpu, its GPU cases on a headless device (backlog S-1).
 add_executable(test_e7_render_fixes src/render/test_e7_render_fixes.cpp)
-target_link_libraries(test_e7_render_fixes donut_render donut_engine donut_core donut_tests_utils)
+target_link_libraries(test_e7_render_fixes donut_app donut_render donut_engine donut_core donut_tests_utils)
 # Its compact-records case sets the geometry cap through RenderVisibility.h's test seam (src/render).
 target_include_directories(test_e7_render_fixes PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/render"
                            "${CMAKE_CURRENT_LIST_DIR}/../src/engine")
 add_dependencies(donut_all_tests test_e7_render_fixes)
 add_test(NAME test_e7_render_fixes COMMAND test_e7_render_fixes)
+# Its GPU cases (named apart from the device-free set; a GPU program: one at a time).
+foreach(_backend d3d12 vulkan)
+    if((_backend STREQUAL "d3d12" AND DONUT_WITH_DX12) OR (_backend STREQUAL "vulkan" AND DONUT_WITH_VULKAN))
+        add_test(NAME test_e7_render_gpu_${_backend} COMMAND test_e7_render_fixes --gpu ${_backend})
+        set_tests_properties(test_e7_render_gpu_${_backend} PROPERTIES RUN_SERIAL TRUE LABELS gpu)
+    endif()
+endforeach()
 set_property(TARGET test_e7_render_fixes PROPERTY FOLDER "Donut/donut_tests/donut_render_tests")
 
 # Visibility and draw packets against the legacy strategies, device-free (sub-plan item E5.2). The ECS allocation

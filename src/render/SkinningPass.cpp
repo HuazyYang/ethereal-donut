@@ -26,10 +26,11 @@
 // dispatches. Its Prepare makes the pipeline once, the binding sets of new instances, and writes each dispatched
 // instance's joint matrices from the snapshot into the leaf's joint buffer on the graph's upload list: the joint
 // buffers are host-kept (ShaderResource), and the upload list records with automatic barriers, so that they are written
-// exactly as Scene::UpdateSkinnedMeshes writes them, and the list is submitted before the frame's other lists. Its
-// Execute, with the plan's barriers only, binds and dispatches per instance in snapshot order with
+// exactly as Scene::UpdateSkinnedMeshes writes them, and the list is submitted before the frame's other lists record.
+// Its Execute, with the plan's barriers only, binds and dispatches per instance in snapshot order with
 // engine::FillSkinningConstants, as Scene::UpdateSkinnedMeshes does. The prototype's vertex buffer, read through a raw
-// SRV, has its permanent state from the upload list (Scene::WriteMeshBufferData) and is not a graph resource.
+// SRV, has its permanent state from the upload list (Scene::WriteMeshBufferData), which is submitted before this
+// pass's list records (also for a prototype made at extraction: backlog S-1), and is not a graph resource.
 
 #include <donut/render/SkinningPass.h>
 #include <donut/core/log.h>

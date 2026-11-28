@@ -1852,26 +1852,21 @@ namespace donut::render::rdg
             }
             AssignTimerSlots(frame);
             instance.segmentCost.resize(segmentCount, 0);
-            const bool parallel = desc.parallelFor && profile.recordingMode != RecordingMode::ImmediateSerial && segmentCount > 1;
-            const uint32_t tasks = parallel ? PlanRecordingTasks(frame, desc.workerCount ? desc.workerCount : segmentCount) : 0;
-            if (tasks > 1)
-            {
-                desc.parallelFor(desc.schedulerContext, tasks, RecordTask, &frame);
-            }
-            else
-            {
-                for (uint32_t i = 0; i < segmentCount; ++i)
-                    RecordTimedSegment(frame, i);
-            }
-            for (uint32_t i = 0; i < segmentCount; ++i)
-            {
-                if (instance.segmentResults[i] != nvrhi::FS_OK && result == nvrhi::FS_OK)
-                    result = instance.segmentResults[i];
-            }
-            runtime.objectsCreated += frame.framebuffersCreated.load(std::memory_order_relaxed);
-            frame.recordTasks = tasks > 1 ? tasks : 1;
+            // The recording tasks (from the instance and the previous frame's segment costs), planned before the
+            // prologue is submitted: their planning can fail (out of memory), and nothing that can fail comes between
+            // that submission and the recording (F9-R1).
+            const bool parallel =
+                desc.parallelFor && profile.recordingMode != RecordingMode::ImmediateSerial && segmentCount > 1;
+            const uint32_t tasks =
+                parallel ? PlanRecordingTasks(frame, desc.workerCount ? desc.workerCount : segmentCount) : 0;
 
-            const auto submitStart = std::chrono::steady_clock::now();
+            // The prologue (the patches, then Prepare's uploads) is submitted before any segment records (9.1): nvrhi
+            // applies a permanent state that the upload list sets (Scene::WriteMeshBufferData: the mesh buffers made
+            // at extraction) only when that list is submitted, and the segments' lists must find it while they record
+            // (backlog S-1). It is still the frame's first graphics submission, and every stream's first segment waits
+            // for it, so the GPU sees the same order. Past the frame's last return (and throw) before recording: a frame
+            // that leaves earlier loses its Prepare, as before.
+            const auto prologueStart = std::chrono::steady_clock::now();
             const bool fences = runtime.fencesSupported;
             const bool prologueNeeded = frame.prologueOpen;
             uint64_t prologueValue = 0;
@@ -1902,6 +1897,25 @@ namespace donut::render::rdg
                     device->executeCommandList(prologue, CommandQueue::Graphics);
                 }
             }
+            const auto prologueEnd = std::chrono::steady_clock::now();
+            if (tasks > 1)
+            {
+                desc.parallelFor(desc.schedulerContext, tasks, RecordTask, &frame);
+            }
+            else
+            {
+                for (uint32_t i = 0; i < segmentCount; ++i)
+                    RecordTimedSegment(frame, i);
+            }
+            for (uint32_t i = 0; i < segmentCount; ++i)
+            {
+                if (instance.segmentResults[i] != nvrhi::FS_OK && result == nvrhi::FS_OK)
+                    result = instance.segmentResults[i];
+            }
+            runtime.objectsCreated += frame.framebuffersCreated.load(std::memory_order_relaxed);
+            frame.recordTasks = tasks > 1 ? tasks : 1;
+
+            const auto submitStart = std::chrono::steady_clock::now();
 
             // Per stream: a (queue, lane) pair. Segments of one stream run in order; streams order through fences.
             std::array<bool, c_MaxStreams> firstOfQueue;
@@ -2010,8 +2024,11 @@ namespace donut::render::rdg
             const auto submitEnd = std::chrono::steady_clock::now();
             RunStatistics& run = runtime.run;
             run.frameIndex = frameIndex;
-            run.recordMilliseconds = std::chrono::duration<float, std::milli>(submitStart - recordStart).count();
-            run.submitMilliseconds = std::chrono::duration<float, std::milli>(submitEnd - submitStart).count();
+            // the prologue's submission, made before the recording, counts as submission time
+            using Milliseconds = std::chrono::duration<float, std::milli>;
+            const auto prologueTime = prologueEnd - prologueStart;
+            run.recordMilliseconds = Milliseconds(submitStart - recordStart - prologueTime).count();
+            run.submitMilliseconds = Milliseconds(submitEnd - submitStart + prologueTime).count();
             run.passes = frame.passes.load(std::memory_order_relaxed);
             run.recordTasks = frame.recordTasks;
             run.segments = segmentCount;

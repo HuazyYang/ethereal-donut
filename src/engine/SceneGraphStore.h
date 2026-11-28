@@ -704,10 +704,11 @@ namespace donut::engine
             std::atomic<uint32_t> content;
         };
         // What a chunk gives its parent when every row has the same parent and no row has children: the union of the
-        // rows' own parts, valid while none of the chunk's relevant versions is newer than `version`.
+        // rows' own parts. Links, parents, leaves and content flags change only with a full pass, which computes every
+        // summary again; the Bounds system updates the box of the chunks it writes.
         struct ChunkSummary
         {
-            uint64_t version = 0;      // 0: not computed
+            uint64_t version = 0;      // 0: not computed; else the world version it was computed at (only told from 0)
             Entity parent = Entity::Null;
             bool single = false;       // one parent (or none: roots) and no row with children
             SubgraphKeys keys{};

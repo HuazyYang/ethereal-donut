@@ -352,8 +352,9 @@ namespace donut::render
         }
         case UploadUseKind::Records:
         {
-            // The upload list that Prepare wrote the mesh data on is submitted with the lists recorded now (the executor
-            // records every pass, failed or not, and then submits).
+            // The upload list that Prepare wrote the mesh data on was submitted before the lists record (the executor
+            // then records every pass, failed or not, and submits them), so the mesh buffers' permanent states hold in
+            // them (backlog S-1).
             if (use.scene)
                 use.scene->ConfirmMeshBufferData();
             engine::GpuSceneScatterRecords records;
